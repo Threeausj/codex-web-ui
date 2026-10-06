@@ -1,0 +1,1112 @@
+<script setup lang="ts">
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
+import { useCodex } from "./lib/useCodex";
+import Icon from "./components/Icon.vue";
+import ConversationOutput from "./components/ConversationOutput.vue";
+import ApprovalCard from "./components/ApprovalCard.vue";
+import Composer from "./components/Composer.vue";
+import WorkspacePanel from "./components/WorkspacePanel.vue";
+import ResizableWorkspace from "./components/ResizableWorkspace.vue";
+import SettingsPanel from "./components/SettingsPanel.vue";
+import ConversationNav from "./components/ConversationNav.vue";
+import ProjectDialog from "./components/ProjectDialog.vue";
+import { isPinned } from "./lib/navigation";
+
+const api = useCodex();
+const state = api.state;
+const sidebarOpen = ref(false);
+const sidebarCollapsed = ref(false);
+const workspaceOpen = ref(false);
+const workspaceTab = ref("files");
+const workspacePath = ref("");
+const workspace = ref<InstanceType<typeof WorkspacePanel>>();
+const composer = ref<InstanceType<typeof Composer>>();
+const scroll = ref<HTMLElement>();
+const showScrollBottom = ref(false);
+const settingsOpen = ref(false);
+const settingsTab = ref("general");
+const paletteOpen = ref(false);
+const paletteQuery = ref("");
+const paletteInput = ref<HTMLInputElement>();
+const paletteSelected = ref(0);
+const searchOpen = ref(false);
+const threadSearch = ref("");
+const threadMenu = ref(false);
+const renameOpen = ref(false);
+const renameValue = ref("");
+const editingProject = ref<any>(null);
+const renameInput = ref<HTMLInputElement>();
+const loginPassword = ref("");
+const loginBusy = ref(false);
+const actionBusy = ref(false);
+let navigationSelection = 0;
+let activeActionCount = 0;
+const theme = ref(localStorage.getItem("codex.theme") || "system");
+const prefersDark = window.matchMedia("(prefers-color-scheme: dark)");
+function updateViewport() {
+  const viewport = window.visualViewport;
+  if (viewport && viewport.width <= 760 && viewport.scale === 1)
+    document.documentElement.style.setProperty(
+      "--app-height",
+      `${viewport.height}px`,
+    );
+  else document.documentElement.style.removeProperty("--app-height");
+}
+const currentHost = computed(() =>
+  state.hosts.find((host: any) => host.id === state.hostId),
+);
+const currentProject = computed(() =>
+  state.projects.find(
+    (project: any) =>
+      [project.path, ...(project.rootPaths || [])].includes(
+        state.projectPath,
+      ) &&
+      (!project.hostId || project.hostId === state.hostId),
+  ),
+);
+const projectName = computed(
+  () =>
+    currentProject.value?.name ||
+    state.projectPath.split("/").filter(Boolean).pop() ||
+    "选择项目",
+);
+const threadTitle = computed(
+  () =>
+    state.activeThread?.name ||
+    state.activeThread?.preview?.slice(0, 70) ||
+    "新对话",
+);
+const visibleThreads = computed(() =>
+  state.threads.filter(
+    (thread: any) =>
+      !threadSearch.value ||
+      `${thread.name || ""} ${thread.preview || ""} ${thread.cwd || ""}`
+        .toLowerCase()
+        .includes(threadSearch.value.toLowerCase()),
+  ),
+);
+const hostProjects = computed(() =>
+  state.projects.filter(
+    (project: any) => !project.hostId || project.hostId === state.hostId,
+  ),
+);
+const activeRequests = computed(() =>
+  state.pendingRequests.filter(
+    (request: any) =>
+      !request.params?.threadId ||
+      request.params.threadId === state.activeThread?.id,
+  ),
+);
+const otherRequests = computed(() =>
+  state.pendingRequests.filter(
+    (request: any) =>
+      request.params?.threadId &&
+      request.params.threadId !== state.activeThread?.id,
+  ),
+);
+const welcome = computed(() => !state.activeThread && !state.items.length);
+const contextUsed = computed(() => state.tokenUsage?.last?.totalTokens ?? 0);
+const contextLimit = computed(() => state.tokenUsage?.modelContextWindow || 0);
+const contextPercent = computed(() =>
+  contextLimit.value
+    ? Math.min(100, Math.round((contextUsed.value / contextLimit.value) * 100))
+    : 0,
+);
+const paletteActions = [
+  {
+    id: "new",
+    name: "新建对话",
+    detail: "⌘ / Ctrl + Shift + O",
+    icon: "SquarePen",
+  },
+  { id: "compact", name: "压缩上下文", detail: "/compact", icon: "RefreshCw" },
+  { id: "fork", name: "创建对话分支", detail: "/fork", icon: "GitBranch" },
+  {
+    id: "terminal",
+    name: "打开终端",
+    detail: "⌘ / Ctrl + J",
+    icon: "Terminal",
+  },
+  {
+    id: "git",
+    name: "Git 与工作树",
+    detail: "分支 · 提交 · Worktree",
+    icon: "GitBranch",
+  },
+  { id: "files", name: "浏览项目文件", detail: "工作区", icon: "Folder" },
+  { id: "preview", name: "打开预览", detail: "工作区", icon: "Eye" },
+  {
+    id: "review",
+    name: "审查代码变更",
+    detail: "/review",
+    icon: "GitCompareArrows",
+  },
+  {
+    id: "settings",
+    name: "设置",
+    detail: "配置 · SSH · 账户",
+    icon: "Settings2",
+  },
+];
+const paletteResults = computed(() => {
+  const q = paletteQuery.value.toLowerCase();
+  const actions: any[] = paletteActions
+    .filter(
+      (action) => !q || `${action.name} ${action.id}`.toLowerCase().includes(q),
+    )
+    .map((action) => ({ ...action, kind: "action" }));
+  const threads = api
+    .navigationThreads()
+    .filter(
+      (thread: any) =>
+        !q ||
+        `${thread.name || ""} ${thread.preview || ""}`
+          .toLowerCase()
+          .includes(q),
+    )
+    .slice(0, q ? 12 : 5)
+    .map((thread: any) => ({
+      id: thread.id,
+      hostId: thread.hostId,
+      name: thread.name || thread.preview || "未命名对话",
+      detail:
+        state.hosts.find((host) => host.id === thread.hostId)?.name || "对话",
+      icon: "Command",
+      kind: "thread",
+    }));
+  return [...actions, ...threads];
+});
+function displayTime(value: number | string) {
+  if (!value) return "";
+  const date = new Date(
+    typeof value === "number" ? (value < 1e12 ? value * 1000 : value) : value,
+  );
+  const age = Date.now() - date.getTime();
+  if (age < 60000) return "刚刚";
+  if (age < 3600000) return `${Math.floor(age / 60000)}分`;
+  if (age < 86400000) return `${Math.floor(age / 3600000)}时`;
+  if (age < 604800000) return `${Math.floor(age / 86400000)}天`;
+  return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+}
+function showError(message: string) {
+  state.error = message;
+}
+async function action(fn: () => any) {
+  ++activeActionCount;
+  actionBusy.value = true;
+  try {
+    return await fn();
+  } catch (cause: any) {
+    showError(cause.message || "操作失败");
+  } finally {
+    actionBusy.value = --activeActionCount > 0;
+  }
+}
+function saveScroll() {
+  if (scroll.value && state.activeThread?.id)
+    sessionStorage.setItem(
+      `codex.scroll.${state.hostId}.${state.activeThread.id}`,
+      JSON.stringify({
+        top: scroll.value.scrollTop,
+        bottom: !showScrollBottom.value,
+      }),
+    );
+}
+function restoreScroll(id: string) {
+  try {
+    const position = JSON.parse(
+      sessionStorage.getItem(`codex.scroll.${state.hostId}.${id}`) || "null",
+    );
+    if (position && !position.bottom && scroll.value) {
+      scroll.value.scrollTop = position.top;
+      onScroll();
+    } else scrollBottom();
+  } catch {
+    scrollBottom();
+  }
+}
+async function selectThread(
+  selection: string | { id: string; hostId: string },
+) {
+  const generation = ++navigationSelection;
+  const id = typeof selection === "string" ? selection : selection.id;
+  const hostId =
+    typeof selection === "string" ? state.hostId : selection.hostId;
+  saveScroll();
+  sidebarOpen.value = false;
+  showScrollBottom.value = true;
+  await action(async () => {
+    try {
+      if (hostId !== state.hostId) await api.setHost(hostId);
+      if (generation !== navigationSelection || hostId !== state.hostId) return;
+      await api.selectThread(id);
+    } catch (error) {
+      if (generation === navigationSelection) throw error;
+    }
+  });
+  if (generation !== navigationSelection) return;
+  await nextTick();
+  restoreScroll(id);
+}
+async function newThread() {
+  ++navigationSelection;
+  saveScroll();
+  sidebarOpen.value = false;
+  threadMenu.value = false;
+  await action(() => api.newThread());
+  await nextTick();
+  composer.value?.focus();
+}
+async function selectProject(project: any) {
+  const generation = ++navigationSelection;
+  const hostId = project.hostId || "local";
+  saveScroll();
+  sidebarOpen.value = false;
+  await action(async () => {
+    try {
+      if (hostId !== state.hostId) await api.setHost(hostId);
+      if (generation !== navigationSelection || hostId !== state.hostId) return;
+      await api.setProject(project.path);
+    } catch (error) {
+      if (generation === navigationSelection) throw error;
+    }
+  });
+}
+async function switchHost(event: Event) {
+  ++navigationSelection;
+  const id = (event.target as HTMLSelectElement).value;
+  await action(() => api.setHost(id));
+}
+async function chooseNewContext(hostId: string, path?: string) {
+  if (state.activeThread || state.changingContext || state.switchingHost ||
+      state.selectingThread || state.busy) return;
+  const generation = ++navigationSelection;
+  const draft = composer.value?.getDraft() || "";
+  saveScroll();
+  sidebarOpen.value = false;
+  await action(async () => {
+    try {
+      await api.chooseNewContext(hostId, path);
+    } catch (error) {
+      if (generation === navigationSelection) throw error;
+    } finally {
+      if (generation === navigationSelection && !state.activeThread && draft) {
+        await nextTick();
+        composer.value?.setDraft(draft);
+      }
+    }
+  });
+  if (generation === navigationSelection && !state.activeThread) {
+    await nextTick();
+    composer.value?.focus();
+  }
+}
+function openWorkspace(tab = "files", path = "") {
+  const samePath = workspaceOpen.value && workspacePath.value === path;
+  workspaceTab.value = tab;
+  workspaceOpen.value = true;
+  workspacePath.value = path;
+  if (path && samePath) void nextTick(() => workspace.value?.revealPath(path));
+  else if (!path) void nextTick(() => workspace.value?.setTab(tab));
+}
+async function projectAction({
+  action: command,
+  project,
+}: {
+  action: string;
+  project: any;
+}) {
+  if (command === "edit") {
+    sidebarOpen.value = false;
+    editingProject.value = project;
+  } else if (command === "files") {
+    await selectProject(project);
+    if (
+      state.hostId === (project.hostId || "local") &&
+      state.projectPath === project.path &&
+      !state.switchingHost
+    )
+      openWorkspace("files", project.path);
+  } else if (command === "remove") {
+    if (
+      window.confirm(
+        `从侧栏移除“${project.name}”？项目文件和对话会保留，可重新添加目录。`,
+      )
+    )
+      await action(() => api.removeProject(project));
+  } else if (command === "archive") {
+    if (
+      window.confirm(
+        `归档“${project.name}”的所有对话？包括其他工作目录中的对话，可在已归档对话中恢复。`,
+      )
+    )
+      await action(() => api.archiveProject(project));
+  }
+}
+function openSettings(tab = "general") {
+  settingsTab.value = tab;
+  settingsOpen.value = true;
+  threadMenu.value = false;
+  sidebarOpen.value = false;
+}
+function openPalette() {
+  paletteQuery.value = "";
+  paletteSelected.value = 0;
+  paletteOpen.value = true;
+  void nextTick(() => paletteInput.value?.focus());
+}
+async function execute(command: string) {
+  threadMenu.value = false;
+  paletteOpen.value = false;
+  if (command === "new") await newThread();
+  else if (command === "compact") {
+    if (state.activeThread && !state.busy) await action(() => api.compact());
+    else
+      showError(
+        state.busy
+          ? "请等待当前任务完成后压缩上下文。"
+          : "先开始一个对话，再压缩上下文。",
+      );
+  } else if (command === "fork") {
+    if (state.activeThread && !state.busy) await action(() => api.fork());
+    else
+      showError(
+        state.busy
+          ? "请等待当前任务完成后创建分支。"
+          : "先选择一个对话，再创建分支。",
+      );
+  } else if (
+    ["terminal", "files", "preview", "changes", "git"].includes(command)
+  )
+    openWorkspace(command);
+  else if (command === "settings") openSettings();
+  else if (command === "settings-projects") openSettings("projects");
+  else if (command === "review") {
+    await action(async () => {
+      if (!state.activeThread) await api.newThread();
+      if (!state.activeThread)
+        await api.send(
+          "请审查当前项目的未提交代码变更，关注错误、回归和缺少的测试。",
+        );
+      else
+        await api.rpc("review/start", {
+          threadId: state.activeThread.id,
+          target: { type: "uncommittedChanges" },
+          delivery: "inline",
+        });
+    });
+  }
+}
+async function fork(turnId?: string) {
+  await action(() => api.fork(turnId));
+  await nextTick();
+  scrollBottom();
+}
+function openRename() {
+  renameValue.value = state.activeThread?.name || "";
+  renameOpen.value = true;
+  threadMenu.value = false;
+  void nextTick(() => renameInput.value?.focus());
+}
+async function rename() {
+  if (!renameValue.value.trim()) return;
+  await action(() => api.renameThread(renameValue.value.trim()));
+  renameOpen.value = false;
+}
+async function archive() {
+  threadMenu.value = false;
+  if (state.activeThread)
+    await action(() => api.archiveThread(state.activeThread.id));
+}
+async function login() {
+  loginBusy.value = true;
+  try {
+    await api.login(loginPassword.value);
+    loginPassword.value = "";
+  } catch (cause: any) {
+    showError(cause.message);
+  } finally {
+    loginBusy.value = false;
+  }
+}
+function onScroll() {
+  if (scroll.value) {
+    showScrollBottom.value =
+      scroll.value.scrollHeight -
+        scroll.value.scrollTop -
+        scroll.value.clientHeight >
+      140;
+    saveScroll();
+  }
+}
+function scrollBottom() {
+  if (scroll.value) {
+    scroll.value.scrollTop = scroll.value.scrollHeight;
+    showScrollBottom.value = false;
+  }
+}
+async function loadOlder() {
+  const height = scroll.value?.scrollHeight || 0;
+  await action(() => api.loadOlderTurns());
+  await nextTick();
+  if (scroll.value) scroll.value.scrollTop = scroll.value.scrollHeight - height;
+}
+async function pickPalette(result: any) {
+  if (!result) return;
+  paletteOpen.value = false;
+  if (result.kind === "thread")
+    await selectThread({ id: result.id, hostId: result.hostId });
+  else await execute(result.id);
+}
+function paletteKey(event: KeyboardEvent) {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const length = paletteResults.value.length;
+    if (length)
+      paletteSelected.value =
+        (paletteSelected.value +
+          (event.key === "ArrowDown" ? 1 : -1) +
+          length) %
+        length;
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    void pickPalette(paletteResults.value[paletteSelected.value]);
+  }
+}
+function onKeydown(event: KeyboardEvent) {
+  const modifier = event.metaKey || event.ctrlKey;
+  const editable = (event.target as HTMLElement)?.closest(
+    'input, textarea, [contenteditable="true"]',
+  );
+  if (modifier && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    paletteOpen.value ? (paletteOpen.value = false) : openPalette();
+  } else if (modifier && event.shiftKey && event.key.toLowerCase() === "o") {
+    event.preventDefault();
+    void newThread();
+  } else if (modifier && event.key.toLowerCase() === "j") {
+    event.preventDefault();
+    openWorkspace("terminal");
+  } else if (event.key === "?" && !editable) {
+    event.preventDefault();
+    openSettings("shortcuts");
+  } else if (event.key === "Escape") {
+    paletteOpen.value = false;
+    settingsOpen.value = false;
+    renameOpen.value = false;
+    sidebarOpen.value = false;
+    threadMenu.value = false;
+  }
+}
+function applyTheme() {
+  document.documentElement.dataset.theme =
+    theme.value === "system"
+      ? prefersDark.matches
+        ? "dark"
+        : "light"
+      : theme.value;
+  document.documentElement.style.colorScheme =
+    document.documentElement.dataset.theme;
+}
+watch(theme, () => {
+  localStorage.setItem("codex.theme", theme.value);
+  applyTheme();
+});
+watch(paletteQuery, () => {
+  paletteSelected.value = 0;
+});
+watch(
+  () => [
+    state.items.length,
+    state.items[state.items.length - 1]?.text,
+    state.items[state.items.length - 1]?.aggregatedOutput,
+    state.pendingRequests.length,
+    state.busy,
+  ],
+  async () => {
+    if (!showScrollBottom.value) {
+      await nextTick();
+      scrollBottom();
+    }
+  },
+);
+onMounted(() => {
+  applyTheme();
+  updateViewport();
+  window.visualViewport?.addEventListener("resize", updateViewport);
+  window.addEventListener("resize", updateViewport);
+  document.addEventListener("keydown", onKeydown);
+  prefersDark.addEventListener("change", applyTheme);
+  void action(() => api.initialize()).then(async () => {
+    await nextTick();
+    if (state.activeThread) restoreScroll(state.activeThread.id);
+  });
+});
+onBeforeUnmount(() => {
+  saveScroll();
+  document.removeEventListener("keydown", onKeydown);
+  prefersDark.removeEventListener("change", applyTheme);
+  window.visualViewport?.removeEventListener("resize", updateViewport);
+  window.removeEventListener("resize", updateViewport);
+});
+</script>
+
+<template>
+  <main v-if="!state.authenticated" class="login-screen">
+    <div class="login-card">
+      <div class="codex-mark large">
+        <Icon name="Command" :size="30" :stroke-width="1.5" />
+      </div>
+      <h1>Codex</h1>
+      <p>
+        {{ state.loading ? "正在连接你的工作区…" : "你的开发伙伴，随处可用。" }}
+      </p>
+      <div v-if="state.loading" class="login-loading">
+        <Icon name="LoaderCircle" :size="22" class="spin" />
+      </div>
+      <form v-else @submit.prevent="login">
+        <label class="form-label"
+          >访问密码
+          <div class="login-password">
+            <Icon name="Lock" :size="17" /><input
+              v-model="loginPassword"
+              type="password"
+              placeholder="输入服务器访问密码"
+              required
+              autofocus
+              autocomplete="current-password"
+              aria-label="访问密码"
+            /></div
+        ></label>
+        <div v-if="state.error" class="inline-error">{{ state.error }}</div>
+        <button
+          class="button button-primary login-submit"
+          type="submit"
+          :disabled="loginBusy || !loginPassword"
+        >
+          <Icon
+            v-if="loginBusy"
+            name="LoaderCircle"
+            :size="17"
+            class="spin"
+          />进入工作区<Icon v-if="!loginBusy" name="ArrowRight" :size="17" />
+        </button>
+      </form>
+      <span class="login-caption">连接你的项目，把想法变成现实。</span>
+    </div>
+  </main>
+  <div
+    v-else
+    class="app-shell"
+    :class="{
+      'sidebar-collapsed': sidebarCollapsed,
+      'workspace-visible': workspaceOpen,
+    }"
+  >
+    <div
+      v-if="sidebarOpen"
+      class="sidebar-backdrop"
+      @click="sidebarOpen = false"
+    ></div>
+    <aside class="sidebar" :class="{ 'mobile-open': sidebarOpen }">
+      <header class="sidebar-header">
+        <a class="brand" href="#" @click.prevent="newThread"
+          ><span class="codex-mark"><Icon name="Command" :size="16" /></span
+          ><strong>Codex</strong></a
+        ><button
+          class="icon-button desktop-only"
+          @click="sidebarCollapsed = true"
+          title="收起侧边栏"
+          aria-label="收起侧边栏"
+        >
+          <Icon name="PanelLeft" :size="17" /></button
+        ><button
+          class="icon-button mobile-only"
+          @click="sidebarOpen = false"
+          aria-label="关闭侧边栏"
+        >
+          <Icon name="X" :size="18" />
+        </button>
+      </header>
+      <div class="sidebar-top">
+        <button class="sidebar-action new-thread-button" @click="newThread">
+          <Icon name="SquarePen" :size="17" /><span>新建对话</span
+          ><kbd>⌘ ⇧ O</kbd></button
+        ><button class="sidebar-action" @click="openPalette">
+          <Icon name="Search" :size="17" /><span>搜索与指令</span><kbd>⌘ K</kbd>
+        </button>
+      </div>
+      <div class="sidebar-scroll">
+        <ConversationNav
+          :api="api"
+          :state="state"
+          @select="selectThread"
+          @project="selectProject"
+          @project-action="projectAction"
+          @settings="openSettings"
+          @error="showError"
+        />
+      </div>
+      <footer class="sidebar-footer">
+        <div class="host-selector">
+          <Icon
+            :name="currentHost?.kind === 'ssh' ? 'Server' : 'Monitor'"
+            :size="17"
+          /><select
+            :value="state.hostId"
+            @change="switchHost"
+            aria-label="选择主机"
+            title="新对话与工作区使用的主机；侧栏始终显示所有主机"
+          >
+            <option v-for="host in state.hosts" :key="host.id" :value="host.id">
+              {{ host.name }}
+            </option></select
+          ><span
+            class="connection-dot"
+            :class="{ connected: state.connected }"
+            :title="state.connected ? '已连接' : '未连接'"
+          ></span
+          ><Icon name="ChevronDown" :size="12" />
+        </div>
+        <button class="sidebar-action settings-button" @click="openSettings()">
+          <Icon name="Settings2" :size="17" /><span>设置</span
+          ><span class="sidebar-account">{{
+            state.account?.account?.email?.split("@")[0] ||
+            state.account?.email?.split("@")[0] ||
+            "工作区"
+          }}</span>
+        </button>
+      </footer>
+    </aside>
+    <section class="main-column">
+      <header class="main-header">
+        <div class="header-left">
+          <button
+            class="icon-button mobile-only"
+            @click="sidebarOpen = true"
+            aria-label="打开侧边栏"
+          >
+            <Icon name="PanelLeft" /></button
+          ><button
+            v-if="sidebarCollapsed"
+            class="icon-button desktop-only"
+            @click="sidebarCollapsed = false"
+            aria-label="展开侧边栏"
+          >
+            <Icon name="PanelLeft" />
+          </button>
+          <div class="header-project">
+            <button
+              @click="openSettings('projects')"
+              :title="state.projectPath"
+            >
+              <Icon name="Folder" :size="15" /><span>{{ projectName }}</span
+              ><Icon name="ChevronDown" :size="12" /></button
+            ><span class="header-breadcrumb">/</span>
+            <h1 :title="threadTitle">{{ threadTitle }}</h1>
+          </div>
+        </div>
+        <div class="header-actions">
+          <span
+            class="host-badge header-host"
+            :title="currentHost?.hostname || currentHost?.name"
+            ><Icon
+              :name="currentHost?.kind === 'ssh' ? 'Server' : 'Monitor'"
+              :size="12"
+            /><span>{{ currentHost?.name || "本机" }}</span></span
+          ><button
+            class="icon-button"
+            :class="{ selected: workspaceOpen }"
+            @click="workspaceOpen = !workspaceOpen"
+            title="工作区：文件、预览、终端"
+            aria-label="切换工作区"
+          >
+            <Icon name="PanelRight" :size="18" />
+          </button>
+          <div class="thread-menu-wrapper">
+            <button
+              class="icon-button"
+              @click="threadMenu = !threadMenu"
+              title="对话操作"
+              aria-label="对话操作"
+              :aria-expanded="threadMenu"
+            >
+              <Icon name="MoreHorizontal" :size="19" />
+            </button>
+            <div v-if="threadMenu" class="thread-menu">
+              <button
+                :disabled="!state.activeThread || state.busy"
+                @click="execute('fork')"
+              >
+                <Icon name="GitBranch" :size="16" />创建分支</button
+              ><button
+                :disabled="!state.activeThread || state.busy"
+                @click="execute('compact')"
+              >
+                <Icon name="RefreshCw" :size="16" />压缩上下文</button
+              ><button :disabled="!state.activeThread" @click="openRename">
+                <Icon name="Pencil" :size="16" />重命名对话</button
+              ><button
+                :disabled="!state.activeThread"
+                @click="
+                  threadMenu = false;
+                  action(() =>
+                    api.pin('thread', state.activeThread.id, threadTitle),
+                  );
+                "
+              >
+                <Icon name="Pin" :size="16" />{{
+                  isPinned(
+                    state.preferences.pins,
+                    state.hostId,
+                    "thread",
+                    state.activeThread?.id,
+                  )
+                    ? "取消置顶"
+                    : "置顶对话"
+                }}</button
+              ><button
+                :disabled="!state.activeThread"
+                @click="
+                  threadMenu = false;
+                  action(() =>
+                    api.exportThread(state.activeThread.id, 'markdown'),
+                  );
+                "
+              >
+                <Icon name="Download" :size="16" />导出 Markdown</button
+              ><button
+                :disabled="!state.activeThread || state.busy"
+                @click="archive"
+              >
+                <Icon name="Archive" :size="16" />归档对话
+              </button>
+              <hr />
+              <button @click="openSettings('shortcuts')">
+                <Icon name="Keyboard" :size="16" />快捷键
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
+      <div v-if="state.error" class="global-error" role="alert">
+        <Icon name="AlertCircle" :size="16" /><span>{{ state.error }}</span
+        ><button
+          v-if="!state.connected"
+          @click="action(() => api.initialize())"
+        >
+          重新连接</button
+        ><button
+          class="icon-button"
+          @click="state.error = ''"
+          aria-label="关闭错误"
+        >
+          <Icon name="X" :size="14" />
+        </button>
+      </div>
+      <div v-if="!state.connected && !state.error" class="connection-banner">
+        <Icon
+          :name="state.loading ? 'LoaderCircle' : 'WifiOff'"
+          :size="15"
+          :class="{ spin: state.loading }"
+        />{{
+          state.loading
+            ? "正在连接 App Server…"
+            : "App Server 已断开，正在尝试重连…"
+        }}
+      </div>
+      <button
+        v-if="otherRequests.length"
+        class="other-requests-banner"
+        @click="selectThread(otherRequests[0].params.threadId)"
+      >
+        <Icon name="Shield" :size="15" />{{
+          otherRequests.length
+        }}
+        个其他对话正在等待审批<Icon name="ArrowRight" :size="14" />
+      </button>
+      <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
+        <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
+          <div v-if="welcome" class="welcome">
+            <div class="welcome-mark">
+              <Icon name="Command" :size="36" :stroke-width="1.45" />
+            </div>
+            <h2>今天，想构建什么？</h2>
+            <p>
+              在
+              {{ projectName === "选择项目" ? "你的项目" : projectName }} 中，与
+              Codex 一起把想法变成现实。
+            </p>
+            <div class="welcome-suggestions">
+              <button
+                :disabled="!state.connected || state.changingContext"
+                @click="
+                  composer?.setDraft(
+                    '请阅读当前项目，介绍它的结构、主要功能和如何运行。',
+                  )
+                "
+              >
+                <Icon name="FolderOpen" :size="17" /><span>了解这个项目</span
+                ><Icon name="ArrowUpRight" :size="13" /></button
+              ><button
+                :disabled="!state.connected || state.changingContext"
+                @click="
+                  composer?.setDraft(
+                    '请审查当前项目的代码，找出最值得优先解决的问题，并说明原因。',
+                  )
+                "
+              >
+                <Icon name="Eye" :size="17" /><span>一起审查代码</span
+                ><Icon name="ArrowUpRight" :size="13" /></button
+              ><button
+                :disabled="!state.connected || state.changingContext"
+                @click="
+                  composer?.setDraft(
+                    '我想在这个项目中添加一个新功能。请先阅读项目，然后和我一起明确实现方案。',
+                  )
+                "
+              >
+                <Icon name="Code2" :size="17" /><span>实现一个想法</span
+                ><Icon name="ArrowUpRight" :size="13" />
+              </button>
+            </div>
+          </div>
+          <div v-else class="message-list">
+            <button
+              v-if="state.moreTurns"
+              class="load-older"
+              :disabled="actionBusy"
+              @click="loadOlder"
+            >
+              <Icon
+                :name="actionBusy ? 'LoaderCircle' : 'ArrowUp'"
+                :size="14"
+                :class="{ spin: actionBusy }"
+              />加载更早的消息
+            </button>
+            <div v-if="state.activeThread?.forkedFromId" class="fork-indicator">
+              <Icon name="GitBranch" :size="14" />此对话由另一段对话分支而来
+            </div>
+            <ConversationOutput
+              :key="`${state.hostId}:${state.activeThread?.id || 'new'}`"
+              :items="state.items"
+              :turns="state.turns"
+              :busy="state.busy"
+              @fork="fork"
+              @open-file="openWorkspace('files', $event)"
+              @error="showError"
+            />
+            <ApprovalCard
+              v-for="request in activeRequests"
+              :key="String(request.id)"
+              :request="request"
+              :api="api"
+            />
+            <div
+              v-if="
+                !state.items.length &&
+                !state.turns.length &&
+                !state.busy &&
+                !activeRequests.length
+              "
+              class="empty-conversation"
+            >
+              <Icon name="Command" :size="27" />
+              <p>从一条消息开始</p>
+            </div>
+          </div>
+        </div>
+        <button
+          v-if="showScrollBottom"
+          class="scroll-bottom"
+          @click="scrollBottom"
+          title="跳到最新消息"
+          aria-label="跳到最新消息"
+        >
+          <Icon name="ArrowDown" :size="18" />
+        </button>
+        <div class="composer-container">
+          <div v-if="state.plan?.length" class="turn-plan">
+            <details>
+              <summary>
+                <Icon name="ListTodo" :size="14" /><span>执行计划</span
+                ><span
+                  >{{
+                    state.plan.filter(
+                      (step: any) => step.status === "completed",
+                    ).length
+                  }}/{{ state.plan.length }}</span
+                ><Icon name="ChevronDown" :size="12" />
+              </summary>
+              <div v-for="(step, index) in state.plan" :key="index">
+                <Icon
+                  :name="
+                    step.status === 'completed'
+                      ? 'CheckCircle2'
+                      : step.status === 'inProgress'
+                        ? 'LoaderCircle'
+                        : 'Circle'
+                  "
+                  :size="14"
+                  :class="{ spin: step.status === 'inProgress' }"
+                />{{ step.step }}
+              </div>
+            </details>
+          </div>
+          <div v-if="state.tokenUsage" class="context-status">
+            <button
+              @click="execute('compact')"
+              :disabled="state.busy"
+              :title="`已使用 ${contextUsed.toLocaleString()} / ${contextLimit.toLocaleString()} tokens，点击压缩上下文`"
+            >
+              <span
+                class="context-ring"
+                :style="{ '--context-used': contextPercent + '%' }"
+              ></span
+              ><span>上下文 {{ contextPercent }}%</span
+              ><span v-if="state.autoCompact" class="context-auto"
+                >自动压缩</span
+              >
+            </button>
+          </div>
+          <Composer
+            ref="composer"
+            :api="api"
+            :state="state"
+            :welcome="welcome"
+            :context-busy="state.changingContext"
+            @project="chooseNewContext($event.hostId || 'local', $event.path)"
+            @host="chooseNewContext($event)"
+            @command="execute"
+            @error="showError"
+          />
+        </div>
+      </div>
+    </section>
+    <ResizableWorkspace v-if="workspaceOpen">
+      <WorkspacePanel
+        id="workspace-panel"
+        ref="workspace"
+        :api="api"
+        :state="state"
+        :initial-tab="workspaceTab"
+        :open-path="workspacePath"
+        @close="workspaceOpen = false"
+        @error="showError"
+      />
+    </ResizableWorkspace>
+    <ProjectDialog
+      v-if="editingProject"
+      :key="`${editingProject.hostId}:${editingProject.path}`"
+      :project="editingProject"
+      :api="api"
+      :state="state"
+      @close="editingProject = null"
+    />
+    <SettingsPanel
+      v-if="settingsOpen"
+      :api="api"
+      :state="state"
+      :theme="theme"
+      :initial-tab="settingsTab"
+      @close="settingsOpen = false"
+      @theme="theme = $event"
+    />
+    <div
+      v-if="paletteOpen"
+      class="modal-backdrop palette-backdrop"
+      @click.self="paletteOpen = false"
+    >
+      <section
+        class="command-palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="命令面板"
+      >
+        <div class="palette-search">
+          <Icon name="Search" :size="20" /><input
+            ref="paletteInput"
+            v-model="paletteQuery"
+            placeholder="搜索对话或输入指令…"
+            aria-label="搜索对话或指令"
+            @keydown="paletteKey"
+          /><kbd @click="paletteOpen = false">Esc</kbd>
+        </div>
+        <div class="palette-results">
+          <button
+            v-for="(result, index) in paletteResults"
+            :key="result.kind + result.id"
+            :class="{ selected: index === paletteSelected }"
+            @click="pickPalette(result)"
+          >
+            <Icon :name="result.icon" :size="18" /><span>{{ result.name }}</span
+            ><small>{{ result.detail }}</small
+            ><Icon
+              v-if="index === paletteSelected"
+              name="CornerDownLeft"
+              :size="14"
+            />
+          </button>
+          <div v-if="!paletteResults.length" class="palette-empty">
+            没有找到匹配的对话或指令
+          </div>
+        </div>
+        <footer>↑ ↓ 选择<span>↵ 打开</span></footer>
+      </section>
+    </div>
+    <div
+      v-if="renameOpen"
+      class="modal-backdrop"
+      @click.self="renameOpen = false"
+    >
+      <form class="small-modal" @submit.prevent="rename">
+        <header class="modal-header">
+          <h2>重命名对话</h2>
+          <button
+            type="button"
+            class="icon-button"
+            @click="renameOpen = false"
+            aria-label="关闭重命名"
+          >
+            <Icon name="X" :size="17" />
+          </button>
+        </header>
+        <input
+          ref="renameInput"
+          v-model="renameValue"
+          class="text-input"
+          placeholder="对话名称"
+          aria-label="对话名称"
+          required
+        />
+        <div class="form-actions">
+          <button
+            type="button"
+            class="button button-secondary"
+            @click="renameOpen = false"
+          >
+            取消</button
+          ><button
+            type="submit"
+            class="button button-primary"
+            :disabled="!renameValue.trim() || actionBusy"
+          >
+            保存
+          </button>
+        </div>
+      </form>
+    </div>
+    <Transition name="toast"
+      ><div v-if="state.toast" class="toast-message" role="status">
+        <Icon name="CheckCircle2" :size="17" />{{ state.toast }}
+      </div></Transition
+    >
+  </div>
+</template>

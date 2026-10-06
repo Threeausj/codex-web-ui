@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Use the account that owns the intended Codex configuration and workspace.
+User=codexweb
+Group=codexweb
+WorkingDirectory=/opt/codex-web-ui
+EnvironmentFile=/etc/codex-web-ui.env
+ExecStart=/usr/bin/node /opt/codex-web-ui/dist-server/server/index.js
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

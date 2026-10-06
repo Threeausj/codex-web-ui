@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build && npm prune --omit=dev
+
+FROM node:22-bookworm-slim AS runtime
+ARG CODEX_VERSION=0.159.2
+LABEL org.opencontainers.image.title="Codex Web UI" \
+      org.opencontainers.image.description="Vue web client for the official Codex app-server protocol" \
+      io.codex-web.codex-version="${CODEX_VERSION}"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       bash ca-certificates git libgcc-s1 libstdc++6 openssh-client python3 ripgrep tini tmux \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && install -d -o node -g node -m 0700 /app/data /home/node/.codex \
+    && install -d -o node -g node -m 0755 /workspace
+COPY --from=build /app/package.json /app/package-lock.json /app/
+COPY --from=build /app/node_modules /app/node_modules
+COPY --from=build /app/dist-server /app/dist-server
+COPY --from=build /app/dist /app/dist
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8787 \
+    DATA_DIR=/app/data \
+    STATIC_DIR=/app/dist \
+    CODEX_HOME=/home/node/.codex \
+    CODEX_BIN=codex \
+    CODEX_CONNECTION_MODE=spawn \
+    PUBLIC_ORIGIN=http://127.0.0.1:8787,http://localhost:8787 \
+    TRUST_PROXY=0
+USER node
+WORKDIR /workspace
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=6s --start-period=30s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:8787/api/health', { signal: AbortSignal.timeout(5000) }).then(async r => { if (!r.ok || !(await r.json()).ok) process.exit(1) }).catch(() => process.exit(1))"
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "/app/dist-server/server/index.js"]

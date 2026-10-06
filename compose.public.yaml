@@ -1,0 +1,28 @@
+# Use this with compose.yaml only; do not also load compose.local.yaml.
+services:
+  app:
+    environment:
+      NODE_ENV: production
+      PUBLIC_ORIGIN: https://${PUBLIC_HOST:?Set PUBLIC_HOST to your public domain without scheme or path}
+      TRUST_PROXY: "1"
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST to your public domain without scheme or path}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL for certificate renewal notices}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  caddydata:
+  caddyconfig:

@@ -1,0 +1,5 @@
+# Replace this hostname; point its DNS records at this server first.
+codex.example.com {
+    # Caddy provides automatic HTTPS and forwards WebSocket upgrades.
+    reverse_proxy 127.0.0.1:8787
+}

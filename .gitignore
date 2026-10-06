@@ -1,0 +1,23 @@
+node_modules/
+dist/
+dist-server/
+.env
+.env.*
+!.env.example
+deploy/docker/.env
+deploy/docker/*.env
+compose.ssh.yaml
+.data/
+workspace/
+backups/
+.ssh/
+.codex/
+*.pem
+*.key
+*.p12
+# Historical verification images contain local machine/project metadata.
+docs/screenshots/
+test-results/
+playwright-report/
+*.log
+.DS_Store
