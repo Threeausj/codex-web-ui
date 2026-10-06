@@ -329,7 +329,7 @@ export async function testDevicePush(api: HttpApi) {
   try {
     subscription = await registration?.pushManager.getSubscription();
     if (!subscription) throw new Error('先在这台设备启用通知');
-    return await api.requestHttp('/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }) }, false);
+    return await api.requestHttp('/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
   } catch (cause: any) {
     if (cause.status === 410 && subscription) {
       const message = '这台设备的通知订阅已失效，请重新启用通知。';
@@ -337,6 +337,29 @@ export async function testDevicePush(api: HttpApi) {
       throw Object.assign(new Error(message), { status: 410 });
     }
     pwaState.pushError = cause.message || '无法发送测试通知';
+    throw cause;
+  } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
+}
+
+export async function testSystemNotification() {
+  if (deviceInitialization) await deviceInitialization;
+  if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成');
+  pwaState.pushBusy = true;
+  pwaState.pushError = '';
+  const finishDeviceOperation = beginDeviceOperation();
+  try {
+    if (Notification.permission !== 'granted') throw new Error('请先允许这台设备发送通知');
+    const worker = await initPwa();
+    if (!worker) throw new Error('通知服务尚未就绪，请刷新后重试');
+    await worker.showNotification('Codex 系统通知检查', {
+      body: '收到这条通知表示应用的系统通知可以正常显示。',
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      tag: `codex-system-test-${Date.now()}`,
+      data: {},
+    });
+  } catch (cause: any) {
+    pwaState.pushError = cause.message || '无法显示系统通知';
     throw cause;
   } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
 }

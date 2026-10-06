@@ -65,11 +65,13 @@ self.addEventListener("push", (event) => {
   const data = navigationData(payload.data);
   const title = typeof payload.title === "string" ? payload.title.slice(0, 100) : "Codex Web";
   const body = typeof payload.body === "string" ? payload.body.slice(0, 240) : "工作区有新的进展，打开应用查看。";
+  const tag = typeof payload.tag === "string" ? payload.tag.slice(0, 160) : undefined;
   event.waitUntil(self.registration.showNotification(title || "Codex Web", {
     body,
     icon: "/icons/icon-192.png",
     badge: "/icons/icon-192.png",
-    tag: typeof payload.tag === "string" ? payload.tag.slice(0, 160) : undefined,
+    tag,
+    renotify: !!tag,
     data,
   }));
 });

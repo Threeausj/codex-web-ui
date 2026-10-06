@@ -120,6 +120,7 @@ let turnCursor: string | null = null;
 let selectionGeneration = 0;
 let hostSelectionGeneration = 0;
 let connecting: Promise<void> | null = null;
+let connectionRecovery: { generation: number; promise: Promise<void> } | null = null;
 let listGeneration = 0;
 let configGeneration = 0;
 let integrationGeneration = 0;
@@ -906,10 +907,22 @@ function connect(): Promise<void> {
 }
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(async () => {
-    if (!state.authenticated) return;
+  if (state.authenticated && state.online)
+    reconnectTimer = setTimeout(() => { void resumeConnection(); }, 2500);
+}
+function resumeConnection(): Promise<void> {
+  if (!state.online || !state.authenticated || state.loading || state.switchingHost)
+    return Promise.resolve();
+  const generation = hostSelectionGeneration;
+  const hostId = state.hostId;
+  if (connectionRecovery?.generation === generation) return connectionRecovery.promise;
+  const current = () => state.online && state.authenticated && !state.loading &&
+    !state.switchingHost && hostId === state.hostId && generation === hostSelectionGeneration;
+  clearTimeout(reconnectTimer);
+  const recovery = (async () => {
     try {
-      const session = await http("/auth/session");
+      const session = await http("/auth/session", { signal: AbortSignal.timeout(10000) }, false);
+      if (!current()) return;
       if (!session.authenticated) {
         state.authenticated = false;
         closeConnection();
@@ -917,13 +930,33 @@ function scheduleReconnect() {
         return;
       }
       csrfToken = session.csrfToken ?? csrfToken;
+      const previous = socket;
+      if (state.connected && previous?.readyState === WebSocket.OPEN) {
+        // Android can resume a socket that still reports OPEN but no longer carries data.
+        // Probe with a bounded, read-only request; never replay user commands.
+        try { await rpc("thread/loaded/list", { limit: 1 }, 5000, { silentError: true }); }
+        catch {
+          if (!current() || socket !== previous) return;
+          closeConnection();
+        }
+        if (!current() || (socket && socket !== previous)) return;
+      } else if (!connecting) closeConnection();
+      if (!current()) return;
       await connect();
+      if (!current()) return;
+      startNavigationRefresh();
       await sync();
     } catch (error) {
-      fail(error);
-      if (state.authenticated && !state.connected) scheduleReconnect();
+      if (current()) fail(error);
+    } finally {
+      if (current() && !state.connected) scheduleReconnect();
     }
-  }, 2500);
+  })();
+  const promise = recovery.finally(() => {
+    if (connectionRecovery?.promise === promise) connectionRecovery = null;
+  });
+  connectionRecovery = { generation, promise };
+  return promise;
 }
 async function bootstrap() {
   const data = await http("/bootstrap");
@@ -2631,6 +2664,7 @@ export function useCodex() {
   return {
     state,
     initialize,
+    resumeConnection,
     login,
     logout,
     setOnline,

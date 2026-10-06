@@ -56,6 +56,14 @@ test('push displays nested server destinations and generic notifications for mal
   assert.match(target.notifications[1].options.body, /工作区/);
 });
 
+test('replacing a conversation notification alerts again and missing tags remain valid', async () => {
+  const target = worker();
+  for (const tag of ['codex-thread-completed', 'codex-thread-completed', '', undefined]) {
+    await target.fire('push', { data: { json: () => ({ tag }) } });
+  }
+  assert.deepEqual(target.notifications.map(entry => entry.options.renotify), [true, true, false, false]);
+})
+
 test('notification click focuses an app window and messages it without reloading a running chat', async () => {
   const target = worker();
   let focused = 0;

@@ -128,6 +128,7 @@ test('the default production sender generates encrypted VAPID requests and handl
     const headers = sent.options.headers as Record<string, string>
     assert.equal(headers['Content-Encoding'], 'aes128gcm')
     assert.equal(String(headers.TTL), '3600')
+    assert.equal(headers.Urgency, 'high')
     assert.match(headers.Authorization!, /^vapid /)
     const ciphertext = Buffer.concat(sent.chunks)
     assert.ok(ciphertext.length > 100 && !ciphertext.includes(Buffer.from('后台通知已开启')))
@@ -184,6 +185,20 @@ test('push HTTP routes require authentication, CSRF and valid device keys withou
   } finally { await app.cleanup() }
 })
 
+test('repeated tests have independent notification tags and push topics, including in the same millisecond', async () => {
+  const app = await application({ now: () => 1791216000000 })
+  try {
+    const device = subscription('repeated-test')
+    await app.push.subscribe('session', device)
+    await app.push.test('session', device.endpoint)
+    await app.push.test('session', device.endpoint)
+    assert.equal(app.sent.length, 2)
+    assert.notEqual(app.sent[0]!.payload.tag, app.sent[1]!.payload.tag)
+    assert.notEqual(app.sent[0]!.options.topic, app.sent[1]!.options.topic)
+    assert.ok(app.sent.every(entry => entry.options.urgency === 'high'))
+  } finally { await app.cleanup() }
+})
+
 test('completed turns and pending approvals push after all browser sockets close without changing RPC', async () => {
   const observed: RpcMessage[] = []
   const app = await application({}, undefined, message => { observed.push(message); if (message.method === 'turn/completed') throw new Error('External observer failure') })
@@ -213,6 +228,7 @@ test('completed turns and pending approvals push after all browser sockets close
     fixture.receive({ method: 'turn/completed', params: { threadId: 'thread-a', turn: { id: 'failed', status: 'failed' } } })
     await app.push.flush()
     assert.equal(app.sent.length, 6)
+    assert.ok(app.sent.every(entry => entry.options.urgency === 'high'))
     assert.equal(app.sent.filter(entry => (entry.payload.data as { kind: string }).kind === 'completed').length, 1)
     assert.equal(app.sent.filter(entry => (entry.payload.data as { kind: string }).kind === 'approval').length, 4)
     assert.equal(app.sent.filter(entry => (entry.payload.data as { kind: string }).kind === 'errors').length, 1)
