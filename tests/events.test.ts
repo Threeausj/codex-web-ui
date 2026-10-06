@@ -132,7 +132,7 @@ test("authoritative user messages clear temporary sending status", () => {
 test("browser state handles out-of-order RPCs and live events without reviving turns or changing selected chats", async (t) => {
   const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
   const install = (key: string, value: unknown) => {
-    savedGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    if (!savedGlobals.has(key)) savedGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, {
       value,
       configurable: true,
@@ -243,8 +243,11 @@ test("browser state handles out-of-order RPCs and live events without reviving t
   }
   install("WebSocket", FakeSocket);
   let sessionActive = true;
-  install("fetch", async (url: string) => {
-    const data = url.endsWith("/bootstrap")
+  const fetchCalls: { url: string; options: RequestInit }[] = [];
+  const fetchResponse = async (url: string, options: RequestInit = {}) => {
+    fetchCalls.push({ url, options });
+    const pathname = new URL(url, 'http://localhost:8787').pathname;
+    const data = pathname.endsWith("/bootstrap")
       ? {
           hosts: [{ id: "local", name: "Local" }],
           projects: [],
@@ -252,7 +255,7 @@ test("browser state handles out-of-order RPCs and live events without reviving t
           connectionMode: "spawn",
         }
       : {
-          authenticated: sessionActive && !url.endsWith("/logout"),
+          authenticated: sessionActive && !pathname.endsWith("/logout"),
           authRequired: true,
           csrfToken: "csrf",
         };
@@ -260,7 +263,8 @@ test("browser state handles out-of-order RPCs and live events without reviving t
       status: 200,
       headers: { "content-type": "application/json" },
     });
-  });
+  };
+  install("fetch", fetchResponse);
   const { useCodex } = await import("../src/lib/useCodex");
   const api = useCodex();
   try {
@@ -853,6 +857,77 @@ test("browser state handles out-of-order RPCs and live events without reviving t
         handle = defaults;
       },
     );
+    await t.test('private GETs use distinct cache keys and preserve existing query parameters', async () => {
+      const before = fetchCalls.length;
+      await api.http('/preferences?source=history');
+      await api.http('/preferences?source=history');
+      const reads = fetchCalls.slice(before);
+      assert.equal(reads.length, 2);
+      const urls = reads.map(call => new URL(call.url, 'http://localhost:8787'));
+      assert.ok(urls.every(url => url.pathname === '/api/preferences' && url.searchParams.get('source') === 'history'));
+      assert.ok(urls.every(url => !!url.searchParams.get('_request')));
+      assert.notEqual(urls[0].searchParams.get('_request'), urls[1].searchParams.get('_request'));
+      assert.ok(reads.every(call => call.options.cache === 'no-store' && call.options.credentials === 'same-origin'));
+      assert.ok(urls.every(url => !url.searchParams.has('csrfToken')));
+    });
+    await t.test('a delayed unauthorized push response cannot overwrite a newer login', async () => {
+      let release!: (response: Response) => void;
+      const held = new Promise<Response>(resolve => { release = resolve; });
+      install('fetch', (url: string, options?: RequestInit) => url === '/api/push/test' ? held : fetchResponse(url, options));
+      try {
+        const request = api.http('/push/test', { method: 'POST', body: '{}' }, false).catch(error => error);
+        await api.login('fake-password');
+        ws = FakeSocket.instances.at(-1)!;
+        release(new Response(JSON.stringify({ error: 'Old session expired' }), { status: 401 }));
+        assert.equal((await request).status, 401);
+        assert.equal(api.state.authenticated, true);
+        assert.equal(api.state.connected, true);
+        assert.doesNotMatch(api.state.error, /登录已过期/);
+      } finally { install('fetch', fetchResponse); }
+    });
+    await t.test('an unauthorized push request checks the current cookie without treating network errors as logout', async () => {
+      let checks = 0;
+      let unavailable = false;
+      install('fetch', (url: string, options?: RequestInit) => {
+        const pathname = new URL(url, 'http://localhost:8787').pathname;
+        if (pathname === '/api/push/test') return Promise.resolve(new Response(JSON.stringify({ error: 'Unauthorized push request' }), { status: 401 }));
+        if (pathname === '/api/auth/session') {
+          checks++;
+          if (unavailable) return Promise.reject(new TypeError('Temporary network error'));
+        }
+        return fetchResponse(url, options);
+      });
+      try {
+        for (unavailable of [false, true]) {
+          await assert.rejects(api.http('/push/test', { method: 'POST', body: '{}' }, false), (error: any) => error.status === 401);
+          assert.equal(api.state.authenticated, true);
+          assert.equal(api.state.connected, true);
+        }
+        assert.equal(checks, 2);
+      } finally { install('fetch', fetchResponse); }
+    });
+    await t.test('a stale session check cannot clear a login established while it was waiting', async () => {
+      let release!: (response: Response) => void;
+      const held = new Promise<Response>(resolve => { release = resolve; });
+      let checked = false;
+      install('fetch', (url: string, options?: RequestInit) => {
+        const pathname = new URL(url, 'http://localhost:8787').pathname;
+        if (pathname === '/api/push/test') return Promise.resolve(new Response('{}', { status: 401 }));
+        if (pathname === '/api/auth/session') { checked = true; return held; }
+        return fetchResponse(url, options);
+      });
+      try {
+        const request = api.http('/push/test', { method: 'POST', body: '{}' }, false).catch(error => error);
+        await tick();
+        assert.equal(checked, true);
+        await api.login('fake-password');
+        ws = FakeSocket.instances.at(-1)!;
+        release(new Response(JSON.stringify({ authenticated: false, authRequired: true })));
+        assert.equal((await request).status, 401);
+        assert.equal(api.state.authenticated, true);
+        assert.equal(api.state.connected, true);
+      } finally { install('fetch', fetchResponse); }
+    });
     await t.test(
       "expired sessions stop reconnect attempts and return to login",
       async () => {

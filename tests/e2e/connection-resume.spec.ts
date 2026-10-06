@@ -45,6 +45,46 @@ test('a socket that stays OPEN but stops answering is replaced automatically wit
   expect(mock.request('turn/start')).toBeUndefined();
 });
 
+test('a socket auth close rechecks the current session before reconnecting without losing the draft', async ({ page, mock }) => {
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('有效登录仍然保留');
+  const checks: URL[] = [];
+  await page.route('**/api/auth/session*', route => {
+    const url = new URL(route.request().url());
+    checks.push(url);
+    const authenticated = url.searchParams.has('_request') && mock.authenticated;
+    return route.fulfill({ json: { authenticated, authRequired: true, ...(authenticated ? { csrfToken: 'mock-csrf' } : {}) } });
+  });
+  missedTurn(mock);
+  await mock.sockets[0]!.close({ code: 4003, reason: 'Stale socket session' });
+  await expect.poll(() => checks.length).toBeGreaterThan(0);
+  await expect.poll(() => mock.sockets.length, { timeout: 12000 }).toBe(2);
+  await expect(page.locator('.agent-message').last()).toHaveText('后台完成的结果已恢复');
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+  await expect(input).toHaveValue('有效登录仍然保留');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
+  expect(checks.every(url => !!url.searchParams.get('_request'))).toBe(true);
+  expect(mock.request('turn/start')).toBeUndefined();
+});
+
+test('a socket auth close shows login when a fresh session check confirms expiry', async ({ page, mock }) => {
+  await login(page);
+  const checks: URL[] = [];
+  await page.route('**/api/auth/session*', route => {
+    checks.push(new URL(route.request().url()));
+    return route.fulfill({ json: { authenticated: false, authRequired: true } });
+  });
+  mock.authenticated = false;
+  await mock.sockets[0]!.close({ code: 4003, reason: 'Expired session' });
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toBeVisible();
+  expect(checks.length).toBeGreaterThan(0);
+  expect(checks.every(url => !!url.searchParams.get('_request'))).toBe(true);
+  expect(mock.sockets).toHaveLength(1);
+  expect(mock.request('turn/start')).toBeUndefined();
+});
+
 test('a fresh app window restores the host, project, chat and draft without logging in again', async ({ page, context, mock }) => {
   const remote = new MockCodex();
   remote.threads[0].name = '远程重进测试';

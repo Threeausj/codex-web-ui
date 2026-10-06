@@ -28,7 +28,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve())); });
 
 async function loginBuilt(page: Page, key = publicKey, authenticated = false) {
-  await page.route("**/api/push/config", (route) => route.fulfill({ json: { enabled: true, publicKey: key } }));
+  await page.route("**/api/push/config*", (route) => route.fulfill({ json: { enabled: true, publicKey: key } }));
   await page.goto(origin);
   if (!authenticated) {
     await page.getByRole("textbox", { name: "访问密码" }).fill("test-password-123");
@@ -229,6 +229,68 @@ test('returning to the foreground renews the existing device without asking for 
   expect(fixture.permissionRequests).toBe(0);
   expect(fixture.subscriptions).toEqual([]);
   expect(fixture.unsubscriptions).toBe(0);
+});
+
+test('backgrounding a pending push test bypasses a cached anonymous session and reconnects without logging out or replaying actions', async ({ page, mock }) => {
+  const calls: PushCall[] = [];
+  const sessionRequests: URL[] = [];
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, calls);
+  await page.route('**/api/auth/session*', route => {
+    const url = new URL(route.request().url());
+    sessionRequests.push(url);
+    // Reproduce the deployed proxy: the plain URL has a cached anonymous response.
+    const authenticated = url.searchParams.has('_request') && mock.authenticated;
+    return route.fulfill({ json: { authenticated, authRequired: true, ...(authenticated ? { csrfToken: 'mock-csrf' } : {}) } });
+  });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let testRequests = 0;
+  await page.route('**/api/push/test', async route => {
+    testRequests++;
+    await pending;
+    await route.fulfill({ json: { ok: true } });
+  });
+  await loginBuilt(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('测试通知切后台后保留草稿');
+  await openPushSettings(page);
+  const before = sessionRequests.length;
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => testRequests).toBe(1);
+  try {
+    await page.evaluate(() => {
+      (window as any).testVisibility = 'hidden';
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (window as any).testVisibility });
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => (window as any).testVisibility === 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await mock.sockets[0]!.close({ code: 1001, reason: 'Mobile app backgrounded' });
+    mock.turns.get('thread-existing')!.push({
+      id: 'push-test-background-turn', status: 'completed',
+      items: [{ id: 'push-test-background-answer', type: 'agentMessage', text: '测试通知期间完成的历史已恢复' }],
+    });
+    await page.evaluate(() => {
+      (window as any).testVisibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+      document.dispatchEvent(new Event('resume'));
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect.poll(() => mock.sockets.length, { timeout: 12000 }).toBe(2);
+    await expect(page.locator('.agent-message').last()).toHaveText('测试通知期间完成的历史已恢复');
+    await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+    await expect(input).toHaveValue('测试通知切后台后保留草稿');
+    expect(sessionRequests.length).toBeGreaterThan(before);
+    expect(sessionRequests.slice(before).every(url => !!url.searchParams.get('_request'))).toBe(true);
+    release();
+    await expect(page.getByRole('status')).toContainText('推送服务已接收测试通知');
+    await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+    expect(testRequests).toBe(1);
+    expect(mock.request('turn/start')).toBeUndefined();
+    expect(mock.authenticated).toBe(true);
+    expect((await page.evaluate(() => (window as any).pushFixture)).permissionRequests).toBe(0);
+  } finally { release(); }
 });
 
 test("a waiting production worker prompts for update and cannot reload an active turn", async ({ page, mock }) => {
