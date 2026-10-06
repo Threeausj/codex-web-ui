@@ -32,16 +32,19 @@ const parentPath = computed(() => {
 async function navigate(path?: string) {
   const requestGeneration = ++generation;
   const hostId = props.hostId;
+  const requestedAddress = path?.trim() || "";
   loading.value = true;
   error.value = "";
   currentPath.value = "";
   entries.value = [];
-  address.value = path?.trim() || "";
+  address.value = requestedAddress;
   try {
-    const result = await props.api.browseDirectory(hostId, path?.trim() || undefined);
+    const result = await props.api.browseDirectory(hostId, requestedAddress || undefined);
     if (!mounted || requestGeneration !== generation || hostId !== props.hostId) return;
     currentPath.value = result.path;
-    address.value = result.path;
+    // A folder response may arrive after the user starts typing the next path.
+    // Keep that draft; it must be navigated before the folder can be selected.
+    if (address.value === requestedAddress) address.value = result.path;
     entries.value = result.entries
       .filter((entry: any) => entry.isDirectory)
       .sort((a: any, b: any) => a.fileName.localeCompare(b.fileName));
@@ -174,7 +177,7 @@ onBeforeUnmount(() => {
   overflow: auto;
   box-shadow: 0 20px 80px #0002;
 }
-.folder-picker::backdrop { background: #0004; backdrop-filter: blur(3px); }
+.folder-picker::backdrop { background: var(--scrim); backdrop-filter: blur(3px); }
 header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 22px; }
 h2 { font-size: 20px; font-weight: 600; letter-spacing: -.3px; }
 .picker-host { display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; color: var(--muted); font-size: 12px; }

@@ -636,12 +636,12 @@ defineExpose({ refresh });
   overflow-wrap: anywhere;
 }
 .git-error {
-  background: rgba(202, 62, 62, 0.09);
-  color: #bd4545;
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+  color: var(--red);
 }
 .git-notice {
-  background: rgba(39, 147, 99, 0.1);
-  color: #26845c;
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  color: var(--green);
 }
 .git-empty {
   display: flex;
@@ -785,14 +785,14 @@ defineExpose({ refresh });
   white-space: pre;
   font-size: 10px;
   letter-spacing: 1px;
-  color: #aa7d28;
+  color: var(--warning);
   flex-shrink: 0;
 }
 .git-file-name code.conflict {
-  color: #c34444;
+  color: var(--red);
 }
 .git-file-name code.untracked {
-  color: #28905b;
+  color: var(--green);
 }
 .git-file-name span {
   overflow: hidden;
@@ -903,14 +903,14 @@ defineExpose({ refresh });
   white-space: pre;
 }
 .git-diff-line.added {
-  background: rgba(48, 162, 96, 0.12);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
 }
 .git-diff-line.removed {
-  background: rgba(210, 60, 60, 0.1);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
 }
 .git-diff-line.hunk {
-  background: rgba(60, 128, 211, 0.1);
-  color: #5c8bd1;
+  background: color-mix(in srgb, var(--info) 10%, transparent);
+  color: var(--info);
 }
 .git-diff-line.meta {
   color: var(--muted);

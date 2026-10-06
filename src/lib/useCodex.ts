@@ -1,5 +1,6 @@
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
+import { subagentStatus } from "./subagents";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { revokeDevicePush } from "./pwa";
 import {
@@ -90,6 +91,7 @@ const state = reactive({
   tokenUsage: null as any,
   busy: false,
   pendingRequests: [] as any[],
+  agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number }>,
   attachments: [] as any[],
   config: null as any,
   skills: [] as any[],
@@ -815,6 +817,12 @@ function receive(message: any) {
   if (method === "thread/status/changed") {
     const thread = state.threads.find((t) => t.id === p.threadId);
     if (thread) updateThread({ ...thread, status: p.status });
+    const previous = state.agentActivity[p.threadId];
+    const status = p.status?.type === 'idle' ? 'idle' : subagentStatus(p.status);
+    // Idle/unloaded describes the runtime, not whether the last turn succeeded.
+    const retainFailure = ['idle', 'unknown'].includes(status)
+      && ['errored', 'interrupted', 'shutdown'].includes(previous?.status || '');
+    state.agentActivity[p.threadId] = { ...previous, status: retainFailure ? previous!.status : status, updatedAt: Date.now() };
     noteRuntime(p.threadId, p.status?.type === "active");
   }
   if (method === "thread/archived") {
@@ -841,12 +849,17 @@ function receive(message: any) {
     const itemId = p.item?.id ?? p.itemId;
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
+    const item = items.find(item => item.id === itemId);
+    if (item?.type === 'agentMessage') {
+      state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], text: item.text, updatedAt: Date.now() };
+    }
     if (p.item?.type === "contextCompaction" && method === "item/completed") {
       compactedSinceInput.add(p.threadId);
       if (state.activeThread?.id === p.threadId) toast("上下文已压缩");
     }
   }
   if (method === "turn/started") {
+    state.agentActivity[p.threadId] = { status: 'running', startedAt: Date.now(), updatedAt: Date.now() };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
     noteRuntime(p.threadId, true, p.turn.id);
@@ -857,6 +870,7 @@ function receive(message: any) {
     }
   }
   if (method === "turn/completed") {
+    state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], status: p.turn.status === 'failed' ? 'errored' : p.turn.status, updatedAt: Date.now() };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
     if (
@@ -1131,6 +1145,7 @@ async function logout() {
     );
   state.activeThread = null;
   state.pendingRequests = [];
+  state.agentActivity = {};
   state.terminalRunning = false;
   state.terminalProcessId = "";
   state.terminalOutput = "";
@@ -1326,6 +1341,7 @@ async function selectThread(id: string) {
     const result = await rpc("thread/resume", {
       threadId: id,
       excludeTurns: true,
+      config: { 'features.default_mode_request_user_input': true },
     });
     if (generation !== selectionGeneration || hostId !== state.hostId) return;
     let page = await history(id, null, hostId);
@@ -1639,6 +1655,7 @@ async function send(text: string, editedInput?: any[]) {
         sandbox: permission as any,
         approvalPolicy: approval,
         historyMode: "paginated",
+        config: { 'features.default_mode_request_user_input': true },
       });
       id = result.thread.id;
       if (hostId !== state.hostId)
@@ -2133,6 +2150,7 @@ async function setHost(id: string) {
   state.projectThreadPages = {};
   state.pendingRequests = [];
   state.hostId = id;
+  state.agentActivity = {};
   state.model = "";
   state.models = [];
   state.config = null;
@@ -2511,8 +2529,24 @@ async function stopTerminal() {
   if (state.terminalProcessId)
     await rpc("command/exec/terminate", { processId: state.terminalProcessId });
 }
+async function listSubagents(threadId: string, cursor: string | null = null) {
+  if (!threadId) return { data: [], nextCursor: null };
+  return rpc('thread/list', {
+    ancestorThreadId: threadId, sourceKinds: ['subAgent'], modelProviders: [],
+    cursor, limit: 60,
+  }, 45000, { silentError: true });
+}
+async function readSubagent(threadId: string, cursor: string | null = null) {
+  const hostId = state.hostId;
+  const [metadata, page] = await Promise.all([
+    rpc('thread/read', { threadId, includeTurns: false }, 45000, { silentError: true }),
+    rpc('thread/turns/list', { threadId, cursor, limit: 30, sortDirection: 'desc', itemsView: 'full' }, 45000, { silentError: true }),
+  ]);
+  if (hostId !== state.hostId) throw new Error('工作站已切换');
+  return { thread: metadata.thread, turns: [...page.data].reverse(), nextCursor: page.nextCursor };
+}
 function respond(id: string | number, result: any) {
-  if (!socket || !state.connected)
+  if (!socket || !state.connected || socket.readyState !== WebSocket.OPEN)
     throw fail(new Error("连接断开，请等待重新连接后审批"));
   socket.send(JSON.stringify({ id, result }));
   state.pendingRequests = state.pendingRequests.filter(
@@ -2884,6 +2918,8 @@ export function useCodex() {
     logout,
     setOnline,
     rpc,
+    listSubagents,
+    readSubagent,
     refreshThreads,
     loadMoreThreads,
     loadProjectThreads,

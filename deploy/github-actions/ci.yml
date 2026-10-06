@@ -19,7 +19,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm install --global @openai/codex@0.159.2
+      - run: npm install --global @openai/codex@latest
       - run: npm test
       - run: npm run build
       - run: npx playwright install --with-deps chromium
@@ -42,25 +42,35 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install current CLI on the CI host, outside the image
+        run: npm install --global @openai/codex@latest
       - uses: docker/setup-buildx-action@v3
       - name: Prepare isolated deployment
         run: |
           mkdir workspace
           sudo chown 1000:1000 workspace
           umask 077
-          printf 'CODEX_WEB_PASSWORD=%s\nWORKSPACE_PATH=./workspace\n' "$(openssl rand -hex 32)" > .env.docker
+          printf 'CODEX_WEB_PASSWORD=%s\nWORKSPACE_PATH=./workspace\nHOST_CODEX_DIRECTORY=%s/@openai\n' "$(openssl rand -hex 32)" "$(npm root -g)" > .env.docker
       - name: Validate both Compose deployments
         run: |
           docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml config --quiet
+          docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml config --quiet
           PUBLIC_HOST=codex-smoke.example ACME_EMAIL=ci@example.com docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml config --quiet
       - name: Build and start loopback deployment
         run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up --build --wait --wait-timeout 120
+      - name: Verify web startup without a bundled or mounted CLI
+        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec -T app node --input-type=module - web < scripts/docker-smoke.mjs
+      - name: Reuse the CI host installation through a read-only directory mount
+        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up --no-build --wait --wait-timeout 120
       - name: Container integration smoke
-        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec -T app node --input-type=module - write < scripts/docker-smoke.mjs
+        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec -T app node --input-type=module - write < scripts/docker-smoke.mjs
       - name: Recreate without deleting persistent volumes
-        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up --force-recreate --wait --wait-timeout 120
+        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up --force-recreate --wait --wait-timeout 120
       - name: Verify persistence and reconnect
-        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec -T app node --input-type=module - verify < scripts/docker-smoke.mjs
+        run: docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec -T app node --input-type=module - verify < scripts/docker-smoke.mjs
       - name: Validate Caddy configuration
         run: docker run --rm -e PUBLIC_HOST=codex-smoke.example -e ACME_EMAIL=ci@example.com -v "$PWD/deploy/docker/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.10.2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: Start internal HTTPS-origin application

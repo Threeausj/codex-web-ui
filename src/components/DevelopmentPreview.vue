@@ -71,8 +71,8 @@ onBeforeUnmount(() => { mounted = false; void close() })
 .dev-preview-status { display:flex;flex-shrink:0;justify-content:space-between;gap:6px;padding:8px 12px;color:var(--text-muted);font-size:10px; }
 .dev-preview-actions { display:flex;flex-shrink:0;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--border); }
 .dev-preview-expiry { flex:1;color:var(--text-muted);font-size:10px;text-align:right; }
-.dev-preview-frame { flex:1;min-height:0;background:#e8e8e8;display:flex;justify-content:center;overflow:hidden; }
-.dev-preview-frame iframe { display:block;width:100%;height:100%;min-height:0;border:0;background:#fff; }
+.dev-preview-frame { flex:1;min-height:0;background:var(--soft);display:flex;justify-content:center;overflow:hidden; }
+.dev-preview-frame iframe { display:block;width:100%;height:100%;min-height:0;border:0;background:var(--surface); }
 .dev-preview-frame.mobile iframe { max-width:390px; }
 .dev-preview-empty { margin:auto;padding:32px 24px;text-align:center;color:var(--text-muted); }
 .dev-preview-empty p { margin:12px 0 8px;font-size:14px;color:var(--text); }

@@ -118,6 +118,15 @@ const otherRequests = computed(() =>
       request.params.threadId !== state.activeThread?.id,
   ),
 );
+const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput')));
+const activeChoices = computed(() => activeRequests.value.filter((request: any) => request.method?.includes('requestUserInput')));
+function showChoices() {
+  scroll.value?.querySelector('.question-card')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+watch(() => [state.authenticated, choiceRequests.value.length, threadTitle.value], () => {
+  const reminder = choiceRequests.value.length ? `（${choiceRequests.value.length} 待选择）` : '';
+  document.title = state.authenticated ? `${reminder}${threadTitle.value} · Codex Web` : 'Codex Web';
+}, { immediate: true });
 const welcome = computed(() => !state.activeThread && !state.items.length);
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.loading || !state.online ||
@@ -157,6 +166,7 @@ const paletteActions = [
     icon: "GitBranch",
   },
   { id: "files", name: "浏览项目文件", detail: "工作区", icon: "Folder" },
+  { id: "agents", name: "查看子智能体", detail: "状态与对话", icon: "Bot" },
   { id: "preview", name: "打开预览", detail: "工作区", icon: "Eye" },
   {
     id: "review",
@@ -404,7 +414,7 @@ async function execute(command: string) {
           : "先选择一个对话，再创建分支。",
       );
   } else if (
-    ["terminal", "files", "preview", "changes", "git"].includes(command)
+    ["terminal", "files", "preview", "changes", "git", "agents"].includes(command)
   )
     openWorkspace(command);
   else if (command === "settings") openSettings();
@@ -587,6 +597,8 @@ function applyTheme() {
       : theme.value;
   document.documentElement.style.colorScheme =
     document.documentElement.dataset.theme;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content',
+    getComputedStyle(document.documentElement).getPropertyValue('--bg').trim());
 }
 watch(theme, () => {
   localStorage.setItem("codex.theme", theme.value);
@@ -825,6 +837,14 @@ watch(() => [state.authenticated, state.loading], () => {
             /><span>{{ currentHost?.name || "本机" }}</span></span
           ><button
             class="icon-button"
+            :disabled="!state.activeThread"
+            @click="openWorkspace('agents')"
+            title="查看子智能体"
+            aria-label="查看子智能体"
+          >
+            <Icon name="Bot" :size="18" />
+          </button><button
+            class="icon-button"
             :class="{ selected: workspaceOpen }"
             @click="workspaceOpen = !workspaceOpen"
             title="工作区：文件、预览、终端"
@@ -939,8 +959,12 @@ watch(() => [state.authenticated, state.loading], () => {
         <Icon name="Shield" :size="15" />{{
           otherRequests.length
         }}
-        个其他对话正在等待审批<Icon name="ArrowRight" :size="14" />
+        个其他对话等待选择或确认<Icon name="ArrowRight" :size="14" />
       </button>
+      <div v-if="activeChoices.length" class="connection-banner choice-reminder" role="status">
+        <Icon name="Bell" :size="15" />{{ activeChoices.length }} 个问题等待你的选择
+        <button class="button button-small button-secondary" @click="showChoices">查看问题</button>
+      </div>
       <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
         <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
           <div v-if="welcome" class="welcome">

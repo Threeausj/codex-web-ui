@@ -2,6 +2,12 @@ import type { Host } from './types.js'
 
 export function shellQuote(value: string) { return `'${value.replace(/'/g, `'"'"'`)}'` }
 
+/** Process-only override: allow structured questions in regular conversations. */
+export function codexAppServerArgs(mode: 'spawn' | 'proxy' = 'spawn', socketPath?: string) {
+  return ['-c', 'features.default_mode_request_user_input=true', 'app-server',
+    ...(mode === 'proxy' ? ['proxy', ...(socketPath ? ['--sock', socketPath] : [])] : ['--listen', 'stdio://'])]
+}
+
 /**
  * SSH starts a non-interactive shell whose PATH often misses nvm, mise or npm
  * installs. Let the account's interactive login shell initialize its environment
@@ -16,7 +22,7 @@ export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn'
     `codex_bin=${shellQuote(command)}`,
     'codex_bin=$(command -v "$codex_bin" 2>/dev/null) || { printf "%s\\n" "Codex was not found in the remote login-shell PATH" >&2; exit 127; }',
     ...(probeVersion ? ['printf "%s" "__CODEX_WEB_VERSION__=" >&2', '"$codex_bin" --version >&2 || exit $?'] : []),
-    `exec "$codex_bin" app-server ${mode === 'proxy' ? 'proxy' : '--listen stdio://'}`,
+    `exec "$codex_bin" ${codexAppServerArgs(mode).map(shellQuote).join(' ')}`,
   ].join('\n')
   // The command executed by the user's shell is deliberately just exec + sh;
   // the launcher itself also works when the login shell is fish.

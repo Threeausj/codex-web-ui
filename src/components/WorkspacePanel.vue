@@ -16,6 +16,7 @@ const DevelopmentPreview = defineAsyncComponent(
   () => import("./DevelopmentPreview.vue"),
 );
 const TmuxPanel = defineAsyncComponent(() => import("./TmuxPanel.vue"));
+const SubagentsPanel = defineAsyncComponent(() => import("./SubagentsPanel.vue"));
 
 const props = defineProps<{
   api: any;
@@ -27,6 +28,7 @@ const emit = defineEmits<{ close: []; error: [message: string] }>();
 const tab = ref(props.initialTab || "files");
 const tabs = [
   { id: "files", name: "文件", icon: "Folder" },
+  { id: "agents", name: "子智能体", icon: "Bot" },
   { id: "preview", name: "预览", icon: "Eye" },
   { id: "terminal", name: "终端", icon: "Terminal" },
   { id: "tmux", name: "Tmux", icon: "Layers" },
@@ -501,6 +503,9 @@ defineExpose({
           </p>
         </div>
       </div>
+    </div>
+    <div v-else-if="tab === 'agents'" class="workspace-body agents-view">
+      <SubagentsPanel :api="api" :state="state" />
     </div>
     <div v-else-if="tab === 'tmux'" class="workspace-body tmux-view">
       <TmuxPanel :api="api" :state="state" @attach="attachTmux" />

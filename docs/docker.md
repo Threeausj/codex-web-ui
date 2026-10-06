@@ -2,7 +2,7 @@
 
 **简体中文** · [English](docker.en.md)
 
-镜像使用 Node.js 22 Debian Bookworm、多阶段构建及非 root 用户 `node`（UID/GID `1000:1000`）。内置 Codex CLI `0.159.2`、Git、OpenSSH、Tmux、Python 3 和 ripgrep。对话及执行仍经官方 Codex app-server stdio 协议；容器不发布原始 app-server transport。
+镜像使用 Node.js 22 Debian Bookworm、多阶段构建及非 root 用户 `node`（UID/GID `1000:1000`），包含 Git、OpenSSH、Tmux、Python 3 和 ripgrep。Codex 使用本机或 SSH 远端已有的安装，镜像不安装、固定或自动更新 Codex。对话及执行仍经官方 Codex app-server stdio 协议；容器不发布原始 app-server transport。
 
 ## 文件与数据
 
@@ -11,6 +11,7 @@
 | `Dockerfile` / `.dockerignore` | 构建生产前端/服务端；排除凭据、工作区和本机数据 |
 | `compose.yaml` | 应用基础配置，不发布端口 |
 | `compose.local.yaml` | 只将 `127.0.0.1:8787` 发布给本机 |
+| `compose.host-codex.yaml` | 可选：只读挂载 Linux 宿主已有 Codex 安装目录 |
 | `compose.public.yaml` | Caddy 暴露 80/443；应用仅在 Compose 网络内可达 |
 | `deploy/docker/env.example` | 环境模板，复制为被 Git 忽略的 `.env.docker` |
 | `deploy/docker/Caddyfile` | 自动 HTTPS 与 WebSocket 反向代理 |
@@ -37,17 +38,41 @@ Linux 下目录须由 UID/GID `1000:1000` 可读写。若使用专门的空工�
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --build --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex --version
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex login --device-auth
 ```
 
-第三条在容器内完成 Codex 账户登录，按照终端提示在浏览器授权；账户需允许设备登录。已有账户或提供方配置也可按官方 CLI 方式设置到持久化 `CODEX_HOME`。网页访问密码不提供模型权限。
+纯 SSH 部署到这里即可：网页和健康检查无需容器内存在 Codex。进入“设置 → 连接”添加已安装 Codex 的远端，测试后选择该主机；SSH 配置见下文。本机未挂载安装时，选择“本机”会显示配置提示，不影响网页登录或设置远端。
 
-打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，输入网页密码，然后浏览 `/workspace` 并添加项目。若宿主机已有服务占用 8787，先停止其中一个服务，或修改本地 overlay 的宿主机端口，并同步本地 `PUBLIC_ORIGIN`。
+打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，输入网页密码，选择已配置的主机和项目。若宿主机已有服务占用 8787，先停止其中一个服务，或修改本地 overlay 的宿主机端口，并同步本地 `PUBLIC_ORIGIN`。
 
 本地 HTTP origin 不设置 Secure Cookie；公网 HTTPS origin 自动设置 Secure Cookie。两种方式均保留 HttpOnly、SameSite、CSRF 与 Origin 校验，`NODE_ENV` 不用于关闭鉴权。
 
 使用 NAS IP 或自己的 HTTPS 反向代理时，将浏览器实际使用的 Origin（协议、主机、端口）加入 `PUBLIC_ORIGIN`；未配置的来源会收到 `403 Untrusted origin`，即使密码正确。多个 Origin 用逗号分隔。混合 HTTP/HTTPS 部署按登录请求的可信 Origin 设置 Secure Cookie，让局域网 HTTP 登录可用，同时保护 HTTPS 登录；只配置 HTTPS Origin 时始终要求 Secure Cookie。HTTP 页面使用 `crypto.getRandomValues` 生成兼容 UUID，不依赖仅安全上下文可用的 `crypto.randomUUID`。
+
+## 直接使用宿主 Codex
+
+Linux 宿主本机模式需要将已有安装目录只读挂载，CLI 架构须与容器一致。使用 npm 安装时，在安装 Codex 的账户环境中执行 `npm root -g`；将其下的整个 `@openai` 目录设为 `HOST_CODEX_DIRECTORY`，包含 `codex` 和其平台二进制依赖。仅挂载 `/usr/local/bin/codex` 符号链接或单个 JS 文件会缺少依赖。写入 `.env.docker`，实际路径按 npm/nvm 安装修改：
+
+```dotenv
+HOST_CODEX_DIRECTORY=/usr/local/lib/node_modules/@openai
+CODEX_BIN=/opt/host-codex/codex/bin/codex.js
+```
+
+对这个部署的每条 Compose 命令增加 `-f compose.host-codex.yaml`：
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml config --quiet
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up -d --build --wait
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" --version'
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" login --device-auth'
+```
+
+最后一条在容器的持久化 `CODEX_HOME` 登录，不会修改宿主账户。已有提供方也可在该目录配置；网页访问密码不提供模型权限。宿主 CLI 的安装目录和账户数据目录是两项配置：只挂载安装不会自动共享宿主历史，账户复用见“与桌面同步”。安装目录需允许 UID 1000 读取文件和执行程序；不要让网页账户写入安装目录。
+
+独立 Linux 原生安装同样挂载**实际可执行文件所在目录**，并设 `CODEX_BIN=/opt/host-codex/实际文件名`；例如 `HOST_CODEX_DIRECTORY=/srv/codex-bin`、`CODEX_BIN=/opt/host-codex/codex`。保留安装依赖和符号链接指向的文件；避免只挂载版本文件，因为宿主升级的原子替换可能让容器保留旧 inode。pnpm/Bun 等跨目录符号链接布局需自行提供覆盖所有目标的受限目录挂载，或使用 SSH 连接宿主机。macOS/Windows 的二进制不能在 Linux 容器运行，请用 SSH 在对应主机执行。
+
+更新 Codex 使用宿主或远端原有的升级方式；网页不会执行升级，也无需因此重建 Web 镜像。升级后先完成活动任务，再重启应用服务以重建 app-server；仍运行的 app-server 和普通浏览器重连继续使用旧进程。目录路径保持不变时，下一次启动直接使用已更新文件；若 nvm 切换 Node 版本或安装前缀变动，修改 `HOST_CODEX_DIRECTORY` 后重新创建容器。SSH 每次真正建立 app-server 连接都会重新解析远端登录 shell 的 PATH。
+
+网页启动的 app-server 通过进程参数 `-c features.default_mode_request_user_input=true` 启用普通模式的结构化选择，不写入宿主 `config.toml`。连接既有 daemon 的 `proxy` 模式仍受该 daemon 与会话配置控制，proxy 命令本身不能修改已运行 daemon 的启动配置。
 
 ## 模型网关与客户端标识
 
@@ -82,7 +107,6 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 ```dotenv
 CODEX_WEB_PASSWORD=replace-with-your-generated-password
 WORKSPACE_PATH=/srv/codex-workspace
-CODEX_VERSION=0.159.2
 PUBLIC_HOST=codex.example.com
 ACME_EMAIL=admin@example.com
 # 可选，替换成维护者真实邮箱；留空使用 HTTPS 公网 Origin。
@@ -96,11 +120,10 @@ PUSH_SUBJECT=mailto:admin@example.com
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml down
 docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml up -d --build --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml exec app codex login --device-auth
 docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml logs --tail 100 caddy
 ```
 
-访问 `https://你的域名` 并登录。不要同时加载 `compose.local.yaml` 与 `compose.public.yaml`，否则会添加不必要的后端端口。若使用已有反向代理，可以仅运行基础 Compose，并由受控网络中的代理连接 `app:8787`；按实际 HTTPS origin 和可信代理配置覆盖环境，不将 8787 直接暴露到公网。
+访问 `https://你的域名` 并登录，再设置 SSH 主机；需要宿主本机执行时在命令中继续添加 `-f compose.host-codex.yaml`。不要同时加载 `compose.local.yaml` 与 `compose.public.yaml`，否则会添加不必要的后端端口。若使用已有反向代理，可以仅运行基础 Compose，并由受控网络中的代理连接 `app:8787`；按实际 HTTPS origin 和可信代理配置覆盖环境，不将 8787 直接暴露到公网。
 
 该产品是单用户工作站入口：登录者可以操作所挂载的文件和已经配置的 SSH 主机。它不提供多租户隔离或共享 SaaS 的权限体系。Docker 配置没有启用 `privileged`、Docker socket 挂载或关闭 seccomp。
 
@@ -188,7 +211,7 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml buil
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --wait
 ```
 
-`CODEX_VERSION` 固定兼容基线，可显式更改后重建。升级 CLI 时同时核对协议类型和运行验证，避免浮动 `latest` 改变行为。
+Web 镜像升级与 Codex 升级相互独立。CLI 升级后核对协议兼容性；本机/远端升级不要求重建镜像，完成活动任务后重新启动 app-server 即可。
 
 ## 检查与排错
 
@@ -198,7 +221,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 | Bind mount 不存在/Permission denied | `WORKSPACE_PATH` 是宿主机已有目录，UID 1000 具有访问权限 |
 | 登录后仍显示未登录 | 域名与 `PUBLIC_ORIGIN` 一致；HTTPS 配置需 HTTPS 访问，检查代理与 Cookie |
 | `.env.docker` 密码无法登录 | 已保存的 `web-password.json` 优先；使用设置里更新后的密码，忘记时按访问密码重置步骤恢复 |
-| 网页可登录但模型不可用 | 容器中执行 `codex login --device-auth`；确认账户模型权限/提供方配置 |
+| 本机提示未找到 Codex | 镜像不内置 CLI；添加宿主安装 overlay，核对 `HOST_CODEX_DIRECTORY` 和绝对 `CODEX_BIN`，或选择 SSH 主机 |
+| 网页可登录但模型不可用 | 在执行 CLI 的远端或容器 `CODEX_HOME` 登录；确认账户模型权限/提供方配置 |
 | SSH 错误 | 从容器测试同一别名，检查挂载路径、身份文件权限及已核验的 `known_hosts` |
 | 没有桌面历史 | 默认卷独立；核对同数据目录和绝对项目路径，不假设自动云同步 |
 | Linux sandbox/namespace 不可用 | 宿主机内核和容器策略会影响 Codex sandbox；先检查具体错误，配置不自动放宽 Docker 权限 |
@@ -209,8 +233,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 
 本次标准 Docker 实测中，只读/工作区写入命令均遇到 `bwrap: No permissions to create a new namespace`；容器内的“完全访问”命令和 PTY 可运行。细粒度 sandbox 需要相应内核/user namespace/容器策略支持，部署时另行确认。如用户明确选择 Codex“完全访问”，它作用于容器进程可访问的挂载和 SSH 工作站，不会授予宿主机 Docker 管理权限。不要为了启动而自动切换权限或增加 `--privileged`。
 
-可启用的 [CI 示例](../deploy/github-actions/README.md) 验证应用测试/构建与隔离容器：健康检查、登录/Cookie、未登录拒绝、真实 app-server 握手/文件/PTY/Tmux、重建后的数据保存，以及 HTTPS origin 的 Secure Cookie 和 Caddy 配置。复制到 `.github/workflows/ci.yml` 后启用。测试不需要模型账户或推理额度；真实域名证书、实际 SSH 和桌面活动 turn 仍由部署环境验收。[验证清单](validation.md)。
+可启用的 [CI 示例](../deploy/github-actions/README.md) 验证应用测试/构建与隔离容器：无 CLI 时的健康检查/网页登录，再只读挂载 CI 宿主 CLI 检查真实 app-server 握手/文件/PTY/Tmux、重建后的数据保存，以及 HTTPS origin 的 Secure Cookie 和 Caddy 配置。复制到 `.github/workflows/ci.yml` 后启用。测试不需要模型账户或推理额度；真实域名证书、实际 SSH 和桌面活动 turn 仍由部署环境验收。[验证清单](validation.md)。
 
-2026-10-06 已在独立 Colima 的 Linux/ARM64 环境实际完成镜像构建、上述容器检查及强制重建持久化验证；公网 origin/Cookie 和 Caddy 配置验证通过。未测试 amd64 镜像或真实 ACME 证书签发。
+2026-10-06 曾在独立 Colima Linux/ARM64 环境验证内置 CLI 的旧版镜像及强制重建持久化；该结果不代表本次宿主 CLI 挂载方案已在所有平台验收。新的 CI 示例覆盖无 CLI 启动和宿主安装复用，真实 ACME 证书签发另行验收。
 
 参考：[Docker Compose 生产部署](https://docs.docker.com/compose/how-tos/production/)、[Codex CLI](https://learn.chatgpt.com/docs/codex/cli)、[app-server](https://learn.chatgpt.com/docs/app-server)。

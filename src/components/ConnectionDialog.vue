@@ -420,7 +420,7 @@ onBeforeUnmount(() => {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: #15171332;
+  background: var(--scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -433,9 +433,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 20px;
-  box-shadow:
-    0 16px 60px #0002,
-    0 2px 6px #0001;
+  box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
   outline: none;
@@ -555,7 +553,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   width: 40px;
   flex-shrink: 0;
-  color: #bca15f;
+  color: var(--warning);
   border-right: 1px solid var(--border);
 }
 .ssh-name-input input {

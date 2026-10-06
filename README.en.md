@@ -20,14 +20,30 @@ Edit `.env.docker`: set `CODEX_WEB_PASSWORD` to a unique password of at least 12
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --build
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex login --device-auth
 ```
 
-Open [http://127.0.0.1:8787](http://127.0.0.1:8787) and sign in with `CODEX_WEB_PASSWORD`. Add a project under `/workspace` in the UI. The web password and Codex account login are separate.
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and add an SSH machine with Codex installed under Settings → Connections. Select that host and its project. SSH-only deployment needs no CLI inside the container. The web password and Codex account login are separate.
+
+For local Linux execution, reuse the host installation read-only. With npm, set `HOST_CODEX_DIRECTORY` in `.env.docker` to the complete `@openai` scope beneath `npm root -g`, along with the container entrypoint. For example:
+
+```dotenv
+HOST_CODEX_DIRECTORY=/usr/local/lib/node_modules/@openai
+CODEX_BIN=/opt/host-codex/codex/bin/codex.js
+```
+
+Retain `-f compose.host-codex.yaml` in every command for that deployment:
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up -d --build
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" --version'
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" login --device-auth'
+```
+
+Login uses the container's persistent `CODEX_HOME`; sharing an installation does not automatically share host account data. See [host Codex setup](docs/docker.en.md#reuse-the-host-codex-installation) for native Linux binaries, nvm paths, and account reuse. After a host/remote CLI upgrade, finish active tasks and restart the corresponding app-server; the web image needs no rebuild.
 
 Standard Docker isolation can block the Linux namespaces required by Codex's sandbox; read-only/workspace-write commands encountered this limit in the tested container. For terminal, tmux, or model command tools, users can explicitly choose Codex Full access, which covers the mounts and SSH hosts accessible to the container. The deployment never changes permissions automatically or enables privileged mode. See [permission notes](docs/docker.en.md#validation-and-troubleshooting).
 
-The image includes Codex CLI `0.159.2`, Git, SSH, and tmux, runs as a non-root user, and persists web metadata and Codex configuration/history in separate named volumes. The local overlay publishes only a loopback port. The base Compose file publishes no ports. In Docker, **Local** means the container, and `/workspace` is the mounted host directory. It does not automatically connect to a macOS/Windows desktop Codex process or use that desktop account's history.
+The non-root image includes Git, SSH, and tmux. Codex comes directly from an existing host or remote installation; the image neither bundles nor pins the CLI. Web metadata and container Codex configuration/history use separate persistent volumes, while SSH history stays on the remote workstation. The local overlay publishes only a loopback port. The base Compose file publishes no ports. In Docker, **Local** means the container, and `/workspace` is the mounted host directory. It does not automatically connect to a macOS/Windows desktop Codex process or use that desktop account's history.
 
 For public access, use the Caddy HTTPS overlay, set the real domain and certificate contact, and follow [Docker deployment](docs/docker.en.md). That guide also covers SSH mounts, existing Codex data, upgrades, backups, and troubleshooting. Do not combine the local and public overlays.
 
@@ -41,7 +57,7 @@ VAPID keys are generated automatically and persisted in `DATA_DIR`, already cove
 
 ## Run with Node.js
 
-Requires Node.js 22+ and an executable Codex CLI. The current development baseline is `codex-cli 0.159.2`. Configure Codex as the same system user that will run the web service:
+Requires Node.js 22+. Local execution uses an existing executable CLI; SSH-only use requires Codex on the remote machine. Runtime compatibility has been checked with `codex-cli 0.160.0`; the application does not pin or automatically update it. For this local example, configure Codex as the system user that will run the web service:
 
 ```sh
 codex --version
@@ -84,6 +100,8 @@ Implemented features have both protocol integration and UI. Environment-specific
 | Models and permissions | Model/reasoning controls, persistent global read-only/default/full-access setting, per-conversation choices, named web presets, managed policy/provider capability display | Global changes apply to the next new turn, not an already running turn; managed restrictions still apply; listed models do not guarantee account access |
 | Uploads | Up to 8 files per upload, 20 MB each; files go to the selected workstation; images use `localImage` | Proxy base64 messages also face the daemon's 16 MiB transport limit; ordinary files are passed as paths rather than guaranteed native parsing |
 | Conversations | Create/resume/stop/steer, fork, rename, archive/restore, search, export, pagination, drafts, and reading position | Content updates control recency; opening a chat does not reorder it; live desktop sharing requires the same daemon |
+| Structured choices | Recommended options and explanations, Other, multiple questions, secret inputs, and page/notification reminders | Uses official `requestUserInput` requests; plain reply lists are not converted into forms; regular-mode support uses process/session configuration overrides without changing host configuration |
+| Subagent workspace | Ancestor-scoped active/waiting/completed groups, live events and polling, paginated child conversations | Read-only metadata/history requests; does not resume child threads or switch the parent conversation; parent drafts remain intact |
 | Output presentation | Show public reasoning summaries, progress, and tools while running; collapse after completion, failure, or stop; show the final answer directly | Process details can be toggled manually; approvals and failures remain visible; private reasoning content is not exposed |
 | Sidebar | Pinned, Projects, and Recent across all hosts; subtle host labels; project context menus | Pinned and regular projects each show 4 by default; each project shows 4 chats; expand/collapse retains the selected item; old history remains paginated |
 | Workspace layout | Drag the left edge to resize, keyboard controls, double-click reset, browser-local width preference | Width is clamped to retain chat space; mobile uses a full-screen workspace; terminals resize with the panel |

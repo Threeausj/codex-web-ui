@@ -7,15 +7,19 @@ import { spawnSync } from 'node:child_process';
 import WebSocket from '/app/node_modules/ws/index.js';
 
 const phase = process.argv[2] || 'write';
-assert.ok(['write', 'verify', 'https'].includes(phase), 'Expected write, verify or https phase');
+assert.ok(['web', 'write', 'verify', 'https'].includes(phase), 'Expected web, write, verify or https phase');
 assert.equal(process.getuid(), 1000, 'Application must run as UID 1000');
 assert.equal(process.cwd(), '/workspace');
-for (const command of ['codex', 'git', 'ssh', 'tmux', 'bash', 'python3', 'rg']) {
+for (const command of ['git', 'ssh', 'tmux', 'bash', 'python3', 'rg']) {
   assert.equal(spawnSync('/bin/sh', ['-c', 'command -v "$1"', 'check', command]).status, 0, `${command} must be installed`);
 }
-const version = spawnSync('codex', ['--version'], { encoding: 'utf8' });
-assert.equal(version.status, 0);
-assert.match(version.stdout, /codex(?:-cli)? 0\.159\.2\b/);
+if (phase === 'web') {
+  assert.equal(spawnSync('codex', ['--version']).error?.code, 'ENOENT', 'The image must not bundle Codex');
+} else if (phase !== 'https') {
+  const version = spawnSync(process.env.CODEX_BIN || 'codex', ['--version'], { encoding: 'utf8' });
+  assert.equal(version.status, 0, 'The read-only host installation must be executable');
+  assert.match(version.stdout, /codex(?:-cli)? \d+\.\d+\.\d+/);
+}
 const base = 'http://127.0.0.1:8787';
 const origin = phase === 'https' ? 'https://codex-smoke.example' : base;
 const password = process.env.CODEX_WEB_PASSWORD;
@@ -58,7 +62,12 @@ const bootstrap = await (await fetch(base + '/api/bootstrap', { headers })).json
 assert.equal(bootstrap.cwd, '/workspace');
 assert.equal(bootstrap.codexHome, '/home/node/.codex');
 
-if (phase === 'https') {
+if (phase === 'web') {
+  // Pure SSH deployments must be able to sign in and configure hosts even when
+  // no local Codex is mounted. Do not attempt model inference or modify history.
+  console.log('Docker without bundled Codex passed: health, authentication, bootstrap and frontend.');
+  process.exit(0);
+} else if (phase === 'https') {
   // Simulate the trusted TLS reverse proxy without obtaining a public certificate.
   const proxied = await fetch(base + '/api/auth/login', { method: 'POST', headers: { ...jsonHeaders, 'x-forwarded-proto': 'https' }, body: JSON.stringify({ password }) });
   assert.equal(proxied.status, 200);
