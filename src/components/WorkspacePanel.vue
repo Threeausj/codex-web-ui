@@ -776,17 +776,18 @@ defineExpose({
       <div class="changes-heading">
         <span>本次对话 · {{ changes.length }} 个文件</span>
       </div>
-      <div v-for="change in changes" :key="change.path" class="change-card">
-        <button class="file-diff-heading" :title="change.path" @click="openFile(change.path)">
+      <details v-for="change in changes" :key="`${state.hostId}:${state.activeThread?.id || ''}:${change.path}`" class="change-card">
+        <summary class="file-diff-heading" :title="change.path">
           <Icon name="FileText" :size="15" /><span>{{
             change.path.replace(state.projectPath + "/", "")
           }}</span
-          ><Icon name="ArrowUpRight" :size="14" />
-        </button>
+          ><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="openFile(change.path)"><Icon name="ArrowUpRight" :size="14" /></button
+          ><Icon name="ChevronDown" :size="14" />
+        </summary>
         <pre
           class="diff-code"
         ><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
-      </div>
+      </details>
       <div v-if="!changes.length" class="panel-empty">
         <Icon name="GitCompareArrows" :size="32" />
         <p>暂无文件变更</p>
@@ -797,6 +798,10 @@ defineExpose({
 </template>
 
 <style scoped>
+.change-card > summary { list-style: none; cursor: pointer; }
+.change-card > summary::-webkit-details-marker { display: none; }
+.change-card > summary > svg:last-child { transition: transform .15s; }
+.change-card[open] > summary > svg:last-child { transform: rotate(180deg); }
 .file-view-switch { flex: 0 0 auto; }
 .file-view-switch button { padding: 4px 7px; font-size: 12px; }
 .file-editor-heading { gap: 6px; min-width: 0; }

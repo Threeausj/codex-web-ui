@@ -123,16 +123,21 @@ function onLink(event: MouseEvent) {
   <details v-else class="tool-item" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
     <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><code v-if="item.command" class="tool-command">{{ item.command }}</code><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <div v-if="item.type === 'fileChange'" class="file-changes">
-      <div v-for="change in item.changes" :key="change.path" class="file-diff">
-        <button class="file-diff-heading" @click="emit('openFile', change.path)"><Icon name="FileText" :size="15" />{{ change.path }}<span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><Icon name="ArrowUpRight" :size="14" /></button>
+      <details v-for="change in item.changes" :key="change.path" class="file-diff">
+        <summary class="file-diff-heading"><Icon name="FileText" :size="15" /><span class="file-diff-path" :title="change.path">{{ change.path }}</span><span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="emit('openFile', change.path)"><Icon name="ArrowUpRight" :size="14" /></button><Icon name="ChevronDown" :size="14" /></summary>
         <pre class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
-      </div>
+      </details>
     </div>
     <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>
   </details>
 </template>
 
 <style scoped>
+.file-diff > summary { list-style: none; cursor: pointer; }
+.file-diff > summary::-webkit-details-marker { display: none; }
+.file-diff-heading .file-diff-path { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-diff > summary > svg:last-child { transition: transform .15s; }
+.file-diff[open] > summary > svg:last-child { transform: rotate(180deg); }
 .message-editor {
   width: min(100%, 680px);
   padding: 12px;

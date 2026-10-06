@@ -1,5 +1,7 @@
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
+import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
+import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import { subagentStatus } from "./subagents";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { revokeDevicePush } from "./pwa";
@@ -95,6 +97,16 @@ const state = reactive({
   attachments: [] as any[],
   config: null as any,
   skills: [] as any[],
+  skillsLoading: false,
+  skillsError: "",
+  selectedSkills: [] as any[],
+  collaborationMode: "default" as "default" | "plan",
+  goalMode: false,
+  goal: null as ThreadGoal | null,
+  goalTokenBudget: null as number | null,
+  modeCapabilities: { plan: false, goal: false, loaded: false },
+  modeBusy: false,
+  modeError: "",
   apps: [] as any[],
   mcpServers: [] as any[],
   account: null as any,
@@ -132,6 +144,15 @@ let connectionRecovery: { generation: number; promise: Promise<void> } | null = 
 let listGeneration = 0;
 let configGeneration = 0;
 let integrationGeneration = 0;
+let skillsGeneration = 0;
+let skillsRequest: { scope: string; promise: Promise<any> } | null = null;
+let skillsLoadedScope = "";
+let capabilityGeneration = 0;
+let capabilityRequest: { hostId: string; promise: Promise<void> } | null = null;
+let modeOperation = 0;
+const goals = new Map<string, ThreadGoal | null>();
+const goalRevisions = new Map<string, number>();
+const conversationModes = new Map<string, 'default' | 'plan' | 'goal'>();
 let threadListScope = "";
 let loadedMorePages = false;
 let loadedGlobalPages = false;
@@ -266,7 +287,7 @@ async function http(
     }
     const error = Object.assign(new Error(
       result.error?.message ?? result.error ?? `请求失败 (${response.status})`,
-    ), { status: response.status });
+    ), { status: response.status, code: result.code });
     throw reportError && generation === authenticationGeneration ? fail(error) : error;
   }
   return result;
@@ -736,6 +757,7 @@ function receive(message: any) {
     if (message.error) {
       const error = Object.assign(new Error(message.error.message), {
         uncertain: !!message.error.data?.uncertain,
+        code: message.error.code,
       });
       entry.reject(entry.silentError ? error : fail(error));
     } else entry.resolve(message.result);
@@ -798,6 +820,11 @@ function receive(message: any) {
     state.pendingRequests = state.pendingRequests.filter(
       (request) => request.id !== p.requestId,
     );
+    return;
+  }
+  if (method === "skills/changed") { void loadSkills({ forceReload: true }).catch(() => {}); return; }
+  if (method === "thread/goal/updated" || method === "thread/goal/cleared") {
+    applyGoal(state.hostId, p.threadId, method === "thread/goal/cleared" ? null : p.goal);
     return;
   }
   if (method === "thread/started") updateThread(p.thread);
@@ -1101,6 +1128,7 @@ async function initialize() {
 async function login(password: string) {
   authenticationGeneration++;
   closeConnection();
+  resetModeContext(true);
   permissionSelections.clear();
   localReverts.clear();
   discardedTurns.clear();
@@ -1130,6 +1158,7 @@ async function logout() {
   csrfToken = "";
   state.authenticated = false;
   closeConnection();
+  resetModeContext(true);
   permissionSelections.clear();
   localReverts.clear();
   discardedTurns.clear();
@@ -1160,7 +1189,7 @@ async function sync() {
   const hostId = state.hostId;
   const generation = selectionGeneration;
   const selectedId = state.activeThread?.id;
-  await Promise.allSettled([refreshThreads(), readConfig()]);
+  await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills()]);
   if (
     hostId === state.hostId &&
     generation === selectionGeneration &&
@@ -1320,7 +1349,19 @@ async function selectThread(id: string) {
   const generation = ++selectionGeneration;
   const hostId = state.hostId;
   const previousId = state.activeThread?.id;
-  if (previousId !== id) pendingMessageEdit = null;
+  if (previousId !== id) {
+    pendingMessageEdit = null;
+    state.selectedSkills = [];
+    ++modeOperation;
+    state.modeBusy = false;
+    state.modeError = "";
+  }
+  const modeKey = recencyKey(hostId, id);
+  const rememberedMode = conversationModes.get(modeKey) || (previousId === id ? (state.goalMode ? 'goal' : state.collaborationMode) : 'default');
+  state.collaborationMode = rememberedMode === 'plan' ? 'plan' : 'default';
+  state.goalMode = rememberedMode === 'goal';
+  state.goal = goals.get(modeKey) || null;
+  state.goalTokenBudget = state.goal?.tokenBudget ?? null;
   const previousProfileId = state.activePermissionProfileId;
   const previousPolicy = state.runtimePolicy;
   state.selectingThread = true;
@@ -1392,6 +1433,10 @@ async function selectThread(id: string) {
       });
     updateThread(state.activeThread);
     state.projectPath = result.thread.cwd ?? state.projectPath;
+    if (result.collaborationMode?.mode === 'plan' || result.collaborationMode?.mode === 'default') {
+      state.collaborationMode = result.collaborationMode.mode;
+      if (state.collaborationMode === 'plan') state.goalMode = false;
+    }
     state.model = result.model ?? result.thread.model ?? state.model;
     state.effort =
       result.reasoningEffort ?? result.thread.reasoningEffort ?? state.effort;
@@ -1433,7 +1478,10 @@ async function selectThread(id: string) {
     if (state.projectPath !== previousProject) {
       rememberProject();
       void readConfig();
+      state.selectedSkills = [];
+      void loadSkills().catch(() => {});
     }
+    await refreshGoal(hostId, id);
   } catch (error) {
     if (generation === selectionGeneration) {
       newThread();
@@ -1480,6 +1528,14 @@ function newThread(remember = true) {
   ++selectionGeneration;
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   state.activeThread = null;
+  state.selectedSkills = [];
+  state.goal = null;
+  state.goalTokenBudget = null;
+  state.goalMode = false;
+  state.collaborationMode = 'default';
+  state.modeError = "";
+  state.modeBusy = false;
+  ++modeOperation;
   state.items = [];
   state.turns = [];
   state.busy = false;
@@ -1572,11 +1628,20 @@ function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
 async function send(text: string, editedInput?: any[]) {
-  if (!text.trim() && !state.attachments.length && !editedInput?.length) return;
+  if (!text.trim() && !state.attachments.length && !editedInput?.length && !state.selectedSkills.length) return;
   if (state.editingMessage && !editedInput) throw fail(new Error("正在重新发送编辑后的消息，请稍候"));
   if (state.selectingThread || state.switchingHost || state.changingContext)
     throw fail(new Error("正在加载会话或主机配置，请稍后发送"));
   if (sendInFlight) throw fail(new Error("上一条消息正在发送，请稍候"));
+  if (state.modeBusy) throw fail(new Error("正在切换模式，请稍候"));
+  const goalMode = state.goalMode;
+  const collaborationMode = state.collaborationMode;
+  const supportsCollaborationModes = state.modeCapabilities.plan;
+  const goalBudget = state.goalTokenBudget;
+  const selectedSkills = editedInput ? [] : [...state.selectedSkills];
+  const createGoal = goalMode && (!state.goal || state.goal.status === 'complete');
+  if (createGoal && (!text.trim() || text.trim().length > 4000))
+    throw fail(new Error("Goal 目标需要 1–4000 个字符，请填写目标后发送"));
   const hostId = state.hostId;
   const generation = selectionGeneration;
   const cwd = state.projectPath;
@@ -1628,7 +1693,11 @@ async function send(text: string, editedInput?: any[]) {
     throw fail(
       new Error("当前模型只支持文本输入，请选择支持图片的模型或移除图片附件"),
     );
-  const inputs: any[] = editedInput ?? [{ type: "text", text, text_elements: [] }];
+  const skillReferences = selectedSkills.filter(skill => !skillMention(text, skill.name)).map(skill => `$${skill.name}`).join(' ');
+  const messageText = [skillReferences, text].filter(Boolean).join('\n\n');
+  const inputs: any[] = editedInput ?? [{ type: "text", text: messageText, text_elements: [] }];
+  for (const skill of selectedSkills)
+    inputs.push({ type: 'skill', name: skill.name, path: skill.path });
   for (const file of attachments) {
     if (file.mime?.startsWith("image/"))
       inputs.push({ type: "localImage", path: file.path });
@@ -1636,7 +1705,7 @@ async function send(text: string, editedInput?: any[]) {
   }
   // Explicit skill/app selections are persisted as structured protocol inputs.
   for (const skill of state.skills)
-    if (inputs[0].text.includes(`$${skill.name}`) && !inputs.some(input => input.type === 'skill' && input.path === skill.path))
+    if (skill.enabled !== false && skillMention(inputs[0].text || "", skill.name) && !inputs.some(input => input.type === 'skill' && input.path === skill.path))
       inputs.push({ type: "skill", name: skill.name, path: skill.path });
   for (const app of state.apps)
     if (app.slug && inputs[0].text.includes(`$${app.slug}`) && !inputs.some(input => input.type === 'mention' && input.path === `app://${app.id}`))
@@ -1646,6 +1715,7 @@ async function send(text: string, editedInput?: any[]) {
   sendInFlight = true;
   let id = state.activeThread?.id as string | undefined;
   const messageId = randomUUID();
+  let activateGoal: ThreadGoal | null = null;
   try {
     if (!id) {
       const result = await rpc("thread/start", {
@@ -1670,6 +1740,15 @@ async function send(text: string, editedInput?: any[]) {
     }
     if (hostId !== state.hostId)
       throw new Error("工作站已切换，请在原工作站确认消息状态");
+    if (goalMode) {
+      const currentGoal = goals.get(recencyKey(hostId, id!));
+      if (!currentGoal || currentGoal.status === 'complete') {
+        activateGoal = await mutateGoal(hostId, id!, { objective: text.trim(), status: 'paused', tokenBudget: goalBudget });
+      } else if (currentGoal.status === 'paused') {
+        activateGoal = currentGoal;
+      }
+      if (hostId !== state.hostId) throw new Error('工作站已切换，请在原工作站确认目标状态');
+    }
     compactedSinceInput.delete(id!);
     upsertItem(currentItems(id!), {
       id: messageId,
@@ -1709,6 +1788,7 @@ async function send(text: string, editedInput?: any[]) {
         effort: effort as any,
         approvalPolicy: approval,
         sandboxPolicy: policy,
+        ...(supportsCollaborationModes ? { collaborationMode: nativeCollaborationMode(collaborationMode, model, effort) } : {}),
       });
       if ((turnRevisions.get(id!) ?? 0) === revision) {
         const running =
@@ -1723,11 +1803,23 @@ async function send(text: string, editedInput?: any[]) {
           noteItem(id!, item.id);
         }
     }
+    if (activateGoal) {
+      // An accepted turn must never be retried because a later goal activation failed.
+      // Live complete/clear notifications win over the earlier paused snapshot.
+      const current = goals.get(recencyKey(hostId, id!));
+      if (current?.status === 'paused' && current.objective === activateGoal.objective) {
+        try { await mutateGoal(hostId, id!, { status: 'active' }); }
+        catch (error) {
+          if (hostId === state.hostId && state.activeThread?.id === id)
+            state.modeError = `消息已发送，目标仍暂停，请点击继续：${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+    }
     releaseAttachments(attachments);
-    if (generation === selectionGeneration && hostId === state.hostId)
-      state.attachments = state.attachments.filter(
-        (file) => !attachments.includes(file),
-      );
+    if (generation === selectionGeneration && hostId === state.hostId) {
+      state.attachments = state.attachments.filter((file) => !attachments.includes(file));
+      state.selectedSkills = state.selectedSkills.filter(skill => !selectedSkills.some(sent => sent.path === skill.path));
+    }
   } catch (error) {
     if (id && hostId === state.hostId) {
       const items = currentItems(id);
@@ -1857,7 +1949,17 @@ async function resendEditedMessage(itemId: string, text: string) {
 async function interrupt() {
   const id = state.activeThread?.id;
   const turnId = id && activeTurns.get(id);
-  if (turnId) await rpc("turn/interrupt", { threadId: id, turnId });
+  if (!id || !turnId) return;
+  const hostId = state.hostId;
+  // Send both requests on the captured connection before awaiting either one.
+  // A failed pause must not prevent the user's Stop from interrupting the turn.
+  const pause = state.goal?.status === 'active'
+    ? mutateGoal(hostId, id, { status: 'paused' }) : Promise.resolve(null);
+  const stop = rpc('turn/interrupt', { threadId: id, turnId });
+  const [paused, interrupted] = await Promise.allSettled([pause, stop]);
+  if (paused.status === 'rejected' && hostId === state.hostId && state.activeThread?.id === id)
+    state.modeError = `停止已提交，目标暂停状态需确认：${paused.reason.message}`;
+  if (interrupted.status === 'rejected') throw interrupted.reason;
 }
 async function fork(lastTurnId?: string) {
   if (!state.activeThread) return;
@@ -1944,7 +2046,7 @@ async function setProject(path: string) {
   state.projectPath = path;
   newThread();
   rememberProject();
-  await Promise.allSettled([refreshThreads(), readConfig()]);
+  await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills()]);
 }
 function rememberProject() {
   const paths = saved<Record<string, string>>("codex.projectPaths", {});
@@ -2156,7 +2258,7 @@ async function setHost(id: string) {
   state.config = null;
   state.requirements = null;
   state.nativePermissionProfiles = [];
-  state.skills = [];
+  resetModeContext();
   state.apps = [];
   state.mcpServers = [];
   state.integrationErrors = [];
@@ -2643,13 +2745,198 @@ async function saveConfig(edits: any[]) {
   await readConfig();
   toast("已保存到 Codex 配置");
 }
+function resetModeContext(clearGoals = false) {
+  ++skillsGeneration;
+  ++capabilityGeneration;
+  ++modeOperation;
+  skillsRequest = null;
+  capabilityRequest = null;
+  skillsLoadedScope = "";
+  state.skills = [];
+  state.skillsLoading = false;
+  state.skillsError = "";
+  state.selectedSkills = [];
+  state.modeCapabilities = { plan: false, goal: false, loaded: false };
+  state.modeBusy = false;
+  state.modeError = "";
+  state.goal = null;
+  state.goalTokenBudget = null;
+  state.goalMode = false;
+  state.collaborationMode = 'default';
+  if (clearGoals) { goals.clear(); goalRevisions.clear(); conversationModes.clear(); }
+}
+async function loadSkills(options: { forceReload?: boolean } = {}) {
+  const requestScope = scope();
+  if (!options.forceReload && skillsRequest?.scope === requestScope) return skillsRequest.promise;
+  if (!options.forceReload && skillsLoadedScope === requestScope) return { data: [{ cwd: state.projectPath, skills: state.skills }] };
+  const generation = ++skillsGeneration;
+  const auth = authenticationGeneration;
+  const cwd = state.projectPath;
+  if (skillsLoadedScope !== requestScope) { state.skills = []; state.selectedSkills = []; }
+  state.skillsLoading = true;
+  state.skillsError = '';
+  const promise = rpc('skills/list', { cwds: [cwd], forceReload: !!options.forceReload }, 10000, { silentError: true })
+    .then(result => {
+      if (generation === skillsGeneration && requestScope === scope() && auth === authenticationGeneration) {
+        state.skills = skillInventory(result, cwd);
+        skillsLoadedScope = requestScope;
+        state.selectedSkills = state.selectedSkills.filter(selected => state.skills.some(skill => skill.path === selected.path && skill.enabled !== false));
+        const errors = result.data?.filter((entry: any) => entry.cwd === cwd).flatMap((entry: any) => entry.errors || []) || [];
+        state.skillsError = errors.map((error: any) => error.message).filter(Boolean).join('；');
+      }
+      return result;
+    }).catch(error => {
+      if (generation === skillsGeneration && requestScope === scope() && auth === authenticationGeneration) state.skillsError = error.message;
+      throw error;
+    }).finally(() => {
+      if (generation === skillsGeneration) { state.skillsLoading = false; skillsRequest = null; }
+    });
+  skillsRequest = { scope: requestScope, promise };
+  return promise;
+}
+function attachSkill(candidate: any) {
+  const skill = state.skills.find(skill => skill.path === candidate.path && skill.name === candidate.name && skill.enabled !== false);
+  if (!skill) throw new Error('技能不可用，请重新加载当前工作区的技能');
+  if (!state.selectedSkills.some(selected => selected.path === skill.path)) state.selectedSkills.push(skill);
+}
+function removeSkill(path: string) { state.selectedSkills = state.selectedSkills.filter(skill => skill.path !== path); }
+async function loadModeCapabilities() {
+  const hostId = state.hostId;
+  if (state.modeCapabilities.loaded) return;
+  if (capabilityRequest?.hostId === hostId) return capabilityRequest.promise;
+  const generation = ++capabilityGeneration;
+  const auth = authenticationGeneration;
+  const promise = (async () => {
+    const [plan, goal] = await Promise.allSettled([
+      rpc('collaborationMode/list', {}, 8000, { silentError: true }),
+      rpc('thread/goal/get', { threadId: '00000000-0000-0000-0000-000000000000' }, 8000, { silentError: true }),
+    ]);
+    if (hostId !== state.hostId || generation !== capabilityGeneration || auth !== authenticationGeneration) return;
+    state.modeCapabilities = {
+      loaded: true,
+      plan: plan.status === 'fulfilled' && plan.value.data?.some((entry: any) => entry.mode === 'plan'),
+      goal: goal.status === 'fulfilled' || goalMethodSupported(goal.reason),
+    };
+  })().finally(() => { if (generation === capabilityGeneration) capabilityRequest = null; });
+  capabilityRequest = { hostId, promise };
+  return promise;
+}
+function applyGoal(hostId: string, threadId: string, goal: ThreadGoal | null) {
+  const key = recencyKey(hostId, threadId);
+  goals.set(key, goal);
+  goalRevisions.set(key, (goalRevisions.get(key) || 0) + 1);
+  if (hostId !== state.hostId || threadId !== state.activeThread?.id) return;
+  state.goal = goal;
+  state.goalTokenBudget = goal?.tokenBudget ?? null;
+  if (goal && state.collaborationMode !== 'plan' && (!conversationModes.has(key) || conversationModes.get(key) === 'goal')) state.goalMode = true;
+}
+async function goalRpc(hostId: string, method: 'thread/goal/get' | 'thread/goal/set' | 'thread/goal/clear', params: any) {
+  return hostId === state.hostId
+    ? rpc(method, params, 15000, { silentError: true })
+    : http(`/goals/${encodeURIComponent(hostId)}`, { method: 'POST', body: JSON.stringify({ method, params }) }, false);
+}
+async function refreshGoal(hostId: string, threadId: string) {
+  const selection = selectionGeneration;
+  if (!state.modeCapabilities.goal || hostId !== state.hostId) return;
+  const key = recencyKey(hostId, threadId);
+  const revision = goalRevisions.get(key) || 0;
+  const auth = authenticationGeneration;
+  try {
+    const result = await goalRpc(hostId, 'thread/goal/get', { threadId });
+    if (auth !== authenticationGeneration || selection !== selectionGeneration || hostId !== state.hostId || revision !== (goalRevisions.get(key) || 0)) return;
+    applyGoal(hostId, threadId, result.goal);
+  } catch (error) {
+    if (hostId === state.hostId && threadId === state.activeThread?.id && auth === authenticationGeneration)
+      state.modeError = `无法读取目标：${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+async function mutateGoal(hostId: string, threadId: string, patch: { objective?: string; status?: 'active' | 'paused'; tokenBudget?: number | null }): Promise<ThreadGoal | null> {
+  const key = recencyKey(hostId, threadId);
+  const revision = goalRevisions.get(key) || 0;
+  const auth = authenticationGeneration;
+  const result = await goalRpc(hostId, 'thread/goal/set', { threadId, ...patch });
+  if (auth === authenticationGeneration && revision === (goalRevisions.get(key) || 0)) applyGoal(hostId, threadId, result.goal);
+  return goals.get(key) || null;
+}
+async function modeAction(action: (hostId: string, threadId: string | undefined, selected: () => boolean) => Promise<void>) {
+  if (state.modeBusy || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext)
+    throw new Error('正在提交或加载会话，请稍候');
+  if (!state.connected || !state.online) throw new Error('请先连接工作站');
+  const operation = ++modeOperation;
+  const generation = selectionGeneration;
+  const auth = authenticationGeneration;
+  const hostId = state.hostId;
+  const threadId = state.activeThread?.id;
+  const selected = () => operation === modeOperation && generation === selectionGeneration && hostId === state.hostId && auth === authenticationGeneration;
+  state.modeBusy = true;
+  state.modeError = '';
+  try { await action(hostId, threadId, selected); }
+  catch (error) {
+    if (selected()) state.modeError = error instanceof Error ? error.message : String(error);
+    throw error;
+  } finally { if (operation === modeOperation) state.modeBusy = false; }
+}
+async function setConversationMode(mode: 'default' | 'plan' | 'goal') {
+  if (state.busy && !(mode === 'goal' && state.goal && state.collaborationMode === 'default'))
+    throw new Error('请等待当前任务结束，或先停止任务再切换模式');
+  return modeAction(async (hostId, threadId, selected) => {
+    await loadModeCapabilities();
+    if (!selected()) throw new Error('会话已切换，请在当前会话重新选择模式');
+    if (mode === 'plan' && !state.modeCapabilities.plan) throw new Error('当前 Codex 版本未提供 Plan 模式');
+    if (mode === 'goal' && !state.modeCapabilities.goal) throw new Error('当前 Codex 版本未提供 Goal 模式');
+    const key = threadId && recencyKey(hostId, threadId);
+    const goal = key ? goals.get(key) : null;
+    if (mode === 'goal' && goal?.status === 'budgetLimited' && goal.tokenBudget != null && goal.tokensUsed >= goal.tokenBudget)
+      throw new Error('目标已达到 token 预算，请先增加或移除预算再继续');
+    const restartGoal = mode === 'goal' && goal?.status === 'active' && state.collaborationMode === 'plan';
+    if (threadId && (mode !== 'goal' || restartGoal) && goal?.status === 'active') await mutateGoal(hostId, threadId, { status: 'paused' });
+    if (!selected()) throw new Error('会话已切换，请返回原会话确认模式');
+    if (threadId && state.modeCapabilities.plan) {
+      await rpc('thread/settings/update', { threadId, collaborationMode: nativeCollaborationMode(mode === 'plan' ? 'plan' : 'default', state.model, state.effort) }, 15000, { silentError: true });
+    }
+    if (!selected()) throw new Error('会话已切换，请返回原会话确认模式');
+    const latestGoal = key ? goals.get(key) : null;
+    if (threadId && mode === 'goal' && goal && latestGoal && latestGoal.objective === goal.objective &&
+        latestGoal.createdAt === goal.createdAt && latestGoal.status !== 'active' && latestGoal.status !== 'complete') {
+      if (latestGoal.status === 'budgetLimited' && latestGoal.tokenBudget != null && latestGoal.tokensUsed >= latestGoal.tokenBudget)
+        throw new Error('目标已达到 token 预算，请先增加或移除预算再继续');
+      await mutateGoal(hostId, threadId, { status: 'active' });
+    }
+    if (!selected()) return;
+    state.collaborationMode = mode === 'plan' ? 'plan' : 'default';
+    state.goalMode = mode === 'goal';
+    if (key) conversationModes.set(key, mode);
+  });
+}
+async function pauseGoal() {
+  return modeAction(async (hostId, threadId) => {
+    if (threadId && state.goal) await mutateGoal(hostId, threadId, { status: 'paused' });
+  });
+}
+async function resumeGoal() { return setConversationMode('goal'); }
+async function setGoalBudget(tokenBudget: number | null) {
+  if (tokenBudget !== null && (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0)) throw new Error('预算需为正整数，留空表示不限');
+  return modeAction(async (hostId, threadId, selected) => {
+    if (threadId && state.goal) await mutateGoal(hostId, threadId, { tokenBudget });
+    if (selected()) state.goalTokenBudget = tokenBudget;
+  });
+}
+async function clearGoal() {
+  return modeAction(async (hostId, threadId) => {
+    if (!threadId) return;
+    const auth = authenticationGeneration;
+    const key = recencyKey(hostId, threadId);
+    const revision = goalRevisions.get(key) || 0;
+    await goalRpc(hostId, 'thread/goal/clear', { threadId });
+    if (auth === authenticationGeneration && revision === (goalRevisions.get(key) || 0)) applyGoal(hostId, threadId, null);
+  });
+}
+
 async function loadIntegrations() {
   const generation = ++integrationGeneration;
   const requestScope = scope();
   const results = await Promise.allSettled([
-    rpc("skills/list", { cwds: [state.projectPath] }, 45000, {
-      silentError: true,
-    }),
+    loadSkills({ forceReload: true }),
     rpc("app/list", { limit: 100 }, 45000, { silentError: true }),
     rpc(
       "mcpServerStatus/list",
@@ -2669,10 +2956,7 @@ async function loadIntegrations() {
         ]
       : [],
   );
-  if (results[0].status === "fulfilled")
-    state.skills = results[0].value.data.flatMap(
-      (entry: any) => entry.skills ?? [],
-    );
+
   if (results[1].status === "fulfilled") state.apps = results[1].value.data;
   if (results[2].status === "fulfilled")
     state.mcpServers = results[2].value.data;
@@ -3001,6 +3285,15 @@ export function useCodex() {
     readConfig,
     saveConfig,
     loadIntegrations,
+    loadSkills,
+    loadModeCapabilities,
+    attachSkill,
+    removeSkill,
+    setConversationMode,
+    pauseGoal,
+    resumeGoal,
+    clearGoal,
+    setGoalBudget,
     toast,
   };
 }

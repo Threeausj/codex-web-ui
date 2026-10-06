@@ -11,6 +11,7 @@ const error = ref("");
 const persistent = ref(false);
 const persistentNote = ref("");
 const starting = ref(false);
+const mounted = ref(false);
 const ctrl = ref(false);
 const keys = [
   { label: "Ctrl+C", value: "\u0003" },
@@ -27,6 +28,9 @@ let fit: FitAddon | undefined;
 let observer: ResizeObserver | undefined;
 let unsubscribe: (() => void) | undefined;
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+let disposed = false;
+let startGeneration = 0;
+let automaticScope = "";
 
 function fitTerminal() {
   if (!element.value?.clientWidth || !terminal || !fit) return;
@@ -44,6 +48,10 @@ function fitTerminal() {
   }, 120);
 }
 async function start() {
+  if (disposed || starting.value || props.state.terminalRunning ||
+      !props.state.connected || !props.state.projectPath ||
+      props.state.switchingHost || props.state.permission === "read-only") return;
+  const generation = ++startGeneration;
   error.value = "";
   persistentNote.value = "";
   starting.value = true;
@@ -54,7 +62,7 @@ async function start() {
   const projectPath = props.state.projectPath;
   const permission = props.state.permission;
   const requestedPersistent = persistent.value;
-  const current = () => hostId === props.state.hostId &&
+  const current = () => !disposed && generation === startGeneration && hostId === props.state.hostId &&
     projectPath === props.state.projectPath && permission === props.state.permission &&
     requestedPersistent === persistent.value;
   try {
@@ -82,7 +90,7 @@ async function start() {
   } catch (cause: any) {
     if (current()) error.value = cause.message;
   } finally {
-    starting.value = false;
+    if (generation === startGeneration) starting.value = false;
   }
 }
 async function stop() {
@@ -104,6 +112,7 @@ async function writeKey(value: string) {
 }
 onMounted(async () => {
   await nextTick();
+  if (disposed || !element.value) return;
   terminal = new Terminal({
     cursorBlink: true,
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
@@ -137,13 +146,49 @@ onMounted(async () => {
   observer = new ResizeObserver(fitTerminal);
   observer.observe(element.value!);
   fitTerminal();
+  mounted.value = true;
 });
+watch(
+  () => [mounted.value, props.state.hostId, props.state.projectPath,
+    props.state.connected, props.state.switchingHost, props.state.changingContext,
+    props.state.selectingThread, props.state.permission],
+  () => {
+    if (!mounted.value || disposed || !props.state.connected ||
+        !props.state.projectPath || props.state.switchingHost ||
+        props.state.changingContext || props.state.selectingThread ||
+        props.state.permission === "read-only") return;
+    const scope = `${props.state.hostId}\0${props.state.projectPath}`;
+    if (automaticScope === scope) return;
+    automaticScope = scope;
+    // Opening the panel reuses a live shell; tabs and reconnects must not
+    // create another PTY merely because xterm mounted again.
+    if (props.state.terminalRunning) return;
+    const existing = props.state.terminalProcesses?.find((process: any) =>
+      process.tty && process.cwd === props.state.projectPath);
+    if (existing) props.api.attachTerminal(existing.processId);
+    else void start();
+  },
+  { flush: "post" },
+);
+watch(
+  () => [props.state.hostId, props.state.projectPath, props.state.connected,
+    props.state.permission],
+  () => {
+    ++startGeneration;
+    starting.value = false;
+    persistentNote.value = "";
+    error.value = "";
+  },
+  { flush: "sync" },
+);
 watch(
   () => props.state.terminalProcessId,
   () => terminal?.reset(),
   { flush: "sync" },
 );
 onBeforeUnmount(() => {
+  disposed = true;
+  ++startGeneration;
   clearTimeout(resizeTimer);
   observer?.disconnect();
   unsubscribe?.();

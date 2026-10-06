@@ -103,7 +103,10 @@ for (const viewport of [
     await expect(view.getByText("本次对话 · 45 个文件", { exact: true })).toBeVisible();
     await expect(cards).toHaveCount(45);
     const heights = await cards.evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
-    expect(Math.min(...heights), "Every file must keep room for its heading and diff, rather than shrink to a line").toBeGreaterThan(80);
+    expect(Math.min(...heights), "Each collapsed file retains a usable heading").toBeGreaterThan(40);
+    await expect(cards.first()).not.toHaveAttribute("open", "");
+    await expect(cards.first().locator(".diff-code")).toBeHidden();
+    await cards.first().locator("summary").click();
     const scroll = await view.evaluate((element) => ({ height: element.clientHeight, content: element.scrollHeight }));
     expect(scroll.content).toBeGreaterThan(scroll.height * 2);
     await actualDiffLines(cards.first().locator(".diff-code"), changes[0]!.diff);
@@ -112,9 +115,10 @@ for (const viewport of [
     await last.scrollIntoViewIfNeeded();
     await expect(last.locator(".file-diff-heading")).toBeInViewport();
     expect(await view.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+    await last.locator("summary").click();
     await actualDiffLines(last.locator(".diff-code"), changes.at(-1)!.diff);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
-    await last.locator(".file-diff-heading").click();
+    await last.getByRole("button", { name: `打开文件 ${changes.at(-1)!.path}`, exact: true }).click();
     await expect(panel(page).getByRole("textbox", { name: "long-component-name-45.vue 文件内容" })).toHaveValue(/文件读取正常/);
     expect(mock.request("fs/readFile")?.params.path).toBe(changes.at(-1)!.path);
   });
@@ -127,6 +131,8 @@ test("expanded chat file-change output uses real diff lines as the workspace doe
   const turn = page.locator('.conversation-turn[data-turn-id="turn-history"]');
   await turn.locator(".turn-activity > summary").click();
   await turn.locator(".tool-item > summary").click();
+  await expect(turn.locator(".file-diff .diff-code")).toBeHidden();
+  await turn.locator(".file-diff > summary").click();
   const diff = turn.locator(".file-diff .diff-code");
   await expect(diff).toBeVisible();
   await actualDiffLines(diff, changes[0]!.diff);

@@ -131,6 +131,8 @@ test('file and image uploads carry host/cwd and generate localImage + file refer
 test('terminal handles byte-split Unicode output and stdin through app-server', async ({ page, mock }) => {
   await login(page)
   await slash(page, 'terminal')
+  await expect(page.getByRole('button', { name: '结束终端', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: '结束终端', exact: true }).click()
   await page.getByRole('button', { name: '命令模式', exact: true }).click()
   const input = page.getByRole('textbox', { name: '终端命令' })
   await input.fill('echo test')
@@ -161,7 +163,6 @@ test('HTML file preview runs in opaque sandbox and cannot access parent DOM', as
 test('PTY shell sends stdin, resize and termination using connection process id', async ({ page, mock }) => {
   await login(page)
   await slash(page, 'terminal')
-  await page.getByRole('button', { name: '启动终端', exact: true }).click()
   await expect(page.getByLabel('交互式终端')).toBeVisible()
   await expect.poll(() => mock.request('command/exec')?.params.tty).toBe(true)
   const processId = mock.request('command/exec')?.params.processId

@@ -108,7 +108,8 @@ Implemented features have both protocol integration and UI. Environment-specific
 | Mobile UI / PWA | Chat drawer, full-screen workspace, consistent fonts/touch targets, themes, home-screen installation, and user-triggered updates | The Service Worker caches public UI assets only, never APIs or private conversations; sending, approvals, and execution require a connection |
 | Background notifications | Opt-in standard Web Push for completion, approval/additional input, and failures; category controls, test notification, and navigation to the correct host/chat | Device authorization up to 30 days; explicit logout revokes associated subscriptions; server/tasks must remain running and device delivery needs [PWA acceptance](docs/pwa.en.md) |
 | Git/worktrees | Branches, status, line diffs, stage/unstage, selected-file commits, create/import/switch worktrees | Runs on the selected host; commits only selected files and preserves unrelated staged files |
-| Skills/Apps/MCP | View and use integrations already configured on the selected host | No plugin marketplace; advanced OAuth, automations, and desktop-specific host capabilities need further work |
+| Skills/Apps/MCP | Search available host/project Skills with `/`, send native skill references, and use existing Apps/MCP | Skills load separately for each host; no plugin marketplace; advanced OAuth, automations, and desktop-specific host capabilities need further work |
+| Plan / Goal | Select Default, Plan, or Goal with `@`; native planning and persisted thread objectives, pause/resume/clear controls, and optional token budgets | Requires the selected Codex host's protocol and feature support; Plan pauses goal progress, Codex schedules continuation, and permission settings still apply |
 
 ## Desktop synchronization
 
@@ -129,7 +130,9 @@ There is no automatic cross-machine cloud synchronization. A service on another 
 ## Everyday workflow
 
 - `Cmd/Ctrl + K`: command palette; `Cmd/Ctrl + Shift + O`: new chat; `Cmd/Ctrl + J`: terminal. `Enter` sends, `Shift + Enter` adds a line, and `Esc` closes panels.
-- Type `/` for commands or `@` to search project files. Use the attachment button for files and images.
+- Type `/` to search commands and the selected host's Skills. Selecting a skill adds a reference token; sending includes `$skill-name` and its native skill path. Type `@` for project files or Default, Plan, and Goal modes. Use the attachment button for files and images.
+- Plan uses Codex's built-in planning mode. Goal saves the supplied objective on the current thread, with an optional positive integer token budget; leaving it empty adds no limit. Its card shows status and cumulative usage, with pause, resume, and clear controls. Wait for the current turn to finish or use Stop before changing modes. Switching to Plan pauses an active goal. Modes keep the chosen permissions.
+- Codex continues a Goal while the thread is idle and eligible. Continuing after the web page closes requires its server and app-server to remain running. Plan turns, pending input, active work, or budget limits suppress continuation. Pausing prevents subsequent automatic turns; use **Stop** to interrupt a running turn. Native modes and goal APIs were verified against `0.159.2` and `0.160.0` with isolated mock providers. Hosts that lack or disable Goals show a capability message. See the [official Goal guide](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex) and [app-server protocol](https://learn.chatgpt.com/docs/app-server).
 - Select a project and local/remote host above the new-chat composer. Draft text is retained when switching; attachments are uploaded again when changing hosts. Existing chats retain their original host and directory.
 - Browse directories when adding a project; enter an absolute path and press Enter to navigate directly. Browsing another host does not switch the active chat.
 - Right-click a project or use `…` to pin, edit, archive chats, remove its web metadata, or show it in workspace files. Removing a project does not delete disk files. Use file download buttons to save originals.

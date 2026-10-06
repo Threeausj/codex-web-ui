@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 
 type Session = {
@@ -27,6 +27,8 @@ const selectedId = ref("");
 const panes = ref<Pane[]>([]);
 const paneId = ref("");
 const snapshot = ref("");
+const snapshotElement = ref<HTMLElement>();
+let followingOutput = true;
 const available = ref<boolean | null>(null);
 const reason = ref("");
 const error = ref("");
@@ -86,6 +88,16 @@ function request(action: string, values: Record<string, unknown> = {}) {
 function current(generation: number) {
   return !disposed && generation === scopeGeneration;
 }
+function rememberScroll() {
+  const element = snapshotElement.value;
+  if (element)
+    followingOutput = element.scrollHeight - element.clientHeight - element.scrollTop <= 24;
+}
+function scrollToBottom() {
+  followingOutput = true;
+  const element = snapshotElement.value;
+  if (element) element.scrollTop = element.scrollHeight;
+}
 async function read(id = selectedId.value, pane?: string) {
   if (!canRead.value || !id || available.value !== true) return;
   const generation = scopeGeneration;
@@ -102,6 +114,9 @@ async function read(id = selectedId.value, pane?: string) {
       selectedId.value !== id
     )
       return;
+    const forceBottom = !lastRead.value || paneId.value !== result.paneId;
+    const previousTop = snapshotElement.value?.scrollTop || 0;
+    const follow = forceBottom || followingOutput;
     panes.value = result.panes || [];
     paneId.value = result.paneId;
     snapshot.value = result.text || "";
@@ -110,6 +125,10 @@ async function read(id = selectedId.value, pane?: string) {
       minute: "2-digit",
     });
     error.value = "";
+    await nextTick();
+    if (!current(generation) || readingRequest !== readGeneration || selectedId.value !== id) return;
+    if (follow) scrollToBottom();
+    else if (snapshotElement.value) snapshotElement.value.scrollTop = previousTop;
   } catch (cause: any) {
     if (current(generation) && readingRequest === readGeneration)
       error.value = cause.message || "读取会话失败";
@@ -191,6 +210,7 @@ async function create() {
     paneId.value = "";
     panes.value = [];
     snapshot.value = "";
+    followingOutput = true;
     lastRead.value = "";
     showCreate.value = false;
     sessionName.value = "";
@@ -283,6 +303,7 @@ watch(
     snapshot.value = "";
     lastRead.value = "";
     error.value = "";
+    followingOutput = true;
     reason.value = "";
     available.value = null;
     loading.value = false;
@@ -483,11 +504,12 @@ onBeforeUnmount(() => {
             <Icon name="RefreshCw" :size="13" :class="{ spinning: reading }" />
           </button>
         </div>
-        <pre class="tmux-snapshot" tabindex="0" aria-label="Tmux 输出快照">{{
+        <pre ref="snapshotElement" class="tmux-snapshot" tabindex="0" aria-label="Tmux 输出快照" @scroll="rememberScroll">{{
           snapshot || (reading ? "正在读取…" : "暂无输出")
         }}</pre>
         <div class="tmux-reader-note">
           <span>只读取输出，不发送按键</span
+          ><button class="tmux-bottom" @click="scrollToBottom" aria-label="滚动到 Tmux 最新输出">最新输出 <Icon name="ArrowDown" :size="11" /></button
           ><span v-if="lastRead">{{ lastRead }} 更新</span>
         </div>
       </section>
@@ -772,6 +794,17 @@ onBeforeUnmount(() => {
   font-size: 10px;
   color: var(--muted);
 }
+.tmux-bottom {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+}
+.tmux-bottom:hover { color: var(--text); }
 @media (max-width: 760px) {
   .tmux-panel {
     padding: 12px;

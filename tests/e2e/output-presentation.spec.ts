@@ -132,13 +132,15 @@ test("live process keeps commands and file changes collapsed by default while pr
   const command = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "运行命令" }) });
   const changes = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "修改文件" }) });
   await expect(command.locator("summary")).toBeVisible();
-  await expect(changes.locator("summary")).toBeVisible();
+  await expect(changes.locator(":scope > summary")).toBeVisible();
   await expect(command).not.toHaveAttribute("open", "");
   await expect(changes).not.toHaveAttribute("open", "");
   await expect(group.getByText("工作目录输出", { exact: true })).toBeHidden();
   await expect(changes.locator(".file-changes")).toBeHidden();
   await command.locator("summary").click();
-  await changes.locator("summary").click();
+  await changes.locator(":scope > summary").click();
+  await expect(changes.locator(".diff-code")).toBeHidden();
+  await changes.locator(".file-diff > summary").click();
   await expect(group.getByText("工作目录输出", { exact: true })).toBeVisible();
   await expect(changes.locator(".diff-code")).toContainText("+new");
   await expect(changes.locator(".diff-code")).toBeVisible();
@@ -148,7 +150,7 @@ test("live process keeps commands and file changes collapsed by default while pr
   await expect(changes.locator(".diff-code")).toContainText("+updated");
   await expect(changes.locator(".diff-code")).toBeVisible();
   await command.locator("summary").click();
-  await changes.locator("summary").click();
+  await changes.locator(":scope > summary").click();
   await expect(group.locator(".turn-activity")).toHaveAttribute("open", "");
   await expect(group.getByText("正在处理…", { exact: true })).toBeVisible();
   await approval.getByRole("button", { name: "拒绝", exact: true }).click();

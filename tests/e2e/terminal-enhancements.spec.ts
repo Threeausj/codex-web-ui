@@ -4,7 +4,6 @@ test('mobile terminal shortcut keys send exact shell control sequences and Ctrl 
   await page.setViewportSize({ width: 390, height: 844 })
   await login(page)
   await slash(page, 'terminal')
-  await page.getByRole('button', { name: '启动终端', exact: true }).click()
   await expect.poll(() => mock.request('command/exec')?.params.tty).toBe(true)
   for (const [label, text] of [['Ctrl+C', '\u0003'], ['Ctrl+D', '\u0004'], ['Tab', '\t'], ['Esc', '\u001b'], ['↑', '\u001b[A'], ['↓', '\u001b[B'], ['←', '\u001b[D'], ['→', '\u001b[C']]) {
     await page.getByRole('button', { name: `终端按键 ${label}`, exact: true }).click()
@@ -21,10 +20,12 @@ test('persistent terminal gives an explicit unavailable message without silently
   await page.route('**/api/terminal-sessions/prepare', route => route.fulfill({ json: { available: false, reason: '目标主机未检测到 tmux' } }))
   await login(page)
   await slash(page, 'terminal')
+  await expect.poll(() => mock.request('command/exec')?.params.tty).toBe(true)
+  await page.getByRole('button', { name: '结束终端', exact: true }).click()
   await page.getByRole('checkbox', { name: /持久 Shell/ }).check()
   await page.getByRole('button', { name: '启动终端', exact: true }).click()
   await expect(page.locator('.interactive-terminal .inline-error')).toHaveText('目标主机未检测到 tmux')
-  expect(mock.request('command/exec')).toBeUndefined()
+  expect(mock.requests.filter(request => request.method === 'command/exec')).toHaveLength(1)
 })
 
 for (const permission of ['workspace-write', 'danger-full-access'] as const) {
@@ -35,6 +36,8 @@ test(`explicit tmux terminal prepares and attaches with selected ${permission} s
   await login(page)
   await page.getByRole('combobox', { name: '选择权限' }).selectOption(permission)
   await slash(page, 'terminal')
+  await expect.poll(() => mock.request('command/exec')?.params.tty).toBe(true)
+  await page.getByRole('button', { name: '结束终端', exact: true }).click()
   await page.getByRole('checkbox', { name: /持久 Shell/ }).check()
   await page.getByRole('button', { name: '启动终端', exact: true }).click()
   await expect.poll(() => mock.request('command/exec')?.params.command).toEqual(command)

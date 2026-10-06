@@ -112,6 +112,9 @@ async function installTmux(page: Page) {
 }
 async function openTmux(page: Page) {
   await slash(page, "terminal");
+  await expect(page.getByLabel("交互式终端")).toBeVisible();
+  if (await page.getByRole("combobox", { name: "选择权限", exact: true }).inputValue() !== "read-only")
+    await expect(page.locator(".pty-toolbar")).toContainText("Shell 正在运行");
   await page.getByRole("button", { name: "Tmux", exact: true }).click();
   return page.getByRole("region", { name: "Tmux 会话管理" });
 }
@@ -225,7 +228,6 @@ test("attaching tmux preserves an ordinary shell and pending approvals, and swit
   await installTmux(page);
   await login(page);
   await slash(page, "terminal");
-  await page.getByRole("button", { name: "启动终端", exact: true }).click();
   await expect
     .poll(() => mock.request("command/exec")?.params.command)
     .toEqual(["/bin/sh"]);
@@ -334,7 +336,7 @@ test("missing tmux and failed creation keep a useful inline explanation without 
   await expect(
     panel.getByRole("button", { name: "新建", exact: true }),
   ).toBeDisabled();
-  expect(mock.request("command/exec")).toBeUndefined();
+  expect(mock.requests.filter(request => request.method === "command/exec")).toHaveLength(1);
   tmux.available = true;
   await panel
     .getByRole("button", { name: "刷新 Tmux 会话", exact: true })
@@ -353,7 +355,7 @@ test("missing tmux and failed creation keep a useful inline explanation without 
     panel.getByRole("textbox", { name: "新建 Tmux 会话名称" }),
   ).toHaveValue("build");
   expect(tmux.sessions).toHaveLength(2);
-  expect(mock.request("command/exec")).toBeUndefined();
+  expect(mock.requests.filter(request => request.method === "command/exec")).toHaveLength(1);
 });
 
 test("sandbox access failure stays visible and explicitly choosing full access allows a refresh", async ({
@@ -367,7 +369,7 @@ test("sandbox access failure stays visible and explicitly choosing full access a
   await expect(panel.getByRole("alert")).toContainText(
     "当前权限阻止访问 tmux socket",
   );
-  expect(mock.request("command/exec")).toBeUndefined();
+  expect(mock.requests.filter(request => request.method === "command/exec")).toHaveLength(1);
   await page
     .getByRole("combobox", { name: "选择权限", exact: true })
     .selectOption("danger-full-access");
@@ -431,5 +433,5 @@ test("a late local snapshot cannot replace the remote host's output after switch
   );
   await expect(panel.getByLabel("Tmux 输出快照")).not.toContainText("local");
   expect(remote.request("command/exec")).toBeUndefined();
-  expect(mock.request("command/exec")).toBeUndefined();
+  expect(mock.requests.filter(request => request.method === "command/exec")).toHaveLength(1);
 });
