@@ -28,6 +28,7 @@
     "marked": "^16.4.1",
     "multer": "^2.0.2",
     "vue": "^3.5.22",
+    "web-push": "^3.6.7",
     "ws": "^8.18.3",
     "zod": "^4.1.12"
   },
@@ -36,6 +37,7 @@
     "@types/express": "^5.0.3",
     "@types/multer": "^2.0.0",
     "@types/node": "^24.9.1",
+    "@types/web-push": "^3.6.4",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-vue": "^6.0.1",
     "concurrently": "^9.2.1",

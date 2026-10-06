@@ -19,11 +19,13 @@ import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerHostConnection } from './host-connection.js'
 import { registerProjectDirectories } from './project-directories.js'
+import { PushService, registerPush, type PushOptions } from './push.js'
 import type { AuthenticatedRequest } from './types.js'
 
 export type AppOptions = {
   cwd?: string; dataDir?: string; codexHome?: string; password?: string; origins?: string[]; port?: number
   secureCookie?: boolean; trustProxy?: boolean; bridgeOptions?: BridgeOptions; serveStatic?: boolean; staticDir?: string
+  pushOptions?: PushOptions
 }
 
 const asyncRoute = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
@@ -38,8 +40,15 @@ export async function createApp(options: AppOptions = {}) {
   const origins = trustedOrigins(options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean), options.port || Number(process.env.PORT) || 8787)
   const password = await Auth.password(dataDir, options.password || process.env.CODEX_WEB_PASSWORD)
   const auth = new Auth(password, origins, options.secureCookie ?? [...origins].some(o => o.startsWith('https:')))
+  const push = await PushService.create(dataDir, origins, options.pushOptions)
+  const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions }
+  const externalProtocolObserver = bridgeOptions.onProtocolMessage
+  bridgeOptions.onProtocolMessage = (host, message) => {
+    push.observe(host, message)
+    return externalProtocolObserver?.(host, message)
+  }
   const bridges = new Map<string, Bridge>()
   const getBridge = async (hostId = 'local') => {
     const host = storage.host(hostId)
@@ -62,6 +71,7 @@ export async function createApp(options: AppOptions = {}) {
   const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener) })
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
   app.use('/api', auth.requireAuth, auth.requireCsrf)
+  registerPush(app, push)
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
   registerGit(app, { getBridge })
@@ -147,10 +157,16 @@ export async function createApp(options: AppOptions = {}) {
   app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' }))
   if (options.serveStatic !== false) {
     const dist = path.resolve(options.staticDir || process.env.STATIC_DIR || path.join(cwd, 'dist'))
-    app.use(express.static(dist, { index: false, dotfiles: 'deny' }))
+    app.use(express.static(dist, { index: false, dotfiles: 'deny', setHeaders: (res, file) => {
+      const relative = path.relative(dist, file)
+      if (relative === 'sw.js') res.setHeader('Cache-Control', 'no-store')
+      else if (relative === 'manifest.webmanifest' || relative === 'index.html') res.setHeader('Cache-Control', 'no-cache')
+      else if (relative.startsWith(`assets${path.sep}`) && /-[a-zA-Z0-9_-]{8,}\.[^.]+$/.test(path.basename(file))) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+      if (relative === 'sw.js') res.setHeader('Service-Worker-Allowed', '/')
+    } }))
     app.get('/{*path}', asyncRoute(async (req, res) => {
       if (!req.accepts('html')) { res.status(404).end(); return }
-      try { await fs.access(path.join(dist, 'index.html')); res.sendFile(path.join(dist, 'index.html')) }
+      try { await fs.access(path.join(dist, 'index.html')); res.set('Cache-Control', 'no-cache'); res.sendFile(path.join(dist, 'index.html')) }
       catch { res.status(503).send('Frontend is not built. Run npm run dev or npm run build.') }
     }))
   }
@@ -162,7 +178,10 @@ export async function createApp(options: AppOptions = {}) {
     res.status(error.status || 500).json({ error: error.message || 'Request failed' })
   }
   app.use(errorHandler)
-  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview }
+  // Subscription grants survive server restarts. Restore host observers independently
+  // of a phone being online; unavailable SSH hosts must not prevent server startup.
+  if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
+  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, stopPushLogoutListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -209,10 +228,12 @@ export async function createServer(options: AppOptions = {}) {
   const close = async () => {
     clearInterval(heartbeat)
     stopListeningForRevocation()
+    context.stopPushLogoutListener()
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
     for (const ws of wss.clients) ws.terminate()
     wss.close()
+    await context.push.close()
     if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   }
   return { ...context, server, wss, close }

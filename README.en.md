@@ -31,6 +31,14 @@ The image includes Codex CLI `0.159.2`, Git, SSH, and tmux, runs as a non-root u
 
 For public access, use the Caddy HTTPS overlay, set the real domain and certificate contact, and follow [Docker deployment](docs/docker.en.md). That guide also covers SSH mounts, existing Codex data, upgrades, backups, and troubleshooting. Do not combine the local and public overlays.
 
+## Mobile installation and background notifications
+
+With a public HTTPS deployment, open **Settings → App and notifications** (the UI label is “应用与通知”) to install the PWA and explicitly enable notifications. Android Chrome supports the app's install button or the browser installation menu. On iOS/iPadOS 16.4+, use Safari's **Share → Add to Home Screen**, launch the installed app, and then enable notifications.
+
+Standard Web Push can report completed replies, approvals/additional input, and failed runs while the page is closed or the phone is locked. The server and relevant Codex task must keep running. Device authorization lasts up to 30 days independently of the 8-hour web login; explicit logout revokes subscriptions associated with that login. Notification wording is generic and excludes conversation text, project names, commands, and file paths. Force-stopping apps, power-saving policies, Focus modes, and OS notification settings can affect delivery; real Android/iPhone acceptance still requires the target devices.
+
+VAPID keys are generated automatically and persisted in `DATA_DIR`, already covered by Docker's `webdata` volume. See the [PWA and notification guide](docs/pwa.en.md) / [简体中文](docs/pwa.md) for installation, updates, deployment settings, and device acceptance steps.
+
 ## Run with Node.js
 
 Requires Node.js 22+ and an executable Codex CLI. The current development baseline is `codex-cli 0.159.2`. Configure Codex as the same system user that will run the web service:
@@ -76,7 +84,8 @@ Implemented features have both protocol integration and UI. Environment-specific
 | Output presentation | Show public reasoning summaries, progress, and tools while running; collapse after completion, failure, or stop; show the final answer directly | Process details can be toggled manually; approvals and failures remain visible; private reasoning content is not exposed |
 | Sidebar | Pinned, Projects, and Recent across all hosts; subtle host labels; project context menus | Pinned and regular projects each show 4 by default; each project shows 4 chats; expand/collapse retains the selected item; old history remains paginated |
 | Workspace layout | Drag the left edge to resize, keyboard controls, double-click reset, browser-local width preference | Width is clamped to retain chat space; mobile uses a full-screen workspace; terminals resize with the panel |
-| Mobile UI | Chat drawer, full-screen workspace, consistent fonts/touch targets, two-row composer toolbar, light/dark/system theme | No PWA, background push, or offline execution |
+| Mobile UI / PWA | Chat drawer, full-screen workspace, consistent fonts/touch targets, themes, home-screen installation, and user-triggered updates | The Service Worker caches public UI assets only, never APIs or private conversations; sending, approvals, and execution require a connection |
+| Background notifications | Opt-in standard Web Push for completion, approval/additional input, and failures; category controls, test notification, and navigation to the correct host/chat | Device authorization up to 30 days; explicit logout revokes associated subscriptions; server/tasks must remain running and device delivery needs [PWA acceptance](docs/pwa.en.md) |
 | Git/worktrees | Branches, status, line diffs, stage/unstage, selected-file commits, create/import/switch worktrees | Runs on the selected host; commits only selected files and preserves unrelated staged files |
 | Skills/Apps/MCP | View and use integrations already configured on the selected host | No plugin marketplace; advanced OAuth, automations, and desktop-specific host capabilities need further work |
 
@@ -108,6 +117,7 @@ There is no automatic cross-machine cloud synchronization. A service on another 
 - Use **Git** for branches, selected-file commits, and worktrees; **Preview → Development service** for local/SSH ports; **Tmux** for session management. Deleting a tmux session ends its processes and asks for confirmation.
 - In **Settings → Connections**, add/edit SSH hosts and test before saving. Accept `host`, `user@host`, or SSH aliases; leave the port blank to use SSH configuration and the Codex path blank for automatic discovery. Identity paths are on the backend machine (inside Docker when deployed there).
 - Running chats display public process summaries and tools; finished processes collapse under elapsed time or **Work process**. Manual collapse during a run is retained across progress updates. Final answers remain directly visible.
+- **Settings → App and notifications** offers installation, notification opt-in/disable, category preferences, and a test notification. Select **Update app** when a new version is available; wait for the current task to finish first.
 
 ## Development and validation
 
@@ -126,6 +136,6 @@ Browser tests run the real Vue UI against test-only HTTP/WebSocket protocol fixt
 
 `npm run doctor` diagnoses the current connection without changing it. `npm run doctor -- --turn` explicitly creates a small inference chat, verifies cross-process history, and archives the diagnostic chat afterward; it uses the configured model account's quota. It does not prove live synchronization with the desktop daemon. After a CLI upgrade, run `npm run protocol:generate`, review generated changes in `shared/protocol/`, and rerun checks.
 
-`src/` contains the Vue UI, `server/` authentication/bridges/workstations, `shared/protocol/` generated CLI types, `tests/` verification, and `docs/`/`deploy/` deployment resources. `DATA_DIR` holds web-owned metadata and uploads; Codex owns conversation history. Keep credentials, `.env` files, and private workspace data out of version control.
+`src/` contains the Vue UI, `server/` authentication/bridges/workstations, `shared/protocol/` generated CLI types, `tests/` verification, and `docs/`/`deploy/` deployment resources. `DATA_DIR` holds web-owned metadata, uploads, private push keys, and device subscriptions; Codex owns conversation history. Keep credentials, `.env` files, and private workspace data out of version control.
 
-On 2026-10-06, 103 unit/protocol tests, 86 browser tests, and the production build passed. Docker was built and started in an isolated Linux/ARM64 environment, with real protocol, terminal, Unicode tmux, and volume-persistence checks. Other real-environment checks cover model inference, cross-process history, PTYs, isolated daemon collaboration, Git/worktrees, Vite HMR, isolated tmux lifecycle, and directory browsing. See [validation](docs/validation.md) and [workflow roadmap](docs/roadmap.md) for exact boundaries. The [optional GitHub Actions template](deploy/github-actions/README.md) builds and checks the Docker deployment without model credentials. Copy it to `.github/workflows/ci.yml` to enable it; uploading workflow files through gh requires the additional GitHub `workflow` scope.
+On 2026-10-06, 117 unit/protocol tests, 105 browser tests, and the production build passed, including offline startup, updates, and notification subscription recovery with a real Service Worker. Real phone background notification delivery remains unverified. Docker was built and started in an isolated Linux/ARM64 environment, with real protocol, terminal, Unicode tmux, and volume-persistence checks. Other real-environment checks cover model inference, cross-process history, PTYs, isolated daemon collaboration, Git/worktrees, Vite HMR, isolated tmux lifecycle, and directory browsing. See [validation](docs/validation.md) and [workflow roadmap](docs/roadmap.md) for exact boundaries. The [optional GitHub Actions template](deploy/github-actions/README.md) builds and checks the Docker deployment without model credentials. Copy it to `.github/workflows/ci.yml` to enable it; uploading workflow files through gh requires the additional GitHub `workflow` scope.

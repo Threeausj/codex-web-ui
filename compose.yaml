@@ -19,6 +19,10 @@ services:
       CODEX_HOME: /home/node/.codex
       CODEX_BIN: codex
       CODEX_CONNECTION_MODE: spawn
+      # Empty values use auto-generated keys persisted in the webdata volume.
+      PUSH_VAPID_PUBLIC_KEY: ${PUSH_VAPID_PUBLIC_KEY:-}
+      PUSH_VAPID_PRIVATE_KEY: ${PUSH_VAPID_PRIVATE_KEY:-}
+      PUSH_SUBJECT: ${PUSH_SUBJECT:-}
     volumes:
       - webdata:/app/data
       - codexhome:/home/node/.codex

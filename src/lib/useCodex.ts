@@ -1,4 +1,5 @@
 import { reactive, toRaw } from "vue";
+import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -46,6 +47,7 @@ const saved = <T>(key: string, fallback: T): T => {
 };
 const state = reactive({
   authenticated: false,
+  online: navigator.onLine !== false,
   authRequired: true,
   loading: true,
   error: "",
@@ -218,6 +220,10 @@ async function http(
   options: RequestInit = {},
   reportError = true,
 ) {
+  if (!state.online) {
+    const error = new Error("目前离线，请联网后重试。操作不会在后台自动提交。");
+    throw reportError ? fail(error) : error;
+  }
   const headers = new Headers(options.headers);
   if (!(options.body instanceof FormData) && options.body)
     headers.set("Content-Type", "application/json");
@@ -233,9 +239,9 @@ async function http(
       state.authenticated = false;
       closeConnection();
     }
-    const error = new Error(
+    const error = Object.assign(new Error(
       result.error?.message ?? result.error ?? `请求失败 (${response.status})`,
-    );
+    ), { status: response.status });
     throw reportError ? fail(error) : error;
   }
   return result;
@@ -824,6 +830,7 @@ function receive(message: any) {
   }
 }
 function connect(): Promise<void> {
+  if (!state.online) return Promise.reject(new Error("目前离线，请联网后重试。"));
   if (state.connected && socket?.readyState === WebSocket.OPEN)
     return Promise.resolve();
   if (connecting) return connecting;
@@ -966,6 +973,7 @@ function startNavigationRefresh() {
 }
 async function initialize() {
   state.loading = true;
+  state.error = "";
   try {
     const session = await http("/auth/session");
     state.authenticated = session.authenticated;
@@ -994,6 +1002,9 @@ async function login(password: string) {
   }
 }
 async function logout() {
+  if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+    await revokeDevicePush({ requestHttp: http });
+  }
   await http("/auth/logout", { method: "POST" });
   state.authenticated = false;
   closeConnection();
@@ -1013,6 +1024,10 @@ async function logout() {
   state.terminalOutput = "";
   state.terminalProcesses = [];
   sessionStorage.setItem("codex.terminalProcessIds", "{}");
+}
+function setOnline(online: boolean) {
+  state.online = online;
+  if (!online) closeConnection();
 }
 async function sync() {
   const hostId = state.hostId;
@@ -2609,6 +2624,7 @@ export function useCodex() {
     initialize,
     login,
     logout,
+    setOnline,
     rpc,
     refreshThreads,
     loadMoreThreads,

@@ -1,0 +1,311 @@
+import http from "node:http";
+import path from "node:path";
+import fs from "node:fs/promises";
+import express from "express";
+import webPush from "web-push";
+import { test, expect, send } from "./fixtures";
+import type { Page } from "@playwright/test";
+
+// Exercise built assets and a real Service Worker, independently of the Vite dev server.
+// API/RPC responses stay isolated in the existing wire fixtures; no model or push provider is contacted.
+test.describe.configure({ mode: "serial" });
+let server: http.Server;
+let origin = "";
+let workerRevision = "";
+const publicKey = webPush.generateVAPIDKeys().publicKey;
+
+test.beforeAll(async () => {
+  const dist = path.resolve("dist");
+  const worker = await fs.readFile(path.join(dist, "sw.js"), "utf8");
+  if (worker.includes("__CODEX_PRECACHE__")) throw new Error("Run npm run build before PWA browser tests");
+  const app = express();
+  app.get("/sw.js", (_req, res) => res.set({ "Cache-Control": "no-store", "Service-Worker-Allowed": "/" }).type("js").send(worker + workerRevision));
+  app.use(express.static(dist));
+  server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  origin = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+});
+test.afterAll(async () => { if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve())); });
+
+async function loginBuilt(page: Page, key = publicKey, authenticated = false) {
+  await page.route("**/api/push/config", (route) => route.fulfill({ json: { enabled: true, publicKey: key } }));
+  await page.goto(origin);
+  if (!authenticated) {
+    await page.getByRole("textbox", { name: "访问密码" }).fill("test-password-123");
+    await page.getByRole("button", { name: "进入工作区", exact: true }).click();
+  }
+  await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+}
+
+// Keep the browser subscription shared across tabs and reloads, just like PushManager.
+// This replaces only consent/subscription APIs; installation and worker lifecycle remain real.
+async function installPushFixture(page: Page, initial: { active?: boolean; key?: string; permission?: NotificationPermission } = {}) {
+  await page.addInitScript(({ key, active, permission }) => {
+    const storageKey = "codex.testPushSubscription";
+    const decodeKey = (encoded: string) => Uint8Array.from(atob(encoded.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=")), (character) => character.charCodeAt(0));
+    const encodeKey = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const read = () => JSON.parse(localStorage.getItem(storageKey)!);
+    const write = (value: any) => localStorage.setItem(storageKey, JSON.stringify(value));
+    if (!localStorage.getItem(storageKey)) write({ active, key, permission, generation: 0, endpoint: "https://fcm.googleapis.com/fcm/send/fixture-device-0" });
+    const state = { permissionRequests: 0, gestures: [] as boolean[], subscriptions: [] as any[], unsubscriptions: 0 };
+    (window as any).pushFixture = state;
+    const subscriptionFor = (value: any) => ({
+      endpoint: value.endpoint,
+      options: { userVisibleOnly: true, applicationServerKey: decodeKey(value.key).buffer },
+      toJSON: () => ({ endpoint: value.endpoint, expirationTime: null, keys: { p256dh: "fixture-public-key", auth: "fixture-auth" } }),
+      unsubscribe: async () => {
+        state.unsubscriptions++;
+        const current = read();
+        if (current.endpoint === value.endpoint) write({ ...current, active: false });
+        return true;
+      },
+    });
+    Object.defineProperty(Notification, "permission", { configurable: true, get: () => read().permission });
+    Notification.requestPermission = async () => {
+      state.permissionRequests++;
+      state.gestures.push(navigator.userActivation.isActive);
+      write({ ...read(), permission: "granted" });
+      return "granted";
+    };
+    Object.defineProperty(ServiceWorkerRegistration.prototype, "pushManager", { configurable: true, get: () => ({
+      getSubscription: async () => { const current = read(); return current.active ? subscriptionFor(current) : null; },
+      subscribe: async (options: any) => {
+        const bytes = new Uint8Array(options.applicationServerKey);
+        state.subscriptions.push({ userVisibleOnly: options.userVisibleOnly, keyLength: bytes.length });
+        const current = read();
+        const generation = current.generation + 1;
+        const value = { ...current, active: true, key: encodeKey(bytes), generation, endpoint: `https://fcm.googleapis.com/fcm/send/fixture-device-${generation}` };
+        write(value);
+        return subscriptionFor(value);
+      },
+    }) });
+  }, { key: initial.key ?? publicKey, active: initial.active ?? false, permission: initial.permission ?? "default" });
+}
+
+type PushCall = { method: string; pathname: string; body: any; csrf?: string; tab?: string };
+async function capturePushApi(page: Page, calls: PushCall[], options: { tab?: string; testStatus?: number; key?: string } = {}) {
+  await page.route("**/api/push/**", (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.endsWith("/config")) return route.fulfill({ json: { enabled: true, publicKey: options.key ?? publicKey } });
+    calls.push({ method: request.method(), pathname, body: request.postDataJSON(), csrf: request.headers()["x-csrf-token"], tab: options.tab });
+    if (pathname.endsWith("/test") && options.testStatus) return route.fulfill({ status: options.testStatus, json: { error: "Notification subscription has expired" } });
+    return route.fulfill({ json: { ok: true, expiresAt: Date.now() + 2_592_000_000 } });
+  });
+}
+async function openPushSettings(page: Page) {
+  const sidebar = page.getByRole("button", { name: "打开侧边栏", exact: true });
+  if (await sidebar.isVisible()) await sidebar.click();
+  await page.locator(".settings-button").click();
+  await page.getByRole("button", { name: "应用与通知", exact: true }).click();
+}
+
+test("built PWA installs its real worker, caches public resources only and starts offline without private history", async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await loginBuilt(page);
+  const manifest = await (await context.request.get(origin + "/manifest.webmanifest")).json();
+  expect(manifest.display).toBe("standalone");
+  expect(manifest.icons.some((icon: any) => icon.sizes === "512x512" && icon.purpose === "maskable")).toBe(true);
+  for (const icon of manifest.icons) expect((await context.request.get(origin + icon.src)).status()).toBe(200);
+  await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(page.locator(".agent-message")).toContainText("历史保持可读");
+  await openPushSettings(page);
+  const enable = page.getByRole("button", { name: "启用通知", exact: true });
+  // Headless Chromium may deny notifications by default; the real worker must respect it.
+  if (await page.evaluate(() => Notification.permission === "denied")) {
+    await expect(enable).toBeDisabled();
+    await expect(page.getByText("通知已被阻止。请在系统或浏览器设置中允许此应用发送通知。", { exact: true })).toBeVisible();
+  } else await expect(enable).toBeEnabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  const cached = await page.evaluate(async () => {
+    const result: string[] = [];
+    for (const name of await caches.keys()) for (const request of await (await caches.open(name)).keys()) result.push(new URL(request.url).pathname);
+    return result;
+  });
+  expect(cached).toContain("/index.html");
+  expect(cached.some((pathname) => pathname.includes("InteractiveTerminal"))).toBe(true);
+  expect(cached.some((pathname) => pathname.startsWith("/api/") || pathname.includes("thread-existing"))).toBe(false);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByText("目前离线，联网后即可登录工作区。", { exact: true })).toBeVisible();
+  await expect(page.locator(".agent-message")).toHaveCount(0);
+  await page.getByRole("textbox", { name: "访问密码" }).fill("test-password-123");
+  await expect(page.getByRole("button", { name: "进入工作区", exact: true })).toBeDisabled();
+  await context.setOffline(false);
+  await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
+});
+
+test("notification consent is requested only on click; device preferences, test, disable and logout use authenticated endpoints", async ({ page, mock }) => {
+  const calls: PushCall[] = [];
+  await installPushFixture(page);
+  await capturePushApi(page, calls);
+  await loginBuilt(page);
+  await openPushSettings(page);
+  const enable = page.getByRole("button", { name: "启用通知", exact: true });
+  await expect(enable).toBeEnabled();
+  expect(await page.evaluate(() => (window as any).pushFixture.permissionRequests)).toBe(0);
+  await enable.click();
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  const consent = await page.evaluate(() => (window as any).pushFixture);
+  expect(consent.permissionRequests).toBe(1);
+  expect(consent.gestures).toEqual([true]);
+  expect(consent.subscriptions).toEqual([{ userVisibleOnly: true, keyLength: 65 }]);
+  await page.getByRole("checkbox", { name: "回复已完成", exact: true }).uncheck();
+  await expect.poll(() => calls.find((call) => call.method === "PATCH")?.body.preferences.completed).toBe(false);
+  await page.getByRole("button", { name: "发送测试通知", exact: true }).click();
+  await expect.poll(() => calls.some((call) => call.pathname.endsWith("/test"))).toBe(true);
+  await page.getByRole("button", { name: "关闭通知", exact: true }).click();
+  await expect(enable).toBeVisible();
+  expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(1);
+  expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
+  await enable.click();
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  expect(calls.filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription")).at(-1)?.body.preferences.completed).toBe(false);
+  await page.getByRole("button", { name: "账户", exact: true }).click();
+  await page.getByRole("button", { name: "退出网页", exact: true }).click();
+  await expect(page.getByRole("button", { name: "进入工作区", exact: true })).toBeVisible();
+  expect(mock.authenticated).toBe(false);
+  expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(2);
+  expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(2);
+  expect(calls.every((call) => call.csrf === "mock-csrf")).toBe(true);
+});
+
+test("a waiting production worker prompts for update and cannot reload an active turn", async ({ page, mock }) => {
+  await loginBuilt(page);
+  mock.holdFinalMessage = true;
+  await send(page, "更新时保留运行中的任务");
+  await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
+  workerRevision = "\n// lifecycle-update-fixture\n";
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    const update = page.getByRole("button", { name: "任务完成后更新", exact: true });
+    await expect(update).toBeVisible();
+    await expect(update).toBeDisabled();
+    expect(await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())!.waiting)).toBe(true);
+    mock.finishStream();
+    const ready = page.getByRole("button", { name: "更新应用", exact: true });
+    await expect(ready).toBeEnabled();
+    await Promise.all([page.waitForEvent("domcontentloaded"), ready.click()]);
+    await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
+    await expect(ready).toHaveCount(0);
+    expect(mock.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+  } finally { workerRevision = ""; }
+});
+
+test("rotated VAPID keys retire the old device subscription without automatic consent or resubscription", async ({ page }) => {
+  const oldKey = webPush.generateVAPIDKeys().publicKey;
+  const calls: PushCall[] = [];
+  await installPushFixture(page, { active: true, key: oldKey, permission: "granted" });
+  await capturePushApi(page, calls);
+  await loginBuilt(page);
+  await openPushSettings(page);
+  const enable = page.getByRole("button", { name: "启用通知", exact: true });
+  await expect(enable).toBeEnabled();
+  await expect(page.getByRole("alert")).toContainText("请重新启用通知");
+  expect(await page.evaluate(() => (window as any).pushFixture)).toMatchObject({ permissionRequests: 0, subscriptions: [], unsubscriptions: 1 });
+  expect(calls.filter((call) => call.pathname.endsWith("/subscription"))).toHaveLength(0);
+
+  await enable.click();
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).pushFixture)).toMatchObject({ permissionRequests: 0, subscriptions: [{ userVisibleOnly: true, keyLength: 65 }], unsubscriptions: 1 });
+  const registered = calls.find((call) => call.method === "POST" && call.pathname.endsWith("/subscription"));
+  expect(registered?.body.subscription.endpoint).toBe("https://fcm.googleapis.com/fcm/send/fixture-device-1");
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("codex.testPushSubscription")!).key)).toBe(publicKey);
+});
+
+test("an expired push endpoint is removed locally and cannot be silently restored after refresh", async ({ page }) => {
+  const calls: PushCall[] = [];
+  const expiredEndpoint = "https://fcm.googleapis.com/fcm/send/fixture-device-0";
+  await installPushFixture(page, { active: true, permission: "granted" });
+  await capturePushApi(page, calls, { testStatus: 410 });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  expect(calls.some((call) => call.method === "POST" && call.pathname.endsWith("/subscription"))).toBe(true);
+  await page.getByRole("button", { name: "发送测试通知", exact: true }).click();
+  const enable = page.getByRole("button", { name: "启用通知", exact: true });
+  await expect(enable).toBeEnabled();
+  await expect(page.getByRole("alert")).toContainText("通知订阅已失效");
+  expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(1);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("codex.testPushSubscription")!).active)).toBe(false);
+
+  await page.getByRole("button", { name: "刷新通知状态", exact: true }).click();
+  await expect(enable).toBeEnabled();
+  await page.reload();
+  await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
+  await openPushSettings(page);
+  await expect(enable).toBeEnabled();
+  const testRequestIndex = calls.findIndex((call) => call.pathname.endsWith("/test"));
+  expect(testRequestIndex).toBeGreaterThanOrEqual(0);
+  expect(calls.slice(testRequestIndex + 1).filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription"))).toHaveLength(0);
+  expect(await page.evaluate(() => (window as any).pushFixture)).toMatchObject({ permissionRequests: 0, subscriptions: [] });
+
+  await enable.click();
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  const freshRegistration = calls.filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription")).at(-1);
+  expect(freshRegistration?.body.subscription.endpoint).not.toBe(expiredEndpoint);
+  expect(freshRegistration?.body.subscription.endpoint).toBe("https://fcm.googleapis.com/fcm/send/fixture-device-1");
+});
+
+test("notification preferences stay synchronized across tabs and restoring a device preserves the latest choice", async ({ page, context, mock }) => {
+  const calls: PushCall[] = [];
+  await installPushFixture(page, { active: true, permission: "granted" });
+  await capturePushApi(page, calls, { tab: "first" });
+  await loginBuilt(page);
+  await openPushSettings(page);
+
+  const other = await context.newPage();
+  try {
+    await mock.install(other);
+    await installPushFixture(other, { active: true, permission: "granted" });
+    await capturePushApi(other, calls, { tab: "second" });
+    await loginBuilt(other, publicKey, true);
+    await openPushSettings(other);
+    const otherErrors = other.getByRole("checkbox", { name: "运行出错", exact: true });
+    await expect(otherErrors).toBeChecked();
+
+    await page.getByRole("checkbox", { name: "运行出错", exact: true }).uncheck();
+    await expect.poll(() => calls.find((call) => call.method === "PATCH")?.body.preferences.errors).toBe(false);
+    await expect(otherErrors).not.toBeChecked();
+    expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(1);
+
+    const previousCalls = calls.length;
+    await other.getByRole("button", { name: "刷新通知状态", exact: true }).click();
+    await expect.poll(() => calls.slice(previousCalls).find((call) => call.tab === "second" && call.method === "POST" && call.pathname.endsWith("/subscription"))?.body.preferences.errors).toBe(false);
+    await expect(otherErrors).not.toBeChecked();
+    expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(1);
+    expect(calls.every((call) => call.csrf === "mock-csrf")).toBe(true);
+  } finally { await other.close(); }
+});
+
+test("slow subscription restoration cannot overwrite a preference change or re-register an expired device", async ({ page }) => {
+  const calls: PushCall[] = [];
+  let releaseRestore: (() => Promise<void>) | undefined;
+  await installPushFixture(page, { active: true, permission: "granted" });
+  await capturePushApi(page, calls, { testStatus: 410 });
+  await page.route("**/api/push/subscription", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    calls.push({ method: "POST", pathname: "/api/push/subscription", body: route.request().postDataJSON() });
+    releaseRestore = async () => { await route.fulfill({ json: { ok: true } }); };
+  });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
+  await expect.poll(() => !!releaseRestore).toBe(true);
+  const testNotification = page.getByRole("button", { name: "发送测试通知", exact: true });
+  await expect(testNotification).toBeDisabled();
+  await page.getByRole("checkbox", { name: "运行出错", exact: true }).uncheck();
+  expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(0);
+  await page.unroute("**/api/push/subscription");
+  await releaseRestore!();
+  await expect.poll(() => calls.find((call) => call.method === "PATCH")?.body.preferences.errors).toBe(false);
+  await expect(testNotification).toBeEnabled();
+  await testNotification.click();
+  await expect(page.getByRole("button", { name: "启用通知", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "刷新通知状态", exact: true }).click();
+  await expect(page.getByRole("button", { name: "启用通知", exact: true })).toBeEnabled();
+  const expired = calls.findIndex((call) => call.pathname.endsWith("/test"));
+  expect(calls.slice(expired + 1).filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription"))).toHaveLength(0);
+});

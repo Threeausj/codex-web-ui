@@ -14,7 +14,7 @@
 | `compose.public.yaml` | Caddy 暴露 80/443；应用仅在 Compose 网络内可达 |
 | `deploy/docker/env.example` | 环境模板，复制为被 Git 忽略的 `.env.docker` |
 | `deploy/docker/Caddyfile` | 自动 HTTPS 与 WebSocket 反向代理 |
-| `webdata` 卷 → `/app/data` | 网页主机、项目、偏好、上传与元数据 |
+| `webdata` 卷 → `/app/data` | 网页主机、项目、偏好、上传、推送密钥与设备授权 |
 | `codexhome` 卷 → `/home/node/.codex` | Codex 登录、配置和持久化历史 |
 | `WORKSPACE_PATH` → `/workspace` | 宿主机项目目录，读写挂载 |
 
@@ -57,6 +57,8 @@ WORKSPACE_PATH=/srv/codex-workspace
 CODEX_VERSION=0.159.2
 PUBLIC_HOST=codex.example.com
 ACME_EMAIL=admin@example.com
+# 可选，替换成维护者真实邮箱；留空使用 HTTPS 公网 Origin。
+PUSH_SUBJECT=mailto:admin@example.com
 ```
 
 `PUBLIC_HOST` 只填域名，不包含协议、路径或末尾斜杠。公网配置生成精确的 `https://PUBLIC_HOST` origin，设置 `TRUST_PROXY=1`，由 Caddy 处理 TLS 和 WebSocket。基础应用没有宿主机端口映射。
@@ -73,6 +75,21 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml log
 访问 `https://你的域名` 并登录。不要同时加载 `compose.local.yaml` 与 `compose.public.yaml`，否则会添加不必要的后端端口。若使用已有反向代理，可以仅运行基础 Compose，并由受控网络中的代理连接 `app:8787`；按实际 HTTPS origin 和可信代理配置覆盖环境，不将 8787 直接暴露到公网。
 
 该产品是单用户工作站入口：登录者可以操作所挂载的文件和已经配置的 SSH 主机。它不提供多租户隔离或共享 SaaS 的权限体系。Docker 配置没有启用 `privileged`、Docker socket 挂载或关闭 seccomp。
+
+## PWA 与手机后台推送
+
+公网 HTTPS 部署后，在“设置 → 应用与通知”安装应用并主动启用通知。Android Chrome 使用安装提示或浏览器菜单；iOS/iPadOS 16.4+ 在 Safari 添加到主屏幕，从图标打开应用后启用。通知支持回复完成、需要审批/补充输入、运行失败；页面关闭和锁屏后无需维持前端连接，Node 服务及对应任务需要继续运行。具体安装、隐私、授权期限和真机验收见 [PWA 指南](pwa.md)。系统强退、省电和通知设置可能影响送达。
+
+Compose 已转发三个可选环境变量：
+
+| 变量 | 默认/用途 |
+| --- | --- |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` | 两项都留空时自动生成并保存到 `/app/data/push-vapid.json`；使用既有密钥时必须成对提供 |
+| `PUSH_SUBJECT` | 第一个 HTTPS `PUBLIC_ORIGIN`，本地 HTTP 回退到项目 GitHub URL；公网推荐维护者真实 `mailto:` 联系地址 |
+
+`webdata` 还保存 `push-subscriptions.json`，设备授权最长 30 天，网页登录自然过期/常规服务重启保留仍有效授权；明确退出撤销该登录关联的设备订阅。无需另外创建推送卷或手工生成密钥。备份、升级和迁移必须保留该卷及密钥；轮换密钥或更换域名后重新注册设备，私有密钥/endpoint 不进入镜像、日志截图或仓库。
+
+服务器须能访问支持的浏览器厂商推送服务，手机须能访问应用的 HTTPS 地址。只接受官方推送 endpoint，无 `PUSH_ALLOWED_HOSTS` 覆盖项。PWA 只缓存公开静态界面，不缓存 API 或私人历史，不提供离线提交。重启容器仍会结束容器内任务，磁盘卷不会保存运行进程。
 
 ## SSH 工作站
 
@@ -156,6 +173,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 | Linux sandbox/namespace 不可用 | 宿主机内核和容器策略会影响 Codex sandbox；先检查具体错误，配置不自动放宽 Docker 权限 |
 | 重启后 Tmux 不在 | 磁盘卷不保存进程；使用容器外 SSH 主机可让其 Tmux 独立于 Web 容器 |
 | Caddy 未获得证书 | 域名 DNS、80/443、ACME 联系人、CAA/网络，查看 Caddy 日志 |
+| 手机不能启用通知 | 可信 HTTPS、正确 Origin；iOS 16.4+ 从主屏幕应用打开后主动启用；系统拒绝需到通知设置允许 |
+| 测试通知未送达 | 用户主动授权、类别/30 天期限、推送服务网络、VAPID 配对与 `webdata`；强退/省电/专注模式另行排查 |
 
 本次标准 Docker 实测中，只读/工作区写入命令均遇到 `bwrap: No permissions to create a new namespace`；容器内的“完全访问”命令和 PTY 可运行。细粒度 sandbox 需要相应内核/user namespace/容器策略支持，部署时另行确认。如用户明确选择 Codex“完全访问”，它作用于容器进程可访问的挂载和 SSH 工作站，不会授予宿主机 Docker 管理权限。不要为了启动而自动切换权限或增加 `--privileged`。
 

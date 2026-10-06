@@ -14,7 +14,7 @@ The multi-stage image uses Node.js 22 on Debian Bookworm and runs as non-root `n
 | `compose.public.yaml` | Caddy publishes 80/443; app remains on the Compose network |
 | `deploy/docker/env.example` | Copy to the Git-ignored `.env.docker` |
 | `deploy/docker/Caddyfile` | Automatic HTTPS and WebSocket reverse proxy |
-| `webdata` volume → `/app/data` | Web hosts, projects, preferences, uploads, and metadata |
+| `webdata` volume → `/app/data` | Web hosts, projects, preferences, uploads, push keys, and device authorizations |
 | `codexhome` volume → `/home/node/.codex` | Codex login, configuration, and durable history |
 | `WORKSPACE_PATH` → `/workspace` | Writable bind mount of your host project directory |
 
@@ -57,6 +57,8 @@ WORKSPACE_PATH=/srv/codex-workspace
 CODEX_VERSION=0.159.2
 PUBLIC_HOST=codex.example.com
 ACME_EMAIL=admin@example.com
+# Optional: replace with a real maintainer contact; empty uses the HTTPS origin.
+PUSH_SUBJECT=mailto:admin@example.com
 ```
 
 `PUBLIC_HOST` must be a hostname without scheme, path, or trailing slash. The public overlay sets the exact HTTPS origin and `TRUST_PROXY=1`. Caddy handles TLS and WebSocket upgrades; the app has no host port mapping.
@@ -73,6 +75,21 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml log
 Visit your HTTPS domain and sign in. Do not combine the local and public overlays: that would add an unnecessary backend port. With an existing reverse proxy, run the base Compose file and connect the trusted proxy to `app:8787` on a controlled network, overriding the HTTPS origin/trust settings for your setup. Do not expose the backend directly.
 
 This is a single-user workstation gateway. Signed-in users can operate mounted files and configured SSH hosts; it does not provide tenant isolation. The deployment does not enable privileged mode, mount the Docker socket, or disable seccomp.
+
+## PWA and mobile background push
+
+After deploying public HTTPS, open **Settings → App and notifications** to install and explicitly enable notifications. Android Chrome offers an install prompt/browser menu; on iOS/iPadOS 16.4+, add the app to the home screen in Safari and enable notifications from the installed app. Completion, approval/additional input, and failures can arrive without the page remaining open, provided Node and the relevant task keep running. See the [PWA guide](pwa.en.md) for installation, privacy, authorization, and actual-device acceptance. Force-stop, power-saving, and OS notification policies can affect delivery.
+
+Compose forwards three optional variables:
+
+| Variable | Default/purpose |
+| --- | --- |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` | Leave both empty to generate `/app/data/push-vapid.json`; supply both when managing an existing key pair |
+| `PUSH_SUBJECT` | First HTTPS `PUBLIC_ORIGIN`, or the project GitHub URL for local HTTP; a real maintainer `mailto:` contact is recommended publicly |
+
+`webdata` also stores `push-subscriptions.json`. Device authorization lasts up to 30 days; natural login expiry/routine server restarts retain valid authorizations, while explicit logout revokes subscriptions associated with that login. No extra push volume or manual key generation is needed. Preserve this volume and keys during backups/upgrades/migrations; re-register devices after key/domain changes. Keep private keys/endpoints out of images, published logs, and Git.
+
+The server needs access to supported browser-vendor push services, and the phone needs access to the app's HTTPS origin. Only official endpoints are accepted; there is no `PUSH_ALLOWED_HOSTS` override. PWA caching includes public static assets only, never APIs/private history, and provides no offline submissions. Container restarts still end container tasks; volumes cannot preserve running processes.
 
 ## SSH workstations
 
@@ -156,6 +173,8 @@ The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check pr
 | Sandbox/namespace errors | Codex sandbox depends on the kernel/container policy; the configuration never silently expands permissions |
 | tmux gone after restart | File volumes do not preserve processes; SSH-host tmux can live independently of the web container |
 | Caddy certificate failure | DNS, TCP 80/443, ACME contact, CAA/network, and Caddy logs |
+| Phone cannot enable notifications | Trusted HTTPS/exact origin; launch the home-screen app on iOS 16.4+; change denied OS permission in notification settings |
+| Test notification not delivered | Explicit opt-in, categories/30-day expiry, vendor network access, matching VAPID keys, and `webdata`; inspect force-stop/power-saving/Focus separately |
 
 In the tested standard Docker deployment, read-only/workspace-write commands reported `bwrap: No permissions to create a new namespace`; container-bound Full access commands and PTYs worked. Fine-grained sandbox modes require suitable kernel/user-namespace/container-policy support and need separate environment verification. If a user explicitly selects Codex Full access, it applies to mounts/processes/SSH hosts accessible to the container and does not grant host Docker management. Do not automatically switch permissions or enable `--privileged` to work around an error.
 

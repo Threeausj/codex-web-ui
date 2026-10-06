@@ -33,6 +33,7 @@ export class Auth {
   private sessions = new Map<string, Session>()
   private attempts = new Map<string, { count: number; startedAt: number }>()
   private revokeListeners = new Set<(sessionId: string) => void>()
+  private logoutListeners = new Set<(sessionId: string) => void | Promise<void>>()
   constructor(password: string, readonly allowedOrigins: Set<string>, private readonly secureCookie = false) {
     if (password.length < 12) throw new Error('CODEX_WEB_PASSWORD must contain at least 12 characters')
     this.passwordHash = scryptSync(password, this.salt, 64)
@@ -74,6 +75,12 @@ export class Auth {
   onSessionRevoked(listener: (sessionId: string) => void) {
     this.revokeListeners.add(listener)
     return () => this.revokeListeners.delete(listener)
+  }
+
+  /** Device grants survive natural session expiry, but an explicit sign-out revokes them. */
+  onLogout(listener: (sessionId: string) => void | Promise<void>) {
+    this.logoutListeners.add(listener)
+    return () => this.logoutListeners.delete(listener)
   }
 
   private revoke(sessionId: string) {
@@ -122,10 +129,12 @@ export class Auth {
     res.set('Cache-Control', 'no-store').json({ authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt })
   }
 
-  logout: RequestHandler = (req: AuthenticatedRequest, res: Response) => {
+  logout: RequestHandler = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     const session = req.session || this.getSession(req.headers.cookie)
     if (session) this.revoke(session.id)
     res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure, path: '/' })
+    try { if (session) await Promise.all([...this.logoutListeners].map(listener => listener(session.id))) }
+    catch (error) { next(error); return }
     res.json({ authenticated: false })
   }
 }

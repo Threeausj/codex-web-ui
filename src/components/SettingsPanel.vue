@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import ConnectionDialog from "./ConnectionDialog.vue";
 import FolderPicker from "./FolderPicker.vue";
+import PwaSettings from "./PwaSettings.vue";
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -24,6 +25,7 @@ const emit = defineEmits<{ close: []; theme: [value: string] }>();
 const section = ref(props.initialTab || "general");
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
+  { id: "pwa", label: "应用与通知", icon: "Smartphone" },
   { id: "projects", label: "项目", icon: "Folder" },
   { id: "hosts", label: "连接", icon: "Globe" },
   { id: "permissions", label: "权限预设", icon: "Shield" },
@@ -435,6 +437,7 @@ watch(
               </p>
             </div>
           </template>
+          <PwaSettings v-else-if="section === 'pwa'" :api="api" :state="state" />
           <template v-else-if="section === 'projects'">
             <h3>项目</h3>
             <p class="settings-description">
@@ -919,7 +922,8 @@ watch(
               <button
                 v-if="state.authRequired"
                 class="button button-small button-secondary"
-                @click="api.logout()"
+                :disabled="saving"
+                @click="action(() => api.logout())"
               >
                 退出网页
               </button>

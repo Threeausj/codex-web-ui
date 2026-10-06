@@ -18,9 +18,14 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
 import ProjectDialog from "./components/ProjectDialog.vue";
 import { isPinned } from "./lib/navigation";
+import { initializeDevicePush, onPushNavigate, pwaState, updatePwa } from "./lib/pwa";
+import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navigation";
 
 const api = useCodex();
 const state = api.state;
+let pendingPushTarget: PushTarget | null = pushTargetFromUrl(new URL(location.href));
+let openingPushTarget = false;
+let stopPushNavigation: (() => void) | undefined;
 const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
@@ -436,6 +441,42 @@ async function login() {
     loginBusy.value = false;
   }
 }
+async function openPendingPushTarget() {
+  if (openingPushTarget || !pendingPushTarget || !state.authenticated ||
+      !state.online || state.loading || state.switchingHost ||
+      state.selectingThread) return;
+  openingPushTarget = true;
+  try {
+    while (pendingPushTarget && state.authenticated && state.online) {
+      const target = pendingPushTarget;
+      pendingPushTarget = null;
+      if (!state.hosts.some((host: any) => host.id === target.hostId)) {
+        showError("通知对应的主机已被移除。");
+        continue;
+      }
+      await selectThread({ id: target.threadId, hostId: target.hostId });
+      if (state.hostId === target.hostId && state.activeThread?.id === target.threadId) {
+        settingsOpen.value = false;
+        workspaceOpen.value = false;
+        paletteOpen.value = false;
+        const url = new URL(location.href);
+        const link = pushTargetFromUrl(url);
+        if (link?.hostId === target.hostId && link.threadId === target.threadId) {
+          url.searchParams.delete("host");
+          url.searchParams.delete("thread");
+          history.replaceState(history.state, "", url);
+        }
+      }
+    }
+  } finally {
+    openingPushTarget = false;
+  }
+}
+function onNetworkChange() {
+  api.setOnline(navigator.onLine);
+  if (state.online && !state.connected && !state.loading)
+    void action(() => api.initialize());
+}
 function onScroll() {
   if (scroll.value) {
     showScrollBottom.value =
@@ -544,6 +585,14 @@ onMounted(() => {
   window.addEventListener("resize", updateViewport);
   document.addEventListener("keydown", onKeydown);
   prefersDark.addEventListener("change", applyTheme);
+  window.addEventListener("online", onNetworkChange);
+  window.addEventListener("offline", onNetworkChange);
+  stopPushNavigation = onPushNavigate((value) => {
+    const target = pushTarget(value);
+    if (!target) return;
+    pendingPushTarget = target;
+    void openPendingPushTarget();
+  });
   void action(() => api.initialize()).then(async () => {
     await nextTick();
     if (state.activeThread) restoreScroll(state.activeThread.id);
@@ -555,6 +604,16 @@ onBeforeUnmount(() => {
   prefersDark.removeEventListener("change", applyTheme);
   window.visualViewport?.removeEventListener("resize", updateViewport);
   window.removeEventListener("resize", updateViewport);
+  window.removeEventListener("online", onNetworkChange);
+  window.removeEventListener("offline", onNetworkChange);
+  stopPushNavigation?.();
+});
+watch(() => [state.authenticated, state.online, state.connected, state.loading, state.switchingHost, state.selectingThread], () => {
+  void openPendingPushTarget();
+});
+watch(() => [state.authenticated, state.loading], () => {
+  if (state.authenticated && state.connected && !state.loading)
+    void initializeDevicePush(api);
 });
 </script>
 
@@ -589,7 +648,7 @@ onBeforeUnmount(() => {
         <button
           class="button button-primary login-submit"
           type="submit"
-          :disabled="loginBusy || !loginPassword"
+          :disabled="loginBusy || !loginPassword || !state.online"
         >
           <Icon
             v-if="loginBusy"
@@ -599,6 +658,7 @@ onBeforeUnmount(() => {
           />进入工作区<Icon v-if="!loginBusy" name="ArrowRight" :size="17" />
         </button>
       </form>
+      <p v-if="!state.online" class="inline-error" role="status">目前离线，联网后即可登录工作区。</p>
       <span class="login-caption">连接你的项目，把想法变成现实。</span>
     </div>
   </main>
@@ -811,7 +871,10 @@ onBeforeUnmount(() => {
           <Icon name="X" :size="14" />
         </button>
       </div>
-      <div v-if="!state.connected && !state.error" class="connection-banner">
+      <div v-if="!state.online" class="connection-banner" role="status">
+        <Icon name="WifiOff" :size="15" />目前离线，联网后将重新连接。操作不会自动提交。
+      </div>
+      <div v-else-if="!state.connected && !state.error" class="connection-banner">
         <Icon
           :name="state.loading ? 'LoaderCircle' : 'WifiOff'"
           :size="15"
@@ -821,6 +884,10 @@ onBeforeUnmount(() => {
             ? "正在连接 App Server…"
             : "App Server 已断开，正在尝试重连…"
         }}
+      </div>
+      <div v-if="pwaState.updateAvailable" class="connection-banner" role="status">
+        <Icon name="Download" :size="15" />应用有新版本
+        <button class="button button-small button-secondary" :disabled="state.busy || actionBusy" @click="updatePwa()">{{ state.busy ? '任务完成后更新' : '更新应用' }}</button>
       </div>
       <button
         v-if="otherRequests.length"
