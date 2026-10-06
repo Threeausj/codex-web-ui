@@ -26,6 +26,7 @@ const state = api.state;
 let pendingPushTarget: PushTarget | null = pushTargetFromUrl(new URL(location.href));
 let openingPushTarget = false;
 let stopPushNavigation: (() => void) | undefined;
+let foregroundTimer: ReturnType<typeof setTimeout> | undefined;
 const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
@@ -474,8 +475,22 @@ async function openPendingPushTarget() {
 }
 function onNetworkChange() {
   api.setOnline(navigator.onLine);
-  if (state.online && !state.connected && !state.loading)
-    void action(() => api.initialize());
+  if (state.online && !state.loading) {
+    if (!state.authenticated) void action(() => api.initialize());
+    else onForeground();
+  }
+}
+function onForeground() {
+  if (document.visibilityState !== "visible" || !navigator.onLine) return;
+  clearTimeout(foregroundTimer);
+  foregroundTimer = setTimeout(async () => {
+    await api.resumeConnection();
+    if (state.authenticated && state.online && !state.loading)
+      await initializeDevicePush(api);
+  }, 250);
+}
+function onPageShow(event: PageTransitionEvent) {
+  if (event.persisted) onForeground();
 }
 function onScroll() {
   if (scroll.value) {
@@ -587,6 +602,10 @@ onMounted(() => {
   prefersDark.addEventListener("change", applyTheme);
   window.addEventListener("online", onNetworkChange);
   window.addEventListener("offline", onNetworkChange);
+  document.addEventListener("visibilitychange", onForeground);
+  document.addEventListener("resume", onForeground);
+  window.addEventListener("pageshow", onPageShow);
+  window.addEventListener("focus", onForeground);
   stopPushNavigation = onPushNavigate((value) => {
     const target = pushTarget(value);
     if (!target) return;
@@ -606,6 +625,11 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", updateViewport);
   window.removeEventListener("online", onNetworkChange);
   window.removeEventListener("offline", onNetworkChange);
+  document.removeEventListener("visibilitychange", onForeground);
+  document.removeEventListener("resume", onForeground);
+  window.removeEventListener("pageshow", onPageShow);
+  window.removeEventListener("focus", onForeground);
+  clearTimeout(foregroundTimer);
   stopPushNavigation?.();
 });
 watch(() => [state.authenticated, state.online, state.connected, state.loading, state.switchingHost, state.selectingThread], () => {

@@ -36,6 +36,7 @@ async function loginBuilt(page: Page, key = publicKey, authenticated = false) {
   }
   await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
   await expect.poll(() => page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+  expect(await page.evaluate(async () => (await navigator.serviceWorker.ready).active?.scriptURL)).toContain('/sw.js?build=');
 }
 
 // Keep the browser subscription shared across tabs and reloads, just like PushManager.
@@ -170,6 +171,64 @@ test("notification consent is requested only on click; device preferences, test,
   expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(2);
   expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(2);
   expect(calls.every((call) => call.csrf === "mock-csrf")).toBe(true);
+});
+
+test('push tests show pending, acceptance and failure; a separate local test checks display without sending push', async ({ page }) => {
+  const calls: PushCall[] = [];
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, calls);
+  await page.addInitScript(() => {
+    (window as any).systemNotifications = [];
+    ServiceWorkerRegistration.prototype.showNotification = async (title, options) => {
+      (window as any).systemNotifications.push({ title, options });
+    };
+  });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let testRequests = 0;
+  await page.route('**/api/push/test', async route => {
+    testRequests++;
+    await pending;
+    await route.fulfill({ json: { ok: true } });
+  });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => testRequests).toBe(1);
+  await expect(page.getByRole('button', { name: '正在发送…', exact: true })).toBeDisabled();
+  await expect(page.getByRole('status')).toContainText('正在发送测试通知…');
+  release();
+  await expect(page.getByRole('status')).toContainText('推送服务已接收测试通知，请查看系统通知。');
+  await page.getByRole('button', { name: '检查系统通知', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('系统通知已发出，请查看通知栏。');
+  expect(await page.evaluate(() => (window as any).systemNotifications)).toEqual([
+    { title: 'Codex 系统通知检查', options: expect.objectContaining({ data: {}, tag: expect.stringContaining('codex-system-test-') }) },
+  ]);
+  expect(testRequests).toBe(1);
+  await page.route('**/api/push/test', route => route.fulfill({ status: 502, json: { error: 'Unable to deliver the notification; check server access to the push provider' } }));
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Unable to deliver');
+  await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+});
+
+test('returning to the foreground renews the existing device without asking for permission or replacing it', async ({ page }) => {
+  const calls: PushCall[] = [];
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await page.addInitScript(() => localStorage.setItem('codex.devicePushPreferences', JSON.stringify({ completed: false, approval: true, errors: true })));
+  await capturePushApi(page, calls);
+  await loginBuilt(page);
+  await expect.poll(() => calls.filter(call => call.pathname.endsWith('/subscription')).length).toBeGreaterThan(0);
+  const before = calls.length;
+  await page.evaluate(() => document.dispatchEvent(new Event('resume')));
+  await expect.poll(() => calls.length).toBeGreaterThan(before);
+  const restored = calls.at(-1)!;
+  expect(restored.method).toBe('POST');
+  expect(restored.body.subscription.endpoint).toContain('fixture-device-0');
+  expect(restored.body.preferences).toEqual({ completed: false, approval: true, errors: true });
+  const fixture = await page.evaluate(() => (window as any).pushFixture);
+  expect(fixture.permissionRequests).toBe(0);
+  expect(fixture.subscriptions).toEqual([]);
+  expect(fixture.unsubscriptions).toBe(0);
 });
 
 test("a waiting production worker prompts for update and cannot reload an active turn", async ({ page, mock }) => {

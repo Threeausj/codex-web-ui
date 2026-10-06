@@ -223,7 +223,7 @@ export class PushService {
     const recent = (this.testTimes.get(endpoint) || []).filter(time => time > this.now() - 60000)
     if (recent.length >= 5) throw Object.assign(new Error('Wait a minute before sending another test notification'), { status: 429 })
     this.testTimes.set(endpoint, [...recent, this.now()])
-    await this.enqueue(() => this.deliver(device, { title: 'Codex', body: '后台通知已开启。', tag: 'codex-push-test', data: { url: '/', kind: 'test' } }))
+    await this.enqueue(() => this.deliver(device, { title: 'Codex', body: '后台通知已开启。', tag: `codex-push-test-${randomUUID()}`, data: { url: '/', kind: 'test' } }))
     return { ok: true }
   }
 
@@ -297,7 +297,7 @@ export class PushService {
     let deadline: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        this.send(device.subscription, JSON.stringify(notice), { vapidDetails: this.keys, TTL: 3600, timeout: 10000, contentEncoding: 'aes128gcm', urgency: notice.data.kind === 'approval' ? 'high' : 'normal', topic: hash(notice.tag).slice(0, 32) }),
+        this.send(device.subscription, JSON.stringify(notice), { vapidDetails: this.keys, TTL: 3600, timeout: 10000, contentEncoding: 'aes128gcm', urgency: 'high', topic: hash(notice.tag).slice(0, 32) }),
         new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error('Push delivery timed out')), 12000); deadline.unref() }),
       ])
     } catch (error) {

@@ -33,6 +33,10 @@ iOS/iPadOS Web Push is available to home-screen web apps. Permission needs a dir
 
 ## Categories, privacy, and authorization
 
+The test button shows progress, errors, and confirmation that the push provider accepted the request. Acceptance is not a device delivery receipt. **Check system notifications** (“检查系统通知”) displays a notification directly through the device's Service Worker, independently of the remote push network. If this succeeds but remote tests do not arrive, check phone connectivity to Google's push service and battery restrictions. FCM device connections require TCP 443 and 5228–5230; an HTTP proxy cannot proxy that connection. [Firebase network configuration](https://firebase.google.com/docs/cloud-messaging/network-configuration).
+
+Tests use unique notification tags/topics, all user-visible task notifications use high urgency, and replacement notifications alert again.
+
 **Reply completed**, **Approval needed**, and **Run failed** are enabled by default. Approval notifications also cover requests for additional input. Categories are device-specific; other devices can choose differently. **Disable notifications** (“关闭通知”) removes the current device's subscription without changing others.
 
 Notifications contain generic wording and exclude replies, project names, file paths, commands, and chat titles. Navigation data identifies the host/chat to reopen; a valid web login is still required. A notification never approves a request or runs an operation.
@@ -51,6 +55,12 @@ Private state is stored with mode `0600` in `DATA_DIR`:
 Back up this state with private deployment configuration and keep it out of Git. Keeping the same VAPID keys/subscriptions preserves device registration through routine container recreation. Re-register after changing domains or keys. Manual key generation is not required to deploy.
 
 ## Background operation, offline behavior, and updates
+
+Reverse proxies/CDNs should honor origin cache headers: revalidate HTML/manifest, never cache `sw.js` or APIs, and cache content-hashed assets long term. Worker registration and entry-file fetches include a build identifier to avoid stale upstream cache entries. If a previous deployment's entry page is already cached, purge `/`, `/index.html`, and `/sw.js`, or initially open `/?update=current-version`; subsequent navigation through the updated Worker bypasses stale entry HTML.
+
+On becoming visible, resuming from a frozen state, returning from the back/forward cache, or reconnecting to the network, the app checks its session and connection. A bounded read-only request detects sockets that still report OPEN but no longer answer. Recovery reconnects and synchronizes the selected chat; it never resends messages, commands, or approvals. Browser storage preserves the host, project, chat selection, and drafts across reopening. Existing authorized push subscriptions are synchronized and renewed on return.
+
+Android may freeze or discard background pages, so a permanent browser WebSocket cannot provide durable execution. The server's app-server keeps running independently of browser clients; the app restores its connection and reads the current task state on return. [Chrome Page Lifecycle API](https://developer.chrome.com/docs/web-platform/page-lifecycle-api).
 
 When the page closes or the phone locks, the backend keeps receiving events from existing host connections and attempts push delivery. With valid subscriptions, startup attempts to restore configured host connections. Notifications cannot keep a stopped Node server or Codex task alive. Container restarts end container processes; disk persistence cannot restore execution. Notifications for surviving proxy/remote tasks depend on app-server reconnection events.
 

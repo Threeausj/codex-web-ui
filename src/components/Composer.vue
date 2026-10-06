@@ -306,22 +306,23 @@ const draftKey = computed(
   () =>
     `codex.draft.${props.state.hostId}.${props.state.activeThread?.id || props.state.projectPath || "new"}`,
 );
+function saveDraft(key: string, value: string) {
+  if (value) localStorage.setItem(key, value);
+  else localStorage.removeItem(key);
+  // Migrate drafts from versions that only kept them for the current window.
+  sessionStorage.removeItem(key);
+}
 watch(
   draftKey,
   (key, previous) => {
-    if (previous) {
-      if (draft.value) sessionStorage.setItem(previous, draft.value);
-      else sessionStorage.removeItem(previous);
-    }
-    draft.value = sessionStorage.getItem(key) || "";
+    if (previous) saveDraft(previous, draft.value);
+    draft.value = localStorage.getItem(key) ?? sessionStorage.getItem(key) ?? "";
+    saveDraft(key, draft.value);
     void nextTick(resize);
   },
   { immediate: true, flush: "sync" },
 );
-watch(draft, (value) => {
-  if (value) sessionStorage.setItem(draftKey.value, value);
-  else sessionStorage.removeItem(draftKey.value);
-});
+watch(draft, (value) => saveDraft(draftKey.value, value), { flush: "sync" });
 function setDraft(text: string) {
   draft.value = text;
   void nextTick(() => {
@@ -639,18 +640,6 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           </button>
         </div>
       </div>
-    </div>
-    <div class="composer-footnote">
-      <span>{{
-        state.busy
-          ? "Codex 正在处理你的任务"
-          : "Enter 发送 · Shift + Enter 换行"
-      }}</span
-      ><span v-if="state.projectPath" :title="state.projectPath"
-        ><Icon name="Folder" :size="11" />{{
-          state.projectPath.split("/").filter(Boolean).pop()
-        }}</span
-      >
     </div>
   </div>
 </template>

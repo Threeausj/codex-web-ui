@@ -51,6 +51,7 @@ const makeTurn = (id: string, items: any[] = [], status = "completed") => ({
 
 /** Wire fixtures only. Product code always uses a real app-server connection. */
 export class MockCodex {
+  unresponsiveSockets = new Set<WebSocketRoute>();
   hosts: any[] = [{ id: "local", name: "本机", kind: "local" }];
   hostMocks = new Map<string, MockCodex>();
   requests: Rpc[] = [];
@@ -288,8 +289,11 @@ export class MockCodex {
       return;
     }
     this.requests.push(request);
+    if (this.unresponsiveSockets.has(socket)) return;
     const p = request.params || {};
     switch (request.method) {
+      case "thread/loaded/list":
+        return this.reply(socket, request, { data: ["thread-existing"], nextCursor: null });
       case "thread/list":
       case "thread/search": {
         const candidates = p.archived ? this.archivedThreads : this.threads;

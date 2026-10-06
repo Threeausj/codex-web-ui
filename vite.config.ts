@@ -23,6 +23,7 @@ function appServiceWorker(): Plugin {
 }
 
 export default defineConfig({
+  define: { 'import.meta.env.VITE_BUILD_ID': JSON.stringify(Date.now().toString(36)) },
   plugins: [vue(), appServiceWorker()],
   server: {
     port: 5173,

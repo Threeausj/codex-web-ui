@@ -9,12 +9,15 @@ import {
   enableDevicePush,
   disableDevicePush,
   testDevicePush,
+  testSystemNotification,
   saveDevicePushPreferences,
   type PushPreferences,
 } from '../lib/pwa';
 const props = defineProps<{ api: any; state: any }>();
 const notice = ref('');
 const localError = ref('');
+const testing = ref<'push' | 'system' | ''>('');
+const android = /Android/i.test(navigator.userAgent);
 const categories: { key: keyof PushPreferences; label: string; description: string }[] = [
   { key: 'completed', label: '回复已完成', description: 'Codex 完成本次任务时提醒' },
   { key: 'approval', label: '需要审批', description: '需要你批准操作或回答问题时提醒' },
@@ -33,11 +36,21 @@ const pushReason = computed(() => {
   return '';
 });
 const canEnable = computed(() => !pwaState.pushBusy && !pwaState.offline && pwaState.pushReady && pwaState.pushPermission !== 'denied' && (!pwaState.appleMobile || pwaState.installed));
-async function operate(action: () => Promise<any>, message: string) {
-  notice.value = '';
+async function operate(action: () => Promise<any>, message: string, progress = '') {
+  notice.value = progress;
   localError.value = '';
   try { await action(); notice.value = message; }
   catch (cause: any) { localError.value = cause.message || '操作失败，请重试'; }
+}
+async function sendTest(kind: 'push' | 'system') {
+  testing.value = kind;
+  try {
+    await operate(
+      () => kind === 'push' ? testDevicePush(props.api) : testSystemNotification(),
+      kind === 'push' ? '推送服务已接收测试通知，请查看系统通知。' : '系统通知已发出，请查看通知栏。',
+      kind === 'push' ? '正在发送测试通知…' : '正在检查系统通知…',
+    );
+  } finally { testing.value = ''; }
 }
 async function preferenceChanged(key: keyof PushPreferences, event: Event) {
   const input = event.target as HTMLInputElement;
@@ -84,8 +97,9 @@ onMounted(() => { void initializeDevicePush(props.api); });
         <button v-if="!pwaState.pushSubscribed" class="button" :disabled="!canEnable" @click="operate(() => enableDevicePush(api), '已启用这台设备的后台通知')"><Icon :name="pwaState.pushBusy ? 'LoaderCircle' : 'CheckCircle2'" :size="16" />启用通知</button>
         <template v-else>
           <button class="button button-secondary" :disabled="pwaState.pushBusy || pwaState.offline" @click="operate(() => disableDevicePush(api), '已关闭这台设备的后台通知')">关闭通知</button>
-          <button class="button button-secondary" :disabled="pwaState.pushBusy || pwaState.offline || !pwaState.pushReady" @click="operate(() => testDevicePush(api), '测试通知已提交，请查看系统通知')"><Icon name="Send" :size="15" />发送测试通知</button>
+          <button class="button button-secondary" :disabled="pwaState.pushBusy || !!testing || pwaState.offline || !pwaState.pushReady" @click="sendTest('push')"><Icon :name="testing === 'push' ? 'LoaderCircle' : 'Send'" :class="{ spin: testing === 'push' }" :size="15" />{{ testing === 'push' ? '正在发送…' : '发送测试通知' }}</button>
         </template>
+        <button v-if="pwaState.pushPermission === 'granted'" class="button button-secondary" :disabled="pwaState.pushBusy || !!testing" @click="sendTest('system')"><Icon :name="testing === 'system' ? 'LoaderCircle' : 'Bell'" :class="{ spin: testing === 'system' }" :size="15" />检查系统通知</button>
         <button class="icon-button" aria-label="刷新通知状态" title="刷新通知状态" :disabled="pwaState.pushBusy || pwaState.offline" @click="operate(() => initializeDevicePush(api), '')"><Icon name="RefreshCw" :size="16" /></button>
       </div>
       <div class="pwa-preferences" aria-label="通知类别">
@@ -95,9 +109,10 @@ onMounted(() => { void initializeDevicePush(props.api); });
         </label>
       </div>
       <p class="pwa-subtle">设置仅作用于这台设备。退出登录会撤销本机通知；移动系统可能因省电或网络状态延迟送达。</p>
+      <p v-if="android" class="pwa-subtle">Android Chrome 的后台通知需要手机能连接 Google 推送服务。若测试已接收却未收到，先点击“检查系统通知”；能收到系统检查通知时，请检查手机的 Google 服务连接和省电设置。</p>
     </section>
     <div v-if="localError || pwaState.pushError" class="pwa-feedback error" role="alert"><Icon name="AlertCircle" :size="16" /><span>{{ localError || pwaState.pushError }}</span></div>
-    <div v-else-if="notice" class="pwa-feedback" role="status"><Icon name="CheckCircle2" :size="16" /><span>{{ notice }}</span></div>
+    <div v-else-if="notice" class="pwa-feedback" role="status"><Icon :name="testing ? 'LoaderCircle' : 'CheckCircle2'" :class="{ spin: !!testing }" :size="16" /><span>{{ notice }}</span></div>
   </div>
 </template>
 

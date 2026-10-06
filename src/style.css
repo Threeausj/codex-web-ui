@@ -1252,25 +1252,6 @@ hr {
   background: currentColor;
   border-radius: 2px;
 }
-.composer-footnote {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  color: var(--muted);
-  font-size: 10px;
-  padding: 10px 4px 0;
-  gap: 10px;
-  opacity: 0.8;
-}
-.composer-footnote > span:last-child {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .composer-picker {
   position: absolute;
   bottom: calc(100% - 15px);
@@ -2723,13 +2704,6 @@ hr {
   .send-button {
     height: 29px;
     width: 29px;
-  }
-  .composer-footnote {
-    padding-top: 8px;
-    font-size: 10px;
-  }
-  .composer-footnote > span:last-child {
-    max-width: 120px;
   }
   .composer-picker {
     width: 100%;
