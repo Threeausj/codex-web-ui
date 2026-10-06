@@ -14,8 +14,16 @@ const failure = (message: string, status = 400) => Object.assign(new Error(messa
 
 export class SshKeys {
   readonly directory: string
+  private hostMutations: Promise<unknown> = Promise.resolve()
   constructor(dataDir: string, private readonly storage: Storage) {
     this.directory = path.resolve(dataDir, 'ssh-keys')
+  }
+
+  /** Serialize host saves and key cleanup so a concurrent save cannot lose its identity file. */
+  withHostMutation<T>(work: () => Promise<T>): Promise<T> {
+    const pending = this.hostMutations.then(work)
+    this.hostMutations = pending.catch(() => {})
+    return pending
   }
 
   async upload(buffer: Buffer) {
@@ -75,6 +83,6 @@ export function registerSshKeys(app: Express, keys: SshKeys) {
     void keys.upload(req.file.buffer).then(key => res.status(201).json(key)).catch(next)
   })
   app.delete('/api/ssh-keys/:id', (req, res, next) => {
-    void keys.remove(String(req.params.id)).then(() => res.json({ ok: true })).catch(next)
+    void keys.withHostMutation(() => keys.remove(String(req.params.id))).then(() => res.json({ ok: true })).catch(next)
   })
 }

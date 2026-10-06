@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createServer } from './app.js'
 import { Storage } from './storage.js'
-import { SSH_KEY_MAX_BYTES } from './ssh-keys.js'
+import { SSH_KEY_MAX_BYTES, SshKeys } from './ssh-keys.js'
 
 const run = promisify(execFile)
 const origin = 'http://localhost:8787'
@@ -129,4 +129,40 @@ test('editing and deleting hosts remove only unreferenced uploaded keys, preserv
   assert.equal(await fs.access(third.identityFile).then(() => true, () => false), false)
   assert.equal((await f.request(`/api/hosts/${a.id}`, { method: 'DELETE' })).status, 200)
   await fs.access(f.privateFile)
+})
+
+test('concurrent host changes serialize persistence and cleanup, including a pending save that uses an uploaded key', async t => {
+  const f = await fixture(t)
+  const first = await f.upload()
+  const second = await f.upload()
+  const third = await f.upload()
+  const response = await f.json('/api/hosts', 'POST', { name: 'Concurrent', hostname: 'host.example.test', identityFile: first.identityFile })
+  assert.equal(response.status, 201)
+  const { host } = await response.json()
+  const responses = await Promise.all([
+    f.json(`/api/hosts/${host.id}`, 'PATCH', { identityFile: second.identityFile }),
+    f.json(`/api/hosts/${host.id}`, 'PATCH', { identityFile: third.identityFile }),
+  ])
+  assert.deepEqual(responses.map(r => r.status), [200, 200])
+  const hosts = (await (await f.request('/api/hosts')).json()).hosts
+  const saved = hosts.find((entry: { id: string }) => entry.id === host.id)
+  assert.deepEqual(await fs.readdir(path.join(f.dataDir, 'ssh-keys')), [path.basename(saved.identityFile)])
+
+  // Hold persistence before hosts becomes visible, reproducing the reference-check race deterministically.
+  const storage = new Storage(path.join(f.directory, 'queued-data'))
+  await storage.init()
+  const keys = new SshKeys(storage.dataDir, storage)
+  const key = await keys.upload(f.key)
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  const save = keys.withHostMutation(async () => {
+    await held
+    return storage.addHost({ name: 'Pending', hostname: 'host.example.test', identityFile: key.identityFile })
+  })
+  const remove = keys.withHostMutation(() => keys.remove(key.id))
+  const protectedRemoval = assert.rejects(remove, { status: 409 })
+  release()
+  await save
+  await protectedRemoval
+  await fs.access(key.identityFile)
 })
