@@ -103,7 +103,7 @@ export function initPwa(): Promise<ServiceWorkerRegistration | null> {
     if (!window.isSecureContext || !('serviceWorker' in navigator)) { pwaState.registrationStatus = 'unavailable'; return null; }
     pwaState.registrationStatus = 'registering';
     try {
-      const result = await navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' });
+      const result = await navigator.serviceWorker.register(`/sw.js?build=${import.meta.env.VITE_BUILD_ID}`, { scope: '/', updateViaCache: 'none' });
       if (result.waiting) pwaState.updateAvailable = true;
       result.addEventListener('updatefound', () => {
         const worker = result.installing;

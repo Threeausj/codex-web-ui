@@ -36,6 +36,7 @@ async function loginBuilt(page: Page, key = publicKey, authenticated = false) {
   }
   await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
   await expect.poll(() => page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+  expect(await page.evaluate(async () => (await navigator.serviceWorker.ready).active?.scriptURL)).toContain('/sw.js?build=');
 }
 
 // Keep the browser subscription shared across tabs and reloads, just like PushManager.

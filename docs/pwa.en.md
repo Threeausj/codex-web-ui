@@ -56,6 +56,8 @@ Back up this state with private deployment configuration and keep it out of Git.
 
 ## Background operation, offline behavior, and updates
 
+Reverse proxies/CDNs should honor origin cache headers: revalidate HTML/manifest, never cache `sw.js` or APIs, and cache content-hashed assets long term. Worker registration and entry-file fetches include a build identifier to avoid stale upstream cache entries. If a previous deployment's entry page is already cached, purge `/`, `/index.html`, and `/sw.js`, or initially open `/?update=current-version`; subsequent navigation through the updated Worker bypasses stale entry HTML.
+
 On becoming visible, resuming from a frozen state, returning from the back/forward cache, or reconnecting to the network, the app checks its session and connection. A bounded read-only request detects sockets that still report OPEN but no longer answer. Recovery reconnects and synchronizes the selected chat; it never resends messages, commands, or approvals. Browser storage preserves the host, project, chat selection, and drafts across reopening. Existing authorized push subscriptions are synchronized and renewed on return.
 
 Android may freeze or discard background pages, so a permanent browser WebSocket cannot provide durable execution. The server's app-server keeps running independently of browser clients; the app restores its connection and reads the current task state on return. [Chrome Page Lifecycle API](https://developer.chrome.com/docs/web-platform/page-lifecycle-api).

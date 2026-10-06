@@ -10,10 +10,14 @@ self.addEventListener("install", (event) => {
     const cache = await caches.open(CACHE_NAME);
     await Promise.all(PRECACHE.map(async (pathname) => {
       // Never include login cookies or cache an authenticated HTTP response.
-      const request = new Request(pathname, { credentials: "omit", cache: "reload" });
+      const cacheKey = new Request(new URL(pathname, self.location.origin), { credentials: "omit" });
+      const target = new URL(cacheKey.url);
+      // Unhashed entry files can be cached by a proxy even when the origin says no-cache.
+      if (!pathname.startsWith("/assets/")) target.searchParams.set("codex-build", BUILD);
+      const request = new Request(target, { credentials: "omit", cache: "reload" });
       const response = await fetch(request);
       if (!response.ok || response.type !== "basic") throw new Error("App shell unavailable");
-      await cache.put(request, response);
+      await cache.put(cacheKey, response);
     }));
   })());
 });
@@ -39,7 +43,11 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     if (url.pathname !== "/" && url.pathname !== "/index.html") return;
     event.respondWith((async () => {
-      try { return await fetch(request); }
+      try {
+        const target = new URL(request.url);
+        target.searchParams.set("codex-build", BUILD);
+        return await fetch(target, { credentials: request.credentials, headers: request.headers, cache: "no-store" });
+      }
       catch {
         const cache = await caches.open(CACHE_NAME);
         return (await cache.match("/index.html")) || (await cache.match("/offline.html")) || Response.error();

@@ -35,7 +35,13 @@ function worker() {
       async delete() { return true; },
       async open() { return { async match(path: string) { return cached.get(new URL(path, self.location.origin).href)?.clone(); }, async put(request: Request, response: Response) { cached.set(request.url, response.clone()); } }; },
     },
-    async fetch(request: any) { networkRequests.push(request); if (offline) throw new TypeError('Network unavailable'); return new Response('network'); },
+    async fetch(request: any, options?: RequestInit) {
+      networkRequests.push(request instanceof URL ? new Request(request, options) : request);
+      if (offline) throw new TypeError('Network unavailable');
+      const response = new Response('network');
+      Object.defineProperty(response, 'type', { value: 'basic' });
+      return response;
+    },
   });
   async function fire(name: string, event: any) {
     const pending: Promise<any>[] = [];
@@ -84,6 +90,36 @@ test('notification click opens only the app root and ignores unsafe identifiers 
   assert.equal(target.opened[0], 'https://codex.example/?host=local&thread=thread-1');
   await target.fire('notificationclick', { notification: { close() {}, data: { hostId: '../secret', threadId: '<script>', url: 'https://malicious.example/' } } });
   assert.equal(target.opened[1], 'https://codex.example/');
+});
+
+test('installation bypasses proxy caches for entry files and preserves stable public offline cache keys', async () => {
+  const target = worker();
+  await target.fire('install', {});
+  const entry = target.networkRequests.find(request => new URL(request.url).pathname === '/index.html');
+  assert.equal(new URL(entry.url).searchParams.get('codex-build'), 'test-revision');
+  assert.equal(entry.credentials, 'omit');
+  assert.equal(entry.cache, 'reload');
+  assert.ok(target.cached.has('https://codex.example/index.html'));
+  assert.ok(target.cached.has('https://codex.example/assets/public.js'));
+  assert.ok([...target.cached.keys()].every(key => !new URL(key).search));
+});
+
+test('root navigation bypasses stale proxy HTML while preserving notification destinations and credentials', async () => {
+  const target = worker();
+  let response!: Promise<Response>;
+  target.listeners.get('fetch')!({
+    request: { method: 'GET', mode: 'navigate', url: 'https://codex.example/?host=remote&thread=chat', credentials: 'include' },
+    respondWith(value: Promise<Response>) { response = value; },
+  });
+  assert.equal(await (await response).text(), 'network');
+  const request = target.networkRequests[0];
+  const url = new URL(request.url);
+  assert.equal(url.searchParams.get('codex-build'), 'test-revision');
+  assert.equal(url.searchParams.get('host'), 'remote');
+  assert.equal(url.searchParams.get('thread'), 'chat');
+  assert.equal(request.credentials, 'include');
+  assert.equal(request.cache, 'no-store');
+  assert.equal(target.cached.size, 0);
 });
 
 test('worker leaves authenticated APIs, uploads, previews, project files and external requests untouched', () => {
