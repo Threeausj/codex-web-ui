@@ -18,6 +18,7 @@ import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerHostConnection } from './host-connection.js'
+import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { registerProjectDirectories } from './project-directories.js'
 import { PushService, registerPush, type PushOptions } from './push.js'
 import type { AuthenticatedRequest } from './types.js'
@@ -85,24 +86,30 @@ export async function createApp(options: AppOptions = {}) {
   }))
   app.get('/api/hosts', (_req, res) => res.json({ hosts: storage.hosts }))
   registerHostConnection(app, bridgeOptions)
-  app.post('/api/hosts', asyncRoute(async (req, res) => res.status(201).json({ host: await storage.addHost(req.body) })))
-  app.patch('/api/hosts/:id', asyncRoute(async (req, res) => {
+  const sshKeys = new SshKeys(dataDir, storage)
+  registerSshKeys(app, sshKeys)
+  app.post('/api/hosts', asyncRoute((req, res) => sshKeys.withHostMutation(async () => res.status(201).json({ host: await storage.addHost(req.body) }))))
+  app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
+    const previousIdentityFile = storage.host(id)?.identityFile
     const result = await storage.updateHost(id, req.body)
     if (result.connectionReset) {
       developmentPreview.deleteHost(id)
       bridges.get(id)?.close('Host settings changed', 4001)
       bridges.delete(id)
     }
+    if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
     res.json({ ...result, hosts: storage.hosts })
-  }))
-  app.delete('/api/hosts/:id', asyncRoute(async (req, res) => {
+  })))
+  app.delete('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
+    const previousIdentityFile = storage.host(id)?.identityFile
     await storage.deleteHost(id)
+    await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
     developmentPreview.deleteHost(id)
     bridges.get(id)?.close(); bridges.delete(id)
     res.json({ ok: true })
-  }))
+  })))
   app.get('/api/projects', asyncRoute(async (_req, res) => res.json({ projects: await storage.projects() })))
   app.post('/api/projects', asyncRoute(async (req, res) => {
     const { path: projectPath, name, hostId, rootPaths } = z.object({ path: absolutePath, rootPaths: z.array(absolutePath).max(12).optional(), name: z.string().min(1).max(256).optional(), hostId: z.string().default('local') }).parse(req.body)

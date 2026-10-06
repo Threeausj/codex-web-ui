@@ -14,7 +14,10 @@ const props = defineProps<{ api: any; host?: any }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
 const modal = ref<HTMLElement>();
 const form = ref<HTMLFormElement>();
-const busy = ref<"" | "test" | "save">("");
+const keyInput = ref<HTMLInputElement>();
+const busy = ref<"" | "test" | "save" | "upload">("");
+const uploadedKey = ref<{ identityFile: string; name: string }>();
+const draftKeys = new Map<string, string>();
 const error = ref("");
 const testResult = ref<any>(null);
 const identityMode = ref(props.host?.identityFile ? "file" : "default");
@@ -33,6 +36,44 @@ const title = computed(() =>
 const testedVersion = computed(() => testResult.value?.version || "");
 let previousFocus: HTMLElement | null = null;
 let disposed = false;
+let savedIdentityFile = "";
+
+async function cleanDraftKeys(keep = "") {
+  await Promise.all([...draftKeys].map(async ([id, identityFile]) => {
+    if (identityFile === keep) return;
+    draftKeys.delete(id);
+    await props.api.removeSshKey(id).catch(() => {});
+  }));
+}
+
+async function uploadKey(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file || busy.value) return;
+  error.value = "";
+  if (!file.size || file.size > 64 * 1024) {
+    error.value = "请选择非空且不超过 64 KB 的私钥文件。";
+    return;
+  }
+  busy.value = "upload";
+  testResult.value = null;
+  try {
+    const key = await props.api.uploadSshKey(file);
+    draftKeys.set(key.id, key.identityFile);
+    if (disposed) {
+      await cleanDraftKeys();
+      return;
+    }
+    draft.identityFile = key.identityFile;
+    uploadedKey.value = { identityFile: key.identityFile, name: file.name };
+    await cleanDraftKeys(key.identityFile);
+  } catch (cause: any) {
+    if (!disposed) error.value = cause?.message || "上传私钥失败";
+  } finally {
+    if (!disposed) busy.value = "";
+  }
+}
 
 watch(
   [draft, identityMode],
@@ -52,7 +93,7 @@ function payload() {
   const identityFile =
     identityMode.value === "file" ? draft.identityFile.trim() : "";
   if (identityMode.value === "file" && !identityFile)
-    throw new Error("请输入身份文件路径，或选择无身份验证");
+    throw new Error("请上传私钥或填写身份文件路径");
   return {
     name: draft.name.trim() || hostname,
     hostname,
@@ -80,18 +121,21 @@ async function submit(kind: "test" | "save") {
     } else {
       if (props.host?.id) await props.api.updateHost(props.host.id, fields);
       else await props.api.addHost(fields);
-      emit("saved");
+      savedIdentityFile = fields.identityFile;
+      await cleanDraftKeys(savedIdentityFile);
+      if (!disposed) emit("saved");
     }
   } catch (cause: any) {
     if (!disposed)
       error.value =
         cause?.message || (kind === "test" ? "连接测试失败" : "保存连接失败");
   } finally {
-    if (!disposed) busy.value = "";
+    if (disposed) await cleanDraftKeys(savedIdentityFile);
+    else busy.value = "";
   }
 }
 function close() {
-  if (busy.value !== "save") emit("close");
+  if (busy.value !== "save" && busy.value !== "upload") emit("close");
 }
 function focusableElements() {
   return [
@@ -140,6 +184,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   disposed = true;
+  if (!busy.value) void cleanDraftKeys(savedIdentityFile);
   document.removeEventListener("keydown", onKeyDown, true);
   if (previousFocus?.isConnected) previousFocus.focus();
 });
@@ -162,7 +207,7 @@ onBeforeUnmount(() => {
             class="ssh-close icon-button"
             type="button"
             aria-label="关闭 SSH 连接"
-            :disabled="busy === 'save'"
+            :disabled="busy === 'save' || busy === 'upload'"
             @click="close"
           >
             <Icon name="X" :size="18" />
@@ -235,18 +280,47 @@ onBeforeUnmount(() => {
                 身份文件
               </button>
             </div>
-            <label v-if="identityMode === 'file'" class="ssh-field">
-              <span>身份文件路径</span>
+            <div v-if="identityMode === 'file'" class="ssh-field">
+              <div class="ssh-key-heading">
+                <label for="ssh-identity-file">身份文件路径</label>
+                <button
+                  type="button"
+                  class="ssh-upload-button"
+                  :disabled="!!busy"
+                  @click="keyInput?.click()"
+                >
+                  <Icon
+                    :name="busy === 'upload' ? 'LoaderCircle' : 'Upload'"
+                    :size="14"
+                    :class="{ spin: busy === 'upload' }"
+                  />{{ busy === "upload" ? "上传中…" : "上传私钥" }}
+                </button>
+              </div>
               <input
+                ref="keyInput"
+                type="file"
+                class="ssh-key-input"
+                aria-label="SSH 私钥文件"
+                :disabled="!!busy"
+                @change="uploadKey"
+              />
+              <input
+                id="ssh-identity-file"
                 v-model="draft.identityFile"
                 aria-label="SSH 身份文件路径"
+                placeholder="上传私钥或填写服务端路径"
                 :disabled="!!busy"
                 required
                 autocomplete="off"
                 spellcheck="false"
               />
-              <small>文件须已存在于运行 Web 服务的主机。</small>
-            </label>
+              <small
+                v-if="uploadedKey?.identityFile === draft.identityFile"
+                class="ssh-upload-result"
+                role="status"
+              >已上传 {{ uploadedKey?.name }}</small>
+              <small>支持无口令的 OpenSSH / PEM 私钥，最大 64 KB。也可填写服务端已有文件路径。</small>
+            </div>
             <p v-else class="ssh-form-note">使用已有的 SSH 配置和代理身份。</p>
             <details class="ssh-advanced">
               <summary>高级选项 <Icon name="ChevronDown" :size="14" /></summary>
@@ -321,7 +395,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="ssh-cancel"
-                :disabled="busy === 'save'"
+                :disabled="busy === 'save' || busy === 'upload'"
                 @click="close"
               >
                 取消
@@ -408,6 +482,30 @@ onBeforeUnmount(() => {
   font-size: 13px;
   font-weight: 500;
   line-height: 1.5;
+}
+.ssh-key-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.ssh-upload-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.ssh-field .ssh-key-input {
+  display: none;
+}
+.ssh-field .ssh-upload-result {
+  overflow-wrap: anywhere;
 }
 .ssh-field small {
   font-size: 11px;

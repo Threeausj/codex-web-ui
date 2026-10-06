@@ -1937,6 +1937,14 @@ async function testHost(host: any) {
     false,
   );
 }
+async function uploadSshKey(file: File) {
+  const body = new FormData();
+  body.append("key", file);
+  return http("/ssh-keys", { method: "POST", body }, false);
+}
+async function removeSshKey(id: string) {
+  return http(`/ssh-keys/${encodeURIComponent(id)}`, { method: "DELETE" }, false);
+}
 async function addHost(host: any) {
   const result = await http("/hosts", {
     method: "POST",
@@ -2650,6 +2658,8 @@ export function useCodex() {
     setHost,
     addHost,
     testHost,
+    uploadSshKey,
+    removeSshKey,
     updateHost,
     removeHost,
     uploadFiles,

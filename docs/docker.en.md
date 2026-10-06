@@ -125,7 +125,9 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f c
 
 Run `codex --version` inside that remote interactive shell so that PATH initialization through nvm/mise or similar tools takes effect.
 
-In Settings → Connections, enter a hostname or SSH alias and use container identity paths such as `/home/node/.ssh/...`. Leave the Codex path empty for remote interactive-login-shell discovery, or specify the remote executable. Test the connection before saving it. Remote projects use remote paths, not container `/workspace` paths. Keep private keys, populated SSH overrides, `.env.docker`, and Codex login data out of Git.
+In Settings → Connections, enter a hostname or SSH alias. Select Identity file → Upload private key to upload or replace an unencrypted OpenSSH / PEM private key, up to 64 KB. The server validates the key and fills in its container path. Keys persist under `/app/data/ssh-keys` in the web-data volume, with directory mode `0700` and file mode `0600`. Cancelling an edit removes unsaved uploads; replacing or deleting a connection removes uploaded keys only when no connection references them. You can also enter mounted paths such as `/home/node/.ssh/...`; these existing files are never deleted automatically. Uploading a key does not replace fingerprint verification in `known_hosts`.
+
+Leave the Codex path empty for remote interactive-login-shell discovery, or specify the remote executable. Test the connection before saving it. Remote projects use remote paths, not container `/workspace` paths. Keep private keys, populated SSH overrides, `.env.docker`, and Codex login data out of Git.
 
 ## Desktop history and live sharing
 
