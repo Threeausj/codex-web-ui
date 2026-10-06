@@ -47,7 +47,9 @@ caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy
 ```
 
-浏览器访问 `https://codex.example.com` 并用 `CODEX_WEB_PASSWORD` 登录。修改密码并重启服务后，旧登录会话失效。会话保存在 Node 进程内，默认有效期 8 小时，重启后需要重新登录。
+浏览器访问 `https://codex.example.com`，首次使用 `CODEX_WEB_PASSWORD` 登录。会话保存在 Node 进程内，有效期 30 天，重启后需要重新登录。在“设置 → 账户 → 网页访问”使用当前密码修改访问密码，保存后当前登录续期，其他设备的登录及后台通知授权撤销；无需重启服务。
+
+首次启动将访问密码散列保存到 `DATA_DIR/web-password.json`，权限 `0600`；该文件优先于环境变量和初始密码。设置里修改后，原 `CODEX_WEB_PASSWORD` 不再是当前密码，重启也不会覆盖修改。忘记密码时停止服务、备份 `DATA_DIR`，设置新的初始 `CODEX_WEB_PASSWORD`，仅移除 `web-password.json` 后重新启动。不要删除主机、项目、推送密钥或 Codex 历史。
 
 ## 鉴权边界
 

@@ -38,10 +38,10 @@ export async function createApp(options: AppOptions = {}) {
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
   const origins = trustedOrigins(options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean), options.port || Number(process.env.PORT) || 8787)
-  const password = await Auth.password(dataDir, options.password || process.env.CODEX_WEB_PASSWORD)
-  const auth = new Auth(password, origins, options.secureCookie ?? [...origins].some(o => o.startsWith('https:')))
-  const push = await PushService.create(dataDir, origins, options.pushOptions)
+  const auth = await Auth.create(dataDir, options.password || process.env.CODEX_WEB_PASSWORD, origins, options.secureCookie ?? [...origins].some(o => o.startsWith('https:')))
+  const push = await PushService.create(dataDir, origins, { ...options.pushOptions, credentialVersion: auth.pushCredentialVersion })
   const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
+  const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions }
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
@@ -67,6 +67,7 @@ export async function createApp(options: AppOptions = {}) {
   app.get('/api/auth/session', auth.session)
   app.post('/api/auth/login', auth.login)
   app.post('/api/auth/logout', auth.requireAuth, auth.requireCsrf, auth.logout)
+  app.post('/api/auth/password', auth.requireAuth, auth.requireCsrf, auth.changePassword)
   registerPreview(app, { getBridge, getHost: (id: string) => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, allowedOrigins: origins, isSessionActive: (sessionId: string) => auth.isSessionActive(sessionId) })
   const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener) })
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
@@ -172,6 +173,7 @@ export async function createApp(options: AppOptions = {}) {
   }
   const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
     if (res.headersSent) return
+    if (error?.type === 'entity.parse.failed') { res.status(400).json({ error: '请求格式不正确，请重试。' }); return }
     if (error instanceof z.ZodError) { res.status(400).json({ error: error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') }); return }
     if (error instanceof multer.MulterError) { res.status(413).json({ error: error.message }); return }
     if (error instanceof RpcFailure) { res.status(502).json({ error: error.message, code: error.rpc.code }); return }
@@ -181,7 +183,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, stopPushLogoutListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -229,6 +231,7 @@ export async function createServer(options: AppOptions = {}) {
     clearInterval(heartbeat)
     stopListeningForRevocation()
     context.stopPushLogoutListener()
+    context.stopPushPasswordListener()
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
     for (const ws of wss.clients) ws.terminate()

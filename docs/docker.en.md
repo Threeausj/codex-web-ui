@@ -14,7 +14,7 @@ The multi-stage image uses Node.js 22 on Debian Bookworm and runs as non-root `n
 | `compose.public.yaml` | Caddy publishes 80/443; app remains on the Compose network |
 | `deploy/docker/env.example` | Copy to the Git-ignored `.env.docker` |
 | `deploy/docker/Caddyfile` | Automatic HTTPS and WebSocket reverse proxy |
-| `webdata` volume → `/app/data` | Web hosts, projects, preferences, uploads, push keys, and device authorizations |
+| `webdata` volume → `/app/data` | Web password hash, hosts, projects, preferences, uploads, push keys, and device authorizations |
 | `codexhome` volume → `/home/node/.codex` | Codex login, configuration, and durable history |
 | `WORKSPACE_PATH` → `/workspace` | Writable bind mount of your host project directory |
 
@@ -46,6 +46,14 @@ Complete the Codex login using the CLI's browser/device instructions; your accou
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and add a project under `/workspace`. If port 8787 is already used, stop one service or change the host port in the local overlay and update its `PUBLIC_ORIGIN` accordingly.
 
 Local HTTP origins use cookies without Secure; the HTTPS origin enables Secure. Both modes keep HttpOnly, SameSite, CSRF, and Origin checks. `NODE_ENV` does not disable authentication.
+
+## Access password and login
+
+Web login lasts **30 days**. Sessions live in the server process, so restarting it requires login again. Under Settings → Account → Web access → Change access password (Chinese UI: “设置 → 账户 → 网页访问 → 修改访问密码”), enter the current password and confirm a new password of 12–1024 characters. Saving renews the current login for 30 days and preserves its connections, while immediately revoking other devices' logins and push authorizations. This does not change the Codex model account.
+
+The first start initializes credentials from `CODEX_WEB_PASSWORD`; afterward, the scrypt hash in `/app/data/web-password.json` takes precedence over environment variables. The file uses mode `0600`. Changes in settings are not written to `.env.docker`, the plaintext bootstrap file, or logs. Preserve `webdata` to retain the password across restarts. The initial values in `.env.docker` and `bootstrap-password.txt` may no longer be the current password.
+
+To recover a forgotten password, stop the app and back up `webdata`, set a new initial `CODEX_WEB_PASSWORD` in `.env.docker`, remove only `web-password.json` from that volume, and restart. Credentials initialize from the environment again, and previous logins and device grants become invalid. Do not delete the data volume or Codex history to reset access. A corrupt hash file prevents startup; use the same recovery procedure.
 
 ## Public HTTPS
 
@@ -165,6 +173,7 @@ The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check pr
 | Symptom | Check |
 | --- | --- |
 | Missing password | `.env.docker` and `--env-file`; password must contain at least 12 characters |
+| Environment password no longer works | A saved `web-password.json` takes precedence; use the current password or follow the recovery steps above |
 | Missing mount/permission denied | Host `WORKSPACE_PATH` exists and UID 1000 has access |
 | Login does not persist | Correct origin/domain, HTTPS for the public mode, proxy/Cookie configuration |
 | Models unavailable | Run Codex login in the container and check account/provider access |

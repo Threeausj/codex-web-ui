@@ -18,12 +18,14 @@ const subscriptionSchema = z.object({
   expirationTime: z.number().nonnegative().nullable().optional(),
   keys: z.object({ p256dh: z.string().max(128), auth: z.string().max(64) }).strict(),
 }).strict()
-type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number }
+type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string }
 type PushNotice = { title: string; body: string; tag: string; data: { hostId?: string; threadId?: string; url: string; kind: 'completed' | 'approval' | 'errors' | 'test' } }
 export type PushOptions = {
   vapidPublicKey?: string; vapidPrivateKey?: string; subject?: string
   sendNotification?: (subscription: PushSubscription, payload: string, options: RequestOptions) => Promise<unknown>
   now?: () => number
+  /** Bound to the persisted web credential generation; provided by the application. */
+  credentialVersion?: string
 }
 
 /** Only browser-owned push infrastructure is a valid destination, never an arbitrary URL. */
@@ -76,7 +78,7 @@ const actionableRequests = new Set([
 ])
 const elicitationModes = new Set(['form', 'url', 'openai/form', 'openaiForm', 'openai/userVerification'])
 
-/** Durable, single-user device grants are intentionally separate from short-lived login cookies. */
+/** Durable device grants expire independently and are revoked when the access password changes. */
 export class PushService {
   private devices = new Map<string, Device>()
   private events = new Map<string, number>()
@@ -90,10 +92,12 @@ export class PushService {
   private readonly now: () => number
   private keys!: { publicKey: string; privateKey: string; subject: string }
   private readonly send: NonNullable<PushOptions['sendNotification']>
+  private credentialVersion?: string
   private constructor(private readonly dataDir: string, private readonly options: PushOptions, private readonly origins: Set<string>) {
     this.file = path.join(dataDir, 'push-subscriptions.json')
     this.now = options.now || Date.now
     this.send = options.sendNotification || webPush.sendNotification.bind(webPush)
+    this.credentialVersion = options.credentialVersion
   }
 
   static async create(dataDir: string, origins: Set<string>, options: PushOptions = {}) {
@@ -132,15 +136,18 @@ export class PushService {
     } catch { throw new Error('Web Push VAPID keys are invalid or do not form a matching pair') }
     this.keys = { ...pair, subject }
     try {
-      const saved = JSON.parse(await fs.readFile(this.file, 'utf8')) as { subscriptions?: unknown[]; events?: unknown[] }
-      if (!Array.isArray(saved.subscriptions) || saved.subscriptions.length > MAX_DEVICES) throw new Error('Invalid subscription storage')
+      const saved = JSON.parse(await fs.readFile(this.file, 'utf8')) as { version?: number; subscriptions?: unknown[]; events?: unknown[] }
+      if ((saved.version !== 1 && saved.version !== 2) || !Array.isArray(saved.subscriptions) || saved.subscriptions.length > MAX_DEVICES) throw new Error('Invalid subscription storage')
       for (const raw of saved.subscriptions) {
         const device = record(raw)
         if (!device || typeof device.expiresAt !== 'number' || device.expiresAt <= this.now() || typeof device.sessionHash !== 'string' || !/^[a-zA-Z0-9_-]{43}$/.test(device.sessionHash)) continue
+        // Grants from older releases have no provable credential generation. Require
+        // re-registration rather than restoring them after a password reset or backup.
+        if (this.credentialVersion && device.credentialVersion !== this.credentialVersion) continue
         try {
           const subscription = validateSubscription(device.subscription)
           if (subscription.expirationTime && subscription.expirationTime <= this.now()) continue
-          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt })
+          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt, ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : typeof device.credentialVersion === 'string' ? { credentialVersion: device.credentialVersion } : {}) })
         } catch { /* Invalid or unsupported saved device data is never sent to the network. */ }
       }
       if (Array.isArray(saved.events)) for (const raw of saved.events.slice(-MAX_EVENTS)) {
@@ -155,7 +162,7 @@ export class PushService {
   get hasActiveSubscriptions() { return [...this.devices.values()].some(device => device.expiresAt > this.now()) }
 
   private save() {
-    const snapshot = { version: 1, subscriptions: [...this.devices.values()], events: [...this.events].map(([key, expiresAt]) => ({ key, expiresAt })) }
+    const snapshot = { version: 2, subscriptions: [...this.devices.values()], events: [...this.events].map(([key, expiresAt]) => ({ key, expiresAt })) }
     const writing = this.writes.then(() => atomicPrivateJson(this.file, snapshot))
     this.writes = writing.catch(() => {})
     return writing
@@ -169,7 +176,7 @@ export class PushService {
       if (this.devices.size >= MAX_DEVICES) throw Object.assign(new Error('Too many push devices; remove an existing device first'), { status: 409 })
     }
     const expiresAt = Math.min(this.now() + GRANT_TTL, subscription.expirationTime || Infinity)
-    this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(preferences), sessionHash: hash(sessionId), expiresAt })
+    this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(preferences), sessionHash: hash(sessionId), expiresAt, ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : {}) })
     await this.save()
     return { ok: true, expiresAt }
   }
@@ -199,6 +206,16 @@ export class PushService {
     let changed = false
     for (const [endpoint, device] of this.devices) if (device.sessionHash === sessionHash) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); changed = true }
     if (changed) await this.save()
+  }
+
+  async changeCredentialVersion(credentialVersion: string, retainedSessionId: string) {
+    this.credentialVersion = credentialVersion
+    const retainedHash = hash(retainedSessionId)
+    for (const [endpoint, device] of this.devices) {
+      if (device.sessionHash !== retainedHash) { this.devices.delete(endpoint); this.testTimes.delete(endpoint) }
+      else device.credentialVersion = credentialVersion
+    }
+    await this.save()
   }
 
   async test(sessionId: string, endpoint: string) {

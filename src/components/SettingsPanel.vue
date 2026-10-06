@@ -4,6 +4,7 @@ import Icon from "./Icon.vue";
 import ConnectionDialog from "./ConnectionDialog.vue";
 import FolderPicker from "./FolderPicker.vue";
 import PwaSettings from "./PwaSettings.vue";
+import PasswordSettings from "./PasswordSettings.vue";
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -915,7 +916,7 @@ watch(
                 <strong>网页访问</strong
                 ><span>{{
                   state.authRequired
-                    ? "使用访问密码进行身份验证"
+                    ? "使用访问密码验证，网页保持登录 30 天"
                     : "当前服务未要求访问密码"
                 }}</span>
               </div>
@@ -928,6 +929,7 @@ watch(
                 退出网页
               </button>
             </div>
+            <PasswordSettings v-if="state.authRequired" :api="api" :state="state" />
           </template>
           <template v-else-if="section === 'integrations'">
             <div class="settings-title-row">

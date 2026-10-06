@@ -14,17 +14,19 @@ npm run doctor:daemon
 npm run doctor:preview
 ```
 
-`tests/protocol.test.ts` 在安装 Codex CLI 后实际启动隔离的 app-server，不使用真实 `CODEX_HOME`，不发 `turn/start`。缺少 CLI 时会跳过，不能将跳过解释为协议验证成功。首次运行 Playwright 前使用 `npx playwright install chromium`；浏览器用例对真实 Vue 页面注入测试专用 HTTP/WebSocket 事件，不发模型请求。
+`tests/protocol.test.ts` 在安装 Codex CLI 后实际启动隔离的 app-server，不使用真实 `CODEX_HOME`，不发 `turn/start`。缺少 CLI 时会跳过，不能将跳过解释为协议验证成功。首次运行 Playwright 前使用 `npx playwright install chromium`；浏览器用例对真实 Vue 页面注入测试专用 HTTP/WebSocket 事件，不发模型请求。Playwright 仅在独立 `5174` 端口启动前端 Vite，关闭 API 代理，不启动真实后台或复用开发服务器；PWA 用例另启动临时端口的静态资源服务。
 
 `npm run doctor` 默认只读。`npm run doctor -- --turn` 主动发起一条真实推理并验证第二个 app-server 可以从同数据目录读取会话，结束后归档诊断会话。这项操作使用模型额度，适合部署后主动验证。
 
 ## 开发时实际验证（2026-10-06）
 
-- 最终检查：`npm test` 的 117 项单元/协议测试全部通过，无跳过；`npm run build` 完成 Vue 类型检查、Vite 生产构建与 Node 服务端编译。终端断线后的进程/输出恢复、原连接 RPC 隔离和会话失效关闭连接均有测试覆盖。
+- 最终检查：`npm test` 的 127 项单元/协议测试全部通过，无跳过；`npm run build` 完成 Vue 类型检查、Vite 生产构建与 Node 服务端编译。终端断线后的进程/输出恢复、原连接 RPC 隔离和会话失效关闭连接均有测试覆盖。
 - Docker：实际 Linux/ARM64 Debian 镜像通过多阶段构建与健康启动，非 root UID 1000，无 privileged/Docker socket；隔离 Colima 环境中的真实 app-server、登录/CSRF/Origin/WS、独立静态资源、文件、PTY stdin/resize、显式权限的持久 Shell 探测、中文 Tmux 新建/读取/切换参数/删除全部通过。强制重建后 Web 数据卷、Codex home 卷和工作区 bind 文件均保留；公网 overlay 不发布应用端口，HTTPS origin 的 Secure Cookie 与官方 Caddy 容器配置校验通过。测试容器/卷和临时凭据已清理，专用 VM 已停止，原 8787 服务正常。未验实际 ACME 签发、amd64 容器或真实 SSH。
 - Docker 权限与兼容：标准隔离策略下 read-only/workspace-write 命令实际返回 bwrap namespace 权限错误；full access 的命令、终端与 Tmux 已通过，没有自动扩大权限。修复 Debian tmux 3.3a 将 TAB 替换为下划线导致的列表/创建解析问题，版本化可打印字段转义 `%` 和 `|`，兼容旧 TAB；中文、分隔符、反斜杠和特殊路径有真实 tmux 与解析回归。持久 Shell 探测遵循用户选择的权限，namespace 失败明确显示原因且不以更宽权限重试。
-- Playwright Chromium：完整 `npm run test:e2e` 的 105 个真实 Vue 页面用例通过，覆盖登录、增量流式/去重、执行中追加输入的 `turn/steer`、上下文比例、模型/权限、Fork、自动/手动压缩、审批、Slash/@/命令面板、上传数据、命令 Unicode 字节流、HTML sandbox、PTY 输入/resize/结束、SSH 测试与编辑、内容排序、过程运行时展开与结束折叠、侧栏 4 项折叠、工作区调宽、项目菜单、目录选择、新对话位置、文件下载、Tmux 管理、PWA/通知恢复与 390px 手机布局。HTTP/WebSocket 由测试 fixtures 提供，不代表实际模型、SSH 或公网验证。
+- Playwright Chromium：完整 `npm run test:e2e` 的 112 个真实 Vue 页面用例通过，覆盖登录、增量流式/去重、执行中追加输入的 `turn/steer`、上下文比例、模型/权限、Fork、自动/手动压缩、审批、Slash/@/命令面板、上传数据、命令 Unicode 字节流、HTML sandbox、PTY 输入/resize/结束、SSH 测试与编辑、内容排序、过程运行时展开与结束折叠、侧栏 4 项折叠、工作区调宽、项目菜单、目录选择、新对话位置、文件下载、Tmux 管理、PWA/通知恢复与 390px 手机布局。HTTP/WebSocket 由测试 fixtures 提供，不代表实际模型、SSH 或公网验证。
 - PWA：生产构建使用真实 Chromium Service Worker，验证 manifest/icon 可访问、公开资源预缓存、离线启动不展示私人历史、联网重新登录与连接、等待更新不重载活动任务。390px 生产页在本机检查通知设置及主动更新。
+- 访问密码：30 天登录/Cookie 边界、鉴权/CSRF、当前密码校验与共享限流、严格输入、600 散列文件与 700 目录、重启及环境变量优先级、原子写失败保留旧密码、并发修改、其他设备 WebSocket/预览/推送撤销均经过隔离后端验证；有效同代际通知授权跨重启保留，密码重置拒绝旧备份授权及缺少凭证代际的旧版订阅。7 项浏览器用例覆盖表单校验、错误脱敏、成功/取消/关闭清空字段、重复提交、主机断线仍可修改、断网不排队及 390px 布局。
+- 本机密码设置：最新生产服务已重启并用原访问密码重新登录，在 390px 页面核对 30 天提示、三个密码输入框及保存/取消按钮；真实密码修改使用隔离测试数据验证，本机表单保持空白。
 - 后台通知：后端验证鉴权/CSRF、厂商 endpoint 白名单、真实 VAPID/AES128GCM 请求加密（HTTPS 传输模拟，无外网）、成功与 410 清理、WebSocket 全部关闭仍接收事件、主机/设备隔离、去重、自然登录过期保留授权、显式退出撤销及私有文件重启持久化。浏览器验证点击手势、分类/测试/关闭/退出、密钥轮换、失效 endpoint 不重登记、多标签偏好与迟到恢复 POST 竞态；PushManager 与通知许可采用隔离模拟，不实际向手机或外部推送服务发送。
 - 通知导航与断网：5 项浏览器用例验证登录后仍打开指定主机/对话、跨主机同 ID 隔离、当前远端断线不阻塞本机目标、离线通知恢复、草稿保留与不自动重发。手机锁屏/关闭页面后的实际系统送达需要 [真实设备验收](pwa.md#真机验收)。
 - Codex CLI 0.159.2：隔离 stdio 握手、配置/模型/历史列表、文件/目录 RPC通过。

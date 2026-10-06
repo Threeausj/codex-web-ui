@@ -14,7 +14,7 @@
 | `compose.public.yaml` | Caddy 暴露 80/443；应用仅在 Compose 网络内可达 |
 | `deploy/docker/env.example` | 环境模板，复制为被 Git 忽略的 `.env.docker` |
 | `deploy/docker/Caddyfile` | 自动 HTTPS 与 WebSocket 反向代理 |
-| `webdata` 卷 → `/app/data` | 网页主机、项目、偏好、上传、推送密钥与设备授权 |
+| `webdata` 卷 → `/app/data` | 网页访问密码散列、主机、项目、偏好、上传、推送密钥与设备授权 |
 | `codexhome` 卷 → `/home/node/.codex` | Codex 登录、配置和持久化历史 |
 | `WORKSPACE_PATH` → `/workspace` | 宿主机项目目录，读写挂载 |
 
@@ -46,6 +46,14 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，输入网页密码，然后浏览 `/workspace` 并添加项目。若宿主机已有服务占用 8787，先停止其中一个服务，或修改本地 overlay 的宿主机端口，并同步本地 `PUBLIC_ORIGIN`。
 
 本地 HTTP origin 不设置 Secure Cookie；公网 HTTPS origin 自动设置 Secure Cookie。两种方式均保留 HttpOnly、SameSite、CSRF 与 Origin 校验，`NODE_ENV` 不用于关闭鉴权。
+
+## 访问密码与登录
+
+网页登录会话有效期为 **30 天**，保存在服务进程内，重启服务后需重新登录。进入“设置 → 账户 → 网页访问 → 修改访问密码”，输入当前密码及两次新密码；新密码需 12–1024 个字符。保存后当前登录续期 30 天并保留已有连接，其他设备的登录和后台通知授权即时撤销。修改访问密码不修改 Codex 模型账户。
+
+首次启动用 `CODEX_WEB_PASSWORD` 初始化凭证；之后 `/app/data/web-password.json` 中的 scrypt 散列优先于环境变量，文件权限为 `0600`。设置里保存的密码不会写入 `.env.docker`、明文初始密码文件或日志；保留 `webdata` 卷即可跨重启保留密码。初始 `.env.docker` 和 `bootstrap-password.txt` 中的值可能已不再是当前密码。
+
+忘记密码时，先停止应用并备份 `webdata`，将 `.env.docker` 的 `CODEX_WEB_PASSWORD` 设置为新初始密码，再从该卷中仅移除 `web-password.json` 后启动服务。新凭证会从环境变量重新初始化，旧登录及旧设备授权不再有效。不要删除整个数据卷或 Codex 历史来重置密码；散列文件损坏时服务会拒绝启动，需要按相同步骤恢复。
 
 ## 公网 HTTPS
 
@@ -167,6 +175,7 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 | Compose 提示密码未设置 | `--env-file .env.docker` 是否存在，密码是否至少 12 位 |
 | Bind mount 不存在/Permission denied | `WORKSPACE_PATH` 是宿主机已有目录，UID 1000 具有访问权限 |
 | 登录后仍显示未登录 | 域名与 `PUBLIC_ORIGIN` 一致；HTTPS 配置需 HTTPS 访问，检查代理与 Cookie |
+| `.env.docker` 密码无法登录 | 已保存的 `web-password.json` 优先；使用设置里更新后的密码，忘记时按访问密码重置步骤恢复 |
 | 网页可登录但模型不可用 | 容器中执行 `codex login --device-auth`；确认账户模型权限/提供方配置 |
 | SSH 错误 | 从容器测试同一别名，检查挂载路径、身份文件权限及已核验的 `known_hosts` |
 | 没有桌面历史 | 默认卷独立；核对同数据目录和绝对项目路径，不假设自动云同步 |

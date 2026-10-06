@@ -612,7 +612,7 @@ watch(() => [state.authenticated, state.online, state.connected, state.loading, 
   void openPendingPushTarget();
 });
 watch(() => [state.authenticated, state.loading], () => {
-  if (state.authenticated && state.connected && !state.loading)
+  if (state.authenticated && !state.loading)
     void initializeDevicePush(api);
 });
 </script>

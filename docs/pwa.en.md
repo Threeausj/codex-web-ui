@@ -37,7 +37,7 @@ iOS/iPadOS Web Push is available to home-screen web apps. Permission needs a dir
 
 Notifications contain generic wording and exclude replies, project names, file paths, commands, and chat titles. Navigation data identifies the host/chat to reopen; a valid web login is still required. A notification never approves a request or runs an operation.
 
-Device authorization lasts **up to 30 days**, or less if the browser subscription expires sooner, independently of the **8-hour web login**. Natural login expiration or Node restarts do not directly revoke a still-valid device authorization. Restoring/saving an existing subscription after login renews it. Explicit logout revokes subscriptions associated with that login, leaving other devices unaffected. After clearing browser data, revoking OS permission, deleting persistent data, or rotating VAPID keys, sign in and enable notifications again. Push-service responses 404/410 remove invalid subscriptions.
+Device authorization lasts **up to 30 days**, or less if the browser subscription expires sooner, independently of the **30-day web login session**. Natural login expiration or Node restarts do not directly revoke a still-valid device authorization. Restoring/saving an existing subscription after login renews it. Explicit logout revokes subscriptions associated with that login, leaving other devices unaffected. Changing the access password under Settings → Account → Web access revokes other devices' sessions and push authorizations, retaining devices associated with the current login. After clearing browser data, revoking OS permission, deleting persistent data, or rotating VAPID keys, sign in and enable notifications again. Push-service responses 404/410 remove invalid subscriptions.
 
 Private state is stored with mode `0600` in `DATA_DIR`:
 
@@ -59,6 +59,8 @@ Delivery depends on vendor services, network access, permissions, Focus, and OS 
 The Service Worker caches only the public app shell and static assets. APIs, uploads, previews, and private conversations are not cached. The shell may open offline, but sending, approvals, file operations, and task execution require connectivity. Reconnect and obtain current login/chat state before acting.
 
 Settings shows **New version available** (“有新版本可用”) when an update is ready. **Update app** (“更新应用”) activates it and reloads only after your action; the button is disabled during a running task. Version detection never automatically refreshes a working page. Plan backend restarts and retain persistent data as described in [Docker operations](docker.en.md#operations-backups-and-upgrades).
+
+Legacy device subscriptions without a credential generation are revoked on upgrade. Enable notifications again on each affected device.
 
 ## Real-device acceptance
 
