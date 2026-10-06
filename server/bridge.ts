@@ -7,10 +7,11 @@ import type { Host, RpcId, RpcMessage } from './types.js'
 import { rpcError } from './types.js'
 import { webSocketProxyTransport } from './proxy-transport.js'
 import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
+import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
-export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
+export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Pending = { originalId?: RpcId; clientKey?: string; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
@@ -27,7 +28,7 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   const executable = host.kind === 'ssh' ? 'ssh' : options.codexBin || 'codex'
   let args: string[]
   if (host.kind === 'ssh') {
-    args = sshAppServerArgs(host, options.mode, options.connectionProbe)
+    args = sshAppServerArgs(host, options.mode, options.connectionProbe, options.sshHostKeyPin)
   } else args = codexAppServerArgs(options.mode, options.socketPath)
   const child: ChildProcessWithoutNullStreams = spawn(executable, args, {
     cwd: options.cwd || process.cwd(),
@@ -90,7 +91,17 @@ export class Bridge {
   private async initialize() {
     const generation = ++this.generation
     this.lastError = undefined
-    const transport = this.options.transportFactory ? this.options.transportFactory(this.host) : spawnTransport(this.host, this.options)
+    let transport: Transport
+    try {
+      const knownHostsFile = this.host.kind === 'ssh' && this.options.resolveSshHostKeyPin
+        ? await this.options.resolveSshHostKeyPin(this.host) : this.options.sshHostKeyPin
+      if (generation !== this.generation || this.disposed) throw new Error('Host connection was closed')
+      transport = this.options.transportFactory ? this.options.transportFactory(this.host)
+        : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile })
+    } catch (error) {
+      if (generation === this.generation) this.disconnect(error as Error)
+      throw error
+    }
     this.transport = transport
     const decoder = new StringDecoder('utf8')
     let buffer = ''

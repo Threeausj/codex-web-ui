@@ -2193,6 +2193,12 @@ async function testHost(host: any) {
     false,
   );
 }
+async function inspectHostKey(fields: { hostname: string; port?: number | null }) {
+  return http('/hosts/key/inspect', { method: 'POST', body: JSON.stringify(fields) }, false);
+}
+async function trustHostKey(fields: { hostname: string; port?: number | null; challenge: string; replace: boolean }) {
+  return http('/hosts/key/trust', { method: 'POST', body: JSON.stringify(fields) }, false);
+}
 async function uploadSshKey(file: File) {
   const body = new FormData();
   body.append("key", file);
@@ -2305,10 +2311,10 @@ async function readDirectory(path: string) {
         a.name.localeCompare(b.name),
     );
 }
-async function readFile(path: string) {
-  const result = await rpc("fs/readFile", { path });
+async function readFile(path: string, options: { silentError?: boolean } = {}) {
+  const result = await rpc("fs/readFile", { path }, 45000, options);
   if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024 * 4) / 3))
-    throw fail(new Error("文件超过 8 MB，请使用终端读取"));
+    throw (options.silentError ? new Error("文件超过 8 MB，请使用终端读取") : fail(new Error("文件超过 8 MB，请使用终端读取")));
   const extensions: Record<string, string> = {
     png: "image/png",
     jpg: "image/jpeg",
@@ -2316,6 +2322,9 @@ async function readFile(path: string) {
     gif: "image/gif",
     webp: "image/webp",
     svg: "image/svg+xml",
+    bmp: "image/bmp",
+    ico: "image/x-icon",
+    avif: "image/avif",
   };
   const mime =
     extensions[path.split(".").pop()?.toLowerCase() ?? ""] ?? "text/plain";
@@ -2946,6 +2955,8 @@ export function useCodex() {
     setHost,
     addHost,
     testHost,
+    inspectHostKey,
+    trustHostKey,
     uploadSshKey,
     removeSshKey,
     updateHost,

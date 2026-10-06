@@ -12,14 +12,15 @@ export type ConnectionTestResult = {
   elapsedMs: number
   stage: 'identity' | 'ssh' | 'codex' | 'protocol' | 'timeout' | 'ready'
   version?: string
+  hostKeyRequired?: boolean
 }
 
 /** Classify bounded diagnostics; never expose shell banners, paths or account data. */
-export function connectionFailure(error: unknown, diagnostic: string, stage: 'ssh' | 'protocol', timedOut = false): Pick<ConnectionTestResult, 'stage' | 'message'> {
+export function connectionFailure(error: unknown, diagnostic: string, stage: 'ssh' | 'protocol', timedOut = false): Pick<ConnectionTestResult, 'stage' | 'message' | 'hostKeyRequired'> {
   const message = error instanceof Error ? error.message : ''
   const text = `${diagnostic}\n${message}`.slice(-20_000)
   if (/UNPROTECTED PRIVATE KEY FILE|bad permissions|Load key .*?(?:Permission denied|invalid format)|Identity file .*?not accessible/i.test(text)) return { stage: 'identity', message: '无法使用身份文件，请检查文件路径、格式与权限。' }
-  if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .*host key is known|strict checking/i.test(text)) return { stage: 'ssh', message: '主机密钥未受信任或已变更。请先在服务器终端确认此 SSH 主机的指纹，再测试连接。' }
+  if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .*host key is known|strict checking/i.test(text)) return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更。请在此窗口获取服务器指纹，确认并信任后再连接。' }
   if (/Permission denied \(|Authentication failed|Too many authentication failures|sign_and_send_pubkey: signing failed/i.test(text)) return { stage: 'ssh', message: 'SSH 身份验证失败。请检查用户名、身份文件或服务器上的 SSH agent；测试不支持交互输入密码。' }
   if (/Could not resolve hostname|Name or service not known|nodename nor servname provided/i.test(text)) return { stage: 'ssh', message: '无法解析主机名或 SSH 别名，请检查地址和服务器的 SSH 配置。' }
   if (/Connection refused|No route to host|Network is unreachable/i.test(text)) return { stage: 'ssh', message: '无法连接 SSH 端口，请检查主机地址、端口与网络。' }

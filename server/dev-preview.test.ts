@@ -8,6 +8,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { createServer } from './app.js'
 import { rewriteDevelopmentResponse, sshForwardArgs } from './dev-preview.js'
 import { persistentSessionName } from './persistent-terminal.js'
+import { sshKnownHostsArgs } from './ssh.js'
 
 const listen = (server: http.Server) => new Promise<number>(resolve => server.listen(0, '127.0.0.1', () => resolve((server.address() as { port: number }).port)))
 
@@ -106,6 +107,37 @@ test('SSH preview forwarding is loopback-only and rejects argument injection', (
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: '-oProxyCommand=touch /tmp/bad' }, 43210, 5173))
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: 'example.invalid', username: 'user;touch' }, 43210, 5173))
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: 'example.invalid' }, 43210, 80))
+})
+
+test('SSH preview forwarding pins managed keys with the same strict trust options and preserves SSH defaults for unmanaged hosts', () => {
+  const host = { id: 'ssh-pinned', kind: 'ssh' as const, name: 'Pinned fixture', hostname: 'host.example.test', username: 'test', port: 2222, identityFile: '/fixture/key with spaces' }
+  const unmanaged = sshForwardArgs(host, 43210, 5173)
+  assert.deepEqual(unmanaged, [
+    '-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+    '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR',
+    '-L', '127.0.0.1:43210:127.0.0.1:5173', '-p', '2222', '-i', '/fixture/key with spaces',
+    '--', 'test@host.example.test',
+  ])
+  for (const file of ['/fixture/known hosts', '/fixture/"quoted"\\known_hosts', '/fixture/100%complete']) {
+    const pin = { file, hostKeyAlias: '[host.example.test]:2222' }
+    const managed = sshForwardArgs(host, 43210, 5173, pin)
+    const trust = sshKnownHostsArgs(pin)
+    assert.deepEqual(managed, [...unmanaged.slice(0, 14), ...trust, ...unmanaged.slice(14)])
+    assert.equal(managed.filter(value => value === 'StrictHostKeyChecking=yes').length, 1)
+    assert.ok(managed.includes('GlobalKnownHostsFile=/dev/null'))
+    assert.ok(managed.includes('KnownHostsCommand=none'))
+    assert.ok(managed.includes('HostKeyAlias=[host.example.test]:2222'))
+    assert.ok(managed.includes('VerifyHostKeyDNS=no'))
+    assert.ok(managed.includes('NoHostAuthenticationForLocalhost=no'))
+    assert.ok(managed.includes('UpdateHostKeys=no'))
+    assert.ok(managed.includes('ControlPath=none'))
+    assert.ok(managed.includes('ControlMaster=no'))
+    assert.ok(managed.includes('ControlPersist=no'))
+    assert.ok(!managed.includes('StrictHostKeyChecking=no'))
+    assert.ok(!managed.includes('StrictHostKeyChecking=accept-new'))
+    assert.deepEqual(managed.slice(-2), ['--', 'test@host.example.test'])
+  }
+  assert.ok(!unmanaged.some(value => /^(?:UserKnownHostsFile|GlobalKnownHostsFile|KnownHostsCommand)=/.test(value)))
 })
 
 test('preview root assets and project tmux names remain scoped', () => {

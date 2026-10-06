@@ -15,7 +15,20 @@ const emit = defineEmits<{ close: []; saved: [] }>();
 const modal = ref<HTMLElement>();
 const form = ref<HTMLFormElement>();
 const keyInput = ref<HTMLInputElement>();
-const busy = ref<"" | "test" | "save" | "upload">("");
+const busy = ref<"" | "test" | "save" | "upload" | "inspect" | "trust">("");
+type HostKeyInfo = {
+  hostname: string;
+  port: number;
+  status: "unknown" | "trusted" | "changed";
+  keys: { type: string; fingerprint: string }[];
+  previousFingerprints?: (string | { type?: string; fingerprint: string })[];
+  challenge: string;
+  expiresAt?: number | string;
+};
+const hostKey = ref<HostKeyInfo | null>(null);
+const replaceHostKey = ref(false);
+let hostKeyGeneration = 0;
+let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 const uploadedKey = ref<{ identityFile: string; name: string }>();
 const draftKeys = new Map<string, string>();
 const error = ref("");
@@ -34,9 +47,132 @@ const title = computed(() =>
   props.host?.id ? "编辑 SSH 连接" : "添加 SSH 连接",
 );
 const testedVersion = computed(() => testResult.value?.version || "");
+const hostKeyTarget = computed(() => `${draft.hostname.trim()}\n${String(draft.port).trim()}`);
+const hostKeyTrustLabel = computed(() =>
+  hostKey.value?.status === "changed" ? "替换指纹并测试连接" : "信任并测试连接",
+);
 let previousFocus: HTMLElement | null = null;
 let disposed = false;
 let savedIdentityFile = "";
+
+function clearHostKey() {
+  hostKeyGeneration++;
+  hostKey.value = null;
+  replaceHostKey.value = false;
+  clearTimeout(expiryTimer);
+  expiryTimer = undefined;
+}
+watch(hostKeyTarget, clearHostKey, { flush: "sync" });
+
+function keyTarget() {
+  const hostname = draft.hostname.trim();
+  if (!hostname) throw new Error("请输入 SSH 主机名");
+  const port = String(draft.port).trim() ? Number(draft.port) : null;
+  if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535))
+    throw new Error("请输入 1–65535 之间的 SSH 端口");
+  return { hostname, port };
+}
+function isHostKeyError(cause: any) {
+  return cause?.hostKeyRequired === true ||
+    /主机密钥|服务器指纹|host key|host identification/i.test(cause?.message || "");
+}
+function previousFingerprint(key: string | { type?: string; fingerprint: string }) {
+  return typeof key === "string" ? key : `${key.type ? `${key.type} · ` : ""}${key.fingerprint}`;
+}
+function scheduleHostKeyExpiry(info: HostKeyInfo, generation: number) {
+  if (!info.challenge || !info.expiresAt) return;
+  const expiry = typeof info.expiresAt === "number"
+    ? (info.expiresAt < 1e12 ? info.expiresAt * 1000 : info.expiresAt)
+    : Date.parse(info.expiresAt);
+  if (!Number.isFinite(expiry)) return;
+  expiryTimer = setTimeout(() => {
+    if (disposed || generation !== hostKeyGeneration || hostKey.value?.challenge !== info.challenge) return;
+    clearHostKey();
+    error.value = "服务器指纹确认已过期，请重新获取服务器指纹。";
+  }, Math.max(0, expiry - Date.now()));
+}
+async function fetchHostKey(target: { hostname: string; port: number | null }) {
+  clearHostKey();
+  const generation = hostKeyGeneration;
+  const scope = hostKeyTarget.value;
+  const result = await props.api.inspectHostKey(target);
+  if (disposed || generation !== hostKeyGeneration || scope !== hostKeyTarget.value) return;
+  if (!result?.keys?.length || !["unknown", "trusted", "changed"].includes(result.status))
+    throw new Error("未获取到服务器指纹，请稍后重试。");
+  if (result.status !== "trusted" && !result.challenge)
+    throw new Error("服务器指纹确认已过期，请重新获取服务器指纹。");
+  hostKey.value = result;
+  error.value = "";
+  scheduleHostKeyExpiry(result, generation);
+}
+async function finishBusy() {
+  if (disposed) await cleanDraftKeys(savedIdentityFile);
+  else busy.value = "";
+}
+async function inspectHostKey() {
+  if (busy.value) return;
+  error.value = "";
+  testResult.value = null;
+  try {
+    const target = keyTarget();
+    busy.value = "inspect";
+    await fetchHostKey(target);
+  } catch (cause: any) {
+    if (!disposed) error.value = cause?.message || "获取服务器指纹失败";
+  } finally {
+    await finishBusy();
+  }
+}
+async function checkConnection(fields: ReturnType<typeof payload>) {
+  const generation = hostKeyGeneration;
+  const scope = hostKeyTarget.value;
+  const result = await props.api.testHost(fields);
+  if (disposed || generation !== hostKeyGeneration || scope !== hostKeyTarget.value) return;
+  if (result?.ok === false || result?.success === false) {
+    const failure = new Error(result.error || result.message || "连接测试失败");
+    if (result.hostKeyRequired === true) Object.assign(failure, { hostKeyRequired: true });
+    throw failure;
+  }
+  testResult.value = result || { ok: true };
+}
+async function trustHostKey() {
+  const info = hostKey.value;
+  if (busy.value || !info?.challenge || info.status === "trusted" ||
+      (info.status === "changed" && !replaceHostKey.value) || !form.value?.reportValidity()) return;
+  error.value = "";
+  testResult.value = null;
+  try {
+    const fields = payload();
+    const generation = hostKeyGeneration;
+    busy.value = "trust";
+    clearTimeout(expiryTimer);
+    const result = await props.api.trustHostKey({
+      hostname: fields.hostname,
+      port: fields.port,
+      challenge: info.challenge,
+      replace: info.status === "changed",
+    });
+    if (disposed || generation !== hostKeyGeneration) return;
+    if (result?.ok === false) throw new Error(result.error || "信任服务器指纹失败");
+    clearTimeout(expiryTimer);
+    hostKey.value = { ...info, status: "trusted", challenge: "" };
+    replaceHostKey.value = false;
+    busy.value = "test";
+    await checkConnection(fields);
+  } catch (cause: any) {
+    if (!disposed) {
+      error.value = cause?.message || "信任服务器指纹失败";
+      if (busy.value === "trust") clearHostKey();
+      else if (isHostKeyError(cause)) {
+        busy.value = "inspect";
+        try { await fetchHostKey(keyTarget()); }
+        catch (scanError: any) { error.value = scanError?.message || "获取服务器指纹失败"; }
+      }
+    }
+  } finally {
+    await finishBusy();
+  }
+}
 
 async function cleanDraftKeys(keep = "") {
   await Promise.all([...draftKeys].map(async ([id, identityFile]) => {
@@ -85,11 +221,7 @@ watch(
 );
 
 function payload() {
-  const hostname = draft.hostname.trim();
-  if (!hostname) throw new Error("请输入 SSH 主机名");
-  const port = String(draft.port).trim() ? Number(draft.port) : null;
-  if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535))
-    throw new Error("请输入 1–65535 之间的 SSH 端口");
+  const { hostname, port } = keyTarget();
   const identityFile =
     identityMode.value === "file" ? draft.identityFile.trim() : "";
   if (identityMode.value === "file" && !identityFile)
@@ -113,11 +245,7 @@ async function submit(kind: "test" | "save") {
     const fields = payload();
     busy.value = kind;
     if (kind === "test") {
-      const result = await props.api.testHost(fields);
-      if (disposed) return;
-      if (result?.ok === false || result?.success === false)
-        throw new Error(result.error || result.message || "连接测试失败");
-      testResult.value = result || { ok: true };
+      await checkConnection(fields);
     } else {
       if (props.host?.id) await props.api.updateHost(props.host.id, fields);
       else await props.api.addHost(fields);
@@ -126,16 +254,21 @@ async function submit(kind: "test" | "save") {
       if (!disposed) emit("saved");
     }
   } catch (cause: any) {
-    if (!disposed)
+    if (!disposed) {
       error.value =
         cause?.message || (kind === "test" ? "连接测试失败" : "保存连接失败");
+      if (kind === "test" && isHostKeyError(cause)) {
+        busy.value = "inspect";
+        try { await fetchHostKey(keyTarget()); }
+        catch (scanError: any) { error.value = scanError?.message || "获取服务器指纹失败"; }
+      }
+    }
   } finally {
-    if (disposed) await cleanDraftKeys(savedIdentityFile);
-    else busy.value = "";
+    await finishBusy();
   }
 }
 function close() {
-  if (busy.value !== "save" && busy.value !== "upload") emit("close");
+  if (busy.value !== "save" && busy.value !== "upload" && busy.value !== "trust") emit("close");
 }
 function focusableElements() {
   return [
@@ -184,6 +317,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   disposed = true;
+  clearHostKey();
   if (!busy.value) void cleanDraftKeys(savedIdentityFile);
   document.removeEventListener("keydown", onKeyDown, true);
   if (previousFocus?.isConnected) previousFocus.focus();
@@ -207,7 +341,7 @@ onBeforeUnmount(() => {
             class="ssh-close icon-button"
             type="button"
             aria-label="关闭 SSH 连接"
-            :disabled="busy === 'save' || busy === 'upload'"
+            :disabled="busy === 'save' || busy === 'upload' || busy === 'trust'"
             @click="close"
           >
             <Icon name="X" :size="18" />
@@ -256,6 +390,56 @@ onBeforeUnmount(() => {
                 autocomplete="off"
               />
             </label>
+            <button
+              class="ssh-fingerprint-button"
+              type="button"
+              :disabled="!!busy || !draft.hostname.trim()"
+              @click="inspectHostKey"
+            >
+              <Icon
+                :name="busy === 'inspect' ? 'LoaderCircle' : 'Shield'"
+                :size="15"
+                :class="{ spin: busy === 'inspect' }"
+              />{{ busy === "inspect" ? "正在获取服务器指纹…" : "获取服务器指纹" }}
+            </button>
+            <section
+              v-if="hostKey"
+              class="ssh-host-key"
+              :class="{ changed: hostKey.status === 'changed', trusted: hostKey.status === 'trusted' }"
+              aria-label="SSH 服务器指纹"
+            >
+              <h3>{{ hostKey.status === "changed" ? "服务器指纹已变更" : hostKey.status === "trusted" ? "服务器指纹已受信任" : "首次连接：确认服务器指纹" }}</h3>
+              <p class="ssh-host-key-target">{{ hostKey.hostname }}:{{ hostKey.port }}</p>
+              <template v-if="hostKey.status === 'changed'">
+                <p>请确认服务器重装或更换密钥后，再替换此前保存的指纹。</p>
+                <div v-if="hostKey.previousFingerprints?.length" class="ssh-fingerprint-list previous">
+                  <strong>此前信任的指纹</strong>
+                  <code v-for="(key, index) in hostKey.previousFingerprints" :key="index">{{ previousFingerprint(key) }}</code>
+                </div>
+              </template>
+              <p v-else-if="hostKey.status === 'unknown'">核对下方指纹后点击信任，即可直接测试连接。</p>
+              <div class="ssh-fingerprint-list">
+                <strong>{{ hostKey.status === "changed" ? "本次获取的指纹" : "服务器公钥指纹" }}</strong>
+                <div v-for="key in hostKey.keys" :key="`${key.type}:${key.fingerprint}`">
+                  <span>{{ key.type }}</span>
+                  <code>{{ key.fingerprint }}</code>
+                </div>
+              </div>
+              <label v-if="hostKey.status === 'changed'" class="ssh-replace-host-key">
+                <input v-model="replaceHostKey" type="checkbox" :disabled="!!busy" />
+                <span>我已确认服务器密钥变更，同意替换此前信任的指纹</span>
+              </label>
+              <button
+                v-if="hostKey.status !== 'trusted'"
+                class="ssh-trust-button"
+                type="button"
+                :disabled="!!busy || !hostKey.challenge || (hostKey.status === 'changed' && !replaceHostKey)"
+                @click="trustHostKey"
+              >
+                <Icon :name="busy === 'trust' ? 'LoaderCircle' : 'Shield'" :size="15" :class="{ spin: busy === 'trust' }" />
+                {{ busy === "trust" ? "正在保存服务器指纹…" : hostKeyTrustLabel }}
+              </button>
+            </section>
             <div
               class="ssh-identity-selector"
               role="group"
@@ -395,7 +579,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="ssh-cancel"
-                :disabled="busy === 'save' || busy === 'upload'"
+                :disabled="busy === 'save' || busy === 'upload' || busy === 'trust'"
                 @click="close"
               >
                 取消
@@ -539,6 +723,109 @@ onBeforeUnmount(() => {
 }
 .ssh-field input:disabled {
   opacity: 0.6;
+}
+.ssh-fingerprint-button,
+.ssh-trust-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 12px;
+}
+.ssh-fingerprint-button {
+  align-self: flex-start;
+  margin-top: -7px;
+  color: var(--muted);
+}
+.ssh-fingerprint-button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+.ssh-host-key {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.ssh-host-key h3,
+.ssh-host-key p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ssh-host-key h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.ssh-host-key p {
+  color: var(--muted);
+}
+.ssh-host-key .ssh-host-key-target {
+  color: var(--text);
+}
+.ssh-host-key.changed {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+.ssh-host-key.changed h3 {
+  color: var(--warning);
+}
+.ssh-host-key.trusted h3 {
+  color: var(--green);
+}
+.ssh-fingerprint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.ssh-fingerprint-list > strong {
+  font-size: 11px;
+  font-weight: 500;
+}
+.ssh-fingerprint-list > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ssh-fingerprint-list span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.ssh-fingerprint-list code {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.ssh-fingerprint-list.previous {
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--border);
+}
+.ssh-replace-host-key {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+.ssh-replace-host-key input {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--text);
+}
+.ssh-trust-button {
+  align-self: flex-start;
+  color: var(--surface);
+  background: var(--text);
 }
 .ssh-name-input {
   display: flex;
@@ -746,6 +1033,10 @@ onBeforeUnmount(() => {
     gap: 8px;
   }
   .ssh-test-button {
+    min-height: 42px;
+  }
+  .ssh-fingerprint-button,
+  .ssh-trust-button {
     min-height: 42px;
   }
   .ssh-cancel,

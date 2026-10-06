@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream'
 import type { WebSocket } from 'ws'
 import { Bridge, shellQuote, type BridgeOptions, type Transport } from './bridge.js'
 import type { Host, RpcMessage } from './types.js'
+import type { SSHHostKeyPin } from './ssh-host-keys.js'
 
 class Browser extends EventEmitter {
   readyState = 1
@@ -33,6 +34,126 @@ function fixture(options: BridgeOptions = {}, host: Host = { id: 'local', kind: 
   const bridge = new Bridge(host, { ...options, transportFactory: () => transport })
   return { bridge, sent, receive }
 }
+
+/** An isolated protocol peer allows reconnection without launching SSH or Codex. */
+function reconnectableTransport() {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const events = new EventEmitter()
+  const sent: RpcMessage[] = []
+  let buffer = ''
+  let disposed = false
+  input.on('data', chunk => {
+    buffer += chunk.toString()
+    let at: number
+    while ((at = buffer.indexOf('\n')) >= 0) {
+      const message = JSON.parse(buffer.slice(0, at)) as RpcMessage
+      buffer = buffer.slice(at + 1)
+      sent.push(message)
+      if (message.method === 'initialize') queueMicrotask(() => {
+        if (!disposed) output.write(`${JSON.stringify({ id: message.id, result: { userAgent: 'isolated-test' } })}\n`)
+      })
+    }
+  })
+  const transport: Transport = { input, output, events, dispose: () => { disposed = true; input.destroy(); output.destroy() } }
+  return { transport, sent }
+}
+
+const sshResolverHost: Host = { id: 'ssh-pinned', kind: 'ssh', name: 'Pinned fixture', hostname: 'host.example.test', username: 'test', port: 2222 }
+
+test('SSH trust is resolved before each fresh transport while tabs and simultaneous connects reuse the running engine', async () => {
+  const transports: ReturnType<typeof reconnectableTransport>[] = []
+  const resolved: string[] = []
+  let currentKnownHostsFile = { file: '/fixture/known_hosts-first', hostKeyAlias: 'host.example.test' }
+  const bridge = new Bridge(sshResolverHost, {
+    resolveSshHostKeyPin: async host => {
+      assert.equal(host, sshResolverHost)
+      resolved.push(currentKnownHostsFile.file)
+      return currentKnownHostsFile
+    },
+    transportFactory: () => {
+      assert.equal(resolved.length, transports.length + 1, 'Trust must resolve before a new transport starts')
+      const peer = reconnectableTransport()
+      transports.push(peer)
+      return peer.transport
+    },
+  })
+  try {
+    const firstTab = new Browser()
+    bridge.attach('session:first', firstTab.ws(), 'first')
+    await Promise.all([bridge.connect(), bridge.connect()])
+    assert.equal(bridge.connected, true)
+    assert.equal(transports.length, 1)
+    assert.deepEqual(resolved, ['/fixture/known_hosts-first'])
+    currentKnownHostsFile = { file: '/fixture/known_hosts-replaced', hostKeyAlias: 'host.example.test' }
+    firstTab.close()
+    const newTab = new Browser()
+    bridge.attach('session:second', newTab.ws(), 'second')
+    await bridge.connect()
+    assert.equal(transports.length, 1)
+    assert.equal(resolved.length, 1, 'Browser reconnection must retain the existing app-server')
+    transports[0]!.transport.events.emit('transportClose', new Error('Fixture connection dropped'))
+    assert.equal(bridge.connected, false)
+    await Promise.all([bridge.connect(), bridge.connect()])
+    assert.equal(bridge.connected, true)
+    assert.equal(transports.length, 2)
+    assert.deepEqual(resolved, ['/fixture/known_hosts-first', '/fixture/known_hosts-replaced'])
+    for (const peer of transports) assert.equal(peer.sent.filter(message => message.method === 'initialize').length, 1)
+  } finally { bridge.close() }
+})
+
+test('closing a bridge while SSH trust resolution is pending prevents any transport from starting', async () => {
+  let release: ((pin: SSHHostKeyPin) => void) | undefined
+  let transportsCreated = 0
+  const bridge = new Bridge(sshResolverHost, {
+    resolveSshHostKeyPin: () => new Promise(resolve => { release = resolve }),
+    transportFactory: () => { transportsCreated++; throw new Error('Unexpected transport creation') },
+  })
+  const connecting = bridge.connect()
+  const rejected = assert.rejects(connecting, /Host connection was closed/)
+  assert.equal(typeof release, 'function')
+  assert.equal(transportsCreated, 0)
+  bridge.close()
+  release!({ file: '/fixture/known_hosts', hostKeyAlias: 'host.example.test' })
+  await rejected
+  assert.equal(transportsCreated, 0)
+  assert.equal(bridge.connected, false)
+  assert.equal(bridge.lastError, 'Host connection closed')
+})
+
+test('SSH trust resolution failures start no transport and reach the connected browser as an error status', async () => {
+  let transportsCreated = 0
+  const failure = new Error('SSH fingerprint records could not be verified')
+  const bridge = new Bridge(sshResolverHost, {
+    resolveSshHostKeyPin: async () => { throw failure },
+    transportFactory: () => { transportsCreated++; throw new Error('Unexpected transport creation') },
+  })
+  try {
+    const browser = new Browser()
+    bridge.attach('session:test', browser.ws(), 'test')
+    await assert.rejects(bridge.connect(), error => error === failure)
+    assert.equal(transportsCreated, 0)
+    assert.equal(bridge.connected, false)
+    assert.equal(bridge.lastError, failure.message)
+    const status = browser.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as { connected: boolean; error?: string }
+    assert.deepEqual({ connected: status.connected, error: status.error }, { connected: false, error: failure.message })
+  } finally { bridge.close() }
+})
+
+test('local engines do not inspect SSH trust even when the service provides a resolver', async () => {
+  let resolutions = 0
+  const peer = reconnectableTransport()
+  const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Local fixture' }, {
+    resolveSshHostKeyPin: async () => { resolutions++; throw new Error('Unexpected SSH lookup') },
+    transportFactory: () => peer.transport,
+  })
+  try {
+    await bridge.connect()
+    assert.equal(bridge.connected, true)
+    assert.equal(resolutions, 0)
+    assert.equal(peer.sent.filter(message => message.method === 'initialize').length, 1)
+  } finally { bridge.close() }
+})
 
 test('bridge initializes once and routes same browser IDs to their own tab', async () => {
   const f = fixture()

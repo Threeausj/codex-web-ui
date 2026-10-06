@@ -18,6 +18,7 @@ test("workspace list and editor download the saved file bytes without changing i
     "# Demo Project\n文件读取正常",
   );
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
+  await page.getByRole("button", { name: "源码", exact: true }).click();
   await page
     .getByRole("textbox", { name: "README.md 文件内容" })
     .fill("还未保存的新内容");
