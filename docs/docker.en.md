@@ -49,6 +49,24 @@ Local HTTP origins use cookies without Secure; the HTTPS origin enables Secure. 
 
 When using a NAS IP or your own HTTPS reverse proxy, add the browser's exact origin (scheme, hostname and port) to `PUBLIC_ORIGIN`. Unlisted origins receive `403 Untrusted origin` even with the correct password. Separate multiple origins with commas. Mixed HTTP/HTTPS deployments set Secure cookies according to the trusted login origin, so LAN HTTP logins remain usable and HTTPS logins remain protected; HTTPS-only deployments always require Secure cookies. HTTP pages generate compatible UUIDs with `crypto.getRandomValues` instead of requiring the secure-context-only `crypto.randomUUID` API.
 
+## Model gateways and client identity
+
+`CODEX_CLIENT_NAME` sets app-server `initialize.clientInfo.name`, defaulting to `codex_web`. After trimming surrounding spaces, it must contain 1–64 ASCII characters, start with a letter or digit, and use only letters, digits, `_`, `.`, or `-`; control characters are always rejected. It applies to local and SSH `spawn`/`proxy` connections. The application title and version remain `Codex Web` / `0.1.0`.
+
+sub2api's “Codex official clients only” restriction may reject the default `codex_web` identity. Normally, enable “Allow Codex app-server clients” for the gateway account to keep this application's identity. If your configured gateway requires the CLI compatibility identifier, explicitly opt in by setting this in `.env.docker`:
+
+```dotenv
+CODEX_CLIENT_NAME=codex_cli_rs
+```
+
+Finish active tasks, then recreate the application container using your original Compose arguments. For a local deployment:
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --wait
+```
+
+This changes only the client compatibility identifier. It does not make this web application an official client or change the model provider, API credentials, or account permissions. Codex uses the identifier as the `originator` for new threads; a cold resume preserves the identity stored in existing history, so new and continued conversations can receive different gateway decisions. Existing daemons and active threads in `proxy` mode may retain their context. This is not a hot update: verify with a new conversation. See the [protocol notes](protocol.md#客户端标识与模型网关).
+
 ## Access password and login
 
 Web login lasts **30 days**. Sessions live in the server process, so restarting it requires login again. Under Settings → Account → Web access → Change access password (Chinese UI: “设置 → 账户 → 网页访问 → 修改访问密码”), enter the current password and confirm a new password of 12–1024 characters. Saving renews the current login for 30 days and preserves its connections, while immediately revoking other devices' logins and push authorizations. This does not change the Codex model account.

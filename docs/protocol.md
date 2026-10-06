@@ -19,6 +19,14 @@ npm test
 
 只读集成测试 `tests/protocol.test.ts` 使用独立临时 `CODEX_HOME`，实际验证 stdio 握手、配置读取、模型列表、空历史列表、文件与目录读取。它不启动推理 turn，也不修改真实桌面会话。CLI 缺失时该测试跳过。
 
+## 客户端标识与模型网关
+
+Bridge 在每次 `initialize` 中发送 `clientInfo`；`name` 来自服务端 `CODEX_CLIENT_NAME`，默认 `codex_web`，`title:Codex Web` 与 `version:0.1.0` 保持本应用信息。本机与 SSH 的 `spawn`/`proxy` 都使用同一配置。标识去除首尾空格后须为 1–64 个 ASCII 字符，以字母或数字开头，其余只允许字母、数字、`_`、`.`、`-`；控制字符始终拒绝，无效值在服务启动时拒绝。
+
+Codex 将 `clientInfo.name` 用于模型请求的 `originator`。[官方客户端初始化说明](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server)。CLI 0.159.2 的隔离本地模型服务验证表明，新 thread 使用本次初始化标识，跨进程冷恢复已有 thread 时保留历史中的 `originator`。因此继续旧对话成功并不保证新建对话会通过相同的网关客户端限制。
+
+接入 sub2api 时，通常在对应账号启用“允许 Codex app-server 客户端”并保留 `codex_web`。如已配置的网关要求 CLI 兼容标识，可显式设置 `CODEX_CLIENT_NAME=codex_cli_rs`，重新创建服务容器后用新会话验证；已有 daemon 或活动 thread 可能保留原上下文。此设置不宣称官方客户端身份，不更改模型提供方、API 凭据或权限，也不重写历史。Docker 操作见[部署指南](docker.md#模型网关与客户端标识)。
+
 ## 对话与历史
 
 | 场景 | app-server 方法/事件 | 约束 |
