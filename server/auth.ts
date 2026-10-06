@@ -186,7 +186,9 @@ export class Auth {
   private matchesPassword(password: string) { return timingSafeEqual(scryptSync(password, this.salt, 64), this.passwordHash) }
 
   private sessionCookie(req: Request, res: Response, session: Session) {
-    res.cookie(COOKIE_NAME, session.id, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure, maxAge: SESSION_TTL, path: '/' })
+    const origin = req.get('origin')
+    const httpsOrigin = Boolean(origin?.startsWith('https:') && this.isTrustedOrigin(origin))
+    res.cookie(COOKIE_NAME, session.id, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure || httpsOrigin, maxAge: SESSION_TTL, path: '/' })
   }
 
   login: RequestHandler = (req: Request, res: Response) => {

@@ -37,6 +37,41 @@ function filesystemTransport(): Transport {
   return { input, output, events: new EventEmitter(), dispose: () => { input.destroy(); output.destroy() } }
 }
 
+test('mixed HTTP/HTTPS origins keep LAN logins usable and HTTPS cookies Secure', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-origins-test-'))
+  const password = 'mixed-origin-test-password'
+  const httpOrigin = 'http://nas.example:8787'
+  const httpsOrigin = 'https://codex.example'
+  const application = await createServer({ dataDir: directory, password, origins: [httpOrigin, httpsOrigin], serveStatic: false })
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${(application.server.address() as { port: number }).port}`
+  try {
+    for (const origin of [httpOrigin, httpsOrigin]) {
+      const response = await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ password }) })
+      assert.equal(response.status, 200)
+      const cookie = response.headers.get('set-cookie')!
+      assert.equal(/;\s*Secure(?:;|$)/i.test(cookie), origin === httpsOrigin)
+      assert.match(cookie, /HttpOnly/i)
+      assert.match(cookie, /SameSite=Strict/i)
+      const session = await fetch(base + '/api/auth/session', { headers: { cookie: cookie.split(';')[0]! } })
+      assert.equal((await session.json()).authenticated, true)
+    }
+  } finally { await application.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('HTTPS-only deployments still force Secure cookies without an Origin header', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-https-only-test-'))
+  const password = 'https-only-test-password'
+  const application = await createServer({ dataDir: directory, password, origins: ['https://codex.example'], serveStatic: false })
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${(application.server.address() as { port: number }).port}`
+  try {
+    const response = await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) })
+    assert.equal(response.status, 200)
+    assert.match(response.headers.get('set-cookie')!, /;\s*Secure(?:;|$)/i)
+  } finally { await application.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
 test('frontend assets can live separately from the mounted workspace without serving workspace files', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-static-test-'))
   const cwd = path.join(directory, 'workspace')
