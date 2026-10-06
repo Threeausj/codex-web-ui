@@ -34,6 +34,7 @@ Codex 将 `clientInfo.name` 用于模型请求的 `originator`。[官方客户�
 | 新建对话 | `thread/start` | 保存服务返回的 thread id |
 | 恢复 | `thread/resume` | 恢复已有 thread，也用于重新加入同进程活动 thread |
 | Fork | `thread/fork` | 返回新 thread id；`lastTurnId` 可选择截止 turn，但该 turn 不能正在运行 |
+| 编辑上一条消息 | `thread/revert`、`turn/start` | 以 `beforeTurnId` 移除原 turn，再在同一 thread 发送修改后的输入；不撤销文件修改 |
 | 会话列表 | `thread/list` | 使用 `nextCursor` 翻页；默认仅交互来源、未归档历史 |
 | 历史 turn | `thread/turns/list` | 默认时间倒序，`itemsView` 默认 `summary`，完整消息需要 `full` |
 | 历史 item | `thread/items/list` | 使用不透明 `nextCursor`；默认时间正序 |
@@ -43,6 +44,10 @@ Codex 将 `clientInfo.name` 用于模型请求的 `originator`。[官方客户�
 | 审批 | 带 id 的 server request | 用相同 id 回答，不能误当作 notification |
 
 当前生成类型提示：`thread/read` 的 `includeTurns:true` 和 `thread/resume`/`thread/fork` 全历史返回已不推荐。对长历史应使用 metadata-only read、`excludeTurns:true` 与分页方法，按 id 合并已到达的实时事件，避免大历史截断、重复 item 或乱序。列表的 cursor 必须原样回传，不能自行计算时间偏移。
+
+消息的编辑按钮仅对最近一个已完成、失败或中断 turn 中的单条用户消息开放；运行、未确认发送、ephemeral、legacy 或禁止直接输入的代理会话不支持。`turn/steer` 会把追加指令放入同一个 turn，当前不独立编辑这种多用户消息轮，避免一起移除原输入。点击编辑或取消不修改历史，保存并重新发送才调用 `thread/revert({threadId,beforeTurnId})`。原有图片、技能和应用等结构化输入继续保留，修改文字时清空失效的 `text_elements` 偏移。撤回只改变 Codex 对话历史，已执行的命令和文件修改不会撤销。
+
+CLI 0.159.2 的 `thread/revert` 返回空的 `thread.turns` 和分页游标，客户端重新加载保留历史；`thread/reverted` 通知用于使其他连接的旧缓存失效。默认本地 ThreadStore 创建 paginated 历史，恢复仍按 thread id；请求超时或断线时先同步状态，避免自动重复撤回或发送。已用独立临时 `CODEX_HOME` 在 Docker 内的真实 CLI 0.159.2 创建两条固定 `printf` shell turn，验证同一 thread 撤回、保留前轮、冷恢复持久化和替代 turn；该验证没有调用模型或改动真实用户历史。
 
 会话排序和侧栏时间使用 `recencyAt`，列表/搜索请求 `sortKey:recency_at`。`updatedAt` 会因 resume 或配置写入改变，不能代表新消息。旧版本不支持此排序或不返回内容时间时，兼容读取最新 turn 的 `startedAt/completedAt`（`limit:1,itemsView:notLoaded`），按主机缓存并限制并发；读取失败保留已知时间，空对话使用创建时间。
 
@@ -73,6 +78,8 @@ Codex 将 `clientInfo.name` 用于模型请求的 `originator`。[官方客户�
 置顶项目和普通项目各默认显示 4 个，每个项目内聊天默认显示 4 条；已加载的更多内容可展开，当前项目/聊天在有限显示项内优先保留。此项是显示限制，不修改折叠偏好、不减少协议分页或删除历史。项目的分页加载等待本机连接就绪，加载旧对话后保留新增内容可见。
 
 ## 配置来源与权限预设
+
+“设置 → 通用 → 全局默认权限”持久化到 Web 偏好，提供只读、默认（工作区写入）、完全访问三种选择。新建或打开对话使用全局设置；会话内可单独调整，当前页面切换回该会话时保留此选择。重新设置全局权限会清除当前页面的会话权限覆盖，从下一次新 turn 生效，已经运行的 turn 或追加指令不会因此升级权限。选择仍受目标主机的管理策略约束，不修改宿主机、Docker 或 SSH 用户权限。
 
 设置页通过 `config/read(includeLayers:true,cwd)` 显示有效配置、逐项 `origins` 和每层的来源、版本及 `disabledReason`。`configRequirements/read` 返回受管限制或 null，当前 schema 没有 params。管理来源与禁止的权限选项显示为只读，配置写入由 app-server 再次验证。用户配置写入附带相应层的 `filePath/expectedVersion`，版本冲突时需要重新读取，避免覆盖其他客户端的修改；`reloadUserConfig:true` 不会热替换正在运行线程的模型、推理强度等静态默认值。
 

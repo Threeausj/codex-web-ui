@@ -72,6 +72,9 @@ export const preferencesPatch = z
       )
       .optional(),
     activePermissionProfileId: z.string().max(100).optional(),
+    defaultPermission: z
+      .enum(["read-only", "workspace-write", "danger-full-access"])
+      .optional(),
   })
   .strict()
   .refine(
@@ -85,6 +88,7 @@ export const emptyPreferences = () =>
     collapsed: {},
     permissionProfiles: [],
     activePermissionProfileId: "",
+    defaultPermission: "workspace-write",
   }) as Required<WebPreferences>;
 
 export class Preferences {

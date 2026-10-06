@@ -65,6 +65,29 @@ const permissionProfiles = computed(() =>
   availablePermissionProfiles(props.state.preferences?.permissionProfiles),
 );
 const requirements = computed(() => props.state.requirements || null);
+const defaultPermission = computed(
+  () => props.state.preferences?.defaultPermission || "workspace-write",
+);
+function defaultPermissionProblems(mode: string) {
+  return permissionProfileProblems(
+    {
+      id: "global-default",
+      name: "全局默认权限",
+      sandboxMode: mode as WebPermissionProfile["sandboxMode"],
+      approvalPolicy: mode === "danger-full-access" ? "never" : "on-request",
+      networkAccess: mode === "danger-full-access",
+    },
+    requirements.value,
+  );
+}
+async function chooseDefaultPermission(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  await action(
+    () => props.api.selectDefaultPermission(select.value),
+    "全局默认权限已保存，从下一次发送生效",
+  );
+  select.value = defaultPermission.value;
+}
 const configLayers = computed(() => props.state.config?.layers || []);
 const configOrigins = computed(() =>
   Object.entries(props.state.config?.origins || {}).map(([key, value]) => ({
@@ -385,6 +408,26 @@ watch(
                 <option value="dark">深色</option>
               </select>
             </div>
+            <div class="setting-row">
+              <div>
+                <strong>全局默认权限</strong>
+                <span>新建和打开对话时使用此权限；可在对话中单独调整。修改后从下一轮任务生效，正在运行的任务保持原权限。</span>
+              </div>
+              <select
+                class="text-input compact-select"
+                :value="defaultPermission"
+                aria-label="全局默认权限"
+                :disabled="saving || state.selectingThread || state.switchingHost || state.changingContext"
+                @change="chooseDefaultPermission"
+              >
+                <option value="read-only" :disabled="!!defaultPermissionProblems('read-only').length">只读</option>
+                <option value="workspace-write" :disabled="!!defaultPermissionProblems('workspace-write').length">默认</option>
+                <option value="danger-full-access" :disabled="!!defaultPermissionProblems('danger-full-access').length">完全访问</option>
+              </select>
+            </div>
+            <p v-if="defaultPermissionProblems(defaultPermission).length" class="settings-description">
+              {{ defaultPermissionProblems(defaultPermission).join('；') }}。请选择当前主机允许的权限。
+            </p>
             <div class="setting-row">
               <div>
                 <strong>自动压缩上下文</strong
