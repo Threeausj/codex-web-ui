@@ -9,7 +9,7 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { z } from 'zod'
 import { Auth, trustedOrigins } from './auth.js'
 import { Storage } from './storage.js'
-import { Bridge, RpcFailure, type BridgeOptions } from './bridge.js'
+import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
 import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
@@ -36,6 +36,7 @@ export async function createApp(options: AppOptions = {}) {
   const cwd = path.resolve(options.cwd || process.cwd())
   const dataDir = path.resolve(options.dataDir || process.env.DATA_DIR || path.join(cwd, '.data'))
   const codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+  const clientName = normalizeCodexClientName(options.bridgeOptions?.clientName ?? process.env.CODEX_CLIENT_NAME)
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
   const configuredOrigins = options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean)
@@ -46,7 +47,7 @@ export async function createApp(options: AppOptions = {}) {
   const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
   const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
-  const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions }
+  const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message) => {
     push.observe(host, message)

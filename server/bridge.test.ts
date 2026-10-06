@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { WebSocket } from 'ws'
-import { Bridge, shellQuote, type Transport } from './bridge.js'
-import type { RpcMessage } from './types.js'
+import { Bridge, shellQuote, type BridgeOptions, type Transport } from './bridge.js'
+import type { Host, RpcMessage } from './types.js'
 
 class Browser extends EventEmitter {
   readyState = 1
@@ -15,7 +15,7 @@ class Browser extends EventEmitter {
   ws() { return this as unknown as WebSocket }
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
-function fixture() {
+function fixture(options: BridgeOptions = {}, host: Host = { id: 'local', kind: 'local', name: 'Test' }) {
   const input = new PassThrough()
   const output = new PassThrough()
   const sent: RpcMessage[] = []
@@ -30,7 +30,7 @@ function fixture() {
   })
   const receive = (message: RpcMessage) => output.write(`${JSON.stringify(message)}\n`)
   const transport: Transport = { input, output, events: new EventEmitter(), dispose: () => { input.destroy(); output.destroy() } }
-  const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Test' }, { transportFactory: () => transport })
+  const bridge = new Bridge(host, { ...options, transportFactory: () => transport })
   return { bridge, sent, receive }
 }
 
@@ -42,6 +42,8 @@ test('bridge initializes once and routes same browser IDs to their own tab', asy
     f.bridge.attach('session:browser_b', b.ws(), 'browser_b')
     await tick()
     assert.equal(f.sent.filter(m => m.method === 'initialize').length, 1)
+    assert.deepEqual((f.sent.find(m => m.method === 'initialize')!.params as { clientInfo: unknown }).clientInfo,
+      { name: 'codex_web', title: 'Codex Web', version: '0.1.0' })
     assert.ok(f.sent.some(m => m.method === 'initialized'))
     a.request({ id: 1, method: 'model/list', params: { includeHidden: true } })
     b.request({ id: 1, method: 'thread/list', params: { limit: 7 } })
@@ -56,6 +58,57 @@ test('bridge initializes once and routes same browser IDs to their own tab', asy
     assert.deepEqual(a.sent.filter(m => m.id === 1), [{ id: 1, result: { models: ['a'] } }])
     assert.deepEqual(b.sent.filter(m => m.id === 1), [{ id: 1, result: { threads: ['b'] } }])
   } finally { f.bridge.close() }
+})
+
+test('a configured client name initializes local and SSH engines without rewriting new or resumed thread requests', async t => {
+  const hosts: Host[] = [
+    { id: 'local', kind: 'local', name: 'Local' },
+    { id: 'remote', kind: 'ssh', name: 'Remote', hostname: 'remote.test', username: 'test', port: 2222 },
+  ]
+  for (const host of hosts) await t.test(host.kind, async () => {
+    const f = fixture({ clientName: host.kind === 'ssh' ? '  codex_cli_rs  ' : 'codex_cli_rs' }, host)
+    try {
+      await f.bridge.connect()
+      const initialize = f.sent.filter(message => message.method === 'initialize')
+      assert.equal(initialize.length, 1)
+      assert.deepEqual(initialize[0].params, {
+        clientInfo: { name: 'codex_cli_rs', title: 'Codex Web', version: '0.1.0' },
+        capabilities: { experimentalApi: true },
+      })
+      const startParams = {
+        cwd: '/workspace/project', runtimeWorkspaceRoots: ['/workspace/project'],
+        model: 'test-model', modelProvider: 'test-provider',
+        sandbox: 'workspace-write', approvalPolicy: 'on-request',
+      }
+      const started = f.bridge.request('thread/start', startParams)
+      await tick()
+      const start = f.sent.find(message => message.method === 'thread/start')!
+      assert.deepEqual(start.params, startParams)
+      f.receive({ id: start.id, result: { thread: { id: 'test-thread' } } })
+      await started
+      const resumeParams = { threadId: 'test-thread', excludeTurns: true }
+      const resumed = f.bridge.request('thread/resume', resumeParams)
+      await tick()
+      const resume = f.sent.find(message => message.method === 'thread/resume')!
+      assert.deepEqual(resume.params, resumeParams)
+      f.receive({ id: resume.id, result: { thread: { id: 'test-thread' } } })
+      await resumed
+      assert.equal(f.sent.filter(message => message.method === 'initialize').length, 1)
+      assert.ok(!f.sent.some(message => typeof message.params === 'object' && message.params !== null && Object.hasOwn(message.params, 'overrideClientName')))
+    } finally { f.bridge.close() }
+  })
+})
+
+test('invalid client names are rejected before creating an app-server transport', () => {
+  let transportsCreated = 0
+  const invalid = ['codex/cli', 'codex web', 'codex\nweb', '\ncodex_web', 'codex_web\t', 'codex\u0000web', '客户端', '.codex', '-codex', '_codex', 'a'.repeat(65)]
+  for (const clientName of invalid) {
+    assert.throws(() => new Bridge({ id: 'local', kind: 'local', name: 'Test' }, {
+      clientName,
+      transportFactory: () => { transportsCreated++; throw new Error('Unexpected transport creation') },
+    }), undefined, JSON.stringify(clientName))
+  }
+  assert.equal(transportsCreated, 0)
 })
 
 test('all authenticated tabs see approvals, first response wins and pending requests survive reconnect', async () => {

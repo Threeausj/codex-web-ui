@@ -49,6 +49,24 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec
 
 使用 NAS IP 或自己的 HTTPS 反向代理时，将浏览器实际使用的 Origin（协议、主机、端口）加入 `PUBLIC_ORIGIN`；未配置的来源会收到 `403 Untrusted origin`，即使密码正确。多个 Origin 用逗号分隔。混合 HTTP/HTTPS 部署按登录请求的可信 Origin 设置 Secure Cookie，让局域网 HTTP 登录可用，同时保护 HTTPS 登录；只配置 HTTPS Origin 时始终要求 Secure Cookie。HTTP 页面使用 `crypto.getRandomValues` 生成兼容 UUID，不依赖仅安全上下文可用的 `crypto.randomUUID`。
 
+## 模型网关与客户端标识
+
+`CODEX_CLIENT_NAME` 设置 app-server `initialize.clientInfo.name`，默认 `codex_web`。该值去除首尾空格后须为 1–64 个 ASCII 字符，以字母或数字开头，其余只允许字母、数字、`_`、`.`、`-`；控制字符始终拒绝。它适用于本机与 SSH 的 `spawn`/`proxy` 连接；应用标题和版本仍为 `Codex Web` / `0.1.0`。
+
+sub2api 开启“仅允许 Codex 官方客户端”时，可能拒绝默认的 `codex_web`。通常应在网关对应账号启用“允许 Codex app-server 客户端”，保留本应用的标识。如果已配置的网关要求 CLI 兼容标识，可明确选择在 `.env.docker` 中设置：
+
+```dotenv
+CODEX_CLIENT_NAME=codex_cli_rs
+```
+
+完成活动任务后，使用原来的 Compose 参数重新创建应用容器，例如本地部署：
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --wait
+```
+
+此选项只调整客户端兼容标识，不表示本网页是官方客户端，也不更改模型提供方、API 凭据或账户权限。Codex 将该标识用于新 thread 的 `originator`；已有历史冷恢复时仍保留原标识，因此新建和继续对话可能出现不同的网关判定。`proxy` 的已有 daemon 和活动 thread 也可能保留原上下文，不能视为热更新；修改后用新建会话验证。[客户端标识说明](protocol.md#客户端标识与模型网关)。
+
 ## 访问密码与登录
 
 网页登录会话有效期为 **30 天**，保存在服务进程内，重启服务后需重新登录。进入“设置 → 账户 → 网页访问 → 修改访问密码”，输入当前密码及两次新密码；新密码需 12–1024 个字符。保存后当前登录续期 30 天并保留已有连接，其他设备的登录和后台通知授权即时撤销。修改访问密码不修改 Codex 模型账户。

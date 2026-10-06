@@ -10,11 +10,18 @@ import { sshAppServerArgs } from './ssh.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
-export type BridgeOptions = { codexBin?: string; codexHome?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage) => void | Promise<void> }
+export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage) => void | Promise<void> }
 type Pending = { originalId?: RpcId; clientKey?: string; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
+
+export function normalizeCodexClientName(value?: string): string {
+  const name = value?.trim() || 'codex_web'
+  if (/[\x00-\x1f\x7f]/.test(value ?? '') || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/.test(name))
+    throw new Error('CODEX_CLIENT_NAME must be an identifier of 1–64 ASCII letters, digits, dots, underscores or hyphens')
+  return name
+}
 
 export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   const executable = host.kind === 'ssh' ? 'ssh' : options.codexBin || 'codex'
@@ -60,7 +67,10 @@ export class Bridge {
   userAgent?: string
   codexHome?: string
   lastError?: string
-  constructor(readonly host: Host, readonly options: BridgeOptions = {}) {}
+  private readonly clientName: string
+  constructor(readonly host: Host, readonly options: BridgeOptions = {}) {
+    this.clientName = normalizeCodexClientName(options.clientName)
+  }
   get mode() { return this.host.kind === 'ssh' ? 'ssh' : this.options.mode || 'spawn' }
 
   async connect(): Promise<void> {
@@ -94,7 +104,7 @@ export class Bridge {
     transport.events.on('transportError', error => { if (generation === this.generation) this.disconnect(error) })
     transport.events.on('transportClose', error => { if (generation === this.generation) this.disconnect(error) })
     try {
-      const result = await this.rawRequest('initialize', { clientInfo: { name: 'codex_web', title: 'Codex Web', version: '0.1.0' }, capabilities: { experimentalApi: true } }, undefined, undefined, 30000) as { userAgent?: string; codexHome?: string }
+      const result = await this.rawRequest('initialize', { clientInfo: { name: this.clientName, title: 'Codex Web', version: '0.1.0' }, capabilities: { experimentalApi: true } }, undefined, undefined, 30000) as { userAgent?: string; codexHome?: string }
       if (generation !== this.generation) throw new Error('App-server connection changed')
       this.send({ method: 'initialized' })
       this.userAgent = result.userAgent
