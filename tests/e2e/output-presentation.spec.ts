@@ -82,7 +82,7 @@ test("desktop-style output collapses process history behind elapsed time and kee
   ).toBe(true);
 });
 
-test("live process unfolds while running, closes when finished, and keeps final text and approvals visible", async ({
+test("live process keeps commands and file changes collapsed by default while progress and approvals stay visible", async ({
   page,
   mock,
 }) => {
@@ -119,12 +119,36 @@ test("live process unfolds while running, closes when finished, and keeps final 
     turnId,
     item: { id: "live-tool", type: "commandExecution", command: "pwd", status: "inProgress", aggregatedOutput: "工作目录输出" },
   });
+  mock.emit("item/started", {
+    threadId,
+    turnId,
+    item: { id: "live-file-change", type: "fileChange", status: "inProgress", changes: [{ path: "/workspace/demo/README.md", kind: "update", diff: "@@ -1 +1 @@\n-old\n+new" }] },
+  });
   const group = page.locator(`.conversation-turn[data-turn-id="${turnId}"]`);
   await expect(
     group.getByText("一大段中间进展说明", { exact: true }),
   ).toBeVisible();
   await expect(group.getByText("过程摘要", { exact: true })).toBeVisible();
+  const command = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "运行命令" }) });
+  const changes = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "修改文件" }) });
+  await expect(command.locator("summary")).toBeVisible();
+  await expect(changes.locator("summary")).toBeVisible();
+  await expect(command).not.toHaveAttribute("open", "");
+  await expect(changes).not.toHaveAttribute("open", "");
+  await expect(group.getByText("工作目录输出", { exact: true })).toBeHidden();
+  await expect(changes.locator(".file-changes")).toBeHidden();
+  await command.locator("summary").click();
+  await changes.locator("summary").click();
   await expect(group.getByText("工作目录输出", { exact: true })).toBeVisible();
+  await expect(changes.locator(".diff-code")).toContainText("+new");
+  await expect(changes.locator(".diff-code")).toBeVisible();
+  mock.emit("item/commandExecution/outputDelta", { threadId, turnId, itemId: "live-tool", delta: " · 新输出" });
+  mock.emit("item/completed", { threadId, turnId, item: { id: "live-file-change", type: "fileChange", status: "completed", changes: [{ path: "/workspace/demo/README.md", kind: "update", diff: "@@ -1 +1 @@\n-old\n+updated" }] } });
+  await expect(command.getByText("工作目录输出 · 新输出", { exact: true })).toBeVisible();
+  await expect(changes.locator(".diff-code")).toContainText("+updated");
+  await expect(changes.locator(".diff-code")).toBeVisible();
+  await command.locator("summary").click();
+  await changes.locator("summary").click();
   await expect(group.locator(".turn-activity")).toHaveAttribute("open", "");
   await expect(group.getByText("正在处理…", { exact: true })).toBeVisible();
   await approval.getByRole("button", { name: "拒绝", exact: true }).click();
@@ -142,7 +166,7 @@ test("live process unfolds while running, closes when finished, and keeps final 
   await expect(approval).toHaveCount(0);
   await expect(group.locator(".turn-activity")).not.toHaveAttribute("open", "");
   await expect(group.locator(".reasoning-item")).not.toHaveAttribute("open", "");
-  await expect(group.locator(".tool-item")).not.toHaveAttribute("open", "");
+  await expect(group.locator(".tool-item[open]")).toHaveCount(0);
   await group.locator(".turn-activity > summary").click();
   await expect(
     group.getByText("一大段中间进展说明", { exact: true }),
@@ -199,6 +223,8 @@ test("manual process and reasoning toggles survive new deltas, while completed h
   await group.locator(".turn-activity > summary").click();
   await group.locator(".reasoning-item > summary").click();
   await group.locator(".tool-item > summary").click();
+  await expect(group.getByText("manual-turn 工具输出", { exact: true })).toBeVisible();
+  await group.locator(".tool-item > summary").click();
   mock.emit("item/reasoning/summaryTextDelta", { threadId: "thread-existing", turnId: turn.id, itemId: "manual-turn-reasoning", summaryIndex: 0, delta: " · 更多摘要" });
   mock.emit("item/commandExecution/outputDelta", { threadId: "thread-existing", turnId: turn.id, itemId: "manual-turn-tool", delta: " · 更多输出" });
   await expect(group.locator(".reasoning-content")).toContainText("更多摘要");
@@ -222,7 +248,8 @@ for (const status of ["failed", "interrupted"]) {
     const turn = startProcess(mock, `${status}-live`);
     const group = page.locator(`.conversation-turn[data-turn-id="${turn.id}"]`);
     await expect(group.getByText(`${turn.id} 公开摘要`, { exact: true })).toBeVisible();
-    await expect(group.getByText(`${turn.id} 工具输出`, { exact: true })).toBeVisible();
+    await expect(group.getByText(`${turn.id} 工具输出`, { exact: true })).toBeHidden();
+    await expect(group.locator(".tool-item > summary")).toBeVisible();
     const final = { id: `${turn.id}-final`, type: "agentMessage", phase: "final_answer", text: "直接可见的最终答复" };
     mock.emit("item/completed", { threadId: "thread-existing", turnId: turn.id, item: final });
     await expect(group.getByText(final.text, { exact: true })).toBeVisible();

@@ -17,6 +17,7 @@ const toolTitle = computed(() => {
   return labels[item.type] || item.type
 })
 const toolIcon = computed(() => ({ commandExecution: 'Terminal', fileChange: 'GitCompareArrows', mcpToolCall: 'Package', dynamicToolCall: 'Zap', collabAgentToolCall: 'Bot', webSearch: 'Globe', imageView: 'Image', imageGeneration: 'Image', enteredReviewMode: 'Eye', exitedReviewMode: 'CheckCircle2' } as Record<string, string>)[props.item.type] || 'Code2')
+const toolOpenByDefault = computed(() => !!props.busy && !['commandExecution', 'fileChange'].includes(props.item.type))
 const status = computed(() => props.item.status === 'inProgress' || props.item.status === 'running' ? '处理中' : props.item.status === 'failed' ? '失败' : props.item.exitCode != null ? `退出 ${props.item.exitCode}` : '')
 const detailsText = computed(() => props.item.aggregatedOutput || props.item.review || props.item.prompt || (props.item.result ? JSON.stringify(props.item.result, null, 2) : props.item.arguments ? JSON.stringify(props.item.arguments, null, 2) : props.item.output ? JSON.stringify(props.item.output, null, 2) : JSON.stringify(props.item, null, 2)))
 async function copy() {
@@ -53,7 +54,7 @@ function onLink(event: MouseEvent) {
   </details>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon name="RefreshCw" :size="13" />上下文已压缩<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
-  <details v-else class="tool-item" :open="!!busy" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
+  <details v-else class="tool-item" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
     <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><code v-if="item.command" class="tool-command">{{ item.command }}</code><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <div v-if="item.type === 'fileChange'" class="file-changes">
       <div v-for="change in item.changes" :key="change.path" class="file-diff">
