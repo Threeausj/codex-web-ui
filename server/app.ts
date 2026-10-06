@@ -43,15 +43,22 @@ export async function createApp(options: AppOptions = {}) {
   const origins = trustedOrigins(configuredOrigins, options.port || Number(process.env.PORT) || 8787)
   const httpsOnly = configuredOrigins.length > 0 && configuredOrigins.every(origin => origin.trim().startsWith('https:'))
   const auth = await Auth.create(dataDir, options.password || process.env.CODEX_WEB_PASSWORD, origins, options.secureCookie ?? httpsOnly)
-  const push = await PushService.create(dataDir, origins, { ...options.pushOptions, credentialVersion: auth.pushCredentialVersion })
+  const push = await PushService.create(dataDir, origins, {
+    ...options.pushOptions, credentialVersion: auth.pushCredentialVersion,
+    resolveThread: options.pushOptions?.resolveThread ?? (async (host, threadId) => {
+      const bridge = await getBridge(host.id)
+      const result = await bridge.request('thread/read', { threadId, includeTurns: false }, 2500) as { thread?: unknown }
+      return result.thread
+    }),
+  })
   const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
   const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
-  bridgeOptions.onProtocolMessage = (host, message) => {
-    push.observe(host, message)
-    return externalProtocolObserver?.(host, message)
+  bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
+    push.observe(host, message, responseMethod)
+    return externalProtocolObserver?.(host, message, responseMethod)
   }
   const bridges = new Map<string, Bridge>()
   const getBridge = async (hostId = 'local') => {

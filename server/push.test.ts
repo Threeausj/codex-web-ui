@@ -24,7 +24,7 @@ function subscription(name: string, provider = 'fcm.googleapis.com'): PushSubscr
   const ecdh = createECDH('prime256v1'); ecdh.generateKeys()
   return { endpoint: `https://${provider}/push/${name}`, expirationTime: null, keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: randomBytes(16).toString('base64url') } }
 }
-function protocolFixture() {
+function protocolFixture(response?: (message: RpcMessage) => unknown) {
   const input = new PassThrough(); const output = new PassThrough(); let buffer = ''; let disposed = false
   const messages: RpcMessage[] = []
   input.on('data', chunk => {
@@ -32,19 +32,22 @@ function protocolFixture() {
     while (buffer.includes('\n')) {
       const end = buffer.indexOf('\n'); const message = JSON.parse(buffer.slice(0, end)) as RpcMessage; buffer = buffer.slice(end + 1)
       messages.push(message)
-      if (message.id !== undefined && message.method) queueMicrotask(() => output.write(`${JSON.stringify({ id: message.id, result: message.method === 'initialize' ? { userAgent: 'push-test' } : {} })}\n`))
+      if (message.id !== undefined && message.method) queueMicrotask(async () => {
+        const result = message.method === 'initialize' ? { userAgent: 'push-test' } : await response?.(message) ?? {}
+        output.write(`${JSON.stringify({ id: message.id, result })}\n`)
+      })
     }
   })
   const transport: Transport = { input, output, events: new EventEmitter(), dispose: () => { disposed = true; input.destroy(); output.destroy() } }
   return { transport, messages, get disposed() { return disposed }, receive: (message: RpcMessage) => output.write(`${JSON.stringify(message)}\n`) }
 }
-async function application(options: PushOptions = {}, dataDir?: string, observer?: (message: RpcMessage) => void) {
+async function application(options: PushOptions = {}, dataDir?: string, observer?: (message: RpcMessage, responseMethod?: string) => void, response?: (message: RpcMessage) => unknown) {
   const directory = dataDir || await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-http-'))
   const transports: ReturnType<typeof protocolFixture>[] = []
   const sent: { subscription: PushSubscription; payload: Record<string, unknown>; options: RequestOptions }[] = []
   const context = await createServer({ dataDir: directory, codexHome: path.join(directory, 'codex'), cwd: directory, password, secureCookie: false, serveStatic: false,
     pushOptions: { sendNotification: async (subscription, payload, options) => { sent.push({ subscription, payload: JSON.parse(payload), options }) }, ...options },
-    bridgeOptions: { transportFactory: () => { const fixture = protocolFixture(); transports.push(fixture); return fixture.transport }, onProtocolMessage: (_host, message) => observer?.(message) },
+    bridgeOptions: { transportFactory: () => { const fixture = protocolFixture(response); transports.push(fixture); return fixture.transport }, onProtocolMessage: (_host, message, responseMethod) => observer?.(message, responseMethod) },
   })
   await new Promise<void>(resolve => context.server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(context.server.address() as { port: number }).port}`
@@ -209,10 +212,13 @@ test('completed turns and pending approvals push after all browser sockets close
     socket = new WebSocket(app.base.replace('http:', 'ws:') + '/api/rpc?clientId=phone_test', { headers: { cookie: session.cookie, origin } })
     await new Promise<void>((resolve, reject) => { socket!.once('open', resolve); socket!.once('error', reject) })
     await tick(); await tick()
+    const fixture = app.transports[0]!
+    fixture.receive({ method: 'thread/started', params: { thread: { id: 'thread/private?name=秘密', name: '旧名称', preview: 'Private initial prompt' } } })
+    fixture.receive({ method: 'thread/started', params: { thread: { id: 'thread-a', name: '另一条对话', preview: 'Private initial prompt' } } })
     const closed = new Promise<void>(resolve => socket!.once('close', () => resolve()))
     socket.close(); await closed
-    const fixture = app.transports[0]!
     assert.equal(fixture.disposed, false)
+    fixture.receive({ method: 'thread/name/updated', params: { threadId: 'thread/private?name=秘密', threadName: '后台改名后的对话' } })
     const complete = { method: 'turn/completed', params: { threadId: 'thread/private?name=秘密', turn: { id: 'turn-1', status: 'completed', items: [{ text: 'Private response' }] } } }
     fixture.receive(complete); fixture.receive(complete)
     fixture.receive({ method: 'turn/completed', params: { threadId: 'thread-a', turn: { id: 'interrupted', status: 'interrupted' } } })
@@ -233,7 +239,9 @@ test('completed turns and pending approvals push after all browser sockets close
     assert.equal(app.sent.filter(entry => (entry.payload.data as { kind: string }).kind === 'approval').length, 4)
     assert.equal(app.sent.filter(entry => (entry.payload.data as { kind: string }).kind === 'errors').length, 1)
     const notice = app.sent[0]!.payload
-    assert.equal(notice.title, 'Codex')
+    assert.equal(notice.title, '后台改名后的对话')
+    assert.equal(notice.body, '运行完成')
+    assert.deepEqual(app.sent.slice(1).map(entry => entry.payload.body), ['等待命令执行确认', '等待命令执行确认', '等待补充输入', '等待确认或补充输入', '运行失败'])
     assert.ok(!String(notice.body).includes('Private'))
     assert.ok(!JSON.stringify(app.sent.map(entry => ({ body: entry.payload.body, title: entry.payload.title }))).includes('secret'))
     const data = notice.data as { hostId: string; threadId: string; url: string }
@@ -244,6 +252,217 @@ test('completed turns and pending approvals push after all browser sockets close
     assert.equal(app.bridges.get('local')!.connected, true)
     assert.ok(observed.some(message => message.method === 'turn/completed'))
   } finally { socket?.terminate(); await app.cleanup() }
+})
+
+test('thread RPC responses provide notification titles without an extra metadata lookup', async () => {
+  const methods = ['thread/start', 'thread/resume', 'thread/read', 'thread/fork', 'thread/list', 'thread/search']
+  const observedResponses: string[] = []
+  const app = await application({}, undefined, (_message, responseMethod) => { if (responseMethod) observedResponses.push(responseMethod) }, message => {
+    if (!methods.includes(message.method!)) return {}
+    const thread = { id: message.method!, name: `${message.method} 的对话`, preview: 'Unused initial prompt' }
+    return ['thread/list', 'thread/search'].includes(message.method!) ? { data: [thread], nextCursor: null } : { thread }
+  })
+  try {
+    await app.push.subscribe('session', subscription('rpc-thread-names'))
+    const bridge = await app.getBridge('local')
+    for (const method of methods) await bridge.request(method, method === 'thread/read' ? { threadId: method, includeTurns: false } : {})
+    for (const method of methods) {
+      app.transports[0]!.receive({ method: 'turn/completed', params: { threadId: method, turn: { id: `turn-${method}`, status: 'completed' } } })
+      await app.push.flush()
+    }
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), methods.map(method => `${method} 的对话`))
+    assert.ok(methods.every(method => observedResponses.includes(method)))
+    assert.equal(app.transports[0]!.messages.filter(message => message.method === 'thread/read').length, 1)
+  } finally { await app.cleanup() }
+})
+
+test('conversation titles cached before subscribing remain isolated per host and support clearing a name', async () => {
+  const app = await application({ resolveThread: async () => { throw new Error('Known names need no lookup') } })
+  const otherHost = { ...host, id: 'other-host' }
+  try {
+    for (const [source, name] of [[host, '本机对话'], [otherHost, '远端对话']] as const)
+      app.push.observe(source, { method: 'thread/started', params: { thread: { id: 'shared-id', name, preview: '第一条消息' } } })
+    await app.push.subscribe('session', subscription('host-thread-names'))
+    for (const source of [host, otherHost]) {
+      app.push.observe(source, { method: 'turn/completed', params: { threadId: 'shared-id', turn: { id: 'same-turn-id', status: 'completed' } } })
+      await app.push.flush()
+    }
+    app.push.observe(host, { method: 'thread/name/updated', params: { threadId: 'shared-id', name: '兼容旧版改名' } })
+    app.push.observe(host, { id: 'legacy-name', method: 'item/tool/requestUserInput', params: { threadId: 'shared-id' } })
+    await app.push.flush()
+    app.push.observe(host, { method: 'thread/name/updated', params: { threadId: 'shared-id' } })
+    app.push.observe(host, { id: 'cleared-name', method: 'item/tool/requestUserInput', params: { threadId: 'shared-id' } })
+    await app.push.flush()
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), ['本机对话', '远端对话', '兼容旧版改名', '第一条消息'])
+    assert.deepEqual(app.sent.slice(0, 2).map(entry => (entry.payload.data as { hostId: string }).hostId), ['local', 'other-host'])
+  } finally { await app.cleanup() }
+})
+
+test('notification titles normalize whitespace, fall back to preview and fit the worker title limit', async () => {
+  const app = await application({ resolveThread: async () => undefined })
+  try {
+    await app.push.subscribe('session', subscription('formatted-thread-names'))
+    const threads = [
+      { id: 'whitespace-name', name: '  检查\n\t消息推送  ', preview: 'Unused preview' },
+      { id: 'preview-name', name: ' \n\x00\t', preview: '  首条\n\t消息  ' },
+      { id: 'long-name', name: `\x00${'🌟'.repeat(60)}\x7f`, preview: '' },
+      { id: 'no-name', name: null, preview: '' },
+    ]
+    for (const thread of threads) {
+      app.push.observe(host, { method: 'thread/started', params: { thread } })
+      app.push.observe(host, { method: 'turn/completed', params: { threadId: thread.id, turn: { id: `turn-${thread.id}`, status: 'completed' } } })
+      await app.push.flush()
+    }
+    assert.equal(app.sent[0]!.payload.title, '检查 消息推送')
+    assert.equal(app.sent[1]!.payload.title, '首条 消息')
+    const longTitle = String(app.sent[2]!.payload.title)
+    assert.ok(longTitle.length <= 100 && longTitle.startsWith('🌟'))
+    assert.ok(!/[\x00-\x1f\x7f]/.test(longTitle))
+    assert.equal(app.sent[3]!.payload.title, '未命名对话')
+  } finally { await app.cleanup() }
+})
+
+test('new unnamed threads resolve persisted metadata through a read-only RPC and reuse it', async () => {
+  const app = await application({}, undefined, undefined, message => {
+    if (message.method === 'thread/read') return { thread: { id: 'fresh-thread', name: null, preview: '新会话第一条消息' } }
+    return {}
+  })
+  try {
+    await app.push.subscribe('session', subscription('fresh-thread-name'))
+    const bridge = await app.getBridge('local'); await bridge.connect()
+    const fixture = app.transports[0]!
+    fixture.receive({ method: 'thread/started', params: { thread: { id: 'fresh-thread', name: null, preview: '' } } })
+    for (const turnId of ['first-turn', 'continued-turn']) {
+      fixture.receive({ method: 'turn/completed', params: { threadId: 'fresh-thread', turn: { id: turnId, status: 'completed' } } })
+      await app.push.flush()
+    }
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), ['新会话第一条消息', '新会话第一条消息'])
+    const reads = fixture.messages.filter(message => message.method === 'thread/read')
+    assert.equal(reads.length, 1)
+    assert.deepEqual(reads[0]!.params, { threadId: 'fresh-thread', includeTurns: false })
+    assert.ok(!fixture.messages.some(message => ['thread/resume', 'turn/start'].includes(message.method!)))
+  } finally { await app.cleanup() }
+})
+
+test('a failed title lookup still delivers the event once without disclosing the failure', async () => {
+  let lookups = 0
+  const app = await application({ resolveThread: async () => { lookups++; throw new Error('private lookup failure') } })
+  try {
+    await app.push.subscribe('session', subscription('failed-title-lookup'))
+    // Non-thread list responses must never supply a conversation name.
+    app.push.observe(host, { id: 'model-list', result: { data: [{ id: 'missing-thread', name: 'Unrelated model name' }] } }, 'model/list')
+    const event = { method: 'turn/completed', params: { threadId: 'missing-thread', turn: { id: 'finished-turn', status: 'completed' } } }
+    app.push.observe(host, event); app.push.observe(host, event)
+    await app.push.flush()
+    assert.equal(lookups, 1)
+    assert.equal(app.sent.length, 1)
+    assert.equal(app.sent[0]!.payload.title, '未命名对话')
+    assert.equal(app.sent[0]!.payload.body, '运行完成')
+    assert.ok(!JSON.stringify(app.sent[0]!.payload).includes('private lookup failure'))
+  } finally { await app.cleanup() }
+})
+
+test('a title lookup timeout delivers its event with a fallback instead of waiting indefinitely', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-title-timeout-'))
+  const sent: Record<string, unknown>[] = []
+  let markStarted!: () => void
+  const started = new Promise<void>(resolve => { markStarted = resolve })
+  const push = await PushService.create(directory, new Set([origin]), {
+    resolveThread: () => { markStarted(); return new Promise(() => {}) },
+    sendNotification: async (_device, payload) => { sent.push(JSON.parse(payload)) },
+  })
+  try {
+    await push.subscribe('session', subscription('title-timeout'))
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    push.observe(host, { method: 'turn/completed', params: { threadId: 'missing-title', turn: { id: 'timed-out', status: 'completed' } } })
+    await started
+    t.mock.timers.tick(2999); await tick()
+    assert.equal(sent.length, 0)
+    t.mock.timers.tick(1)
+    await push.flush()
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0]!.title, '未命名对话')
+    assert.equal(sent[0]!.body, '运行完成')
+  } finally { await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('a live rename received during a metadata lookup wins over its older RPC response', async () => {
+  let finishRead: ((value: unknown) => void) | undefined
+  let markStarted!: () => void
+  const started = new Promise<void>(resolve => { markStarted = resolve })
+  const app = await application({}, undefined, undefined, message => {
+    if (message.method !== 'thread/read') return {}
+    return new Promise(resolve => { finishRead = resolve; markStarted() })
+  })
+  try {
+    await app.push.subscribe('session', subscription('renamed-during-lookup'))
+    const bridge = await app.getBridge('local'); await bridge.connect()
+    const fixture = app.transports[0]!
+    fixture.receive({ method: 'thread/started', params: { thread: { id: 'renaming-thread', name: null, preview: '' } } })
+    fixture.receive({ method: 'turn/completed', params: { threadId: 'renaming-thread', turn: { id: 'before-read-returned', status: 'completed' } } })
+    await started
+    fixture.receive({ method: 'thread/name/updated', params: { threadId: 'renaming-thread', threadName: '刚修改的对话名' } })
+    finishRead!({ thread: { id: 'renaming-thread', name: '旧响应中的名称', preview: '' } })
+    await app.push.flush()
+    fixture.receive({ method: 'turn/completed', params: { threadId: 'renaming-thread', turn: { id: 'after-read-returned', status: 'completed' } } })
+    await app.push.flush()
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), ['刚修改的对话名', '刚修改的对话名'])
+    assert.equal(fixture.messages.filter(message => message.method === 'thread/read').length, 1)
+  } finally { finishRead?.({}); await app.cleanup() }
+})
+
+test('a late response after the internal metadata RPC timeout cannot overwrite a newer conversation name', async t => {
+  let finishRead: ((value: unknown) => void) | undefined
+  let markStarted!: () => void
+  const started = new Promise<void>(resolve => { markStarted = resolve })
+  const app = await application({}, undefined, undefined, message => {
+    if (message.method !== 'thread/read') return {}
+    return new Promise(resolve => { finishRead = resolve; markStarted() })
+  })
+  try {
+    await app.push.subscribe('session', subscription('late-metadata-response'))
+    const bridge = await app.getBridge('local'); await bridge.connect()
+    const fixture = app.transports[0]!
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    fixture.receive({ method: 'turn/completed', params: { threadId: 'late-read-thread', turn: { id: 'before-timeout', status: 'completed' } } })
+    await started
+    t.mock.timers.tick(2499); await tick()
+    assert.equal(app.sent.length, 0)
+    t.mock.timers.tick(1)
+    await app.push.flush()
+    assert.equal(app.sent[0]!.payload.title, '未命名对话')
+    fixture.receive({ method: 'thread/name/updated', params: { threadId: 'late-read-thread', threadName: '超时后修改的对话名' } })
+    finishRead!({ thread: { id: 'late-read-thread', name: '迟到响应中的旧名称', preview: '' } })
+    await tick()
+    fixture.receive({ method: 'turn/completed', params: { threadId: 'late-read-thread', turn: { id: 'after-late-response', status: 'completed' } } })
+    await app.push.flush()
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), ['未命名对话', '超时后修改的对话名'])
+    assert.equal(fixture.messages.filter(message => message.method === 'thread/read').length, 1)
+  } finally { finishRead?.({}); await app.cleanup() }
+})
+
+test('event text distinguishes completion, failure and the requested confirmation', async () => {
+  const app = await application()
+  const events: [RpcMessage, string, string][] = [
+    [{ method: 'turn/completed', params: { threadId: 'event-thread', turn: { id: 'completed', status: 'completed' } } }, '运行完成', 'completed'],
+    [{ method: 'turn/completed', params: { threadId: 'event-thread', turn: { id: 'failed', status: 'failed', error: { message: 'private error detail' } } } }, '运行失败', 'errors'],
+    [{ id: 'command', method: 'item/commandExecution/requestApproval', params: { threadId: 'event-thread', command: 'private command' } }, '等待命令执行确认', 'approval'],
+    [{ id: 'legacy-command', method: 'execCommandApproval', params: { conversationId: 'event-thread', command: 'private command' } }, '等待命令执行确认', 'approval'],
+    [{ id: 'file', method: 'item/fileChange/requestApproval', params: { threadId: 'event-thread', changes: 'private patch' } }, '等待文件修改确认', 'approval'],
+    [{ id: 'legacy-file', method: 'applyPatchApproval', params: { conversationId: 'event-thread', changes: 'private patch' } }, '等待文件修改确认', 'approval'],
+    [{ id: 'permissions', method: 'item/permissions/requestApproval', params: { threadId: 'event-thread' } }, '等待权限确认', 'approval'],
+    [{ id: 'input', method: 'item/tool/requestUserInput', params: { threadId: 'event-thread', questions: 'private question' } }, '等待补充输入', 'approval'],
+    [{ id: 'mcp', method: 'mcpServer/elicitation/request', params: { threadId: 'event-thread', mode: 'form' } }, '等待确认或补充输入', 'approval'],
+  ]
+  try {
+    await app.push.subscribe('session', subscription('event-text'))
+    app.push.observe(host, { method: 'thread/started', params: { thread: { id: 'event-thread', name: '推送逻辑修改', preview: '' } } })
+    for (const [message] of events) { app.push.observe(host, message); await app.push.flush() }
+    assert.deepEqual(app.sent.map(entry => entry.payload.title), events.map(() => '推送逻辑修改'))
+    assert.deepEqual(app.sent.map(entry => entry.payload.body), events.map(([, body]) => body))
+    assert.deepEqual(app.sent.map(entry => (entry.payload.data as { kind: string }).kind), events.map(([, , kind]) => kind))
+    assert.ok(!JSON.stringify(app.sent.map(entry => ({ title: entry.payload.title, body: entry.payload.body }))).includes('private'))
+  } finally { await app.cleanup() }
 })
 
 test('per-device preferences, natural login expiry and explicit logout preserve the correct grants', async () => {

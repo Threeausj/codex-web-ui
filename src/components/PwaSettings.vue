@@ -90,7 +90,7 @@ onMounted(() => { void initializeDevicePush(props.api); });
         <div class="pwa-title"><Icon name="Wifi" :size="18" /><h4 id="pwa-push-heading">后台通知</h4></div>
         <span class="pwa-status" :class="{ active: pwaState.pushSubscribed }">{{ pwaState.pushSubscribed ? '本机已启用' : '未启用' }}</span>
       </div>
-      <p>关闭页面或切换应用后，服务器通过系统通知提醒你。服务器需保持运行；通知仅包含通用状态，不包含对话内容和文件路径。</p>
+      <p>关闭页面或切换应用后，服务器通过系统通知提醒你。服务器需保持运行；通知显示对话名和事件，不包含回复正文、命令和文件路径。</p>
       <div v-if="pwaState.offline" class="pwa-instructions"><Icon name="WifiOff" :size="17" /><span>当前离线，连接网络后可修改通知设置。</span></div>
       <div v-else-if="pushReason" class="pwa-instructions"><Icon name="CircleHelp" :size="17" /><span>{{ pushReason }}</span></div>
       <div class="pwa-button-row">

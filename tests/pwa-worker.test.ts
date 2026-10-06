@@ -53,8 +53,10 @@ function worker() {
 
 test('push displays nested server destinations and generic notifications for malformed payloads', async () => {
   const target = worker();
-  await target.fire('push', { data: { json: () => ({ title: 'Codex Web', body: '任务完成', data: { hostId: 'remote-1', threadId: 'thread_2', url: 'https://malicious.example/' } }) } });
+  await target.fire('push', { data: { json: () => ({ title: '部署项目', body: '运行完成', data: { hostId: 'remote-1', threadId: 'thread_2', url: 'https://malicious.example/' } }) } });
   assert.equal(target.notifications.length, 1);
+  assert.equal(target.notifications[0].title, '部署项目');
+  assert.equal(target.notifications[0].options.body, '运行完成');
   assert.equal(JSON.stringify(target.notifications[0].options.data), JSON.stringify({ hostId: 'remote-1', threadId: 'thread_2' }));
   await target.fire('push', { data: { json: () => { throw new SyntaxError('Invalid JSON'); } } });
   await target.fire('push', {});
