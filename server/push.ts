@@ -10,6 +10,7 @@ const GRANT_TTL = 30 * 24 * 60 * 60 * 1000
 const EVENT_TTL = 24 * 60 * 60 * 1000
 const MAX_DEVICES = 64
 const MAX_EVENTS = 2000
+const MAX_THREAD_TITLES = 2000
 const preferencesSchema = z.object({ completed: z.boolean(), approval: z.boolean(), errors: z.boolean() }).strict()
 export type PushPreferences = z.infer<typeof preferencesSchema>
 const defaultPreferences: PushPreferences = { completed: true, approval: true, errors: true }
@@ -26,6 +27,8 @@ export type PushOptions = {
   now?: () => number
   /** Bound to the persisted web credential generation; provided by the application. */
   credentialVersion?: string
+  /** Read thread metadata without loading turns or starting a model request. */
+  resolveThread?: (host: Host, threadId: string) => Promise<unknown>
 }
 
 /** Only browser-owned push infrastructure is a valid destination, never an arbitrary URL. */
@@ -62,6 +65,11 @@ function validateSubscription(raw: unknown): PushSubscription {
 function record(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 function id(value: unknown) { return typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f]/.test(value) ? value : undefined }
 function hash(value: string) { return createHash('sha256').update(value).digest('base64url') }
+function titleText(value: unknown) {
+  if (typeof value !== 'string') return undefined
+  return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') || undefined
+}
+type ThreadTitle = { name?: string; preview?: string }
 
 async function atomicPrivateJson(file: string, value: unknown) {
   const temporary = `${file}.${randomUUID()}.tmp`
@@ -83,6 +91,8 @@ export class PushService {
   private devices = new Map<string, Device>()
   private events = new Map<string, number>()
   private testTimes = new Map<string, number[]>()
+  private threadTitles = new Map<string, ThreadTitle>()
+  private threadLookups = new Map<string, Promise<string>>()
   private writes: Promise<void> = Promise.resolve()
   private pending = new Set<Promise<void>>()
   private deliveries: { run: () => Promise<void>; resolve: () => void; reject: (error: unknown) => void }[] = []
@@ -227,42 +237,105 @@ export class PushService {
     return { ok: true }
   }
 
-  observe(host: Host, message: RpcMessage) {
-    if (this.closed || !this.hasActiveSubscriptions) return
+  private rememberThread(host: Host, raw: unknown) {
+    const thread = record(raw); const threadId = id(thread?.id)
+    if (!thread || !threadId || (!('name' in thread) && !('preview' in thread))) return
+    const key = JSON.stringify([host.id, threadId])
+    const title = { ...this.threadTitles.get(key),
+      ...('name' in thread ? { name: titleText(thread.name) } : {}),
+      ...('preview' in thread ? { preview: titleText(thread.preview) } : {}),
+    }
+    this.threadTitles.delete(key)
+    this.threadTitles.set(key, title)
+    while (this.threadTitles.size > MAX_THREAD_TITLES) this.threadTitles.delete(this.threadTitles.keys().next().value!)
+  }
+
+  private observeThread(host: Host, message: RpcMessage, responseMethod?: string) {
+    const params = record(message.params)
+    if (message.method === 'thread/started') this.rememberThread(host, params?.thread)
+    if (message.method === 'thread/name/updated' && params) this.rememberThread(host, {
+      id: params.threadId, name: 'threadName' in params ? params.threadName : params.name,
+    })
+    if (message.error) return
+    const result = record(message.result)
+    const readId = id(record(result?.thread)?.id)
+    if (responseMethod === 'thread/read' && readId && this.threadLookups.has(JSON.stringify([host.id, readId]))) return
+    if (['thread/start', 'thread/resume', 'thread/read', 'thread/fork'].includes(responseMethod || '')) this.rememberThread(host, result?.thread)
+    if (['thread/list', 'thread/search'].includes(responseMethod || '') && Array.isArray(result?.data))
+      for (const thread of result.data) this.rememberThread(host, thread)
+  }
+
+  private threadTitle(host: Host, threadId: string): Promise<string> {
+    const key = JSON.stringify([host.id, threadId])
+    const cached = this.threadTitles.get(key)
+    const title = cached?.name || cached?.preview
+    if (title || !this.options.resolveThread) return Promise.resolve(title || '未命名对话')
+    const pending = this.threadLookups.get(key)
+    if (pending) return pending
+    const lookup = (async () => {
+      let deadline: ReturnType<typeof setTimeout> | undefined
+      try {
+        const raw = await Promise.race([
+          this.options.resolveThread!(host, threadId),
+          new Promise<undefined>(resolve => { deadline = setTimeout(() => resolve(undefined), 3000); deadline.unref() }),
+        ])
+        // A rename received during the lookup is newer than its response.
+        if (id(record(raw)?.id) === threadId && this.threadTitles.get(key) === cached) this.rememberThread(host, raw)
+      } catch { /* Missing metadata never prevents delivery of the event. */ }
+      finally { clearTimeout(deadline) }
+      const current = this.threadTitles.get(key)
+      return current?.name || current?.preview || '未命名对话'
+    })()
+    this.threadLookups.set(key, lookup)
+    void lookup.finally(() => { if (this.threadLookups.get(key) === lookup) this.threadLookups.delete(key) })
+    return lookup
+  }
+
+  observe(host: Host, message: RpcMessage, responseMethod?: string) {
+    if (this.closed) return
+    this.observeThread(host, message, responseMethod)
+    if (!this.hasActiveSubscriptions) return
     const params = record(message.params)
     const threadId = id(params?.threadId) || id(params?.conversationId)
     if (!params || !threadId) return
     let kind: 'completed' | 'approval' | 'errors' | undefined
     let identity: string | undefined
+    let body: string | undefined
     if (message.method === 'turn/completed') {
       const turn = record(params.turn); const turnId = id(turn?.id)
       if (!turnId || !['completed', 'failed'].includes(String(turn?.status))) return
       kind = turn?.status === 'failed' || turn?.error ? 'errors' : 'completed'
+      body = kind === 'errors' ? '运行失败' : '运行完成'
       identity = `turn:${turnId}`
     } else if (message.method === 'error' && params.willRetry === false) {
       const turnId = id(params.turnId)
       if (!turnId) return
       kind = 'errors'; identity = `turn:${turnId}`
+      body = '运行失败'
     } else if (message.id !== undefined && (actionableRequests.has(message.method || '') ||
       (message.method === 'mcpServer/elicitation/request' && elicitationModes.has(String(params.mode))))) {
       if ((typeof message.id !== 'string' && typeof message.id !== 'number') || String(message.id).length > 256) return
       kind = 'approval'; identity = `request:${id(params.turnId) || id(params.callId) || ''}:${message.method}:${JSON.stringify(message.id)}`
+      body = ['item/commandExecution/requestApproval', 'execCommandApproval'].includes(message.method || '') ? '等待命令执行确认'
+        : ['item/fileChange/requestApproval', 'applyPatchApproval'].includes(message.method || '') ? '等待文件修改确认'
+        : message.method === 'item/permissions/requestApproval' ? '等待权限确认'
+        : message.method === 'item/tool/requestUserInput' ? '等待补充输入' : '等待确认或补充输入'
     }
-    if (!kind || !identity) return
+    if (!kind || !identity || !body) return
     const key = JSON.stringify([host.id, threadId, identity])
     for (const [key, expiry] of this.events) if (expiry <= this.now()) this.events.delete(key)
     if (this.events.has(key)) return
     this.events.set(key, this.now() + EVENT_TTL)
     while (this.events.size > MAX_EVENTS) this.events.delete(this.events.keys().next().value!)
-    const body = kind === 'completed' ? '对话运行已完成。' : kind === 'approval' ? '对话需要你的确认或补充输入。' : '对话运行遇到问题，请打开查看。'
     const notice: PushNotice = { title: 'Codex', body, tag: `codex-${hash(key).slice(0, 24)}`, data: { hostId: host.id, threadId, url: `/?host=${encodeURIComponent(host.id)}&thread=${encodeURIComponent(threadId)}`, kind } }
-    const task = this.notify(kind, notice).catch(() => {})
+    const task = this.notify(host, threadId, kind, notice).catch(() => {})
     this.pending.add(task)
     void task.finally(() => this.pending.delete(task))
   }
 
-  private async notify(kind: keyof PushPreferences, notice: PushNotice) {
+  private async notify(host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
     await this.save()
+    notice.title = await this.threadTitle(host, threadId)
     let pruned = false
     const jobs: Promise<void>[] = []
     for (const [endpoint, device] of this.devices) {

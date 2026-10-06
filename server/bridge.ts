@@ -10,7 +10,7 @@ import { sshAppServerArgs } from './ssh.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
-export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage) => void | Promise<void> }
+export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Pending = { originalId?: RpcId; clientKey?: string; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
@@ -145,7 +145,7 @@ export class Bridge {
     })
   }
 
-  async request(method: string, params?: unknown): Promise<unknown> { await this.connect(); return this.rawRequest(method, params) }
+  async request(method: string, params?: unknown, timeout = 120000): Promise<unknown> { await this.connect(); return this.rawRequest(method, params, undefined, undefined, timeout) }
 
   attach(key: string, socket: WebSocket, clientId: string, isAuthenticated = () => true) {
     const previous = this.clients.get(key)
@@ -218,10 +218,10 @@ export class Bridge {
 
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
+    const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
     // Observers must not stall or break RPC, even when a notification provider is offline.
-    try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message)).catch(() => {}) } catch {}
+    try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message, pending?.method)).catch(() => {}) } catch {}
     if (message.id !== undefined && !message.method) {
-      const pending = this.pending.get(String(message.id))
       if (!pending) return
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
       if (pending.method === 'command/exec') this.finishProcess(String(message.id), message.result, message.error)
