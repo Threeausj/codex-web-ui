@@ -125,7 +125,9 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f c
 
 进入远端交互 shell 后执行 `codex --version`，确保 nvm/mise 等 PATH 初始化生效。
 
-网页“连接”中填写主机或 SSH 别名，私钥路径使用 `/home/node/.ssh/...`。Codex 路径留空通过远端交互式登录 shell 识别；也可指定远端可执行文件。先“测试连接”，成功后保存。远端目录使用远端路径，不使用容器 `/workspace` 路径。不要将私钥、实际 SSH override、`.env.docker` 或 Codex 登录数据提交到 Git。
+网页“连接”中填写主机或 SSH 别名。选择“身份文件 → 上传私钥”可上传或替换无口令的 OpenSSH / PEM 私钥，最大 64 KB，上传后自动填入容器路径。上传密钥保存于持久化 Web 数据卷的 `/app/data/ssh-keys`，目录权限 `0700`、文件权限 `0600`。取消编辑会清理未保存的上传文件；替换或移除连接会清理不再被引用的上传密钥。也可手动填写挂载的 `/home/node/.ssh/...` 路径，已有文件不会被自动删除；上传功能不代替 `known_hosts` 的指纹核验。
+
+Codex 路径留空通过远端交互式登录 shell 识别；也可指定远端可执行文件。先“测试连接”，成功后保存。远端目录使用远端路径，不使用容器 `/workspace` 路径。不要将私钥、实际 SSH override、`.env.docker` 或 Codex 登录数据提交到 Git。
 
 ## 与桌面同步
 
