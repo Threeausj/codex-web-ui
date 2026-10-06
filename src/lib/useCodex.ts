@@ -111,6 +111,9 @@ const state = reactive({
 });
 let socket: WebSocket | null = null;
 let csrfToken = "";
+let authenticationGeneration = 0;
+type SessionStatus = { authenticated: boolean; authRequired?: boolean; csrfToken?: string };
+let sessionValidation: { generation: number; promise: Promise<SessionStatus | null> } | null = null;
 let counter = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -230,23 +233,71 @@ async function http(
   if (!(options.body instanceof FormData) && options.body)
     headers.set("Content-Type", "application/json");
   if (csrfToken) headers.set("x-csrf-token", csrfToken);
-  const response = await fetch(`/api${path}`, {
+  const generation = authenticationGeneration;
+  const requestToken = csrfToken;
+  const method = (options.method || "GET").toUpperCase();
+  // Some proxies cache private GETs despite the origin's no-store header.
+  // A per-request nonce prevents stale session/CSRF and private API responses.
+  const url = `/api${path}${method === "GET" || method === "HEAD"
+    ? `${path.includes("?") ? "&" : "?"}_request=${randomUUID()}` : ""}`;
+  const response = await fetch(url, {
     ...options,
     headers,
     credentials: "same-origin",
+    cache: "no-store",
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401) {
-      state.authenticated = false;
-      closeConnection();
+    if (response.status === 401 && state.authenticated &&
+      generation === authenticationGeneration && requestToken === csrfToken &&
+      path !== "/auth/session" && path !== "/auth/login") {
+      // A delayed push request or a connection from an old session cannot
+      // decide whether the browser's current cookie is still authenticated.
+      try { await validateSession(); } catch { /* A network failure is not a logout. */ }
     }
     const error = Object.assign(new Error(
       result.error?.message ?? result.error ?? `请求失败 (${response.status})`,
     ), { status: response.status });
-    throw reportError ? fail(error) : error;
+    throw reportError && generation === authenticationGeneration ? fail(error) : error;
   }
   return result;
+}
+function validateSession(): Promise<SessionStatus | null> {
+  const generation = authenticationGeneration;
+  if (sessionValidation?.generation === generation) return sessionValidation.promise;
+  const apply = (session: SessionStatus) => {
+    if (generation !== authenticationGeneration) return null;
+    if (typeof session.authenticated !== "boolean")
+      throw new Error("登录状态查询返回无效结果，请联网后重试");
+    state.authRequired = session.authRequired ?? state.authRequired;
+    if (session.authenticated) {
+      if (csrfToken && session.csrfToken && csrfToken !== session.csrfToken)
+        authenticationGeneration++;
+      csrfToken = session.csrfToken ?? csrfToken;
+      state.authenticated = true;
+    } else {
+      const wasAuthenticated = state.authenticated;
+      authenticationGeneration++;
+      csrfToken = "";
+      state.authenticated = false;
+      closeConnection();
+      if (wasAuthenticated) state.error = "登录已过期，请重新登录";
+    }
+    return session;
+  };
+  const checking = (async () => {
+    try {
+      return apply(await http("/auth/session", { signal: AbortSignal.timeout(10000) }, false));
+    } catch (error: any) {
+      if (error.status === 401) return apply({ authenticated: false });
+      throw error;
+    }
+  })();
+  const promise = checking.finally(() => {
+    if (sessionValidation?.promise === promise) sessionValidation = null;
+  });
+  sessionValidation = { generation, promise };
+  return promise;
 }
 const navigationRequests = new Map<string, Promise<void>>();
 const navigationRevisions = new Map<string, number>();
@@ -888,8 +939,13 @@ function connect(): Promise<void> {
       pending.clear();
       reject(new Error("连接已断开"));
       if (event.code === 4003) {
-        state.authenticated = false;
-        state.error = "登录已过期，请重新登录";
+        void validateSession().then(session => {
+          if (session?.authenticated && socket === ws) scheduleReconnect();
+        }).catch(error => {
+          if (socket !== ws || !state.authenticated) return;
+          fail(error);
+          scheduleReconnect();
+        });
         return;
       }
       if (event.code === 4001) {
@@ -921,15 +977,8 @@ function resumeConnection(): Promise<void> {
   clearTimeout(reconnectTimer);
   const recovery = (async () => {
     try {
-      const session = await http("/auth/session", { signal: AbortSignal.timeout(10000) }, false);
-      if (!current()) return;
-      if (!session.authenticated) {
-        state.authenticated = false;
-        closeConnection();
-        state.error = "登录已过期，请重新登录";
-        return;
-      }
-      csrfToken = session.csrfToken ?? csrfToken;
+      const session = await validateSession();
+      if (!session?.authenticated || !current()) return;
       const previous = socket;
       if (state.connected && previous?.readyState === WebSocket.OPEN) {
         // Android can resume a socket that still reports OPEN but no longer carries data.
@@ -1009,11 +1058,8 @@ async function initialize() {
   state.loading = true;
   state.error = "";
   try {
-    const session = await http("/auth/session");
-    state.authenticated = session.authenticated;
-    state.authRequired = session.authRequired;
-    csrfToken = session.csrfToken ?? "";
-    if (session.authenticated) await bootstrap();
+    const session = await validateSession();
+    if (session?.authenticated) await bootstrap();
   } catch (error) {
     fail(error);
   } finally {
@@ -1021,6 +1067,8 @@ async function initialize() {
   }
 }
 async function login(password: string) {
+  authenticationGeneration++;
+  closeConnection();
   state.loading = true;
   state.error = "";
   try {
@@ -1028,6 +1076,7 @@ async function login(password: string) {
       method: "POST",
       body: JSON.stringify({ password }),
     });
+    authenticationGeneration++;
     csrfToken = session.csrfToken;
     state.authenticated = true;
     await bootstrap();
@@ -1036,10 +1085,13 @@ async function login(password: string) {
   }
 }
 async function logout() {
+  authenticationGeneration++;
   if (typeof window !== "undefined" && "serviceWorker" in navigator) {
     await revokeDevicePush({ requestHttp: http });
   }
   await http("/auth/logout", { method: "POST" });
+  authenticationGeneration++;
+  csrfToken = "";
   state.authenticated = false;
   closeConnection();
   clearAttachments();

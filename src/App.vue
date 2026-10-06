@@ -484,7 +484,9 @@ function onForeground() {
   if (document.visibilityState !== "visible" || !navigator.onLine) return;
   clearTimeout(foregroundTimer);
   foregroundTimer = setTimeout(async () => {
-    await api.resumeConnection();
+    if (state.loading) return;
+    if (state.authenticated) await api.resumeConnection();
+    else await api.initialize();
     if (state.authenticated && state.online && !state.loading)
       await initializeDevicePush(api);
   }, 250);
