@@ -9,6 +9,9 @@ dist-server
 .data
 data
 workspace
+backups
+deploy/docker/*.env
+compose.ssh.yaml
 test-results
 playwright-report
 coverage

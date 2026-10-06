@@ -1,6 +1,6 @@
 # GitHub Actions
 
-本目录保存可选工作流模板。当前 GitHub 登录没有 `workflow` 权限，因此模板未放入自动执行的 `.github/workflows`，完整源码与 Docker 部署不受影响。
+本目录保存可选工作流模板，默认不放入自动执行的 `.github/workflows`。应用和 Docker 部署可以独立使用；按需启用持续集成。
 
 要启用，在具有相应仓库权限的账户中执行并提交：
 
@@ -15,7 +15,7 @@ cp deploy/github-actions/ci.yml .github/workflows/ci.yml
 
 ---
 
-This directory contains an optional workflow template. The current GitHub login lacks the `workflow` scope, so it is stored outside the automatically executed `.github/workflows` directory. All application sources and Docker deployment files are included.
+This directory contains an optional workflow template, stored outside the automatically executed `.github/workflows` directory by default. Application and Docker deployment files can be used independently; enable continuous integration when needed.
 
 To enable it, copy the template using the commands above and commit with an authorized account. For a gh OAuth login, run `gh auth refresh -h github.com -s workflow` and complete the browser authorization first. The repository owner can also create the workflow through GitHub's web editor.
 

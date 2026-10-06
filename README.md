@@ -25,6 +25,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，用网页密码登录，在 UI 中添加 `/workspace` 下的项目。Codex 模型账户登录与网页密码分别管理。
 
+标准 Docker 隔离策略可能阻止 Codex 的 Linux sandbox 创建 namespace；本次实测只读/工作区命令遇到该限制。需要终端、Tmux 或模型命令工具时，可由用户明确选择 Codex“完全访问”，其范围包含容器可访问的挂载及 SSH 主机。部署配置不会自动切换权限，也不使用 privileged 模式。[权限说明](docs/docker.md#检查与排错)。
+
 镜像包含固定版本 Codex CLI `0.159.2`、Git、SSH、Tmux，使用非 root 用户；网页数据和 Codex 配置/历史分别保存在持久化卷中。本地方案只发布回环端口，公网方案使用 Caddy HTTPS。Docker 中的“本机”指容器；不会自动使用 macOS/Windows 桌面账户或连接桌面 daemon。
 
 完整公网部署、SSH、桌面同步边界、升级备份和排错见 [Docker 部署指南](docs/docker.md) / [English guide](docs/docker.en.md)。本地和公网 Compose 配置分别使用，勿同时加载两个 overlay。
@@ -132,7 +134,7 @@ npm run doctor:preview
 
 目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目与上传元数据，对话历史保存在 Codex 中。
 
-2026-10-06 已验证真实模型推理、跨进程历史、PTY、隔离 daemon 协作、实际 Git/worktree、Vite HMR、隔离 tmux 生命周期与目录浏览；本阶段通过 99 项单元/协议测试、85 项浏览器流程测试和生产构建，详见 [验证清单](docs/validation.md)。桌面和手机页面已在本机验收；原验证截图含本机项目信息，保留在本地，不随仓库发布。
+2026-10-06 已验证真实模型推理、跨进程历史、PTY、隔离 daemon 协作、实际 Git/worktree、Vite HMR、隔离 tmux 生命周期与目录浏览；本阶段通过 103 项单元/协议测试、86 项浏览器流程测试和生产构建。Docker 已在 Linux/ARM64 隔离环境实际构建启动并验证协议、终端、中文 Tmux 与卷持久化，详见 [验证清单](docs/validation.md)。桌面和手机页面已在本机验收；原验证截图含本机项目信息，保留在本地，不随仓库发布。
 
 本阶段工作流及环境验收边界见 [工作流完整度](docs/roadmap.md)。插件市场不在当前范围内。
 

@@ -27,15 +27,20 @@ test('persistent terminal gives an explicit unavailable message without silently
   expect(mock.request('command/exec')).toBeUndefined()
 })
 
-test('explicit tmux terminal attaches through app-server PTY and preserves selected sandbox', async ({ page, mock }) => {
+for (const permission of ['workspace-write', 'danger-full-access'] as const) {
+test(`explicit tmux terminal prepares and attaches with selected ${permission} sandbox`, async ({ page, mock }) => {
   const command = ['/usr/bin/tmux', 'new-session', '-A', '-s', 'codex-web-test', '-c', '/workspace/demo']
-  await page.route('**/api/terminal-sessions/prepare', route => route.fulfill({ json: { available: true, sessionName: 'codex-web-test', command, note: '同一项目复用持久 Shell' } }))
+  let preparation: any
+  await page.route('**/api/terminal-sessions/prepare', route => { preparation = route.request().postDataJSON(); return route.fulfill({ json: { available: true, sessionName: 'codex-web-test', command, note: '同一项目复用持久 Shell' } }) })
   await login(page)
+  await page.getByRole('combobox', { name: '选择权限' }).selectOption(permission)
   await slash(page, 'terminal')
   await page.getByRole('checkbox', { name: /持久 Shell/ }).check()
   await page.getByRole('button', { name: '启动终端', exact: true }).click()
   await expect.poll(() => mock.request('command/exec')?.params.command).toEqual(command)
-  expect(mock.request('command/exec')?.params).toMatchObject({ tty: true, cwd: '/workspace/demo', sandboxPolicy: { type: 'workspaceWrite' } })
+  expect(preparation).toMatchObject({ hostId: 'local', cwd: '/workspace/demo', permission })
+  expect(mock.request('command/exec')?.params).toMatchObject({ tty: true, cwd: '/workspace/demo', sandboxPolicy: { type: permission === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' } })
   await expect(page.locator('.pty-hint')).toHaveText('同一项目复用持久 Shell')
   await page.getByRole('button', { name: '结束终端', exact: true }).click()
 })
+}

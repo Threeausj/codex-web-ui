@@ -93,8 +93,10 @@ Add this override to every command for that deployment. Validate the complete co
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml up -d --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml exec app ssh your-alias codex --version
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml exec app ssh your-alias
 ```
+
+Run `codex --version` inside that remote interactive shell so that PATH initialization through nvm/mise or similar tools takes effect.
 
 In Settings → Connections, enter a hostname or SSH alias and use container identity paths such as `/home/node/.ssh/...`. Leave the Codex path empty for remote interactive-login-shell discovery, or specify the remote executable. Test the connection before saving it. Remote projects use remote paths, not container `/workspace` paths. Keep private keys, populated SSH overrides, `.env.docker`, and Codex login data out of Git.
 
@@ -155,8 +157,10 @@ The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check pr
 | tmux gone after restart | File volumes do not preserve processes; SSH-host tmux can live independently of the web container |
 | Caddy certificate failure | DNS, TCP 80/443, ACME contact, CAA/network, and Caddy logs |
 
-Read-only/workspace-write sandbox modes may depend on kernel/user-namespace support unavailable under a particular Docker policy. If a user explicitly selects Codex Full access, it applies to mounts/processes/SSH hosts accessible to the container and does not grant host Docker management. Do not automatically switch permissions or enable `--privileged` to work around an error.
+In the tested standard Docker deployment, read-only/workspace-write commands reported `bwrap: No permissions to create a new namespace`; container-bound Full access commands and PTYs worked. Fine-grained sandbox modes require suitable kernel/user-namespace/container-policy support and need separate environment verification. If a user explicitly selects Codex Full access, it applies to mounts/processes/SSH hosts accessible to the container and does not grant host Docker management. Do not automatically switch permissions or enable `--privileged` to work around an error.
 
 The [optional CI template](../deploy/github-actions/README.md) checks the application suite/build and an isolated container: health, login/Cookie behavior, unauthorized rejection, real app-server handshake/files/PTY/tmux, persistence after recreation, HTTPS-origin Secure cookies, and Caddy configuration. Copy it to `.github/workflows/ci.yml` to enable it. It needs no model account or inference quota. Real domain certificates, SSH targets, and desktop active turns require deployment-specific verification. See the [validation checklist](validation.md).
+
+On 2026-10-06, the image was built and the container checks above passed in an isolated Colima Linux/ARM64 environment, including forced-recreation persistence, public-origin Cookie behavior, and Caddy validation. An amd64 image and real ACME certificate issuance were not tested.
 
 References: [Compose in production](https://docs.docker.com/compose/how-tos/production/), [Codex CLI](https://learn.chatgpt.com/docs/codex/cli), [app-server](https://learn.chatgpt.com/docs/app-server).

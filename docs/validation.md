@@ -20,9 +20,10 @@ npm run doctor:preview
 
 ## 开发时实际验证（2026-10-06）
 
-- 最终检查：`npm test` 的 99 项单元/协议测试全部通过，无跳过；`npm run build` 完成 Vue 类型检查、Vite 生产构建与 Node 服务端编译。终端断线后的进程/输出恢复、原连接 RPC 隔离和会话失效关闭连接均有测试覆盖。
-- Docker：新增多阶段非 root 镜像、本地/公网 Compose、环境模板、Caddy 和中英文部署指南；静态资源与挂载工作区独立的实际 HTTP 测试已通过。可启用的 CI 示例构建镜像并运行隔离容器集成检查，覆盖官方 app-server、登录/CSRF/Origin、PTY、Tmux、卷重建持久化、HTTPS Cookie 与 Caddy 配置；容器构建和实际启动另行在隔离环境验证，不代表真实域名/SSH 验收。
-- Playwright Chromium：完整 `npm run test:e2e` 的 85 个真实 Vue 页面用例通过，覆盖登录、增量流式/去重、执行中追加输入的 `turn/steer`、上下文比例、模型/权限、Fork、自动/手动压缩、审批、Slash/@/命令面板、上传数据、命令 Unicode 字节流、HTML sandbox、PTY 输入/resize/结束、SSH 测试与编辑、内容排序、过程运行时展开与结束折叠、侧栏 4 项折叠、工作区调宽、项目菜单、目录选择、新对话位置、文件下载、Tmux 管理与 390px 手机布局。HTTP/WebSocket 由测试 fixtures 提供，不代表实际模型、SSH 或公网验证。
+- 最终检查：`npm test` 的 103 项单元/协议测试全部通过，无跳过；`npm run build` 完成 Vue 类型检查、Vite 生产构建与 Node 服务端编译。终端断线后的进程/输出恢复、原连接 RPC 隔离和会话失效关闭连接均有测试覆盖。
+- Docker：实际 Linux/ARM64 Debian 镜像通过多阶段构建与健康启动，非 root UID 1000，无 privileged/Docker socket；隔离 Colima 环境中的真实 app-server、登录/CSRF/Origin/WS、独立静态资源、文件、PTY stdin/resize、显式权限的持久 Shell 探测、中文 Tmux 新建/读取/切换参数/删除全部通过。强制重建后 Web 数据卷、Codex home 卷和工作区 bind 文件均保留；公网 overlay 不发布应用端口，HTTPS origin 的 Secure Cookie 与官方 Caddy 容器配置校验通过。测试容器/卷和临时凭据已清理，专用 VM 已停止，原 8787 服务正常。未验实际 ACME 签发、amd64 容器或真实 SSH。
+- Docker 权限与兼容：标准隔离策略下 read-only/workspace-write 命令实际返回 bwrap namespace 权限错误；full access 的命令、终端与 Tmux 已通过，没有自动扩大权限。修复 Debian tmux 3.3a 将 TAB 替换为下划线导致的列表/创建解析问题，版本化可打印字段转义 `%` 和 `|`，兼容旧 TAB；中文、分隔符、反斜杠和特殊路径有真实 tmux 与解析回归。持久 Shell 探测遵循用户选择的权限，namespace 失败明确显示原因且不以更宽权限重试。
+- Playwright Chromium：完整 `npm run test:e2e` 的 86 个真实 Vue 页面用例通过，覆盖登录、增量流式/去重、执行中追加输入的 `turn/steer`、上下文比例、模型/权限、Fork、自动/手动压缩、审批、Slash/@/命令面板、上传数据、命令 Unicode 字节流、HTML sandbox、PTY 输入/resize/结束、SSH 测试与编辑、内容排序、过程运行时展开与结束折叠、侧栏 4 项折叠、工作区调宽、项目菜单、目录选择、新对话位置、文件下载、Tmux 管理与 390px 手机布局。HTTP/WebSocket 由测试 fixtures 提供，不代表实际模型、SSH 或公网验证。
 - Codex CLI 0.159.2：隔离 stdio 握手、配置/模型/历史列表、文件/目录 RPC通过。
 - 当前主机：真实 HTTP 登录/bootstrap、带鉴权 WebSocket、`command/exec` 执行 Node 版本读取、上传与 `0600` 文件权限通过。
 - 隔离 PTY：真实 `sh -i` 的 tty 输出、stdin、`34x100` resize、`stty size` 与 Ctrl+D 退出经过协议验证，不使用模型额度。

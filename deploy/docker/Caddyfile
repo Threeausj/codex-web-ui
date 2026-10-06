@@ -1,10 +1,10 @@
 {
-    email {$ACME_EMAIL}
-    admin off
+	email {$ACME_EMAIL}
+	admin off
 }
 
 {$PUBLIC_HOST} {
-    encode zstd gzip
-    reverse_proxy app:8787
-    header Strict-Transport-Security "max-age=31536000"
+	encode zstd gzip
+	reverse_proxy app:8787
+	header Strict-Transport-Security "max-age=31536000"
 }

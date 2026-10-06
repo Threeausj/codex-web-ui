@@ -24,6 +24,7 @@ COPY --from=build /app/node_modules /app/node_modules
 COPY --from=build /app/dist-server /app/dist-server
 COPY --from=build /app/dist /app/dist
 ENV NODE_ENV=production \
+    LANG=C.UTF-8 \
     HOST=0.0.0.0 \
     PORT=8787 \
     DATA_DIR=/app/data \

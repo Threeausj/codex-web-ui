@@ -75,10 +75,21 @@ const name = z
     "会话名称只能包含字母、数字、下划线和连字符",
   );
 const MAX_OUTPUT = 256 * 1024;
+const RECORD_PREFIX = "tmux-v1|";
+// tmux 3.3 sanitizes literal TABs in -F into underscores. Use printable fields,
+// escape '%' before '|', and sanitize controls before they can split a record.
+// The nested literal protects the colons in the POSIX character class from the
+// format modifier parser. These substitutions require no remote shell helpers.
+const labelFormat = (variable: string) =>
+  `#{s/%/%25/;s/[|]/%7C/;s/#{l:[[:cntrl:]]}/ /:${variable}}`;
 const SESSION_FORMAT =
-  "#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_name}";
+  `${RECORD_PREFIX}#{session_id}|#{session_windows}|#{session_attached}|#{session_created}|` +
+  labelFormat("session_name");
 const PANE_FORMAT =
-  "#{pane_id}\t#{window_id}\t#{pane_active}\t#{window_active}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}\t#{pane_title}";
+  `${RECORD_PREFIX}#{pane_id}|#{window_id}|#{pane_active}|#{window_active}|` +
+  ["pane_current_command", "pane_current_path", "window_name", "pane_title"]
+    .map(labelFormat)
+    .join("|");
 const route =
   (handler: RequestHandler): RequestHandler =>
   (req, res, next) => {
@@ -124,7 +135,11 @@ async function execute(
 ): Promise<CommandExecResponse> {
   try {
     return (await context.bridge.request("command/exec", {
-      command,
+      // Force UTF-8 output even when a remote host has no UTF-8 locale set.
+      command:
+        command[0] === context.executable
+          ? [command[0]!, "-u", ...command.slice(1)]
+          : command,
       cwd: context.cwd,
       timeoutMs: 10000,
       outputBytesCap: MAX_OUTPUT,
@@ -219,13 +234,24 @@ function metadataSize(result: CommandExecResponse) {
       "tmux_output",
     );
 }
+function recordFields(row: string, count: number): string[] | null {
+  const normalized = row.replace(/\r$/, "");
+  if (!normalized.startsWith(RECORD_PREFIX)) return normalized.split("\t");
+  const fields = normalized.slice(RECORD_PREFIX.length).split("|");
+  if (fields.length !== count) return null;
+  // Decode in one pass: a literal "%7C" was emitted as "%257C", so it must
+  // remain "%7C", rather than becoming another field separator.
+  return fields.map((field) =>
+    field.replace(/%25|%7C/g, (encoded) => (encoded === "%25" ? "%" : "|")),
+  );
+}
 export function parseTmuxSessions(source: string): TmuxSession[] {
   const sessions = new Map<string, TmuxSession>();
   for (const row of source.split("\n")) {
     if (!row) continue;
-    const [id, windows, attached, createdAt, ...nameParts] = row
-      .replace(/\r$/, "")
-      .split("\t");
+    const fields = recordFields(row, 5);
+    if (!fields) continue;
+    const [id, windows, attached, createdAt, ...nameParts] = fields;
     if (
       !sessionId.safeParse(id).success ||
       ![windows, attached, createdAt].every((value) =>
@@ -260,7 +286,7 @@ export function parseTmuxPanes(source: string): TmuxPane[] {
       cwd,
       windowName,
       ...title
-    ] = row.replace(/\r$/, "").split("\t");
+    ] = recordFields(row, 8) || [];
     if (
       !paneId.safeParse(id).success ||
       !/^@(?:0|[1-9]\d{0,12})$/.test(windowId || "") ||

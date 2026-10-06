@@ -52,19 +52,20 @@ async function start() {
     | undefined;
   const hostId = props.state.hostId;
   const projectPath = props.state.projectPath;
+  const permission = props.state.permission;
+  const requestedPersistent = persistent.value;
+  const current = () => hostId === props.state.hostId &&
+    projectPath === props.state.projectPath && permission === props.state.permission &&
+    requestedPersistent === persistent.value;
   try {
     if (persistent.value) {
       const result = await props.api.requestHttp("/terminal-sessions/prepare", {
         method: "POST",
-        body: JSON.stringify({ hostId, cwd: projectPath }),
+        body: JSON.stringify({ hostId, cwd: projectPath, permission }),
       });
+      if (!current()) return;
       if (!result.available)
         throw new Error(result.reason || "所选主机没有 tmux");
-      if (
-        hostId !== props.state.hostId ||
-        projectPath !== props.state.projectPath
-      )
-        return;
       options = {
         command: result.command,
         persistent: true,
@@ -77,9 +78,9 @@ async function start() {
     terminal?.focus();
     void props.api
       .startTerminal(terminal?.cols ?? 80, terminal?.rows ?? 24, options)
-      .catch((cause: Error) => (error.value = cause.message));
+      .catch((cause: Error) => { if (current()) error.value = cause.message; });
   } catch (cause: any) {
-    error.value = cause.message;
+    if (current()) error.value = cause.message;
   } finally {
     starting.value = false;
   }

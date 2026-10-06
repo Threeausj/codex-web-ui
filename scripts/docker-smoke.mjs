@@ -158,10 +158,16 @@ try {
   assert.match(output(), /CODEX_DOCKER_STDIN_OK/);
 
   const scope = { hostId: 'local', cwd: '/workspace', permission: 'danger-full-access' };
+  const persistent = await api('/api/terminal-sessions/prepare', scope);
+  assert.equal(persistent.available, true, 'Explicit full access must detect tmux for the persistent terminal');
+  assert.equal(persistent.persistence, 'tmux');
+  assert.ok(persistent.command.includes('new-session'));
   assert.equal((await api('/api/tmux/list', scope)).available, true);
-  const { session } = await api('/api/tmux/create', { ...scope, name: `docker-smoke-${Date.now()}` });
+  const sessionName = `docker-测试-${Date.now()}`;
+  const { session } = await api('/api/tmux/create', { ...scope, name: sessionName });
+  assert.equal(session.name, sessionName, 'tmux must preserve Unicode labels');
   try {
-    assert.ok((await api('/api/tmux/list', scope)).sessions.some(entry => entry.id === session.id));
+    assert.ok((await api('/api/tmux/list', scope)).sessions.some(entry => entry.id === session.id && entry.name === sessionName));
     const attach = await api('/api/tmux/attach', { ...scope, sessionId: session.id });
     assert.ok(attach.command.includes('attach-session'));
     const send = await rpc('command/exec', { command: ['tmux', 'send-keys', '-t', session.id, 'printf "CODEX_DOCKER_TMUX_OK\\n"', 'Enter'], cwd: '/workspace', timeoutMs: 10000, sandboxPolicy: { type: 'dangerFullAccess' } });

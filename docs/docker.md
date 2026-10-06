@@ -93,8 +93,10 @@ services:
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml up -d --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml exec app ssh your-alias codex --version
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.ssh.yaml exec app ssh your-alias
 ```
+
+进入远端交互 shell 后执行 `codex --version`，确保 nvm/mise 等 PATH 初始化生效。
 
 网页“连接”中填写主机或 SSH 别名，私钥路径使用 `/home/node/.ssh/...`。Codex 路径留空通过远端交互式登录 shell 识别；也可指定远端可执行文件。先“测试连接”，成功后保存。远端目录使用远端路径，不使用容器 `/workspace` 路径。不要将私钥、实际 SSH override、`.env.docker` 或 Codex 登录数据提交到 Git。
 
@@ -155,8 +157,10 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 | 重启后 Tmux 不在 | 磁盘卷不保存进程；使用容器外 SSH 主机可让其 Tmux 独立于 Web 容器 |
 | Caddy 未获得证书 | 域名 DNS、80/443、ACME 联系人、CAA/网络，查看 Caddy 日志 |
 
-工作区写入/只读 sandbox 在不同 Docker 内核策略下可能不可用；如用户明确选择 Codex“完全访问”，它作用于容器进程可访问的挂载和 SSH 工作站，不会授予宿主机 Docker 管理权限。不要为了启动而自动切换权限或增加 `--privileged`。
+本次标准 Docker 实测中，只读/工作区写入命令均遇到 `bwrap: No permissions to create a new namespace`；容器内的“完全访问”命令和 PTY 可运行。细粒度 sandbox 需要相应内核/user namespace/容器策略支持，部署时另行确认。如用户明确选择 Codex“完全访问”，它作用于容器进程可访问的挂载和 SSH 工作站，不会授予宿主机 Docker 管理权限。不要为了启动而自动切换权限或增加 `--privileged`。
 
 可启用的 [CI 示例](../deploy/github-actions/README.md) 验证应用测试/构建与隔离容器：健康检查、登录/Cookie、未登录拒绝、真实 app-server 握手/文件/PTY/Tmux、重建后的数据保存，以及 HTTPS origin 的 Secure Cookie 和 Caddy 配置。复制到 `.github/workflows/ci.yml` 后启用。测试不需要模型账户或推理额度；真实域名证书、实际 SSH 和桌面活动 turn 仍由部署环境验收。[验证清单](validation.md)。
+
+2026-10-06 已在独立 Colima 的 Linux/ARM64 环境实际完成镜像构建、上述容器检查及强制重建持久化验证；公网 origin/Cookie 和 Caddy 配置验证通过。未测试 amd64 镜像或真实 ACME 证书签发。
 
 参考：[Docker Compose 生产部署](https://docs.docker.com/compose/how-tos/production/)、[Codex CLI](https://learn.chatgpt.com/docs/codex/cli)、[app-server](https://learn.chatgpt.com/docs/app-server)。

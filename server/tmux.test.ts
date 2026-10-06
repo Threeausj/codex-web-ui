@@ -31,6 +31,10 @@ type Result = { exitCode: number; stdout: string; stderr: string };
 type Session = { id: string; name: string; created: number };
 const ok = (stdout = ""): Result => ({ exitCode: 0, stdout, stderr: "" });
 const fail = (stderr: string): Result => ({ exitCode: 1, stdout: "", stderr });
+const tmuxCommand = (input: Command) => {
+  assert.equal(input.command[1], "-u", "tmux metadata must force UTF-8 output");
+  return [input.command[0]!, ...input.command.slice(2)];
+};
 const sessionRows = (values: Session[]) =>
   values
     .map((entry) => `${entry.id}\t1\t0\t${entry.created}\t${entry.name}`)
@@ -67,7 +71,8 @@ async function fixture(
           const input = params as Command;
           calls.push({ hostId, input });
           if (handler) return handler(hostId, input);
-          const command = input.command;
+          const command =
+            input.command[0] === "/bin/sh" ? input.command : tmuxCommand(input);
           if (command[0] === "/bin/sh") {
             assert.deepEqual(command, ["/bin/sh", "-c", "command -v tmux"]);
             return ok("/usr/bin/tmux\n");
@@ -401,11 +406,12 @@ test("tmux surfaces sandbox and vanished target failures without retrying with b
 test("tmux capture bounds scrollback lines and byte capture and rejects out-of-range requests", async () => {
   const f = await fixture(async (_host, input) => {
     if (input.command[0] === "/bin/sh") return ok("/usr/bin/tmux\n");
-    if (input.command[1] === "list-sessions") return ok("$1\t1\t0\t10\ttest\n");
-    if (input.command[1] === "list-panes")
+    const command = tmuxCommand(input);
+    if (command[1] === "list-sessions") return ok("$1\t1\t0\t10\ttest\n");
+    if (command[1] === "list-panes")
       return ok("%1\t@1\t1\t1\tzsh\t/repo\tmain\ttitle\n");
-    assert.equal(input.command[1], "capture-pane");
-    assert.deepEqual(input.command.slice(-2), ["-S", "-2"]);
+    assert.equal(command[1], "capture-pane");
+    assert.deepEqual(command.slice(-2), ["-S", "-2"]);
     return ok("first\nsecond\nthird\n");
   });
   try {
@@ -440,6 +446,29 @@ test("tmux parsers preserve labels, ignore malformed records and deduplicate can
   assert.equal(panes[0]!.title, "title continued");
 });
 
+test("tmux printable records preserve delimiters, percent-like strings, Unicode and backslashes", () => {
+  assert.deepEqual(
+    parseTmuxSessions(
+      "tmux-v1|$8|2|1|100|会话%7C%257C\\目录_%25\n" +
+        "tmux-v1|$9|1|0|101|extra|delimiter\n" +
+        "tmux-v1|$01|1|0|102|invalid\n",
+    ),
+    [{ id: "$8", name: "会话|%7C\\目录_%", windows: 2, attached: 1, createdAt: 100 }],
+  );
+  assert.deepEqual(
+    parseTmuxPanes(
+      "tmux-v1|%8|@2|1|0|run%7C%25\\job|/工作区%7C%257C\\目录|窗口%7C%2525|标题%7C%257C\\尾_%25\n" +
+        "tmux-v1|%9|@2|1|1|sh|/repo|window|bad|extra\n" +
+        "tmux-v1|%10|@2|2|1|sh|/repo|window|invalid\n",
+    ),
+    [{
+      id: "%8", windowId: "@2", active: true, windowActive: false,
+      command: "run|%\\job", path: "/工作区|%7C\\目录",
+      windowName: "窗口|%25", title: "标题|%7C\\尾_%",
+    }],
+  );
+});
+
 const tmuxExecutable = spawnSync("/bin/sh", ["-c", "command -v tmux"], {
   encoding: "utf8",
 }).stdout?.trim();
@@ -455,9 +484,11 @@ test(
   "real tmux lifecycle uses a private socket and never touches the user's default sessions",
   { skip: !hasTmux, timeout: 20000 },
   async () => {
-    const directory = await fs.realpath(
+    const rootDirectory = await fs.realpath(
       await fs.mkdtemp(path.join(os.tmpdir(), "codex-tmux-test-")),
     );
+    const directory = path.join(rootDirectory, "工作区|%7C\\目录_%");
+    await fs.mkdir(directory);
     const socket = `codex-web-test-${randomUUID()}`;
     const f = await fixture(async (_host, input) => {
       if (input.command[0] === "/bin/sh") return ok(`${tmuxExecutable}\n`);
@@ -495,9 +526,24 @@ test(
       assert.equal(first.code, 201, JSON.stringify(first.body));
       assert.equal(second.code, 201, JSON.stringify(second.body));
       const firstId = first.body.session.id;
+      const privateTmux = (...args: string[]) =>
+        execute(tmuxExecutable!, ["-L", socket, "-u", ...args]);
+      await privateTmux("rename-session", "-t", firstId, "会话|%7C\\目录_%");
+      await privateTmux("set-option", "-t", firstId, "allow-rename", "off");
+      await privateTmux("rename-window", "-t", firstId, "窗口|%25\\名称_%");
+      await privateTmux("select-pane", "-t", firstId, "-T", "标题|%7C\\尾_%");
+      const nativeName = (await privateTmux("display-message", "-p", "-t", firstId, "#{session_name}")).stdout.trimEnd();
+      const nativeWindow = (await privateTmux("list-panes", "-t", firstId, "-F", "#{window_name}")).stdout.trimEnd();
+      const nativeTitle = (await privateTmux("list-panes", "-t", firstId, "-F", "#{pane_title}")).stdout.trimEnd();
+      assert.equal(
+        (await f.post("list", { cwd: directory })).body.sessions.find((entry: any) => entry.id === firstId).name,
+        nativeName,
+      );
       const read = await f.post("read", { cwd: directory, sessionId: firstId });
       assert.equal(read.code, 200, JSON.stringify(read.body));
       assert.equal(read.body.panes[0].path, directory);
+      assert.equal(read.body.panes[0].windowName, nativeWindow);
+      assert.equal(read.body.panes[0].title, nativeTitle);
       assert.equal(
         (
           await f.post("attach", {
@@ -526,7 +572,7 @@ test(
         () => {},
       );
       await f.close();
-      await fs.rm(directory, { recursive: true, force: true });
+      await fs.rm(rootDirectory, { recursive: true, force: true });
     }
   },
 );
