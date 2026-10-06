@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { z } from 'zod'
 import { Auth, trustedOrigins } from './auth.js'
-import { Storage } from './storage.js'
+import { Storage, hostInput } from './storage.js'
 import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
 import { registerGit } from './git.js'
@@ -19,6 +19,7 @@ import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerHostConnection } from './host-connection.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
+import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
 import { registerProjectDirectories } from './project-directories.js'
 import { PushService, registerPush, type PushOptions } from './push.js'
 import type { AuthenticatedRequest } from './types.js'
@@ -27,6 +28,7 @@ export type AppOptions = {
   cwd?: string; dataDir?: string; codexHome?: string; password?: string; origins?: string[]; port?: number
   secureCookie?: boolean; trustProxy?: boolean; bridgeOptions?: BridgeOptions; serveStatic?: boolean; staticDir?: string
   pushOptions?: PushOptions
+  sshHostKeyOptions?: Omit<SSHHostKeyServiceOptions, 'dataDir'>
 }
 
 const asyncRoute = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
@@ -39,6 +41,7 @@ export async function createApp(options: AppOptions = {}) {
   const clientName = normalizeCodexClientName(options.bridgeOptions?.clientName ?? process.env.CODEX_CLIENT_NAME)
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
+  const sshHostKeys = new SSHHostKeyService({ ...options.sshHostKeyOptions, dataDir })
   const configuredOrigins = options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean)
   const origins = trustedOrigins(configuredOrigins, options.port || Number(process.env.PORT) || 8787)
   const httpsOnly = configuredOrigins.length > 0 && configuredOrigins.every(origin => origin.trim().startsWith('https:'))
@@ -55,6 +58,7 @@ export async function createApp(options: AppOptions = {}) {
   const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
+  bridgeOptions.resolveSshHostKeyPin ??= async host => (await sshHostKeys.connectionKnownHosts(host)) ?? bridgeOptions.sshHostKeyPin
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
     push.observe(host, message, responseMethod)
@@ -80,7 +84,7 @@ export async function createApp(options: AppOptions = {}) {
   app.post('/api/auth/logout', auth.requireAuth, auth.requireCsrf, auth.logout)
   app.post('/api/auth/password', auth.requireAuth, auth.requireCsrf, auth.changePassword)
   registerPreview(app, { getBridge, getHost: (id: string) => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, allowedOrigins: origins, isSessionActive: (sessionId: string) => auth.isSessionActive(sessionId) })
-  const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener) })
+  const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener), resolveSshHostKeyPin: bridgeOptions.resolveSshHostKeyPin })
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
   app.use('/api', auth.requireAuth, auth.requireCsrf)
   registerPush(app, push)
@@ -96,6 +100,16 @@ export async function createApp(options: AppOptions = {}) {
   registerHostConnection(app, bridgeOptions)
   const sshKeys = new SshKeys(dataDir, storage)
   registerSshKeys(app, sshKeys)
+  const fingerprintFields = z.object({ hostname: z.string(), port: z.number().int().min(1).max(65535).nullish() })
+  const fingerprintHost = (fields: { hostname: string; port?: number | null }) => ({ ...hostInput.parse({ name: '服务器指纹', hostname: fields.hostname, port: fields.port }), id: 'fingerprint-draft', kind: 'ssh' as const })
+  app.post('/api/hosts/key/inspect', asyncRoute(async (req: AuthenticatedRequest, res) => {
+    const fields = fingerprintFields.strict().parse(req.body)
+    res.json(await sshHostKeys.inspect(fingerprintHost(fields), req.session!.id))
+  }))
+  app.post('/api/hosts/key/trust', asyncRoute(async (req: AuthenticatedRequest, res) => {
+    const fields = fingerprintFields.extend({ challenge: z.string().min(16).max(256), replace: z.boolean().default(false) }).strict().parse(req.body)
+    res.json({ ok: true, ...await sshHostKeys.trust(fingerprintHost(fields), fields.challenge, fields.replace, req.session!.id) })
+  }))
   app.post('/api/hosts', asyncRoute((req, res) => sshKeys.withHostMutation(async () => res.status(201).json({ host: await storage.addHost(req.body) }))))
   app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
@@ -200,7 +214,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, stopPushLogoutListener, stopPushPasswordListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {

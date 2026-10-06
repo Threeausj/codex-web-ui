@@ -146,7 +146,11 @@ Compose 已转发三个可选环境变量：
 
 远端用户需要可用的 Codex CLI 与账户配置；需要 Tmux 时也在远端安装。SSH 地址、别名、身份文件路径都由容器内的 OpenSSH 解析，宿主机的 `~/.ssh` 不会自动进入容器。
 
-准备一个仅包含所需 SSH 配置、身份文件和已核验 `known_hosts` 的目录，保证容器 UID 1000 能读取私钥；SSH 目录权限 `0700`、私钥 `0600`。先在可信终端核对服务器指纹，再写入 `known_hosts`；不使用 `StrictHostKeyChecking=no`。
+可以直接在网页添加新主机：“设置 → 连接”填写地址、端口和身份文件后，点击“获取服务器指纹”。页面显示目标地址、公钥类型和 SHA256 指纹；确认后点击“信任并测试连接”，无需先进入容器写 `known_hosts`。首次测试遇到未受信任的主机时，也会显示指纹确认区。
+
+已记录的密钥发生变化时，页面同时显示新旧指纹，必须勾选密钥变更确认后点击“替换指纹并测试连接”。信任确认前会再次检查服务器公钥，指纹过期或地址修改后需重新获取。连接一直使用 `StrictHostKeyChecking=yes`；网页确认的记录保存在 Web 数据卷的 `/app/data/ssh/known_hosts`（`DATA_DIR/ssh/known_hosts`，文件权限 `0600`），备份与迁移时保留 `webdata` 即可。
+
+也可挂载已有 SSH 配置与密钥。准备一个仅包含所需 SSH 配置、身份文件和已核验 `known_hosts` 的目录，保证容器 UID 1000 能读取私钥；SSH 目录权限 `0700`、私钥 `0600`。已有记录继续可用；指纹可与服务器管理员提供的值核对。[OpenSSH 文档](https://man.openbsd.org/ssh-keyscan)说明，获取公钥不要求登录，但获取到的公钥本身不能证明服务器身份。SSH 别名会按容器内配置解析地址、端口和 `HostKeyAlias`；配置了 `ProxyJump`、`ProxyCommand` 或 `KnownHostsCommand` 的主机暂不支持网页扫描，仍使用其原有 SSH 配置建立信任。
 
 保存可选 override `compose.ssh.yaml`：
 
@@ -166,7 +170,7 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f c
 
 进入远端交互 shell 后执行 `codex --version`，确保 nvm/mise 等 PATH 初始化生效。
 
-网页“连接”中填写主机或 SSH 别名。选择“身份文件 → 上传私钥”可上传或替换无口令的 OpenSSH / PEM 私钥，最大 64 KB，上传后自动填入容器路径。上传密钥保存于持久化 Web 数据卷的 `/app/data/ssh-keys`，目录权限 `0700`、文件权限 `0600`。取消编辑会清理未保存的上传文件；替换或移除连接会清理不再被引用的上传密钥。也可手动填写挂载的 `/home/node/.ssh/...` 路径，已有文件不会被自动删除；上传功能不代替 `known_hosts` 的指纹核验。
+网页“连接”中填写主机或 SSH 别名。选择“身份文件 → 上传私钥”可上传或替换无口令的 OpenSSH / PEM 私钥，最大 64 KB，上传后自动填入容器路径。上传密钥保存于持久化 Web 数据卷的 `/app/data/ssh-keys`，目录权限 `0700`、文件权限 `0600`。取消编辑会清理未保存的上传文件；替换或移除连接会清理不再被引用的上传密钥。也可手动填写挂载的 `/home/node/.ssh/...` 路径，已有文件不会被自动删除。身份私钥用于登录账户，服务器指纹用于识别目标主机，两者分别设置。
 
 Codex 路径留空通过远端交互式登录 shell 识别；也可指定远端可执行文件。先“测试连接”，成功后保存。远端目录使用远端路径，不使用容器 `/workspace` 路径。不要将私钥、实际 SSH override、`.env.docker` 或 Codex 登录数据提交到 Git。
 
@@ -223,7 +227,8 @@ Web 镜像升级与 Codex 升级相互独立。CLI 升级后核对协议兼容�
 | `.env.docker` 密码无法登录 | 已保存的 `web-password.json` 优先；使用设置里更新后的密码，忘记时按访问密码重置步骤恢复 |
 | 本机提示未找到 Codex | 镜像不内置 CLI；添加宿主安装 overlay，核对 `HOST_CODEX_DIRECTORY` 和绝对 `CODEX_BIN`，或选择 SSH 主机 |
 | 网页可登录但模型不可用 | 在执行 CLI 的远端或容器 `CODEX_HOME` 登录；确认账户模型权限/提供方配置 |
-| SSH 错误 | 从容器测试同一别名，检查挂载路径、身份文件权限及已核验的 `known_hosts` |
+| SSH 主机密钥未受信任/已变更 | 在连接编辑页获取指纹并确认；变更时核对新旧指纹后显式替换，迁移时保留 `webdata` |
+| 其他 SSH 错误 | 从容器测试同一别名，检查挂载路径、身份文件权限和地址/端口 |
 | 没有桌面历史 | 默认卷独立；核对同数据目录和绝对项目路径，不假设自动云同步 |
 | Linux sandbox/namespace 不可用 | 宿主机内核和容器策略会影响 Codex sandbox；先检查具体错误，配置不自动放宽 Docker 权限 |
 | 重启后 Tmux 不在 | 磁盘卷不保存进程；使用容器外 SSH 主机可让其 Tmux 独立于 Web 容器 |

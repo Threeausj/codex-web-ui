@@ -8,6 +8,8 @@ import {
   watch,
 } from "vue";
 import Icon from "./Icon.vue";
+import FileMarkdownPreview from "./FileMarkdownPreview.vue";
+import { isImagePath, isMarkdownPath } from "../lib/file-preview";
 const InteractiveTerminal = defineAsyncComponent(
   () => import("./InteractiveTerminal.vue"),
 );
@@ -58,6 +60,8 @@ const previewInput = ref("");
 const previewUrl = ref("");
 const previewMode = ref("desktop");
 const previewKey = ref(0);
+const previewDocument = ref(false);
+const fileView = ref<"preview" | "source">("preview");
 const dirty = computed(() => content.value !== originalContent.value);
 const changes = computed(() => {
   const map = new Map<string, any>();
@@ -80,6 +84,7 @@ const isImage = computed(
     /^image\//.test(file.value?.mime || "") ||
     /^data:image\//.test(file.value?.dataUrl || ""),
 );
+const isMarkdown = computed(() => !file.value?.binary && isMarkdownPath(file.value?.path || ""));
 function join(base: string, name: string) {
   return `${base.replace(/\/$/, "")}/${name}`;
 }
@@ -104,8 +109,16 @@ async function readDirectory(path: string, interruptReveal = true) {
       loading.value = false;
   }
 }
-async function openFile(path: string) {
+async function openFile(path: string, destination = "files") {
   if (!path) return;
+  if (file.value?.path === path) {
+    ++fileGeneration;
+    loading.value = false;
+    tab.value = destination;
+    previewDocument.value = destination === "preview";
+    if (destination === "preview") previewInput.value = path;
+    return;
+  }
   ++revealGeneration;
   if (
     dirty.value &&
@@ -114,6 +127,7 @@ async function openFile(path: string) {
     return;
   loading.value = true;
   const generation = ++fileGeneration;
+  saving.value = false;
   const scope = fileScope();
   error.value = "";
   try {
@@ -122,7 +136,10 @@ async function openFile(path: string) {
     file.value = { ...result, path };
     content.value = result.content || "";
     originalContent.value = content.value;
-    tab.value = "files";
+    fileView.value = "preview";
+    previewDocument.value = destination === "preview";
+    if (destination === "preview") previewInput.value = path;
+    tab.value = destination;
   } catch (cause: any) {
     if (generation === fileGeneration && scope === fileScope())
       error.value = cause.message || "读取文件失败";
@@ -188,22 +205,40 @@ function up() {
   void readDirectory(path);
 }
 async function save() {
+  if (!file.value || saving.value || props.state.permission === "read-only") return;
+  const path = file.value.path;
+  const savedFile = file.value;
+  const savedContent = content.value;
+  const scope = fileScope();
+  const current = () => file.value === savedFile && scope === fileScope();
   saving.value = true;
   error.value = "";
   try {
-    await props.api.writeFile(file.value.path, content.value);
-    originalContent.value = content.value;
+    await props.api.writeFile(path, savedContent);
+    if (current()) originalContent.value = savedContent;
   } catch (cause: any) {
-    error.value = cause.message || "保存文件失败";
+    if (current()) error.value = cause.message || "保存文件失败";
   } finally {
-    saving.value = false;
+    if (current()) saving.value = false;
   }
 }
-function preview(path?: string) {
+function closeFile() {
+  if (dirty.value && !window.confirm("当前文件有未保存的修改，仍要返回文件列表吗？")) return;
+  ++fileGeneration;
+  file.value = null;
+  content.value = originalContent.value = "";
+  saving.value = false;
+  previewDocument.value = false;
+  tab.value = "files";
+}
+async function preview(path?: string) {
   previewSource.value = "file";
   const input = (path || previewInput.value).trim();
   if (!input) return;
   if (/^https?:\/\//i.test(input)) {
+    ++fileGeneration;
+    loading.value = false;
+    previewDocument.value = false;
     previewUrl.value = input;
     previewInput.value = input;
   } else if (/^[a-z][a-z0-9+.-]*:/i.test(input)) {
@@ -213,6 +248,14 @@ function preview(path?: string) {
     const filePath = input.startsWith("/")
       ? input
       : join(props.state.projectPath, input);
+    if (isMarkdownPath(filePath) || isImagePath(filePath)) {
+      previewInput.value = filePath;
+      await openFile(filePath, "preview");
+      return;
+    }
+    ++fileGeneration;
+    loading.value = false;
+    previewDocument.value = false;
     previewUrl.value = `/api/preview?host=${encodeURIComponent(props.state.hostId)}&path=${encodeURIComponent(filePath)}&root=${encodeURIComponent(props.state.projectPath)}`;
     previewInput.value = filePath;
   }
@@ -272,6 +315,8 @@ watch(
     ++fileGeneration;
     ++revealGeneration;
     downloading.value = "";
+    saving.value = false;
+    previewDocument.value = false;
     if (props.state.connected && props.state.projectPath) {
       file.value = null;
       content.value = originalContent.value = "";
@@ -349,8 +394,20 @@ defineExpose({
         <Icon name="X" :size="13" />
       </button>
     </div>
-    <div v-if="tab === 'files'" class="workspace-body files-view">
+    <div v-if="tab === 'files' || (tab === 'preview' && previewSource === 'file' && previewDocument)" class="workspace-body files-view">
+      <template v-if="tab === 'preview'">
+        <div class="preview-source-toolbar segmented-control">
+          <button class="active" @click="previewSource = 'file'">文件 / URL</button>
+          <button @click="previewSource = 'service'">开发服务</button>
+        </div>
+        <form class="preview-toolbar" @submit.prevent="preview()">
+          <Icon name="FileText" :size="15" />
+          <input v-model="previewInput" placeholder="输入 URL、Markdown、图片或 HTML 路径" aria-label="预览地址" />
+          <button class="icon-button" type="submit" title="打开预览" aria-label="打开预览"><Icon name="ArrowRight" :size="15" /></button>
+        </form>
+      </template>
       <form
+        v-else
         class="directory-toolbar"
         @submit.prevent="readDirectory(directoryInput)"
       >
@@ -383,14 +440,17 @@ defineExpose({
         <div class="file-editor-heading">
           <button
             class="icon-button"
-            @click="file = null"
+            @click="closeFile"
             title="返回文件列表"
             aria-label="返回文件列表"
           >
             <Icon name="ArrowLeft" :size="15" /></button
           ><span :title="file.path"
             >{{ displayName }}<i v-if="dirty" class="dirty-dot"></i></span
-          ><button
+          ><div v-if="isMarkdown" class="segmented-control file-view-switch" aria-label="Markdown 显示方式">
+            <button :class="{ active: fileView === 'preview' }" :aria-pressed="fileView === 'preview'" @click="fileView = 'preview'">预览</button>
+            <button :class="{ active: fileView === 'source' }" :aria-pressed="fileView === 'source'" @click="fileView = 'source'">源码</button>
+          </div><button
             class="icon-button"
             :disabled="!!downloading"
             @click="download(file.path)"
@@ -413,7 +473,7 @@ defineExpose({
           ><button
             v-if="!isImage && !file.binary"
             class="button button-small button-secondary"
-            :disabled="!dirty || saving || state.permission === 'read-only'"
+            :disabled="!dirty || saving || loading || state.permission === 'read-only'"
             @click="save"
           >
             <Icon :name="saving ? 'LoaderCircle' : 'Save'" :size="13" />保存
@@ -427,6 +487,15 @@ defineExpose({
           <p>此文件可下载后查看</p>
           <span>{{ displayName }}</span>
         </div>
+        <FileMarkdownPreview
+          v-else-if="isMarkdown && fileView === 'preview'"
+          :content="content"
+          :path="file.path"
+          :root="state.projectPath || file.path.slice(0, file.path.lastIndexOf('/')) || '/'"
+          :host-id="state.hostId"
+          :api="api"
+          @open-file="openFile($event, tab)"
+        />
         <textarea
           v-else
           v-model="content"
@@ -436,7 +505,7 @@ defineExpose({
           :aria-label="displayName + ' 文件内容'"
         ></textarea>
         <div class="file-editor-footer">
-          <span>{{ content.split("\n").length }} 行</span
+          <span>{{ isImage ? '图片预览' : content.split("\n").length + ' 行' }}</span
           ><span>{{
             state.permission === "read-only"
               ? "只读"
@@ -542,7 +611,7 @@ defineExpose({
         <form class="preview-toolbar" @submit.prevent="preview()">
           <Icon name="Globe" :size="15" /><input
             v-model="previewInput"
-            placeholder="输入 URL 或 HTML 文件路径"
+            placeholder="输入 URL、Markdown、图片或 HTML 路径"
             aria-label="预览地址"
           /><button
             class="icon-button"
@@ -604,7 +673,7 @@ defineExpose({
         <div v-else class="panel-empty">
           <Icon name="Eye" :size="32" />
           <p>把你的作品放在眼前</p>
-          <span>输入运行地址，或打开项目里的 HTML 文件。</span>
+          <span>输入运行地址，或打开项目里的 Markdown、图片和 HTML 文件。</span>
         </div>
       </template>
     </div>
@@ -728,6 +797,10 @@ defineExpose({
 </template>
 
 <style scoped>
+.file-view-switch { flex: 0 0 auto; }
+.file-view-switch button { padding: 4px 7px; font-size: 12px; }
+.file-editor-heading { gap: 6px; min-width: 0; }
+.file-editor-heading > span { min-width: 0; }
 .file-tree-entry {
   display: flex;
   align-items: center;

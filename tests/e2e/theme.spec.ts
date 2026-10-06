@@ -87,6 +87,7 @@ test("dark conversation, Markdown, options, approvals and workspace share readab
   await page.getByRole("button", { name: "切换工作区", exact: true }).click();
   await page.locator("#workspace-panel").getByRole("button", { name: "文件", exact: true }).click();
   await page.locator("#workspace-panel").getByRole("button", { name: "README.md", exact: true }).click();
+  await page.locator("#workspace-panel").getByRole("button", { name: "源码", exact: true }).click();
   await readableDark(page.getByRole("textbox", { name: "README.md 文件内容", exact: true }));
   await page.getByRole("button", { name: "关闭工作区", exact: true }).click();
 

@@ -12,6 +12,8 @@ workspace
 backups
 deploy/docker/*.env
 compose.ssh.yaml
+compose.override.yaml
+DEPLOYMENT.local.md
 test-results
 playwright-report
 coverage

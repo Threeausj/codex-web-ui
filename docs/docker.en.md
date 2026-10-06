@@ -146,7 +146,11 @@ The server needs access to supported browser-vendor push services, and the phone
 
 Remote users need a compatible Codex CLI and account configuration; install tmux remotely if needed. Hostnames, SSH aliases, identity paths, and `known_hosts` are resolved inside the container. The host's `~/.ssh` is not mounted automatically.
 
-Prepare a dedicated directory containing only required SSH settings, identity files, and verified `known_hosts`. Ensure UID 1000 can read the keys; use directory mode `0700` and private-key mode `0600`. Verify server fingerprints in a trusted terminal first; do not disable strict host-key checking.
+Add a new server directly in **Settings → Connections**: enter its address, port, and identity file, then select **Retrieve server fingerprints**. The dialog displays the resolved destination, key types, and SHA256 fingerprints. Confirm **Trust and test connection** to connect without editing `known_hosts` in a terminal. A connection test against an unknown host also opens this confirmation area.
+
+Changed keys display both saved and current fingerprints and require a separate checkbox before **Replace fingerprints and test connection**. Confirmation checks the server keys again; expired confirmations or edited addresses require another scan. Connections retain `StrictHostKeyChecking=yes`. Web-confirmed keys persist at `/app/data/ssh/known_hosts` (`DATA_DIR/ssh/known_hosts`, mode `0600`) in `webdata`; preserve this volume for backups and migrations.
+
+You can also mount existing SSH configuration and keys. Prepare a dedicated directory containing only required settings, identity files, and verified `known_hosts`. Ensure UID 1000 can read the keys; use directory mode `0700` and private-key mode `0600`. Existing records remain usable, and fingerprints can be checked against the server administrator's values. The [OpenSSH documentation](https://man.openbsd.org/ssh-keyscan) explains that scanning requires no login, but a retrieved key alone cannot prove server identity. SSH aliases resolve through the container's configuration, including address, port, and `HostKeyAlias`. Web scanning currently does not support `ProxyJump`, `ProxyCommand`, or `KnownHostsCommand`; use the existing SSH configuration to establish trust for those hosts.
 
 Create optional `compose.ssh.yaml`:
 
@@ -166,7 +170,7 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f c
 
 Run `codex --version` inside that remote interactive shell so that PATH initialization through nvm/mise or similar tools takes effect.
 
-In Settings → Connections, enter a hostname or SSH alias. Select Identity file → Upload private key to upload or replace an unencrypted OpenSSH / PEM private key, up to 64 KB. The server validates the key and fills in its container path. Keys persist under `/app/data/ssh-keys` in the web-data volume, with directory mode `0700` and file mode `0600`. Cancelling an edit removes unsaved uploads; replacing or deleting a connection removes uploaded keys only when no connection references them. You can also enter mounted paths such as `/home/node/.ssh/...`; these existing files are never deleted automatically. Uploading a key does not replace fingerprint verification in `known_hosts`.
+In Settings → Connections, enter a hostname or SSH alias. Select Identity file → Upload private key to upload or replace an unencrypted OpenSSH / PEM private key, up to 64 KB. The server validates the key and fills in its container path. Keys persist under `/app/data/ssh-keys` in the web-data volume, with directory mode `0700` and file mode `0600`. Cancelling an edit removes unsaved uploads; replacing or deleting a connection removes uploaded keys only when no connection references them. You can also enter mounted paths such as `/home/node/.ssh/...`; these existing files are never deleted automatically. Identity keys authenticate the account, while server fingerprints identify the destination; configure them separately.
 
 Leave the Codex path empty for remote interactive-login-shell discovery, or specify the remote executable. Test the connection before saving it. Remote projects use remote paths, not container `/workspace` paths. Keep private keys, populated SSH overrides, `.env.docker`, and Codex login data out of Git.
 
@@ -223,7 +227,8 @@ Web image and Codex upgrades are independent. Check protocol compatibility after
 | Login does not persist | Correct origin/domain, HTTPS for the public mode, proxy/Cookie configuration |
 | Local Codex missing | Mount the host installation with the optional overlay and check `HOST_CODEX_DIRECTORY`/absolute `CODEX_BIN`, or select an SSH host |
 | Models unavailable | Authenticate in the remote user's or container's `CODEX_HOME`; check account/provider access |
-| SSH fails | Test the same alias inside the container; inspect mounts, key permissions, verified `known_hosts` |
+| Unknown or changed SSH host key | Retrieve and confirm fingerprints in the connection dialog; compare old/new keys before explicit replacement and preserve `webdata` during migration |
+| Other SSH failure | Test the same alias inside the container; inspect mounts, identity permissions, and address/port |
 | Desktop history absent | Default volume is independent; check shared data and exact working-directory paths |
 | Sandbox/namespace errors | Codex sandbox depends on the kernel/container policy; the configuration never silently expands permissions |
 | tmux gone after restart | File volumes do not preserve processes; SSH-host tmux can live independently of the web container |

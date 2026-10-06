@@ -1,4 +1,5 @@
 import type { Host } from './types.js'
+import type { SSHHostKeyPin } from './ssh-host-keys.js'
 
 export function shellQuote(value: string) { return `'${value.replace(/'/g, `'"'"'`)}'` }
 
@@ -31,8 +32,20 @@ export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn'
   return `exec /bin/sh -c ${shellQuote(bootstrap)}`
 }
 
-export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false) {
+/** Once an endpoint is pinned in the app, older external keys cannot also pass. */
+export function sshKnownHostsArgs(pin?: SSHHostKeyPin) {
+  if (!pin) return []
+  const file = pin.file
+  const quoted = `"${file.replace(/%/g, '%%').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  return ['-o', `UserKnownHostsFile=${quoted}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'KnownHostsCommand=none',
+    '-o', 'VerifyHostKeyDNS=no', '-o', 'NoHostAuthenticationForLocalhost=no', '-o', 'UpdateHostKeys=no',
+    '-o', 'ControlPath=none', '-o', 'ControlMaster=no', '-o', 'ControlPersist=no',
+    '-o', `HostKeyAlias=${pin.hostKeyAlias}`]
+}
+
+export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, knownHostsFile?: SSHHostKeyPin) {
   const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR']
+  args.push(...sshKnownHostsArgs(knownHostsFile))
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)
   const destination = `${host.username ? `${host.username}@` : ''}${host.hostname}`

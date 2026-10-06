@@ -7,6 +7,8 @@ import type { Express, RequestHandler } from 'express'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { hostInput } from './storage.js'
+import { sshKnownHostsArgs } from './ssh.js'
+import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import type { AuthenticatedRequest, Host } from './types.js'
 
 type Dependencies = {
@@ -15,6 +17,7 @@ type Dependencies = {
   requireCsrf: RequestHandler
   isSessionActive: (id: string) => boolean
   onSessionRevoked: (listener: (id: string) => void) => () => void
+  resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>
 }
 type Ticket = {
   id: string; sessionId: string; hostId: string; port: number; localPort: number
@@ -27,10 +30,11 @@ const input = z.object({
 const PREFIX = '/api/dev-preview/'
 const TTL = 60 * 60 * 1000
 
-export function sshForwardArgs(host: Host, localPort: number, targetPort: number) {
+export function sshForwardArgs(host: Host, localPort: number, targetPort: number, knownHostsFile?: SSHHostKeyPin) {
   const fields = hostInput.parse(Object.fromEntries(Object.entries(host).filter(([key]) => key !== 'id' && key !== 'kind')))
   for (const port of [localPort, targetPort]) if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid forward port')
   const args = ['-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-L', `127.0.0.1:${localPort}:127.0.0.1:${targetPort}`]
+  args.push(...sshKnownHostsArgs(knownHostsFile))
   if (fields.port) args.push('-p', String(fields.port))
   if (fields.identityFile) args.push('-i', fields.identityFile)
   args.push('--', `${fields.username ? `${fields.username}@` : ''}${fields.hostname}`)
@@ -108,8 +112,11 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
     const origin = req.get('origin') && req.get('origin') !== 'null' ? req.get('origin')! : `${req.protocol}://${req.get('host')}`
     const ticket: Ticket = { id, sessionId: req.session!.id, hostId: host.id, port: parsed.port, localPort: parsed.port, origin, expiresAt: Date.now() + TTL, sockets: new Set(), requests: new Set() }
     if (host.kind === 'ssh') {
+      const knownHostsFile = await deps.resolveSshHostKeyPin?.(host)
       ticket.localPort = await freePort()
-      ticket.tunnel = spawn('ssh', sshForwardArgs(host, ticket.localPort, parsed.port), { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
+      if (!deps.isSessionActive(ticket.sessionId)) { res.status(401).json({ error: 'Session expired' }); return }
+      if (deps.getHost(host.id) !== host) { res.status(409).json({ error: 'Host settings changed; open the preview again' }); return }
+      ticket.tunnel = spawn('ssh', sshForwardArgs(host, ticket.localPort, parsed.port, knownHostsFile), { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
       ticket.tunnel.stderr?.on('data', () => {})
       try { await waitForTunnel(ticket.tunnel, ticket.localPort) }
       catch (error) { ticket.tunnel.kill('SIGTERM'); throw error }
