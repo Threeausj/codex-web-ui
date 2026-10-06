@@ -23,6 +23,10 @@ COPY --from=build /app/package.json /app/package-lock.json /app/
 COPY --from=build /app/node_modules /app/node_modules
 COPY --from=build /app/dist-server /app/dist-server
 COPY --from=build /app/dist /app/dist
+# Normalize permissions inherited from NAS ACLs for the non-root runtime user.
+RUN chmod 0644 /app/package.json /app/package-lock.json \
+    && find /app/dist -type d -exec chmod 0755 {} + \
+    && find /app/dist -type f -exec chmod 0644 {} +
 ENV NODE_ENV=production \
     LANG=C.UTF-8 \
     HOST=0.0.0.0 \

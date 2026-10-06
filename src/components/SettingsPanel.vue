@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
+import { randomUUID } from "../lib/uuid";
 import Icon from "./Icon.vue";
 import ConnectionDialog from "./ConnectionDialog.vue";
 import FolderPicker from "./FolderPicker.vue";
@@ -222,7 +223,7 @@ function editProfile(profile?: WebPermissionProfile) {
   Object.assign(
     profileDraft,
     profile || {
-      id: `web-${crypto.randomUUID()}`,
+      id: `web-${randomUUID()}`,
       name: "",
       sandboxMode: "workspace-write",
       approvalPolicy: "on-request",

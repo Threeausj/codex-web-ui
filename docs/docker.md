@@ -47,6 +47,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec
 
 本地 HTTP origin 不设置 Secure Cookie；公网 HTTPS origin 自动设置 Secure Cookie。两种方式均保留 HttpOnly、SameSite、CSRF 与 Origin 校验，`NODE_ENV` 不用于关闭鉴权。
 
+使用 NAS IP 或自己的 HTTPS 反向代理时，将浏览器实际使用的 Origin（协议、主机、端口）加入 `PUBLIC_ORIGIN`；未配置的来源会收到 `403 Untrusted origin`，即使密码正确。多个 Origin 用逗号分隔。混合 HTTP/HTTPS 部署按登录请求的可信 Origin 设置 Secure Cookie，让局域网 HTTP 登录可用，同时保护 HTTPS 登录；只配置 HTTPS Origin 时始终要求 Secure Cookie。HTTP 页面使用 `crypto.getRandomValues` 生成兼容 UUID，不依赖仅安全上下文可用的 `crypto.randomUUID`。
+
 ## 访问密码与登录
 
 网页登录会话有效期为 **30 天**，保存在服务进程内，重启服务后需重新登录。进入“设置 → 账户 → 网页访问 → 修改访问密码”，输入当前密码及两次新密码；新密码需 12–1024 个字符。保存后当前登录续期 30 天并保留已有连接，其他设备的登录和后台通知授权即时撤销。修改访问密码不修改 Codex 模型账户。

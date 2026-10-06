@@ -47,6 +47,8 @@ Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and add a project 
 
 Local HTTP origins use cookies without Secure; the HTTPS origin enables Secure. Both modes keep HttpOnly, SameSite, CSRF, and Origin checks. `NODE_ENV` does not disable authentication.
 
+When using a NAS IP or your own HTTPS reverse proxy, add the browser's exact origin (scheme, hostname and port) to `PUBLIC_ORIGIN`. Unlisted origins receive `403 Untrusted origin` even with the correct password. Separate multiple origins with commas. Mixed HTTP/HTTPS deployments set Secure cookies according to the trusted login origin, so LAN HTTP logins remain usable and HTTPS logins remain protected; HTTPS-only deployments always require Secure cookies. HTTP pages generate compatible UUIDs with `crypto.getRandomValues` instead of requiring the secure-context-only `crypto.randomUUID` API.
+
 ## Access password and login
 
 Web login lasts **30 days**. Sessions live in the server process, so restarting it requires login again. Under Settings → Account → Web access → Change access password (Chinese UI: “设置 → 账户 → 网页访问 → 修改访问密码”), enter the current password and confirm a new password of 12–1024 characters. Saving renews the current login for 30 days and preserves its connections, while immediately revoking other devices' logins and push authorizations. This does not change the Codex model account.

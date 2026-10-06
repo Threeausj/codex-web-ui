@@ -47,6 +47,13 @@ assert.match(htmlText, /<!doctype html>/i);
 const asset = htmlText.match(/(?:src|href)="(\/assets\/[^" ]+)"/)?.[1];
 assert.ok(asset, 'Built frontend must be served when cwd is /workspace');
 assert.equal((await fetch(base + asset)).status, 200);
+const manifestResponse = await fetch(base + '/manifest.webmanifest');
+assert.equal(manifestResponse.status, 200, 'The non-root server must read copied public assets');
+const manifest = await manifestResponse.json();
+for (const assetPath of ['/sw.js', '/offline.html', '/favicon.svg', ...manifest.icons.map(icon => icon.src)]) {
+  assert.equal((await fetch(base + assetPath)).status, 200, `Public asset ${assetPath} must be readable`);
+}
+JSON.parse(await fs.readFile('/app/package.json', 'utf8'));
 const bootstrap = await (await fetch(base + '/api/bootstrap', { headers })).json();
 assert.equal(bootstrap.cwd, '/workspace');
 assert.equal(bootstrap.codexHome, '/home/node/.codex');

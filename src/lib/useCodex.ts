@@ -1,4 +1,5 @@
 import { reactive, toRaw } from "vue";
+import { randomUUID } from "./uuid";
 import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
@@ -129,7 +130,7 @@ let threadEventSequence = 0;
 let itemEventSequence = 0;
 let sendInFlight = false;
 let localCwd = "/tmp";
-let clientId = sessionStorage.getItem("codex.clientId") ?? crypto.randomUUID();
+let clientId = sessionStorage.getItem("codex.clientId") ?? randomUUID();
 sessionStorage.setItem("codex.clientId", clientId);
 const pending = new Map<string | number, Pending>();
 const attachmentOriginals = new WeakMap<object, File>();
@@ -891,7 +892,7 @@ function connect(): Promise<void> {
         return;
       }
       if (event.code === 4001) {
-        clientId = crypto.randomUUID();
+        clientId = randomUUID();
         sessionStorage.setItem("codex.clientId", clientId);
       }
       if (state.authenticated) scheduleReconnect();
@@ -1501,7 +1502,7 @@ async function send(text: string) {
   state.error = "";
   sendInFlight = true;
   let id = state.activeThread?.id as string | undefined;
-  const messageId = crypto.randomUUID();
+  const messageId = randomUUID();
   try {
     if (!id) {
       const result = await rpc("thread/start", {
@@ -2109,7 +2110,7 @@ async function writeFile(path: string, content: string) {
 }
 async function runTerminal(command: string) {
   if (state.terminalRunning) throw fail(new Error("已有终端命令正在运行"));
-  const processId = `web-${crypto.randomUUID()}`;
+  const processId = `web-${randomUUID()}`;
   rememberTerminal(processId);
   state.terminalRunning = true;
   state.terminalSessionName = "";
@@ -2161,7 +2162,7 @@ async function startTerminal(
   if (state.terminalRunning && !options.newConnection) return;
   if (state.permission === "read-only")
     throw fail(new Error("切换到工作区写入权限后启动终端"));
-  const processId = `web-pty-${crypto.randomUUID()}`;
+  const processId = `web-pty-${randomUUID()}`;
   rememberTerminal(processId);
   state.terminalRunning = true;
   state.terminalOutput = "";
