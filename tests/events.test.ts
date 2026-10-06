@@ -475,7 +475,7 @@ test("browser state handles out-of-order RPCs and live events without reviving t
       },
     );
     await t.test(
-      "thread selection blocks sends until its project and permission are hydrated",
+      "thread selection blocks sends until its project and global permission are hydrated",
       async () => {
         let held!: Request;
         handle = (request) =>
@@ -516,20 +516,20 @@ test("browser state handles out-of-order RPCs and live events without reviving t
           ws.requests
             .filter((request) => request.method === "turn/start")
             .at(-1)!.params.approvalPolicy,
-          "untrusted",
+          "on-request",
         );
         assert.equal(
           ws.requests
             .filter((request) => request.method === "turn/start")
             .at(-1)!.params.sandboxPolicy.networkAccess,
-          true,
+          false,
         );
         handle = defaults;
         await api.setProject("/workspace/a");
       },
     );
     await t.test(
-      "resuming full access never silently removes an existing approval requirement",
+      "resuming full access applies the global workspace policy instead of restoring full access",
       async () => {
         handle = (request) =>
           request.method === "thread/resume"
@@ -541,21 +541,23 @@ test("browser state handles out-of-order RPCs and live events without reviving t
               }
             : defaults(request);
         await api.selectThread("strict-full");
-        await api.send("Keep approvals");
+        await api.send("Use the global workspace policy");
         assert.equal(
           ws.requests
             .filter((request) => request.method === "turn/start")
             .at(-1)!.params.approvalPolicy,
-          "untrusted",
+          "on-request",
         );
+        assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
         await api.selectThread("strict-full");
-        await api.send("Keep approvals after reconnect hydration");
+        await api.send("Use the global policy after reconnect hydration");
         assert.equal(
           ws.requests
             .filter((request) => request.method === "turn/start")
             .at(-1)!.params.approvalPolicy,
-          "untrusted",
+          "on-request",
         );
+        assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
         handle = defaults;
         await api.setProject("/workspace/a");
       },

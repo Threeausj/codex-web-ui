@@ -35,6 +35,7 @@ const makeThread = (id: string, name = "测试会话") => ({
   updatedAt: 1791200000,
   status: { type: "idle" },
   source: "cli",
+  historyMode: "paginated",
   path: `/test/sessions/${id}.jsonl`,
   turns: [],
 });
@@ -63,6 +64,11 @@ export class MockCodex {
   holdFinalMessage = false;
   holdTurnStartResponse = false;
   holdConfigReadResponse = false;
+  failRevertNext = false;
+  failTurnStartNext = false;
+  failHistoryNext = false;
+  holdRevertResponse = false;
+  private heldRevertResponse?: () => void;
   private heldConfigReadResponse?: () => void;
   private heldTurnStartResponse?: () => void;
   contextTokens = 200;
@@ -387,10 +393,36 @@ export class MockCodex {
           sandbox: { type: "workspaceWrite" },
         });
       case "thread/turns/list":
+        if (this.failHistoryNext) {
+          this.failHistoryNext = false;
+          return socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: "Test history read failed" } }));
+        }
         return this.reply(socket, request, {
           data: [...(this.turns.get(p.threadId) || [])].reverse(),
           nextCursor: null,
         });
+      case "thread/revert": {
+        if (this.failRevertNext) {
+          this.failRevertNext = false;
+          return socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: "Test revert failed" } }));
+        }
+        const revert = () => {
+          const turns = this.turns.get(p.threadId) || [];
+          const index = turns.findIndex((turn) => turn.id === p.beforeTurnId);
+          if (index < 0)
+            return socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: "Revert turn not found" } }));
+          this.turns.set(p.threadId, turns.slice(0, index));
+          const thread = { ...this.threads.find((thread) => thread.id === p.threadId), turns: [] };
+          const result = { thread, turnsBackwardsCursor: null, itemsBackwardsCursor: null };
+          this.reply(socket, request, result);
+          // Codex also emits a canonical notification after acknowledging the
+          // request. An editor must not let it revive the removed answer.
+          setTimeout(() => this.emit("thread/reverted", { threadId: p.threadId }), 0);
+        };
+        if (this.holdRevertResponse) this.heldRevertResponse = revert;
+        else revert();
+        return;
+      }
       case "thread/fork": {
         const thread = makeThread(`fork-${++this.count}`, "分支测试对话");
         const source = structuredClone(this.turns.get(p.threadId) || []);
@@ -404,6 +436,10 @@ export class MockCodex {
         return this.reply(socket, request, { thread });
       }
       case "turn/start": {
+        if (this.failTurnStartNext) {
+          this.failTurnStartNext = false;
+          return socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: "Test turn start failed" } }));
+        }
         const turn = makeTurn(`turn-${++this.count}`, [], "inProgress");
         const user = {
           id: `user-${this.count}`,
@@ -639,6 +675,11 @@ export class MockCodex {
   releaseTurnStartResponse() {
     this.heldTurnStartResponse?.();
     this.heldTurnStartResponse = undefined;
+  }
+  releaseRevertResponse() {
+    this.holdRevertResponse = false;
+    this.heldRevertResponse?.();
+    this.heldRevertResponse = undefined;
   }
   releaseConfigReadResponse() {
     this.holdConfigReadResponse = false;

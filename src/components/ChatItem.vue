@@ -1,12 +1,32 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import Icon from './Icon.vue'
 
-const props = defineProps<{ item: any; busy?: boolean; canFork?: boolean }>()
+const props = defineProps<{
+  item: any
+  busy?: boolean
+  canFork?: boolean
+  canEdit?: boolean
+  editing?: boolean
+  editDisabled?: boolean
+  editSession?: { itemId: string; draft: string; error: string; saving: boolean } | null
+  beginEdit?: (item: any, text: string) => void
+  cancelEdit?: () => void
+  saveEdit?: () => Promise<void>
+}>()
 const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string]; error: [message: string] }>()
 const copied = ref(false)
+const editorOpen = computed(() => props.editSession?.itemId === props.item.id)
+const editDraft = computed({
+  get: () => props.editSession?.draft || '',
+  set: (value: string) => { if (props.editSession) props.editSession.draft = value },
+})
+const editInput = ref<HTMLTextAreaElement>()
+const editPending = computed(() => props.editSession?.saving || props.editing)
+const hasEditInput = computed(() => !!editDraft.value.trim() ||
+  (props.item.content || []).some((input: any) => ['image', 'localImage'].includes(input.type)))
 const text = computed(() => props.item.text || (props.item.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'))
 const html = computed(() => DOMPurify.sanitize(marked.parse(text.value, { async: false }) as string, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'] }))
 const userImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')))
@@ -24,6 +44,39 @@ async function copy() {
   try { await navigator.clipboard.writeText(text.value); copied.value = true; setTimeout(() => { copied.value = false }, 1600) }
   catch { emit('error', '无法复制到剪贴板，请检查浏览器权限。') }
 }
+function resizeEditor() {
+  if (!editInput.value) return
+  editInput.value.style.height = 'auto'
+  editInput.value.style.height = `${editInput.value.scrollHeight}px`
+}
+onMounted(() => {
+  if (editorOpen.value) resizeEditor()
+})
+async function beginEdit() {
+  if (!props.canEdit || editPending.value || !props.beginEdit) return
+  props.beginEdit(props.item, text.value)
+  await nextTick()
+  resizeEditor()
+  editInput.value?.focus()
+}
+function cancelEdit() {
+  if (editPending.value) return
+  props.cancelEdit?.()
+}
+async function saveEdit() {
+  if (props.editDisabled || editPending.value || !hasEditInput.value) return
+  await props.saveEdit?.()
+}
+function onEditKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    cancelEdit()
+  } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault()
+    void saveEdit()
+  }
+}
 function onLink(event: MouseEvent) {
   const anchor = (event.target as Element).closest('a')
   if (!anchor) return
@@ -37,8 +90,21 @@ function onLink(event: MouseEvent) {
   <article v-if="item.type === 'userMessage'" class="message user-message">
     <div v-if="userImages.length" class="message-images"><img v-for="(img, index) in userImages" :key="index" :src="img.url" alt="上传的图片" loading="lazy" /></div>
     <div v-if="localImages.length" class="message-images"><button v-for="(img, index) in localImages" :key="index" class="button button-secondary" @click="emit('openFile', img.path)"><Icon name="Image" :size="16" />{{ img.path.split('/').pop() }}<Icon name="Eye" :size="14" /></button></div>
-    <div class="user-bubble">{{ text }}</div>
-    <div v-if="canFork" class="message-actions"><button class="icon-button" @click="emit('fork', item.turnId)" title="从此处创建分支" aria-label="从此处创建分支"><Icon name="GitBranch" :size="15" /></button></div>
+    <form v-if="editorOpen" class="message-editor" @submit.prevent="saveEdit">
+      <textarea ref="editInput" v-model="editDraft" aria-label="编辑消息内容" rows="3" :disabled="editPending" @input="resizeEditor" @keydown="onEditKeydown"></textarea>
+      <p class="message-edit-note">重新发送会替换本轮回复，已执行的文件修改不会撤销。</p>
+      <p v-if="editSession?.error" class="message-edit-error" role="alert">{{ editSession.error }}</p>
+      <div class="message-edit-buttons">
+        <button type="button" class="button button-small button-secondary" :disabled="editPending" @click="cancelEdit">取消</button>
+        <button type="submit" class="button button-small button-primary" :disabled="editPending || editDisabled || !hasEditInput"><Icon v-if="editPending" name="LoaderCircle" :size="15" class="spin" />{{ editPending ? '正在重新发送…' : '保存并重新发送' }}</button>
+      </div>
+    </form>
+    <div v-else class="user-bubble">{{ text }}</div>
+    <div v-if="!editorOpen && (text || canEdit || canFork)" class="message-actions">
+      <button v-if="text" class="icon-button" @click="copy" :title="copied ? '已复制' : '复制消息'" aria-label="复制消息"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
+      <button v-if="canEdit && beginEdit" class="icon-button" :disabled="editPending" @click="beginEdit" title="编辑消息" aria-label="编辑消息"><Icon name="Pencil" :size="15" /></button>
+      <button v-if="canFork" class="icon-button" @click="emit('fork', item.turnId)" title="从此处创建分支" aria-label="从此处创建分支"><Icon name="GitBranch" :size="15" /></button>
+    </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
     <div v-if="text" class="markdown" v-html="html" @click="onLink"></div>
@@ -67,6 +133,43 @@ function onLink(event: MouseEvent) {
 </template>
 
 <style scoped>
+.message-editor {
+  width: min(100%, 680px);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--soft);
+}
+.message-editor textarea {
+  display: block;
+  width: 100%;
+  min-height: 84px;
+  max-height: 340px;
+  padding: 5px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  resize: vertical;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.message-edit-note,
+.message-edit-error {
+  margin: 10px 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.message-edit-error {
+  color: var(--red);
+}
+.message-edit-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
 .reasoning-item > summary {
   min-height: 32px;
   font-size: 12px;
@@ -85,6 +188,16 @@ function onLink(event: MouseEvent) {
   transform: rotate(180deg);
 }
 @media (max-width: 760px) {
+  .message-editor textarea {
+    font-size: 16px;
+  }
+  .user-message .message-actions .icon-button {
+    width: 36px;
+    height: 36px;
+  }
+  .message-edit-buttons .button {
+    min-height: 36px;
+  }
   .reasoning-item > summary,
   .tool-item > summary {
     min-height: 40px;

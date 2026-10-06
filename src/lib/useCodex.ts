@@ -1,5 +1,6 @@
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
+import { editableMessage, editedMessageInput } from "./message-edit";
 import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
@@ -63,6 +64,7 @@ const state = reactive({
     collapsed: {} as Record<string, boolean>,
     permissionProfiles: [] as any[],
     activePermissionProfileId: "",
+    defaultPermission: "workspace-write",
   },
   activePermissionProfileId: "",
   requirements: null as any,
@@ -105,6 +107,7 @@ const state = reactive({
   terminalProcesses: [] as any[],
   integrationErrors: [] as { source: string; message: string }[],
   changingContext: false,
+  editingMessage: false,
   compactThreshold: saved("codex.compactThreshold", 85),
   diff: "",
   plan: [] as any[],
@@ -148,6 +151,10 @@ const itemRevisions = new Map<string, Map<string, number>>();
 const threadRevisions = new Map<string, number>();
 const removedThreads = new Set<string>();
 const compactedSinceInput = new Set<string>();
+const permissionSelections = new Map<string, { mode: string; profileId: string }>();
+const localReverts = new Set<string>();
+const discardedTurns = new Set<string>();
+let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
 const terminalListeners = new Set<(chunk: string) => void>();
 const terminalDecoders = new Map<string, TextDecoder>();
 const completedTerminalProcesses = new Set<string>();
@@ -588,6 +595,7 @@ function navigationProjectPage(hostId: string, projectPath: string) {
     : state.navigation[hostId]?.projectPages[projectPath];
 }
 function closeConnection() {
+  localReverts.clear();
   clearTimeout(reconnectTimer);
   clearInterval(refreshTimer);
   const old = socket;
@@ -791,6 +799,15 @@ function receive(message: any) {
     return;
   }
   if (method === "thread/started") updateThread(p.thread);
+  if (method === "thread/reverted") {
+    const key = recencyKey(state.hostId, p.threadId);
+    if (localReverts.delete(key)) return;
+    if (pendingMessageEdit && pendingMessageEdit.threadId === p.threadId) pendingMessageEdit.blocked = true;
+    resetEditedHistory(p.threadId);
+    if (state.activeThread?.id === p.threadId) void selectThread(p.threadId);
+    return;
+  }
+  if (discardedTurns.has(p.turnId || p.turn?.id)) return;
   if (method === "thread/name/updated") {
     const thread = state.threads.find((t) => t.id === p.threadId);
     if (thread) updateThread({ ...thread, name: p.threadName ?? p.name });
@@ -926,6 +943,7 @@ function connect(): Promise<void> {
         reject(new Error("主机选择已变更"));
         return;
       }
+      localReverts.clear();
       state.connected = false;
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
@@ -1069,6 +1087,10 @@ async function initialize() {
 async function login(password: string) {
   authenticationGeneration++;
   closeConnection();
+  permissionSelections.clear();
+  localReverts.clear();
+  discardedTurns.clear();
+  pendingMessageEdit = null;
   state.loading = true;
   state.error = "";
   try {
@@ -1094,6 +1116,10 @@ async function logout() {
   csrfToken = "";
   state.authenticated = false;
   closeConnection();
+  permissionSelections.clear();
+  localReverts.clear();
+  discardedTurns.clear();
+  pendingMessageEdit = null;
   clearAttachments();
   state.items = [];
   state.threads = [];
@@ -1279,6 +1305,7 @@ async function selectThread(id: string) {
   const generation = ++selectionGeneration;
   const hostId = state.hostId;
   const previousId = state.activeThread?.id;
+  if (previousId !== id) pendingMessageEdit = null;
   const previousProfileId = state.activePermissionProfileId;
   const previousPolicy = state.runtimePolicy;
   state.selectingThread = true;
@@ -1362,6 +1389,7 @@ async function selectThread(id: string) {
           "on-request",
       };
     }
+    applyPermissionDefault();
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
     state.turns = [...page.data].reverse();
@@ -1446,6 +1474,9 @@ function newThread(remember = true) {
   state.error = "";
   state.moreTurns = false;
   turnCursor = null;
+  pendingMessageEdit = null;
+  state.activePermissionProfileId = "";
+  state.permission = state.preferences.defaultPermission || "workspace-write";
   const defaultProfile = availablePermissionProfiles(
     state.preferences.permissionProfiles,
   ).find(
@@ -1463,6 +1494,15 @@ function newThread(remember = true) {
       state.activePermissionProfileId = "";
     }
   }
+}
+function applyPermissionDefault() {
+  const key = state.activeThread && recencyKey(state.hostId, state.activeThread.id);
+  const selected = key ? permissionSelections.get(key) : undefined;
+  const profileId = selected?.profileId ?? state.preferences.activePermissionProfileId;
+  const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === profileId);
+  state.activePermissionProfileId = profile?.id || "";
+  state.permission = profile?.sandboxMode ?? selected?.mode ?? state.preferences.defaultPermission ?? "workspace-write";
+  state.runtimePolicy = null;
 }
 function sandboxName(type: string) {
   return (
@@ -1515,8 +1555,9 @@ function sandboxPolicy(
 function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
-async function send(text: string) {
-  if (!text.trim() && !state.attachments.length) return;
+async function send(text: string, editedInput?: any[]) {
+  if (!text.trim() && !state.attachments.length && !editedInput?.length) return;
+  if (state.editingMessage && !editedInput) throw fail(new Error("正在重新发送编辑后的消息，请稍候"));
   if (state.selectingThread || state.switchingHost || state.changingContext)
     throw fail(new Error("正在加载会话或主机配置，请稍后发送"));
   if (sendInFlight) throw fail(new Error("上一条消息正在发送，请稍候"));
@@ -1561,17 +1602,17 @@ async function send(text: string) {
   const workspaceRoots = projectRoots(cwd);
   if (policy.type === "workspaceWrite" && (!resumed || resolvedProfile))
     policy.writableRoots = workspaceRoots;
-  const attachments = [...state.attachments];
+  const attachments = editedInput ? [] : [...state.attachments];
   const selectedModel = state.models.find((entry) => entry.model === model);
   if (
     selectedModel?.inputModalities?.length &&
     !selectedModel.inputModalities.includes("image") &&
-    attachments.some((file) => file.mime?.startsWith("image/"))
+    (attachments.some((file) => file.mime?.startsWith("image/")) || editedInput?.some(input => ['image', 'localImage'].includes(input.type)))
   )
     throw fail(
       new Error("当前模型只支持文本输入，请选择支持图片的模型或移除图片附件"),
     );
-  const inputs: any[] = [{ type: "text", text, text_elements: [] }];
+  const inputs: any[] = editedInput ?? [{ type: "text", text, text_elements: [] }];
   for (const file of attachments) {
     if (file.mime?.startsWith("image/"))
       inputs.push({ type: "localImage", path: file.path });
@@ -1579,12 +1620,13 @@ async function send(text: string) {
   }
   // Explicit skill/app selections are persisted as structured protocol inputs.
   for (const skill of state.skills)
-    if (inputs[0].text.includes(`$${skill.name}`))
+    if (inputs[0].text.includes(`$${skill.name}`) && !inputs.some(input => input.type === 'skill' && input.path === skill.path))
       inputs.push({ type: "skill", name: skill.name, path: skill.path });
   for (const app of state.apps)
-    if (app.slug && inputs[0].text.includes(`$${app.slug}`))
+    if (app.slug && inputs[0].text.includes(`$${app.slug}`) && !inputs.some(input => input.type === 'mention' && input.path === `app://${app.id}`))
       inputs.push({ type: "mention", name: app.name, path: `app://${app.id}` });
   state.error = "";
+  if (!editedInput) pendingMessageEdit = null;
   sendInFlight = true;
   let id = state.activeThread?.id as string | undefined;
   const messageId = randomUUID();
@@ -1596,11 +1638,13 @@ async function send(text: string) {
         model: model || undefined,
         sandbox: permission as any,
         approvalPolicy: approval,
+        historyMode: "paginated",
       });
       id = result.thread.id;
       if (hostId !== state.hostId)
         throw new Error("工作站已切换，请在原工作站确认消息状态");
       updateThread(result.thread);
+      permissionSelections.set(recencyKey(hostId, id!), { mode: permission, profileId: state.activePermissionProfileId });
       if (generation === selectionGeneration && hostId === state.hostId) {
         state.activeThread = result.thread;
         state.items = itemCache.get(id!) ?? [];
@@ -1622,6 +1666,8 @@ async function send(text: string) {
       activeTurns.has(id!) ||
       threadBusy.get(id!) ||
       (state.activeThread?.id === id && state.busy);
+    if (busy && editedInput)
+      throw new Error("会话已开始新的任务，请取消编辑并确认最新历史");
     if (busy && !activeTurns.has(id!))
       throw new Error("当前任务状态正在同步，请稍后发送");
     if (busy) {
@@ -1686,6 +1732,110 @@ async function send(text: string) {
   } finally {
     sendInFlight = false;
   }
+}
+function canEditMessage(itemId: string) {
+  const blocked = !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
+  if (blocked) return false;
+  if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
+    if (pendingMessageEdit.blocked) return false;
+    if (pendingMessageEdit.reverted)
+      return !!pendingMessageEdit.needsHistory || (state.turns.at(-1)?.id ?? null) === pendingMessageEdit.prefixLastTurnId;
+  }
+  return editableMessage(state.items, state.turns, state.activeThread)?.id === itemId;
+}
+function cancelMessageEdit(itemId: string) {
+  if (!state.editingMessage && pendingMessageEdit?.item.id === itemId) pendingMessageEdit = null;
+}
+function resetEditedHistory(threadId: string, removed: string[] = []) {
+  for (const turnId of removed) discardedTurns.add(turnId);
+  itemCache.delete(threadId);
+  itemRevisions.delete(threadId);
+  compactedSinceInput.delete(threadId);
+  noteRuntime(threadId, false);
+  state.pendingRequests = state.pendingRequests.filter(request => (request.params?.threadId || request.params?.conversationId) !== threadId);
+  if (state.activeThread?.id === threadId) {
+    state.items = [];
+    state.turns = [];
+    state.diff = "";
+    state.plan = [];
+    state.tokenUsage = null;
+    state.moreTurns = false;
+    turnCursor = null;
+  }
+}
+async function resendEditedMessage(itemId: string, text: string) {
+  if (!canEditMessage(itemId)) throw fail(new Error("当前消息不能编辑，请等待任务结束并确认会话状态"));
+  const hostId = state.hostId;
+  const threadId = state.activeThread.id;
+  const generation = selectionGeneration;
+  const original = pendingMessageEdit?.reverted && pendingMessageEdit.item.id === itemId
+    ? pendingMessageEdit.item : state.items.find(item => item.id === itemId)!;
+  const input = editedMessageInput(original, text);
+  const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === state.activePermissionProfileId);
+  resolvePermissionProfile(profile || { id: 'edit', name: '消息权限', sandboxMode: state.permission as any, approvalPolicy: approvalPolicy(), networkAccess: state.permission === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
+  const selectedModel = state.models.find(model => model.model === state.model);
+  if (selectedModel?.inputModalities?.length && !selectedModel.inputModalities.includes('image') && input.some(entry => ['image', 'localImage'].includes(entry.type)))
+    throw fail(new Error('当前模型不支持图片，请选择支持图片的模型后重新发送'));
+  if (!pendingMessageEdit?.reverted || pendingMessageEdit.item.id !== itemId)
+    pendingMessageEdit = { hostId, threadId, item: JSON.parse(JSON.stringify(original)), reverted: false, blocked: false, prefixLastTurnId: state.turns.at(-2)?.id ?? null };
+  const edit = pendingMessageEdit;
+  state.editingMessage = true;
+  const key = recencyKey(hostId, threadId);
+  const stillSelected = () => hostId === state.hostId && threadId === state.activeThread?.id && generation === selectionGeneration;
+  try {
+    if (!edit.reverted) {
+      const revision = turnRevisions.get(threadId) ?? 0;
+      const latest = await scopedRpc(hostId, 'thread/turns/list', {
+        threadId, limit: 1, cursor: null, sortDirection: 'desc', itemsView: 'full',
+      });
+      const turn = latest.data[0];
+      const messages = turn?.items?.filter((item: any) => item.type === 'userMessage') ?? [];
+      if (!stillSelected() || state.busy || (turnRevisions.get(threadId) ?? 0) !== revision ||
+          turn?.id !== original.turnId || !['completed', 'failed', 'interrupted'].includes(turn.status) ||
+          messages.length !== 1 || messages[0].id !== original.id) {
+        edit.blocked = true;
+        if (stillSelected()) void selectThread(threadId);
+        throw new Error('会话已被其他客户端更新，请取消编辑并确认最新历史');
+      }
+      localReverts.add(key);
+      const result = await rpc('thread/revert', { threadId, beforeTurnId: original.turnId! });
+      edit.reverted = true;
+      edit.needsHistory = true;
+      if (!stillSelected()) throw new Error('会话已切换，原会话已回退；请返回原会话查看');
+      const removed = state.turns.slice(state.turns.findIndex(turn => turn.id === original.turnId)).map(turn => turn.id);
+      resetEditedHistory(threadId, removed);
+      updateThread(result.thread);
+    }
+    if (edit.reverted) {
+      const revision = turnRevisions.get(threadId) ?? 0;
+      // Read the current head on retries, so a newer turn from another client
+      // cannot be hidden by the cursor returned from the original revert.
+      const page = await history(threadId, null, hostId);
+      if (!stillSelected()) throw new Error('会话已切换，请返回原会话重新发送');
+      if ((page.data[0]?.id ?? null) !== edit.prefixLastTurnId || (turnRevisions.get(threadId) ?? 0) !== revision) {
+        edit.blocked = true;
+        void selectThread(threadId);
+        throw new Error('会话已被其他客户端更新，请取消编辑并确认最新历史');
+      }
+      state.turns = [...page.data].reverse();
+      state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
+      itemCache.set(threadId, state.items);
+      turnCursor = page.nextCursor;
+      state.moreTurns = !!turnCursor;
+      edit.needsHistory = false;
+    }
+    if (!stillSelected() || edit.blocked || state.busy) throw new Error('会话状态已变化，请重新打开后确认');
+    await send(text, input);
+    pendingMessageEdit = null;
+    toast('消息已编辑并重新发送');
+  } catch (error) {
+    if (!edit.reverted) localReverts.delete(key);
+    if ((error as { uncertain?: boolean }).uncertain) {
+      edit.blocked = true;
+      if (stillSelected() && state.connected) void selectThread(threadId);
+    }
+    throw fail(error);
+  } finally { state.editingMessage = false; }
 }
 async function interrupt() {
   const id = state.activeThread?.id;
@@ -1961,6 +2111,9 @@ async function setHost(id: string) {
   previous.projectPages = { ...state.projectThreadPages };
   closeConnection();
   itemCache.clear();
+  discardedTurns.clear();
+  localReverts.clear();
+  pendingMessageEdit = null;
   activeTurns.clear();
   compactedSinceInput.clear();
   turnRevisions.clear();
@@ -2400,10 +2553,10 @@ async function readConfig() {
     if (!state.model && settings.model) state.model = settings.model;
     if (settings.model_reasoning_effort)
       state.effort = settings.model_reasoning_effort;
-    if (!state.activeThread && settings.sandbox_mode)
-      state.permission = settings.sandbox_mode;
   }
   if (!state.activeThread) {
+    state.permission = state.preferences.defaultPermission || "workspace-write";
+    state.activePermissionProfileId = "";
     const profile = availablePermissionProfiles(
       state.preferences.permissionProfiles,
     ).find(
@@ -2549,6 +2702,7 @@ async function selectPermissionProfile(id: string) {
   state.permission = result.sandbox;
   state.activePermissionProfileId = id;
   state.runtimePolicy = null;
+  if (state.activeThread) permissionSelections.set(recencyKey(state.hostId, state.activeThread.id), { mode: state.permission, profileId: id });
   await updatePreferences({ activePermissionProfileId: id });
 }
 function setPermission(mode: string) {
@@ -2569,8 +2723,17 @@ function setPermission(mode: string) {
   state.permission = mode;
   state.activePermissionProfileId = "";
   state.runtimePolicy = null;
+  if (state.activeThread) permissionSelections.set(recencyKey(state.hostId, state.activeThread.id), { mode, profileId: "" });
   if (state.preferences.activePermissionProfileId)
     return updatePreferences({ activePermissionProfileId: "" });
+}
+async function selectDefaultPermission(mode: string) {
+  try {
+    resolvePermissionProfile({ id: 'global', name: '全局默认权限', sandboxMode: mode as any, approvalPolicy: approvalPolicy(mode), networkAccess: mode === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
+    await updatePreferences({ defaultPermission: mode, activePermissionProfileId: "" });
+    permissionSelections.clear();
+    applyPermissionDefault();
+  } catch (error) { throw fail(error); }
 }
 async function queryThreads(
   search = "",
@@ -2728,6 +2891,9 @@ export function useCodex() {
     loadOlderTurns,
     newThread,
     send,
+    canEditMessage,
+    resendEditedMessage,
+    cancelMessageEdit,
     interrupt,
     fork,
     compact,
@@ -2775,6 +2941,7 @@ export function useCodex() {
     projectRoots,
     selectPermissionProfile,
     setPermission,
+    selectDefaultPermission,
     runTerminal,
     startTerminal,
     switchTmuxTerminal,

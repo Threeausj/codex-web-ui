@@ -63,6 +63,42 @@ test("preferences reject unknown fields and prototype keys", () => {
     }).success,
     false,
   );
+  assert.equal(
+    preferencesPatch.safeParse({ defaultPermission: "unrestricted" }).success,
+    false,
+  );
+  assert.equal(
+    preferencesPatch.safeParse({ defaultPermission: null }).success,
+    false,
+  );
+});
+test("global permission defaults migrate and persist independently from navigation", async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), "codex-web-default-permission-"),
+  );
+  try {
+    const file = path.join(directory, "preferences.json");
+    await fs.writeFile(file, JSON.stringify({
+      pins: [{ kind: "thread", hostId: "remote", id: "existing-thread" }],
+      collapsed: { recent: true },
+      activePermissionProfileId: "custom-profile",
+    }));
+    const store = new Preferences(file);
+    await store.init();
+    assert.equal(store.get().defaultPermission, "workspace-write");
+    for (const mode of ["read-only", "workspace-write", "danger-full-access"] as const) {
+      await store.update({ defaultPermission: mode, activePermissionProfileId: "" });
+      const restored = new Preferences(file);
+      await restored.init();
+      assert.equal(restored.get().defaultPermission, mode);
+      assert.equal(restored.get().activePermissionProfileId, "");
+      assert.deepEqual(restored.get().pins, [{ kind: "thread", hostId: "remote", id: "existing-thread" }]);
+      assert.deepEqual(restored.get().collapsed, { recent: true });
+      assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 test("projects retain multiple roots after a service restart", async () => {
   const directory = await fs.mkdtemp(

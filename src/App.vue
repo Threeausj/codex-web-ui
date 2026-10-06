@@ -51,7 +51,8 @@ const editingProject = ref<any>(null);
 const renameInput = ref<HTMLInputElement>();
 const loginPassword = ref("");
 const loginBusy = ref(false);
-const actionBusy = ref(false);
+const actionPending = ref(false);
+const actionBusy = computed(() => actionPending.value || state.editingMessage);
 let navigationSelection = 0;
 let activeActionCount = 0;
 const theme = ref(localStorage.getItem("codex.theme") || "system");
@@ -118,6 +119,15 @@ const otherRequests = computed(() =>
   ),
 );
 const welcome = computed(() => !state.activeThread && !state.items.length);
+const editDisabled = computed(() =>
+  actionBusy.value || state.busy || state.loading || !state.online ||
+  state.selectingThread || state.switchingHost || state.changingContext,
+);
+const editableItemId = computed(() => {
+  if (editDisabled.value) return undefined;
+  const item = state.items.filter((item) => item.type === 'userMessage').at(-1);
+  return item && api.canEditMessage(item.id) ? item.id : undefined;
+});
 const contextUsed = computed(() => state.tokenUsage?.last?.totalTokens ?? 0);
 const contextLimit = computed(() => state.tokenUsage?.modelContextWindow || 0);
 const contextPercent = computed(() =>
@@ -205,14 +215,15 @@ function showError(message: string) {
   state.error = message;
 }
 async function action(fn: () => any) {
+  if (state.editingMessage) return;
   ++activeActionCount;
-  actionBusy.value = true;
+  actionPending.value = true;
   try {
     return await fn();
   } catch (cause: any) {
     showError(cause.message || "操作失败");
   } finally {
-    actionBusy.value = --activeActionCount > 0;
+    actionPending.value = --activeActionCount > 0;
   }
 }
 function saveScroll() {
@@ -241,6 +252,7 @@ function restoreScroll(id: string) {
 async function selectThread(
   selection: string | { id: string; hostId: string },
 ) {
+  if (state.editingMessage) return;
   const generation = ++navigationSelection;
   const id = typeof selection === "string" ? selection : selection.id;
   const hostId =
@@ -262,6 +274,7 @@ async function selectThread(
   restoreScroll(id);
 }
 async function newThread() {
+  if (state.editingMessage) return;
   ++navigationSelection;
   saveScroll();
   sidebarOpen.value = false;
@@ -271,6 +284,7 @@ async function newThread() {
   composer.value?.focus();
 }
 async function selectProject(project: any) {
+  if (state.editingMessage) return;
   const generation = ++navigationSelection;
   const hostId = project.hostId || "local";
   saveScroll();
@@ -286,6 +300,7 @@ async function selectProject(project: any) {
   });
 }
 async function switchHost(event: Event) {
+  if (state.editingMessage) return;
   ++navigationSelection;
   const id = (event.target as HTMLSelectElement).value;
   await action(() => api.setHost(id));
@@ -722,7 +737,7 @@ watch(() => [state.authenticated, state.loading], () => {
         </button>
       </header>
       <div class="sidebar-top">
-        <button class="sidebar-action new-thread-button" @click="newThread">
+        <button class="sidebar-action new-thread-button" :disabled="state.editingMessage" @click="newThread">
           <Icon name="SquarePen" :size="17" /><span>新建对话</span
           ><kbd>⌘ ⇧ O</kbd></button
         ><button class="sidebar-action" @click="openPalette">
@@ -747,6 +762,7 @@ watch(() => [state.authenticated, state.loading], () => {
             :size="17"
           /><select
             :value="state.hostId"
+            :disabled="state.editingMessage"
             @change="switchHost"
             aria-label="选择主机"
             title="新对话与工作区使用的主机；侧栏始终显示所有主机"
@@ -992,6 +1008,11 @@ watch(() => [state.authenticated, state.loading], () => {
               :items="state.items"
               :turns="state.turns"
               :busy="state.busy"
+              :editable-item-id="editableItemId"
+              :editing="state.editingMessage"
+              :edit-disabled="editDisabled"
+              :edit-message="api.resendEditedMessage"
+              :cancel-message-edit="api.cancelMessageEdit"
               @fork="fork"
               @open-file="openWorkspace('files', $event)"
               @error="showError"

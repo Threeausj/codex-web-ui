@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import ChatItem from "./ChatItem.vue";
 import Icon from "./Icon.vue";
 import {
@@ -13,12 +13,57 @@ const props = defineProps<{
   items: DisplayItem[];
   turns: any[];
   busy: boolean;
+  editableItemId?: string;
+  editing?: boolean;
+  editDisabled?: boolean;
+  editMessage?: (itemId: string, text: string) => Promise<void>;
+  cancelMessageEdit?: (itemId: string) => void;
 }>();
 const emit = defineEmits<{
   fork: [turnId?: string];
   openFile: [path: string];
   error: [message: string];
 }>();
+const editSession = ref<{
+  itemId: string;
+  draft: string;
+  error: string;
+  saving: boolean;
+} | null>(null);
+const editingItem = ref<DisplayItem | null>(null);
+function beginEdit(item: DisplayItem, text: string) {
+  if (props.editDisabled || props.editing || !props.editMessage ||
+      item.id !== props.editableItemId || editSession.value) return;
+  editingItem.value = { ...item };
+  editSession.value = { itemId: item.id, draft: text, error: '', saving: false };
+}
+function cancelEdit() {
+  const session = editSession.value;
+  if (!session || session.saving || props.editing) return;
+  props.cancelMessageEdit?.(session.itemId);
+  editSession.value = null;
+  editingItem.value = null;
+}
+async function saveEdit() {
+  const session = editSession.value;
+  const hasImage = editingItem.value?.content?.some((input: any) =>
+    ['image', 'localImage'].includes(input.type));
+  if (!session || session.saving || props.editing || props.editDisabled ||
+      (!session.draft.trim() && !hasImage) || !props.editMessage) return;
+  session.saving = true;
+  session.error = '';
+  try {
+    await props.editMessage(session.itemId, session.draft);
+    if (editSession.value === session) {
+      editSession.value = null;
+      editingItem.value = null;
+    }
+  } catch (cause: any) {
+    session.error = cause?.message || '重新发送失败，请重试。';
+  } finally {
+    session.saving = false;
+  }
+}
 const blocks = computed(() =>
   conversationBlocks(props.items, props.turns).map((block) =>
     block.kind === "message"
@@ -60,7 +105,14 @@ function activityLabel(block: any) {
       v-if="block.kind === 'message'"
       :item="block.item"
       :busy="busy"
-      :can-fork="!busy && !!block.item.turnId"
+      :can-fork="!busy && !editing && !!block.item.turnId"
+      :can-edit="!editSession && block.item.id === editableItemId"
+      :editing="editing"
+      :edit-disabled="editDisabled"
+      :edit-session="editSession"
+      :begin-edit="beginEdit"
+      :cancel-edit="cancelEdit"
+      :save-edit="saveEdit"
       @fork="emit('fork', $event)"
       @open-file="emit('openFile', $event)"
       @error="emit('error', $event)"
@@ -71,7 +123,14 @@ function activityLabel(block: any) {
         :key="item.id"
         :item="item"
         :busy="running(block)"
-        :can-fork="!busy && !!item.turnId"
+        :can-fork="!busy && !editing && !!item.turnId"
+        :can-edit="!editSession && item.id === editableItemId"
+        :editing="editing"
+        :edit-disabled="editDisabled"
+        :edit-session="editSession"
+        :begin-edit="beginEdit"
+        :cancel-edit="cancelEdit"
+        :save-edit="saveEdit"
         @fork="emit('fork', $event)"
         @open-file="emit('openFile', $event)"
         @error="emit('error', $event)"
@@ -125,7 +184,7 @@ function activityLabel(block: any) {
         :key="item.id"
         :item="item"
         :busy="running(block)"
-        :can-fork="!busy && !!item.turnId"
+        :can-fork="!busy && !editing && !!item.turnId"
         @fork="emit('fork', $event)"
         @open-file="emit('openFile', $event)"
         @error="emit('error', $event)"
@@ -139,6 +198,19 @@ function activityLabel(block: any) {
       />
     </section>
   </template>
+  <!-- Revert removes the original turn before the replacement starts. Keep
+       the editor mounted at the history tail so failures retain the draft. -->
+  <ChatItem
+    v-if="editSession && editingItem && !items.some((item) => item.id === editSession?.itemId)"
+    :item="editingItem"
+    :editing="editing"
+    :edit-disabled="editDisabled"
+    :edit-session="editSession"
+    :cancel-edit="cancelEdit"
+    :save-edit="saveEdit"
+    @open-file="emit('openFile', $event)"
+    @error="emit('error', $event)"
+  />
   <div
     v-if="
       busy &&
