@@ -11,7 +11,7 @@ function appServiceWorker(): Plugin {
     apply: 'build',
     configResolved(config) { outputDirectory = path.resolve(config.root, config.build.outDir); },
     async writeBundle(_options, bundle) {
-      const publicFiles = ['index.html', 'offline.html', 'manifest.webmanifest', 'favicon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png'];
+      const publicFiles = ['index.html', 'offline.html', 'manifest.webmanifest', 'favicon-command.svg', 'icons/icon-command-192.png', 'icons/icon-command-512.png', 'icons/icon-command-maskable-512.png', 'icons/apple-touch-icon-command.png'];
       const files = [...publicFiles, ...Object.keys(bundle).filter((name) => name.startsWith('assets/'))].sort();
       const template = await readFile(path.join(outputDirectory, 'sw.js'), 'utf8');
       const revision = createHash('sha256').update(template);
