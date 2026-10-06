@@ -205,7 +205,6 @@ test("workspace drag resizes the existing PTY's columns without starting another
   await page.setViewportSize({ width: 1440, height: 900 });
   await login(page);
   await slash(page, "terminal");
-  await page.getByRole("button", { name: "启动终端", exact: true }).click();
   await expect.poll(() => mock.request("command/exec")?.params.tty).toBe(true);
   const processId = mock.request("command/exec")!.params.processId;
   await expect

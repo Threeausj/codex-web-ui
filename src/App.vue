@@ -9,6 +9,7 @@ import {
 } from "vue";
 import { useCodex } from "./lib/useCodex";
 import Icon from "./components/Icon.vue";
+import CommandLogo from "./components/CommandLogo.vue";
 import ConversationOutput from "./components/ConversationOutput.vue";
 import ApprovalCard from "./components/ApprovalCard.vue";
 import Composer from "./components/Composer.vue";
@@ -674,7 +675,7 @@ watch(() => [state.authenticated, state.loading], () => {
   <main v-if="!state.authenticated" class="login-screen">
     <div class="login-card">
       <div class="codex-mark large">
-        <Icon name="Command" :size="30" :stroke-width="1.5" />
+        <CommandLogo :size="36" />
       </div>
       <h1>Codex</h1>
       <p>
@@ -969,7 +970,7 @@ watch(() => [state.authenticated, state.loading], () => {
         <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
           <div v-if="welcome" class="welcome">
             <div class="welcome-mark">
-              <Icon name="Command" :size="36" :stroke-width="1.45" />
+              <CommandLogo />
             </div>
             <h2>今天，想构建什么？</h2>
             <p>

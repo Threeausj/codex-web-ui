@@ -13,6 +13,7 @@ import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from
 import { registerPreferences } from './preferences.js'
 import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
+import { registerThreadGoals } from './thread-goals.js'
 import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
@@ -92,6 +93,7 @@ export async function createApp(options: AppOptions = {}) {
   const preferences = await registerPreferences(app, dataDir)
   registerGit(app, { getBridge })
   registerNavigation(app, getBridge)
+  registerThreadGoals(app, { getBridge })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
     res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get() })
