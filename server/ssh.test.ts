@@ -36,6 +36,22 @@ test('remote Codex discovery inherits interactive login PATH and keeps startup s
   } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
 })
 
+test('interactive Bash closes extra descriptors at exec but still passes Codex protocol stdout and login PATH', async () => {
+  const fixture = await loginFixture()
+  try {
+    // Do not read the test runner's real login files. Interactive Bash itself
+    // marks inherited fd 3 close-on-exec, as the affected NAS login shell does.
+    await fs.writeFile(fixture.shell, `#!/bin/sh\n[ "$1" = '-ilc' ] || exit 98\nprintf '%s\\n' 'isolated bash startup banner'\nPATH=${shellQuote(fixture.bin)}:$PATH\nexport PATH\nexec /bin/bash --noprofile --norc -ilc "$2"\n`, { mode: 0o700 })
+    const result = await execute('/bin/sh', ['-c', remoteCodexCommand({ ...remote, cwd: fixture.cwd })], { env: fixture.env })
+    assert.deepEqual(JSON.parse(result.stdout), {
+      args: ['-c', 'features.default_mode_request_user_input=true', 'app-server', '--listen', 'stdio://'],
+      cwd: await fs.realpath(fixture.cwd),
+    })
+    assert.match(result.stderr, /isolated bash startup banner/)
+    assert.ok(!result.stdout.includes('startup banner'))
+  } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
+})
+
 test('explicit remote Codex paths preserve spaces, quotes and shell metacharacters, including proxy mode', async () => {
   const fixture = await loginFixture()
   const binary = path.join(fixture.bin, "codex's ; $(touch injected)")

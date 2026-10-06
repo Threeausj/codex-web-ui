@@ -47,14 +47,24 @@ test("mobile touch can choose a file without losing input focus or text", async 
   expect(mock.request("turn/start")).toBeUndefined();
 });
 
-test("welcome and favicon use the supplied Command logo", async ({ page }) => {
+test("website favicon and installed app icons use new URLs for the supplied Command logo", async ({ page }) => {
   await login(page);
   const path = "M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3";
-  await expect(page.locator(".welcome-mark svg path")).toHaveAttribute("d", path);
-  await expect(page.locator(".welcome-mark svg")).toHaveAttribute("stroke-width", "1.45");
-  const favicon = await page.request.get("/favicon.svg");
+  const faviconHref = await page.locator('link[rel="icon"]').getAttribute("href");
+  expect(faviconHref).toBe("/favicon-command.svg");
+  const favicon = await page.request.get(faviconHref!);
   expect(await favicon.text()).toContain(path);
-  const icon = await page.request.get("/icons/icon-192.png");
-  expect(icon.status()).toBe(200);
-  expect(icon.headers()["content-type"]).toContain("image/png");
+  const manifestHref = await page.locator('link[rel="manifest"]').getAttribute("href");
+  const manifest = await (await page.request.get(manifestHref!)).json();
+  expect(manifest.id).toBe("/");
+  expect(manifest.icons.map((icon: { src: string }) => icon.src)).toEqual([
+    "/icons/icon-command-192.png", "/icons/icon-command-512.png", "/icons/icon-command-maskable-512.png",
+  ]);
+  const appleTouchHref = await page.locator('link[rel="apple-touch-icon"]').getAttribute("href");
+  expect(appleTouchHref).toBe("/icons/apple-touch-icon-command.png");
+  for (const iconHref of [...manifest.icons.map((icon: { src: string }) => icon.src), appleTouchHref]) {
+    const icon = await page.request.get(iconHref!);
+    expect(icon.status()).toBe(200);
+    expect(icon.headers()["content-type"]).toContain("image/png");
+  }
 });

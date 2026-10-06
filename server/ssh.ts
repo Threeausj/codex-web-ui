@@ -13,12 +13,11 @@ export function codexAppServerArgs(mode: 'spawn' | 'proxy' = 'spawn', socketPath
  * SSH starts a non-interactive shell whose PATH often misses nvm, mise or npm
  * installs. Let the account's interactive login shell initialize its environment
  * first, then start a POSIX launcher with the resulting PATH. Its startup output
- * goes to stderr; fd 3 is reserved for the app-server protocol stdout.
+ * goes to stderr; fd 3 temporarily preserves the app-server protocol stdout.
  */
 export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false) {
   const command = host.codexPath?.trim() || 'codex'
   const launch = [
-    'exec 1>&3 3>&-',
     ...(host.cwd ? [`cd ${shellQuote(host.cwd)} || exit 126`] : []),
     `codex_bin=${shellQuote(command)}`,
     'codex_bin=$(command -v "$codex_bin" 2>/dev/null) || { printf "%s\\n" "Codex was not found in the remote login-shell PATH" >&2; exit 127; }',
@@ -27,7 +26,9 @@ export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn'
   ].join('\n')
   // The command executed by the user's shell is deliberately just exec + sh;
   // the launcher itself also works when the login shell is fish.
-  const interactiveCommand = `exec /bin/sh -c ${shellQuote(launch)}`
+  // Interactive bash can mark inherited extra descriptors close-on-exec.
+  // Restore standard stdout in that shell, before exec crosses into /bin/sh.
+  const interactiveCommand = `exec /bin/sh -c ${shellQuote(launch)} 1>&3 3>&-`
   const bootstrap = `login_shell=\${SHELL:-/bin/sh}\nexec "$login_shell" -ilc ${shellQuote(interactiveCommand)} 3>&1 1>&2`
   return `exec /bin/sh -c ${shellQuote(bootstrap)}`
 }

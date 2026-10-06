@@ -353,8 +353,8 @@ export async function testSystemNotification() {
     if (!worker) throw new Error('通知服务尚未就绪，请刷新后重试');
     await worker.showNotification('Codex 系统通知检查', {
       body: '收到这条通知表示应用的系统通知可以正常显示。',
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-192.png',
+      icon: '/icons/icon-command-192.png',
+      badge: '/icons/icon-command-192.png',
       tag: `codex-system-test-${Date.now()}`,
       data: {},
     });

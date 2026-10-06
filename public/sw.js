@@ -76,8 +76,8 @@ self.addEventListener("push", (event) => {
   const tag = typeof payload.tag === "string" ? payload.tag.slice(0, 160) : undefined;
   event.waitUntil(self.registration.showNotification(title || "Codex Web", {
     body,
-    icon: "/icons/icon-192.png",
-    badge: "/icons/icon-192.png",
+    icon: "/icons/icon-command-192.png",
+    badge: "/icons/icon-command-192.png",
     tag,
     renotify: !!tag,
     data,

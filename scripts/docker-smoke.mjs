@@ -54,7 +54,10 @@ assert.equal((await fetch(base + asset)).status, 200);
 const manifestResponse = await fetch(base + '/manifest.webmanifest');
 assert.equal(manifestResponse.status, 200, 'The non-root server must read copied public assets');
 const manifest = await manifestResponse.json();
-for (const assetPath of ['/sw.js', '/offline.html', '/favicon.svg', ...manifest.icons.map(icon => icon.src)]) {
+const favicon = htmlText.match(/<link\b[^>]*rel="icon"[^>]*href="([^"]+)"/)?.[1];
+const appleTouchIcon = htmlText.match(/<link\b[^>]*rel="apple-touch-icon"[^>]*href="([^"]+)"/)?.[1];
+assert.ok(favicon && appleTouchIcon, 'Website and installed-app icon links must be present');
+for (const assetPath of ['/sw.js', '/offline.html', favicon, appleTouchIcon, ...manifest.icons.map(icon => icon.src)]) {
   assert.equal((await fetch(base + assetPath)).status, 200, `Public asset ${assetPath} must be readable`);
 }
 JSON.parse(await fs.readFile('/app/package.json', 'utf8'));

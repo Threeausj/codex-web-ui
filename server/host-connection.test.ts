@@ -33,6 +33,7 @@ test('connection failures classify SSH and Codex diagnostics without exposing pr
     ['developer@host: Permission denied (publickey).', 'ssh'],
     ['ssh: Could not resolve hostname private-host: Name or service not known', 'ssh'],
     ['Connection refused', 'ssh'],
+    ['/bin/sh: line 1: 3: Bad file descriptor', 'codex'],
     ['Codex was not found in the remote login-shell PATH', 'codex'],
     ['Invalid JSON from app-server', 'protocol'],
   ] as const
