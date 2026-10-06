@@ -58,7 +58,7 @@ function onLink(event: MouseEvent) {
     <div v-if="item.type === 'fileChange'" class="file-changes">
       <div v-for="change in item.changes" :key="change.path" class="file-diff">
         <button class="file-diff-heading" @click="emit('openFile', change.path)"><Icon name="FileText" :size="15" />{{ change.path }}<span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><Icon name="ArrowUpRight" :size="14" /></button>
-        <pre class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line }}\n</span></pre>
+        <pre class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </div>
     </div>
     <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>

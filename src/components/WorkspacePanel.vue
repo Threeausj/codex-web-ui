@@ -703,7 +703,7 @@ defineExpose({
         <span>本次对话 · {{ changes.length }} 个文件</span>
       </div>
       <div v-for="change in changes" :key="change.path" class="change-card">
-        <button class="file-diff-heading" @click="openFile(change.path)">
+        <button class="file-diff-heading" :title="change.path" @click="openFile(change.path)">
           <Icon name="FileText" :size="15" /><span>{{
             change.path.replace(state.projectPath + "/", "")
           }}</span
@@ -711,7 +711,7 @@ defineExpose({
         </button>
         <pre
           class="diff-code"
-        ><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line }}\n</span></pre>
+        ><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </div>
       <div v-if="!changes.length" class="panel-empty">
         <Icon name="GitCompareArrows" :size="32" />

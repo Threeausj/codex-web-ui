@@ -1081,6 +1081,9 @@ hr {
   margin-left: auto;
   color: var(--muted);
 }
+.file-diff-heading > svg {
+  flex-shrink: 0;
+}
 .diff-code {
   margin: 0;
   padding: 10px 14px;
@@ -1615,6 +1618,7 @@ hr {
 }
 .directory-toolbar,
 .preview-toolbar {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1739,6 +1743,7 @@ hr {
   line-height: 1.6;
 }
 .preview-options {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1777,10 +1782,11 @@ hr {
   overflow: auto;
 }
 .preview-frame-container iframe {
+  display: block;
   background: white;
   width: 100%;
   height: 100%;
-  min-height: 350px;
+  min-height: 0;
   border: 0;
 }
 .preview-frame-container.mobile {
@@ -3086,15 +3092,25 @@ textarea.file-editor {
   background: var(--surface);
 }
 .changes-heading {
+  flex-shrink: 0;
   font-size: 10px;
   color: var(--muted);
   margin-bottom: 15px;
 }
 .change-card {
+  flex-shrink: 0;
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
   margin-bottom: 12px;
   overflow: hidden;
+}
+.change-card .file-diff-heading {
+  min-height: 42px;
+  font-size: 12px;
+}
+.change-card .diff-code {
+  font-size: 12px;
 }
 .change-card .file-diff-heading span {
   flex: 1;
