@@ -6,7 +6,7 @@ import type { WebSocket } from 'ws'
 import type { Host, RpcId, RpcMessage } from './types.js'
 import { rpcError } from './types.js'
 import { webSocketProxyTransport } from './proxy-transport.js'
-import { sshAppServerArgs } from './ssh.js'
+import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
@@ -28,9 +28,7 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   let args: string[]
   if (host.kind === 'ssh') {
     args = sshAppServerArgs(host, options.mode, options.connectionProbe)
-  } else if (options.mode === 'proxy') {
-    args = ['app-server', 'proxy', ...(options.socketPath ? ['--sock', options.socketPath] : [])]
-  } else args = ['app-server', '--listen', 'stdio://']
+  } else args = codexAppServerArgs(options.mode, options.socketPath)
   const child: ChildProcessWithoutNullStreams = spawn(executable, args, {
     cwd: options.cwd || process.cwd(),
     env: { ...process.env, ...(options.codexHome ? { CODEX_HOME: options.codexHome } : {}) },
@@ -40,7 +38,15 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   // Protocol lives exclusively on stdout. Drain stderr without leaking account data into web errors.
   child.stderr.on('data', chunk => options.onStderr?.(chunk.toString()))
   const events = new EventEmitter()
-  child.on('error', error => events.emit('transportError', error))
+  child.on('error', error => {
+    const code = (error as NodeJS.ErrnoException).code
+    if (host.kind === 'local' && (code === 'ENOENT' || code === 'EACCES')) {
+      const message = code === 'ENOENT'
+        ? '未找到本机 Codex。Docker 镜像不内置 Codex；请选择已安装 Codex 的 SSH 主机，或只读挂载本机安装目录并设置 CODEX_BIN 为容器内的绝对路径'
+        : '无法执行本机 Codex。请检查 CODEX_BIN、安装目录挂载和服务用户的读取/执行权限'
+      events.emit('transportError', new Error(message, { cause: error }))
+    } else events.emit('transportError', error)
+  })
   child.on('close', (code, signal) => events.emit('transportClose', new Error(host.kind === 'ssh' && code === 127 ? '远端未找到 Codex，请确认登录 shell 的 PATH，或在主机设置中指定 Codex 路径' : `Codex app-server exited (${signal || code})`)))
   let forceClose: ReturnType<typeof setTimeout> | undefined
   child.once('close', () => { clearTimeout(forceClose) })

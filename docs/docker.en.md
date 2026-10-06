@@ -2,7 +2,7 @@
 
 [简体中文](docker.md) · **English**
 
-The multi-stage image uses Node.js 22 on Debian Bookworm and runs as non-root `node` (`1000:1000`). It includes pinned Codex CLI `0.159.2`, Git, OpenSSH, tmux, Python 3, and ripgrep. Conversations and execution still use the official Codex app-server stdio protocol; its raw transport is not exposed.
+The multi-stage image uses Node.js 22 on Debian Bookworm and runs as non-root `node` (`1000:1000`). It includes Git, OpenSSH, tmux, Python 3, and ripgrep. Codex comes from an existing host or SSH installation; the image neither bundles, pins, nor updates the CLI. Conversations and execution use the official Codex app-server stdio protocol; its raw transport is not exposed.
 
 ## Files and persistent data
 
@@ -11,6 +11,7 @@ The multi-stage image uses Node.js 22 on Debian Bookworm and runs as non-root `n
 | `Dockerfile`, `.dockerignore` | Build the production frontend/backend; exclude credentials and local workspaces |
 | `compose.yaml` | Application base, with no published ports |
 | `compose.local.yaml` | Publish only `127.0.0.1:8787` |
+| `compose.host-codex.yaml` | Optional read-only mount of an existing Linux host Codex installation |
 | `compose.public.yaml` | Caddy publishes 80/443; app remains on the Compose network |
 | `deploy/docker/env.example` | Copy to the Git-ignored `.env.docker` |
 | `deploy/docker/Caddyfile` | Automatic HTTPS and WebSocket reverse proxy |
@@ -37,17 +38,41 @@ On Linux, UID/GID `1000:1000` must be able to read/write the directory. For a de
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --build --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex --version
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex login --device-auth
 ```
 
-Complete the Codex login using the CLI's browser/device instructions; your account must permit device login. You can also configure an existing account/provider in persistent `CODEX_HOME` using the supported CLI flow. The web password does not grant model access.
+This is sufficient for an SSH-only deployment: health checks, login, and connection settings work without a local CLI. Add a remote machine with Codex installed under Settings → Connections, test it, and select that host. See the SSH section below. Selecting Local without a mounted installation shows a configuration message without preventing web login or remote-host setup.
 
-Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and add a project under `/workspace`. If port 8787 is already used, stop one service or change the host port in the local overlay and update its `PUBLIC_ORIGIN` accordingly.
+Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and choose the configured host and project. If port 8787 is already used, stop one service or change the host port in the local overlay and update its `PUBLIC_ORIGIN` accordingly.
 
 Local HTTP origins use cookies without Secure; the HTTPS origin enables Secure. Both modes keep HttpOnly, SameSite, CSRF, and Origin checks. `NODE_ENV` does not disable authentication.
 
 When using a NAS IP or your own HTTPS reverse proxy, add the browser's exact origin (scheme, hostname and port) to `PUBLIC_ORIGIN`. Unlisted origins receive `403 Untrusted origin` even with the correct password. Separate multiple origins with commas. Mixed HTTP/HTTPS deployments set Secure cookies according to the trusted login origin, so LAN HTTP logins remain usable and HTTPS logins remain protected; HTTPS-only deployments always require Secure cookies. HTTP pages generate compatible UUIDs with `crypto.getRandomValues` instead of requiring the secure-context-only `crypto.randomUUID` API.
+
+## Reuse the host Codex installation
+
+Local execution on Linux requires a read-only installation mount with the same architecture as the container. For npm, run `npm root -g` in the environment that installed Codex. Set `HOST_CODEX_DIRECTORY` to the complete `@openai` scope beneath that directory, including Codex and its platform binary dependencies. Mounting only a `/usr/local/bin/codex` symlink or JavaScript entrypoint misses those dependencies. Add these values to `.env.docker`, adjusting for your npm/nvm prefix:
+
+```dotenv
+HOST_CODEX_DIRECTORY=/usr/local/lib/node_modules/@openai
+CODEX_BIN=/opt/host-codex/codex/bin/codex.js
+```
+
+Retain `-f compose.host-codex.yaml` in every command for this deployment:
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml config --quiet
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up -d --build --wait
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" --version'
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" login --device-auth'
+```
+
+The last command authenticates the container's durable `CODEX_HOME`; it does not change the host's account. You can instead configure an existing provider in that home. Installation mounts and account/history mounts are separate: sharing the executable does not automatically share host history. See desktop synchronization below. UID 1000 needs read/execute access to the installation; keep that mount read-only.
+
+For a standalone native Linux installation, mount the directory containing the actual executable and set `CODEX_BIN=/opt/host-codex/actual-filename`; for example, `HOST_CODEX_DIRECTORY=/srv/codex-bin` with `CODEX_BIN=/opt/host-codex/codex`. Include runtime dependencies and symlink targets. Avoid mounting only the versioned executable, because atomic replacement during an upgrade can leave a file mount on the old inode. pnpm/Bun layouts with cross-directory symlinks require explicit limited mounts covering their targets, or an SSH connection to the host. macOS/Windows binaries cannot run inside a Linux container; execute them on their original host through SSH.
+
+Update Codex through the host or remote machine's usual mechanism. The application does not update it and the web image needs no rebuild for a CLI upgrade. Finish active tasks, then restart the web service to spawn a fresh app-server: a running app-server and ordinary browser reconnection keep the existing process. Unchanged directory paths expose updated files on the next spawn. If nvm changes the Node version or installation prefix, update `HOST_CODEX_DIRECTORY` and recreate the container. Each new SSH app-server connection resolves the remote login-shell PATH again.
+
+App-servers launched by the web application receive `-c features.default_mode_request_user_input=true` to allow structured questions in regular conversations, without writing host `config.toml`. Proxy connections to existing daemons depend on the daemon and session configuration; the proxy command cannot replace an existing daemon's startup configuration.
 
 ## Model gateways and client identity
 
@@ -82,7 +107,6 @@ Point a domain at the server and allow TCP 80/443. UDP 443 is optional for HTTP/
 ```dotenv
 CODEX_WEB_PASSWORD=replace-with-your-generated-password
 WORKSPACE_PATH=/srv/codex-workspace
-CODEX_VERSION=0.159.2
 PUBLIC_HOST=codex.example.com
 ACME_EMAIL=admin@example.com
 # Optional: replace with a real maintainer contact; empty uses the HTTPS origin.
@@ -96,11 +120,10 @@ If a local deployment is running, stop/remove its containers while retaining the
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml down
 docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml up -d --build --wait
-docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml exec app codex login --device-auth
 docker compose --env-file .env.docker -f compose.yaml -f compose.public.yaml logs --tail 100 caddy
 ```
 
-Visit your HTTPS domain and sign in. Do not combine the local and public overlays: that would add an unnecessary backend port. With an existing reverse proxy, run the base Compose file and connect the trusted proxy to `app:8787` on a controlled network, overriding the HTTPS origin/trust settings for your setup. Do not expose the backend directly.
+Visit your HTTPS domain, sign in, and configure an SSH host; add `-f compose.host-codex.yaml` to use the host installation locally. Do not combine the local and public overlays: that would add an unnecessary backend port. With an existing reverse proxy, run the base Compose file and connect the trusted proxy to `app:8787` on a controlled network, overriding the HTTPS origin/trust settings for your setup. Do not expose the backend directly.
 
 This is a single-user workstation gateway. Signed-in users can operate mounted files and configured SSH hosts; it does not provide tenant isolation. The deployment does not enable privileged mode, mount the Docker socket, or disable seccomp.
 
@@ -188,7 +211,7 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml buil
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --wait
 ```
 
-The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check protocol compatibility and regenerate types when upgrading the CLI; avoid silently floating to `latest`.
+Web image and Codex upgrades are independent. Check protocol compatibility after a CLI upgrade and restart app-server after finishing active tasks; upgrading the host or remote CLI does not require rebuilding the image.
 
 ## Validation and troubleshooting
 
@@ -198,7 +221,8 @@ The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check pr
 | Environment password no longer works | A saved `web-password.json` takes precedence; use the current password or follow the recovery steps above |
 | Missing mount/permission denied | Host `WORKSPACE_PATH` exists and UID 1000 has access |
 | Login does not persist | Correct origin/domain, HTTPS for the public mode, proxy/Cookie configuration |
-| Models unavailable | Run Codex login in the container and check account/provider access |
+| Local Codex missing | Mount the host installation with the optional overlay and check `HOST_CODEX_DIRECTORY`/absolute `CODEX_BIN`, or select an SSH host |
+| Models unavailable | Authenticate in the remote user's or container's `CODEX_HOME`; check account/provider access |
 | SSH fails | Test the same alias inside the container; inspect mounts, key permissions, verified `known_hosts` |
 | Desktop history absent | Default volume is independent; check shared data and exact working-directory paths |
 | Sandbox/namespace errors | Codex sandbox depends on the kernel/container policy; the configuration never silently expands permissions |
@@ -209,8 +233,8 @@ The pinned `CODEX_VERSION` can be changed explicitly before rebuilding. Check pr
 
 In the tested standard Docker deployment, read-only/workspace-write commands reported `bwrap: No permissions to create a new namespace`; container-bound Full access commands and PTYs worked. Fine-grained sandbox modes require suitable kernel/user-namespace/container-policy support and need separate environment verification. If a user explicitly selects Codex Full access, it applies to mounts/processes/SSH hosts accessible to the container and does not grant host Docker management. Do not automatically switch permissions or enable `--privileged` to work around an error.
 
-The [optional CI template](../deploy/github-actions/README.md) checks the application suite/build and an isolated container: health, login/Cookie behavior, unauthorized rejection, real app-server handshake/files/PTY/tmux, persistence after recreation, HTTPS-origin Secure cookies, and Caddy configuration. Copy it to `.github/workflows/ci.yml` to enable it. It needs no model account or inference quota. Real domain certificates, SSH targets, and desktop active turns require deployment-specific verification. See the [validation checklist](validation.md).
+The [optional CI template](../deploy/github-actions/README.md) checks the application suite/build and an isolated container: health/login without a local CLI, then a read-only CI host installation for real app-server handshake/files/PTY/tmux and persistence, plus HTTPS-origin Secure cookies and Caddy configuration. Copy it to `.github/workflows/ci.yml` to enable it. It needs no model account or inference quota. Real domain certificates, SSH targets, and desktop active turns require deployment-specific verification. See the [validation checklist](validation.md).
 
-On 2026-10-06, the image was built and the container checks above passed in an isolated Colima Linux/ARM64 environment, including forced-recreation persistence, public-origin Cookie behavior, and Caddy validation. An amd64 image and real ACME certificate issuance were not tested.
+On 2026-10-06, the previous image with a bundled CLI passed isolated Colima Linux/ARM64 checks, including forced-recreation persistence. That evidence does not cover every platform for the new host-installation mount. The updated CI template covers startup without Codex and host installation reuse; real ACME issuance still requires separate verification.
 
 References: [Compose in production](https://docs.docker.com/compose/how-tos/production/), [Codex CLI](https://learn.chatgpt.com/docs/codex/cli), [app-server](https://learn.chatgpt.com/docs/app-server).

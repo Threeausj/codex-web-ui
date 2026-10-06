@@ -119,7 +119,7 @@ async function save() {
   box-shadow: 0 20px 80px #0002;
 }
 .project-dialog::backdrop {
-  background: #0004;
+  background: var(--scrim);
   backdrop-filter: blur(3px);
 }
 header {

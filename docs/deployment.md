@@ -6,7 +6,7 @@
 
 ## Linux + Node + Caddy
 
-需要 Node.js 22+、Codex CLI，以及能访问工作目录和 Codex 配置的系统账户。先以该账户完成 `codex login`，然后在项目目录执行：
+需要 Node.js 22+，以及能访问工作目录的系统账户。本机执行使用该账户已有的 Codex CLI 和配置；仅连接 SSH 远端时，Web 主机无需安装 Codex。使用本机时先以该账户完成 `codex login`，然后在项目目录执行：
 
 ```sh
 npm ci
@@ -28,7 +28,7 @@ PUBLIC_ORIGIN=https://codex.example.com
 TRUST_PROXY=1
 ```
 
-`CODEX_BIN` 必须是服务实际可执行的路径。用已有桌面历史时，服务应以相同系统账户运行并使用相同 `CODEX_HOME`。另建 `codexweb` 用户不会自动拥有原用户的桌面历史。
+`CODEX_BIN` 是服务实际可执行的路径；应用不会安装或固定 CLI 版本。纯 SSH 部署可不设置，本机连接缺少 CLI 时会显示配置提示，Web 服务仍正常启动。用已有桌面历史时，服务应以相同系统账户运行并使用相同 `CODEX_HOME`。另建 `codexweb` 用户不会自动拥有原用户的桌面历史。
 
 编辑 `deploy/codex-web.service` 的用户、工作目录和 Node 路径，创建由该用户拥有的 `DATA_DIR`，再将 service 安装到 systemd。示例命令需要管理员身份：
 
@@ -89,6 +89,6 @@ codex login
 
 ## 升级与备份
 
-升级前完成正在运行的 turn，备份 `DATA_DIR` 与目标用户的 `CODEX_HOME`，再更新 CLI、重新生成协议类型和构建。备份包含敏感配置，应按本地私有文件管理。桌面软件升级可能改变其项目元数据格式；遇到项目未显示时可从 UI 手动添加绝对路径。
+升级前完成正在运行的 turn，备份 `DATA_DIR` 与目标用户的 `CODEX_HOME`。CLI 使用本机或远端原有的升级方式，升级后重启 Web 服务或真正重建对应 app-server 连接；仅刷新网页会复用仍在运行的旧 app-server。CLI 升级不需要重建 Web 镜像，协议不兼容时再更新应用与协议类型。备份包含敏感配置，应按本地私有文件管理。桌面软件升级可能改变其项目元数据格式；遇到项目未显示时可从 UI 手动添加绝对路径。
 
 本项目尚未替你配置域名、证书、防火墙、systemd 或 SSH 凭据；这里的文件是可审阅的部署示例。正式上线前执行 [验证清单](validation.md) 的鉴权与移动端部分。

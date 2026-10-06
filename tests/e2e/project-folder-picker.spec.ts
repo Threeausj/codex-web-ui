@@ -54,6 +54,36 @@ test("browse and typed paths select a project and extra workspace roots, excludi
   expect(calls).toEqual(["/workspace", "/workspace/中文项目", "/workspace", "/workspace/手输项目", "/workspace/手输项目", "/workspace/共享"]);
 });
 
+test("typing an extra directory while the initial folder is loading preserves the draft and requires navigation", async ({ page }) => {
+  const calls: string[] = [];
+  let releaseInitial: (() => void) | undefined;
+  await page.route(browseRoute, async route => {
+    const path = new URL(route.request().url()).searchParams.get("path") || "/workspace";
+    calls.push(path);
+    if (path === "/workspace/project")
+      await new Promise<void>(resolve => { releaseInitial = resolve; });
+    await route.fulfill({ json: { path, entries: [] } });
+  });
+  await login(page);
+  const settings = await openProjects(page);
+  await settings.getByRole("textbox", { name: "项目路径", exact: true }).fill("/workspace/project");
+  await settings.getByRole("button", { name: "选择其他工作目录", exact: true }).click();
+  const dialog = picker(page);
+  await expect.poll(() => !!releaseInitial).toBe(true);
+  const address = dialog.getByRole("textbox", { name: "文件夹路径", exact: true });
+  await address.fill("/workspace/共享");
+  releaseInitial!();
+  await expect(dialog.getByText("此文件夹没有子文件夹", { exact: true })).toBeVisible();
+  await expect(address).toHaveValue("/workspace/共享");
+  await expect(dialog.getByRole("button", { name: "使用文件夹", exact: true })).toBeDisabled();
+  await address.press("Enter");
+  await expect(dialog.getByRole("button", { name: "使用文件夹", exact: true })).toBeEnabled();
+  await dialog.getByRole("button", { name: "使用文件夹", exact: true }).click();
+  await expect(settings.getByRole("textbox", { name: "其他工作目录", exact: true })).toHaveValue("/workspace/共享");
+  await expect(settings.getByRole("textbox", { name: "项目路径", exact: true })).toHaveValue("/workspace/project");
+  expect(calls).toEqual(["/workspace/project", "/workspace/共享"]);
+});
+
 test("remote project browsing and addition preserve the current local chat and draft, resetting paths between hosts", async ({ page, mock }) => {
   const remote = new MockCodex();
   mock.hosts.push({ id: "ssh-folders", name: "远程开发机", kind: "ssh", hostname: "server.invalid" });

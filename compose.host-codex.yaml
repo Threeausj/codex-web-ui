@@ -1,0 +1,14 @@
+# Reuse an existing Linux Codex installation. Do not mount the entire host root.
+# npm: HOST_CODEX_DIRECTORY is the complete global node_modules/@openai scope.
+# native: mount the directory containing the executable and set CODEX_BIN.
+services:
+  app:
+    environment:
+      CODEX_BIN: ${CODEX_BIN:-/opt/host-codex/codex/bin/codex.js}
+    volumes:
+      - type: bind
+        source: ${HOST_CODEX_DIRECTORY:?Set HOST_CODEX_DIRECTORY to the existing Linux Codex installation directory}
+        target: /opt/host-codex
+        read_only: true
+        bind:
+          create_host_path: false

@@ -452,6 +452,8 @@ test('event text distinguishes completion, failure and the requested confirmatio
     [{ id: 'legacy-file', method: 'applyPatchApproval', params: { conversationId: 'event-thread', changes: 'private patch' } }, '等待文件修改确认', 'approval'],
     [{ id: 'permissions', method: 'item/permissions/requestApproval', params: { threadId: 'event-thread' } }, '等待权限确认', 'approval'],
     [{ id: 'input', method: 'item/tool/requestUserInput', params: { threadId: 'event-thread', questions: 'private question' } }, '等待补充输入', 'approval'],
+    [{ id: 'choice', method: 'item/tool/requestUserInput', params: { threadId: 'event-thread', isBlocking: false, questions: [{ id: 'split', question: 'private question', options: [{ label: 'private option', description: 'private explanation' }] }] } }, '等待你的选择', 'approval'],
+    [{ id: 'legacy-choice', method: 'tool/requestUserInput', params: { threadId: 'event-thread', questions: [{ options: [{ label: 'private option' }] }] } }, '等待你的选择', 'approval'],
     [{ id: 'mcp', method: 'mcpServer/elicitation/request', params: { threadId: 'event-thread', mode: 'form' } }, '等待确认或补充输入', 'approval'],
   ]
   try {

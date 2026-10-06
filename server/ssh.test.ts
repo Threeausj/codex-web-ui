@@ -29,7 +29,7 @@ test('remote Codex discovery inherits interactive login PATH and keeps startup s
   const fixture = await loginFixture()
   try {
     const result = await execute('/bin/sh', ['-c', remoteCodexCommand({ ...remote, cwd: fixture.cwd })], { env: fixture.env })
-    assert.deepEqual(JSON.parse(result.stdout), { args: ['app-server', '--listen', 'stdio://'], cwd: await fs.realpath(fixture.cwd) })
+    assert.deepEqual(JSON.parse(result.stdout), { args: ['-c', 'features.default_mode_request_user_input=true', 'app-server', '--listen', 'stdio://'], cwd: await fs.realpath(fixture.cwd) })
     assert.match(result.stderr, /login shell startup banner/)
     assert.ok(!result.stdout.includes('startup banner'))
     assert.equal(await fs.stat(fixture.binary).then(stat => stat.isFile()), true)
@@ -42,7 +42,7 @@ test('explicit remote Codex paths preserve spaces, quotes and shell metacharacte
   await fs.writeFile(binary, fixture.source, { mode: 0o700 })
   try {
     const result = await execute('/bin/sh', ['-c', remoteCodexCommand({ ...remote, codexPath: binary, cwd: fixture.cwd }, 'proxy')], { env: fixture.env })
-    assert.deepEqual(JSON.parse(result.stdout), { args: ['app-server', 'proxy'], cwd: await fs.realpath(fixture.cwd) })
+    assert.deepEqual(JSON.parse(result.stdout), { args: ['-c', 'features.default_mode_request_user_input=true', 'app-server', 'proxy'], cwd: await fs.realpath(fixture.cwd) })
     assert.equal(await fs.access(path.join(fixture.cwd, 'injected')).then(() => true, () => false), false)
   } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
 })
@@ -62,7 +62,7 @@ test('connection-test launcher reports the actual remote Codex version on stderr
   await fs.writeFile(fixture.binary, source, { mode: 0o700 })
   try {
     const result = await execute('/bin/sh', ['-c', remoteCodexCommand({ ...remote, cwd: fixture.cwd }, 'spawn', true)], { env: fixture.env })
-    assert.deepEqual(JSON.parse(result.stdout).args, ['app-server', '--listen', 'stdio://'])
+    assert.deepEqual(JSON.parse(result.stdout).args, ['-c', 'features.default_mode_request_user_input=true', 'app-server', '--listen', 'stdio://'])
     assert.match(result.stderr, /__CODEX_WEB_VERSION__=codex-cli 0\.200\.0/)
     assert.ok(!result.stdout.includes('codex-cli'))
   } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }

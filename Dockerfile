@@ -7,16 +7,12 @@ COPY . .
 RUN npm run build && npm prune --omit=dev
 
 FROM node:22-bookworm-slim AS runtime
-ARG CODEX_VERSION=0.159.2
 LABEL org.opencontainers.image.title="Codex Web UI" \
-      org.opencontainers.image.description="Vue web client for the official Codex app-server protocol" \
-      io.codex-web.codex-version="${CODEX_VERSION}"
+      org.opencontainers.image.description="Vue web client for a host or SSH-installed Codex app-server"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        bash ca-certificates git libgcc-s1 libstdc++6 openssh-client python3 ripgrep tini tmux \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install --global "@openai/codex@${CODEX_VERSION}" \
-    && npm cache clean --force \
     && install -d -o node -g node -m 0700 /app/data /home/node/.codex \
     && install -d -o node -g node -m 0755 /workspace
 COPY --from=build /app/package.json /app/package-lock.json /app/

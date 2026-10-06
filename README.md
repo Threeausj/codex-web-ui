@@ -20,14 +20,30 @@ mkdir -p workspace
 
 ```sh
 docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -d --build
-docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml exec app codex login --device-auth
 ```
 
-打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，用网页密码登录，在 UI 中添加 `/workspace` 下的项目。Codex 模型账户登录与网页密码分别管理。
+打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，用网页密码登录，在“设置 → 连接”添加已安装 Codex 的 SSH 主机，选择该主机和项目。纯 SSH 部署无需在容器安装 CLI。Codex 模型账户登录与网页密码分别管理。
+
+Linux 本机执行可直接只读复用宿主已有安装。npm 安装在 `.env.docker` 设置 `HOST_CODEX_DIRECTORY` 为 `npm root -g` 下的整个 `@openai` 目录，并设置容器入口；例如：
+
+```dotenv
+HOST_CODEX_DIRECTORY=/usr/local/lib/node_modules/@openai
+CODEX_BIN=/opt/host-codex/codex/bin/codex.js
+```
+
+随后对该部署的每条 Compose 命令增加 `-f compose.host-codex.yaml`：
+
+```sh
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml up -d --build
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" --version'
+docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f compose.host-codex.yaml exec app sh -c '"$CODEX_BIN" login --device-auth'
+```
+
+登录使用容器持久化的 `CODEX_HOME`，共享安装不会自动共享宿主账户。原生 Linux 二进制、nvm 路径和账户复用见 [宿主 Codex 配置](docs/docker.md#直接使用宿主-codex)。宿主或远端升级 CLI 后，完成活动任务再重新启动对应 app-server；无需重新构建 Web 镜像。
 
 标准 Docker 隔离策略可能阻止 Codex 的 Linux sandbox 创建 namespace；本次实测只读/工作区命令遇到该限制。需要终端、Tmux 或模型命令工具时，可由用户明确选择 Codex“完全访问”，其范围包含容器可访问的挂载及 SSH 主机。部署配置不会自动切换权限，也不使用 privileged 模式。[权限说明](docs/docker.md#检查与排错)。
 
-镜像包含固定版本 Codex CLI `0.159.2`、Git、SSH、Tmux，使用非 root 用户；网页数据和 Codex 配置/历史分别保存在持久化卷中。本地方案只发布回环端口，公网方案使用 Caddy HTTPS。Docker 中的“本机”指容器；不会自动使用 macOS/Windows 桌面账户或连接桌面 daemon。
+镜像包含 Git、SSH、Tmux，使用非 root 用户；Codex 直接使用本机或远端已有安装，镜像不内置或固定 CLI 版本。网页数据和容器 Codex 配置/历史分别保存在持久化卷中，SSH 历史保存在远端。本地方案只发布回环端口，公网方案使用 Caddy HTTPS。Docker 中的“本机”指容器；不会自动使用 macOS/Windows 桌面账户或连接桌面 daemon。
 
 完整公网部署、SSH、桌面同步边界、升级备份和排错见 [Docker 部署指南](docs/docker.md) / [English guide](docs/docker.en.md)。本地和公网 Compose 配置分别使用，勿同时加载两个 overlay。
 
@@ -41,7 +57,7 @@ VAPID 密钥默认自动生成并持久化到 `DATA_DIR`，Docker 的 `webdata` 
 
 ## Node.js 启动
 
-需要 Node.js 22+ 和可执行的 Codex CLI。开发基线核对版本为 `codex-cli 0.159.2`。先以运行 Web 服务的系统账户配置 Codex：
+需要 Node.js 22+；本机执行使用已有的可执行 Codex CLI，纯 SSH 模式只要求远端已安装。当前运行兼容性核对版本为 `codex-cli 0.160.0`，应用不固定或自动更新 CLI。以下本机示例先以运行 Web 服务的系统账户配置 Codex：
 
 ```sh
 codex --version
@@ -86,6 +102,8 @@ npm start
 | 模型与权限选择 | 模型/推理强度、持久化全局只读/默认/完全访问、会话权限覆盖、命名 Web 权限预设、受管策略与提供方能力展示 | 全局修改从下一轮任务生效，受管策略仍约束权限；模型列表不保证账户具备所有模型权限 |
 | 文件/图片上传 | 每次最多 8 个文件、每文件 20 MB（proxy 的 base64 消息还受 16 MiB 传输上限限制），上传到所选工作站；图片以 `localImage` 发送 | 普通文件通过路径交给 Codex；上传不等同于模型原生解析任意文件格式 |
 | 会话与事件 | 新建、恢复、停止、追加指令、Fork、重命名、归档恢复、全文搜索、完整导出、历史分页、草稿/阅读位置；运行时过程展开，结束后折叠，最终回复直接显示 | 内容时间使用 `recencyAt`，打开对话不改变排序；过程可手动展开/收起，审批与失败原因保持可见；跨桌面活动进程同步需连接同 daemon |
+| 结构化选择 | 推荐选项及说明、其他回答、多题、保密输入；页面与通知提醒 | 使用官方 `requestUserInput` 请求，不把普通回复中的列表自动变成表单；普通模式通过进程/会话配置覆盖启用，不修改宿主配置 |
+| 子智能体工作区 | 当前对话祖先范围内的活动、等待、完成分组；实时事件与轮询状态，分页查看子对话 | 子对话只读，使用元数据与历史读取接口，不恢复子对话或切换父对话；保留父对话草稿 |
 | 手机 UI / PWA | 会话抽屉、全屏工作区、统一字号/触控间距、主题切换、安装到主屏幕、用户主动更新 | Service Worker 只缓存公开界面资源；不缓存 API 或私人对话，不支持离线发送/审批/执行 |
 | 后台通知 | 用户主动启用标准 Web Push；回复完成、审批/补充输入、运行失败分类与测试通知，点击回到对应主机/对话 | 设备授权最长 30 天，明确退出撤销当前登录关联的订阅；要求服务器与任务继续运行，手机系统送达及真实设备验收见 [PWA 指南](docs/pwa.md) |
 | Skills/Apps/MCP | 查看和使用当前主机已有集成 | 插件市场不在范围内；复杂 OAuth、automations 与桌面宿主能力另行实现 |

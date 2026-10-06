@@ -82,7 +82,7 @@ async function atomicPrivateJson(file: string, value: unknown) {
 
 const actionableRequests = new Set([
   'item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval',
-  'item/tool/requestUserInput', 'execCommandApproval', 'applyPatchApproval',
+  'item/tool/requestUserInput', 'tool/requestUserInput', 'execCommandApproval', 'applyPatchApproval',
 ])
 const elicitationModes = new Set(['form', 'url', 'openai/form', 'openaiForm', 'openai/userVerification'])
 
@@ -319,7 +319,7 @@ export class PushService {
       body = ['item/commandExecution/requestApproval', 'execCommandApproval'].includes(message.method || '') ? '等待命令执行确认'
         : ['item/fileChange/requestApproval', 'applyPatchApproval'].includes(message.method || '') ? '等待文件修改确认'
         : message.method === 'item/permissions/requestApproval' ? '等待权限确认'
-        : message.method === 'item/tool/requestUserInput' ? '等待补充输入' : '等待确认或补充输入'
+        : message.method?.endsWith('requestUserInput') ? (Array.isArray(params.questions) && params.questions.some(question => Array.isArray(record(question)?.options) && (record(question)!.options as unknown[]).length) ? '等待你的选择' : '等待补充输入') : '等待确认或补充输入'
     }
     if (!kind || !identity || !body) return
     const key = JSON.stringify([host.id, threadId, identity])
