@@ -131,6 +131,7 @@ test("expanded chat file-change output uses real diff lines as the workspace doe
   await openHistory(page);
   const turn = page.locator('.conversation-turn[data-turn-id="turn-history"]');
   await turn.locator(".turn-activity > summary").click();
+  await turn.locator(".activity-batch > summary").click();
   await turn.locator(".tool-item > summary").click();
   await expect(turn.locator(".file-diff .diff-code")).toBeHidden();
   await turn.locator(".file-diff > summary").click();

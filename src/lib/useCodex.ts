@@ -1,5 +1,6 @@
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
+import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import { subagentStatus } from "./subagents";
@@ -228,6 +229,26 @@ const revertedTurnCandidates = new Map<string, { ids: Set<string>; awaitingAckno
 let takeoverOperation = 0;
 let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
 const terminalListeners = new Set<(chunk: string) => void>();
+const protocolListeners = new Set<(hostId: string, message: any) => boolean | void>();
+function subscribeProtocol(listener: (hostId: string, message: any) => boolean | void) {
+  protocolListeners.add(listener);
+  return () => protocolListeners.delete(listener);
+}
+function notifyProtocol(message: any) {
+  let consumed = false;
+  for (const listener of protocolListeners) {
+    try { consumed = listener(state.hostId, message) === true || consumed; }
+    catch { /* One view must not interrupt the shared protocol transport. */ }
+  }
+  return consumed;
+}
+/** Auxiliary conversations share this socket without changing its selected thread. */
+function sideChatRpc(hostId: string, method: Method, params: any) {
+  if (!state.authenticated || state.hostId !== hostId)
+    return Promise.reject(new Error("对话所在的主机或登录状态已变化，请重新选择文本"));
+  return rpc(method, params, 45000, { silentError: true });
+}
+function runtimeIdentity() { return { authenticationGeneration, engineId }; }
 const terminalDecoders = new Map<string, TextDecoder>();
 const completedTerminalProcesses = new Set<string>();
 const recencySortSupport = new Map<string, boolean>();
@@ -813,6 +834,7 @@ function navigationProjectPage(hostId: string, projectPath: string) {
     : state.navigation[hostId]?.projectPages[projectPath];
 }
 function closeConnection() {
+  notifyProtocol({ method: 'bridge/disconnecting', params: { permanent: state.switchingHost || !state.authenticated } });
   saveConversationSnapshot();
   localReverts.clear();
   clearTimeout(reconnectTimer);
@@ -903,7 +925,7 @@ function currentItems(threadId: string): DisplayItem[] {
   return items;
 }
 function updateThread(thread: any) {
-  if (!thread?.id) return;
+  if (!thread?.id || thread.ephemeral) return;
   const previous = state.threads.find((item) => item.id === thread.id);
   thread = {
     ...thread,
@@ -1012,11 +1034,13 @@ function receive(message: any) {
     } else entry.resolve(message.result);
     return;
   }
+  const consumed = notifyProtocol(message);
   if (message.method && message.id !== undefined) {
     if (!state.pendingRequests.some((p) => p.id === message.id))
       state.pendingRequests.push(message);
     return;
   }
+  if (consumed && message.method !== 'bridge/status' && message.method !== 'serverRequest/resolved') return;
   const { method, params: p = {} } = message;
   if (p.threadId || method === 'bridge/thread/changed') scheduleConversationSnapshot(p.threadId);
   if (method === 'bridge/thread/changed') { receiveThreadChange(p); return; }
@@ -2215,12 +2239,15 @@ function sandboxPolicy(
 function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
-async function send(text: string, editedInput?: any[]) {
+async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = []) {
   if (state.compacting) throw fail(new Error('正在压缩上下文，请等待压缩完成后发送。'));
   if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
   if (state.activeThread && !state.threadReady) throw fail(new Error('正在加载会话，请先同步对话后发送。'));
   if (state.threadConflict) throw fail(new Error('此对话仍被其他 Codex 客户端占用，请先重试或强制进入。'));
-  if (!text.trim() && !state.attachments.length && !editedInput?.length && !state.selectedSkills.length) return;
+  if (!text.trim() && !state.attachments.length && !editedInput?.length && !state.selectedSkills.length && !selectionContexts.length) return;
+  const selections = selectionContexts.map(value => normalizeConversationSelection(value));
+  if (selectionContexts.length > 8 || selections.some(source => !source || source.hostId !== state.hostId || source.threadId !== state.activeThread?.id))
+    throw fail(new Error('引用来自其他会话或内容过长，请重新选择文本'));
   if (state.editingMessage && !editedInput) throw fail(new Error("正在重新发送编辑后的消息，请稍候"));
   if (state.selectingThread || state.switchingHost || state.changingContext)
     throw fail(new Error("正在加载会话或主机配置，请稍后发送"));
@@ -2301,6 +2328,9 @@ async function send(text: string, editedInput?: any[]) {
   for (const app of state.apps)
     if (app.slug && inputs[0].text.includes(`$${app.slug}`) && !inputs.some(input => input.type === 'mention' && input.path === `app://${app.id}`))
       inputs.push({ type: "mention", name: app.name, path: `app://${app.id}` });
+  // Quoted text is context, not a source of skill/app commands or a Goal objective.
+  if (!editedInput) for (const selection of selections)
+    inputs.push({ type: 'text', text: formatConversationQuote(selection!), text_elements: [] });
   state.error = "";
   if (!editedInput) pendingMessageEdit = null;
   sendInFlight = true;
@@ -3868,6 +3898,9 @@ export function useCodex() {
     logout,
     setOnline,
     rpc,
+    sideChatRpc,
+    subscribeProtocol,
+    runtimeIdentity,
     listSubagents,
     readSubagent,
     getSubagentSnapshot,

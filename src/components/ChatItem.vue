@@ -5,11 +5,13 @@ import DOMPurify from 'dompurify'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
 import { diffStats } from '../lib/diff-stats'
+import { publicReasoningSummary } from '../lib/activity-presentation'
 
 const props = defineProps<{
   item: any
   hostId?: string
   busy?: boolean
+  collapseTools?: boolean
   canFork?: boolean
   canEdit?: boolean
   editing?: boolean
@@ -34,6 +36,7 @@ const text = computed(() => props.item.text || (props.item.content || []).filter
 const html = computed(() => DOMPurify.sanitize(marked.parse(text.value, { async: false }) as string, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'] }))
 const userImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')))
 const localImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'localImage' && c.path))
+const reasoningSummary = computed(() => publicReasoningSummary(props.item))
 const readActions = computed(() => (props.item.commandActions || []).filter((action: any) => action.type === 'read'))
 const toolTitle = computed(() => {
   const item = props.item
@@ -44,7 +47,7 @@ const toolTitle = computed(() => {
 const toolSummary = computed(() => props.item.type === 'fileChange' ? (props.item.changes || []).map((change: any) => change.path.split('/').pop()).join('、') : readActions.value.length ? readActions.value.map((action: any) => action.name || action.path?.split('/').pop()).join('、') : props.item.command || props.item.query || props.item.path || '')
 const totalChanges = computed(() => (props.item.changes || []).reduce((sum: any, change: any) => { const count = diffStats(change.diff); return { added: sum.added + count.added, removed: sum.removed + count.removed } }, { added: 0, removed: 0 }))
 const toolIcon = computed(() => readActions.value.length ? 'BookOpen' : ({ commandExecution: 'Terminal', fileChange: 'GitCompareArrows', mcpToolCall: 'Package', dynamicToolCall: 'Zap', collabAgentToolCall: 'Bot', webSearch: 'Globe', imageView: 'Image', imageGeneration: 'Image', enteredReviewMode: 'Eye', exitedReviewMode: 'CheckCircle2' } as Record<string, string>)[props.item.type] || 'Code2')
-const toolOpenByDefault = computed(() => !!props.busy && !['commandExecution', 'fileChange'].includes(props.item.type))
+const toolOpenByDefault = computed(() => !props.collapseTools && !!props.busy && !['commandExecution', 'fileChange'].includes(props.item.type))
 const status = computed(() => props.item.status === 'inProgress' || props.item.status === 'running' ? '处理中' : props.item.status === 'failed' ? '失败' : props.item.exitCode != null ? `退出 ${props.item.exitCode}` : '')
 const detailsText = computed(() => props.item.aggregatedOutput || props.item.review || props.item.prompt || (props.item.result ? JSON.stringify(props.item.result, null, 2) : props.item.arguments ? JSON.stringify(props.item.arguments, null, 2) : props.item.output ? JSON.stringify(props.item.output, null, 2) : JSON.stringify(props.item, null, 2)))
 async function copy() {
@@ -106,7 +109,7 @@ function onLink(event: MouseEvent) {
         <button type="submit" class="button button-small button-primary" :disabled="editPending || editDisabled || !hasEditInput"><Icon v-if="editPending" name="LoaderCircle" :size="15" class="spin" />{{ editPending ? '正在重新发送…' : '保存并重新发送' }}</button>
       </div>
     </form>
-    <div v-else class="user-bubble">{{ text }}</div>
+    <div v-else class="user-bubble" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId">{{ text }}</div>
     <div v-if="!editorOpen && (text || canEdit || canFork)" class="message-actions">
       <button v-if="text" class="icon-button" @click="copy" :title="copied ? '已复制' : '复制消息'" aria-label="复制消息"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
       <button v-if="canEdit && beginEdit" class="icon-button" :disabled="editPending" @click="beginEdit" title="编辑消息" aria-label="编辑消息"><Icon name="Pencil" :size="15" /></button>
@@ -114,17 +117,19 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" v-html="html" @click="onLink"></div>
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" v-html="html" @click="onLink"></div>
     <div v-else class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
     <div v-if="text && (!busy || canFork)" class="message-actions">
       <button class="icon-button" @click="copy" :title="copied ? '已复制' : '复制回复'" aria-label="复制回复"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
       <button v-if="canFork" class="icon-button" @click="emit('fork', item.turnId)" title="从此处创建分支" aria-label="从此处创建分支"><Icon name="GitBranch" :size="15" /></button>
     </div>
   </article>
-  <details v-else-if="item.type === 'reasoning'" class="reasoning-item" :open="!!busy">
-    <summary><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
-    <div class="reasoning-content">{{ (item.summary || []).join('\n\n') || '此模型未提供公开的思考摘要。' }}</div>
-  </details>
+  <template v-else-if="item.type === 'reasoning'">
+    <details v-if="reasoningSummary" class="reasoning-item" :open="!!busy">
+      <summary><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
+      <div class="reasoning-content">{{ reasoningSummary }}</div>
+    </details>
+  </template>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon :name="item.status === 'inProgress' ? 'LoaderCircle' : 'RefreshCw'" :size="13" :class="{ spin: item.status === 'inProgress' }" />{{ item.status === 'inProgress' ? '正在压缩上下文…' : item.status === 'failed' ? '上下文压缩失败' : item.status === 'interrupted' ? '上下文压缩已取消' : '上下文已压缩' }}<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
   <details v-else class="tool-item" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">

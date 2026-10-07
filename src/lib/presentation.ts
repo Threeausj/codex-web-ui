@@ -1,4 +1,5 @@
 import type { DisplayItem } from "./events";
+import { activityBlocks, publicReasoningSummary } from './activity-presentation';
 
 export type ConversationBlock =
   | { kind: "message"; id: string; item: DisplayItem }
@@ -76,9 +77,10 @@ export function turnPresentation(items: DisplayItem[]) {
   // position instead of moving every divider behind the final answer.
   const outputs = items.filter((item) => answerIds.has(item.id) || item.type === "contextCompaction");
   const activity = items.filter(
-    (item) => !visible.has(item.id) && item.type !== "contextCompaction",
+    (item) => !visible.has(item.id) && item.type !== "contextCompaction" &&
+      (item.type !== 'reasoning' || !!publicReasoningSummary(item)),
   );
-  return { users, answers, activity, dividers, outputs };
+  return { users, answers, activity, activityBlocks: activityBlocks(items, activity), dividers, outputs };
 }
 
 export function elapsedLabel(turn: any) {

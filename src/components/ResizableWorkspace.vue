@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+withDefaults(defineProps<{ panelId?: string }>(), { panelId: 'workspace-panel' });
 
 const storageKey = "codex.workspaceWidth";
 function savedWidth() {
@@ -127,7 +128,7 @@ onBeforeUnmount(() => {
     :style="{ '--workspace-width': `${width}px` }">
     <div ref="handle" class="workspace-resize-handle" role="separator"
       tabindex="0" aria-label="调整工作区宽度" aria-orientation="vertical"
-      aria-controls="workspace-panel" :aria-valuemin="minWidth"
+      :aria-controls="panelId" :aria-valuemin="minWidth"
       :aria-valuemax="maxWidth" :aria-valuenow="width" :aria-valuetext="`${width} 像素`"
       title="拖动调整宽度 · 双击重置"
       @pointerdown="begin" @pointermove="move" @pointerup="finishPointer($event, true)"

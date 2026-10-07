@@ -4,6 +4,7 @@ import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
 import { clipboardFiles } from "../lib/clipboard";
 import { contextUsage } from "../lib/context-usage";
+import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
 import {
   availablePermissionProfiles,
   permissionProfileProblems,
@@ -16,6 +17,7 @@ const emit = defineEmits<{
   host: [hostId: string];
 }>();
 const draft = ref("");
+const quotedContexts = ref<ConversationSelectionSource[]>([]);
 const input = ref<HTMLTextAreaElement>();
 const area = ref<HTMLElement>();
 const pickerElement = ref<HTMLElement>();
@@ -247,7 +249,7 @@ const canSend = computed(
     !props.contextBusy &&
     !submitting.value &&
     !uploading.value &&
-    (draft.value.trim() || props.state.attachments?.length || props.state.selectedSkills?.length),
+    (draft.value.trim() || quotedContexts.value.length || props.state.attachments?.length || props.state.selectedSkills?.length),
 );
 function resize() {
   if (input.value) {
@@ -390,6 +392,7 @@ async function send() {
   const text = draft.value.trim();
   const submittedKey = draftKey.value;
   const submittedDraft = draft.value;
+  const submittedContexts = [...quotedContexts.value];
   const command = commands.find((command) => command.name === text);
   if (command) {
     emit("command", command.id);
@@ -401,8 +404,12 @@ async function send() {
   pendingDraftSubmission = { key: submittedKey, hostId: props.state.hostId,
     projectPath: props.state.projectPath, threadId: props.state.activeThread?.id };
   try {
-    await props.api.send(text);
+    await props.api.send(text, undefined, submittedContexts);
     clearSubmittedDraft(submittedKey, submittedDraft);
+    const sentKeys = new Set(submittedContexts.map(conversationSelectionKey));
+    if (draftKey.value === submittedKey)
+      quotedContexts.value = quotedContexts.value.filter(source => !sentKeys.has(conversationSelectionKey(source)));
+    else saveContexts(submittedKey, readContexts(submittedKey).filter(source => !sentKeys.has(conversationSelectionKey(source))));
     if (draftKey.value === submittedKey && draft.value === submittedDraft) {
       draft.value = "";
       picker.value = "";
@@ -470,6 +477,44 @@ const draftKey = computed(
   () =>
     `codex.draft.${props.state.hostId}.${props.state.activeThread?.id || props.state.projectPath || "new"}`,
 );
+function saveContexts(key: string, sources: ConversationSelectionSource[]) {
+  try {
+    if (sources.length) localStorage.setItem(`${key}.quotes`, JSON.stringify(sources));
+    else localStorage.removeItem(`${key}.quotes`);
+  } catch { /* The quote remains usable in this window if storage is full. */ }
+}
+function readContexts(key: string): ConversationSelectionSource[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(`${key}.quotes`) || '[]');
+    if (!Array.isArray(saved)) return [];
+    const sources: ConversationSelectionSource[] = [];
+    let size = 0;
+    for (const value of saved.slice(0, 8)) {
+      const source = normalizeConversationSelection(value);
+      if (!source || size + source.text.length > 32_000) continue;
+      size += source.text.length;
+      sources.push(source);
+    }
+    return sources;
+  } catch { return []; }
+}
+function addContext(value: ConversationSelectionSource) {
+  const source = normalizeConversationSelection(value);
+  if (!source || source.hostId !== props.state.hostId || source.threadId !== props.state.activeThread?.id) {
+    emit('error', '对话已切换，请重新选择要引用的文字。');
+    return false;
+  }
+  if (!quotedContexts.value.some(entry => conversationSelectionKey(entry) === conversationSelectionKey(source))) {
+    if (quotedContexts.value.length >= 8 || quotedContexts.value.reduce((size, entry) => size + entry.text.length, source.text.length) > 32_000) {
+      emit('error', '引用内容已达上限，请先发送或移除已有引用。');
+      return false;
+    }
+    quotedContexts.value.push(source);
+  }
+  void nextTick(() => input.value?.focus());
+  return true;
+}
+function removeContext(index: number) { quotedContexts.value.splice(index, 1); }
 function saveDraft(key: string, value: string) {
   if (value) localStorage.setItem(key, value);
   else localStorage.removeItem(key);
@@ -494,8 +539,12 @@ watch(
     searchPending.value = false;
     pickerGeneration++;
     if (searchTimer) clearTimeout(searchTimer);
-    if (previous) saveDraft(previous, draft.value);
+    if (previous) {
+      saveDraft(previous, draft.value);
+      saveContexts(previous, quotedContexts.value);
+    }
     draft.value = localStorage.getItem(key) ?? sessionStorage.getItem(key) ?? "";
+    quotedContexts.value = readContexts(key).filter(source => source.hostId === props.state.hostId && source.threadId === props.state.activeThread?.id);
     saveDraft(key, draft.value);
     void nextTick(resize);
   },
@@ -517,6 +566,7 @@ watch(selected, () => {
   });
 });
 watch(draft, (value) => saveDraft(draftKey.value, value), { flush: "sync" });
+watch(quotedContexts, value => saveContexts(draftKey.value, value), { deep: true, flush: 'sync' });
 function setDraft(text: string) {
   draft.value = text;
   void nextTick(() => {
@@ -545,7 +595,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);
 });
-defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft });
+defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext });
 </script>
 
 <template>
@@ -655,6 +705,13 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         </div>
       </div>
       <div v-if="state.modeError" class="composer-mode-error" role="alert">{{ state.modeError }}</div>
+      <div v-if="quotedContexts.length" class="composer-quotes" aria-label="引用到对话的内容">
+        <div v-for="(source, index) in quotedContexts" :key="conversationSelectionKey(source)" class="composer-quote">
+          <Icon name="Quote" :size="14" />
+          <span :title="source.text">{{ source.text }}</span>
+          <button class="icon-button" :disabled="submitting" :aria-label="`移除引用 ${index + 1}`" @click="removeContext(index)"><Icon name="X" :size="13" /></button>
+        </div>
+      </div>
       <div v-if="state.attachments?.length" class="attachments">
         <div
           v-for="(attachment, index) in state.attachments"
@@ -940,6 +997,11 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .picker-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; font-size: 11px; color: var(--muted); }
 .picker-error, .composer-mode-error { color: var(--danger); }
 .composer-mode-error { padding-bottom: 9px; font-size: 12px; }
+.composer-quotes { display: grid; gap: 5px; margin-bottom: 9px; max-height: 125px; overflow-y: auto; }
+.composer-quote { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 5px 7px; border-left: 2px solid var(--muted); border-radius: 5px; background: var(--soft); color: var(--muted); font-size: 12px; }
+.composer-quote > svg { flex: 0 0 auto; }
+.composer-quote > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-quote .icon-button { flex: 0 0 auto; width: 24px; height: 24px; }
 .composer-tokens { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-bottom: 9px; }
 .composer-token { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 3px 5px 3px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--soft); font-size: 11px; overflow-wrap: anywhere; }
 .composer-token > svg { flex: 0 0 auto; color: var(--muted); }

@@ -9,9 +9,13 @@ import {
 } from "vue";
 import { useCodex } from "./lib/useCodex";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
+import { useSideChat } from "./lib/side-chat";
+import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
 import ConversationOutput from "./components/ConversationOutput.vue";
+import ConversationSelectionToolbar from "./components/ConversationSelectionToolbar.vue";
+import SideChatPanel from "./components/SideChatPanel.vue";
 import ApprovalCard from "./components/ApprovalCard.vue";
 import Composer from "./components/Composer.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
@@ -26,6 +30,8 @@ import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navig
 
 const api = useCodex();
 const state = api.state;
+const sideChat = useSideChat(api, state);
+const sideChatPanel = ref<InstanceType<typeof SideChatPanel>>();
 useSubagentPrefetch(api, state);
 let pendingPushTarget: PushTarget | null = pushTargetFromUrl(new URL(location.href));
 let openingPushTarget = false;
@@ -120,7 +126,8 @@ const otherRequests = computed(() =>
   state.pendingRequests.filter(
     (request: any) =>
       request.params?.threadId &&
-      request.params.threadId !== state.activeThread?.id,
+      request.params.threadId !== state.activeThread?.id &&
+      request.params.threadId !== sideChat.state.threadId,
   ),
 );
 const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput')));
@@ -351,12 +358,36 @@ async function chooseNewContext(hostId: string, path?: string) {
   }
 }
 function openWorkspace(tab = "files", path = "") {
+  sideChat.state.open = false;
   const samePath = workspaceOpen.value && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceOpen.value = true;
   workspacePath.value = path;
   if (path && samePath) void nextTick(() => workspace.value?.revealPath(path));
   else if (!path) void nextTick(() => workspace.value?.setTab(tab));
+}
+function toggleWorkspace() {
+  if (sideChat.state.open) {
+    sideChat.state.open = false;
+    workspaceOpen.value = true;
+  } else workspaceOpen.value = !workspaceOpen.value;
+}
+function selectedSource(value: ConversationSelectionSource) {
+  const source = normalizeConversationSelection(value);
+  return state.authenticated && source?.hostId === state.hostId && source.threadId === state.activeThread?.id ? source : null;
+}
+function addToConversation(value: ConversationSelectionSource) {
+  const source = selectedSource(value);
+  if (!source) return;
+  if (composer.value?.addContext(source)) api.toast('已添加到对话');
+}
+function askInSideChat(value: ConversationSelectionSource) {
+  const source = selectedSource(value);
+  if (!source) return;
+  try {
+    sideChat.prepare(source);
+    void nextTick(() => sideChatPanel.value?.focusQuestion());
+  } catch (error: any) { showError(error.message || '无法打开侧边聊天'); }
 }
 async function projectAction({
   action: command,
@@ -740,7 +771,7 @@ watch(() => [state.authenticated, state.loading], () => {
     class="app-shell"
     :class="{
       'sidebar-collapsed': sidebarCollapsed,
-      'workspace-visible': workspaceOpen,
+      'workspace-visible': workspaceOpen || sideChat.state.open,
     }"
   >
     <div
@@ -868,13 +899,14 @@ watch(() => [state.authenticated, state.loading], () => {
             <Icon name="Bot" :size="18" />
           </button><button
             class="icon-button"
-            :class="{ selected: workspaceOpen }"
-            @click="workspaceOpen = !workspaceOpen"
+            :class="{ selected: workspaceOpen && !sideChat.state.open }"
+            @click="toggleWorkspace"
             title="工作区：文件、预览、终端"
             aria-label="切换工作区"
           >
             <Icon name="PanelRight" :size="18" />
           </button>
+          <button v-if="sideChat.state.source" class="icon-button" :class="{ selected: sideChat.state.open }" title="打开侧边聊天" aria-label="打开侧边聊天" @click="sideChat.state.open = true"><Icon name="MessagesSquare" :size="18" /></button>
           <div class="thread-menu-wrapper">
             <button
               class="icon-button"
@@ -1155,7 +1187,8 @@ watch(() => [state.authenticated, state.loading], () => {
         </div>
       </div>
     </section>
-    <ResizableWorkspace v-if="workspaceOpen">
+    <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" />
+    <ResizableWorkspace v-if="workspaceOpen" v-show="!sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"
         ref="workspace"
@@ -1166,6 +1199,9 @@ watch(() => [state.authenticated, state.loading], () => {
         @close="workspaceOpen = false"
         @error="showError"
       />
+    </ResizableWorkspace>
+    <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" panel-id="side-chat-panel">
+      <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @open-file="openWorkspace('files', $event)" />
     </ResizableWorkspace>
     <ProjectDialog
       v-if="editingProject"
