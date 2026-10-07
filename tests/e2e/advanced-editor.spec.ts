@@ -1,14 +1,24 @@
 import { test, expect, login, slash } from './fixtures';
+import type { Page } from '@playwright/test';
+
+async function replaceSource(page: Page, name: string, text: string) {
+  // Let CodeMirror process its own select-all key binding before text input;
+  // DOM-only fill can race an asynchronously loaded language compartment.
+  const editor = page.getByRole('textbox', { name });
+  await editor.click(); await editor.press('ControlOrMeta+A');
+  await page.keyboard.insertText(text);
+  await expect(editor).toHaveText(text, { useInnerText: true });
+}
 
 test('multiple file drafts survive tab switches, bridge reconnection, panel closure and page reload', async ({ page, mock }) => {
   await login(page); await page.locator('[data-section="recent"] .thread-row').first().click(); await slash(page, 'terminal');
   await page.locator('.workspace-tabs').getByRole('button', { name: '文件', exact: true }).click();
   await page.locator('.file-tree-row').filter({ hasText: 'README.md' }).click();
   await page.locator('.file-view-switch').getByRole('button', { name: '源码', exact: true }).click();
-  await page.getByRole('textbox', { name: 'README.md 文件内容' }).fill('# Private draft\nUnsaved second line');
+  await replaceSource(page, 'README.md 文件内容', '# Private draft\nUnsaved second line');
   await page.getByRole('button', { name: '返回文件列表' }).click();
   await page.locator('.file-tree-row').filter({ hasText: 'index.html' }).click();
-  await page.getByRole('textbox', { name: 'index.html 文件内容' }).fill('<h1>Second draft</h1>');
+  await replaceSource(page, 'index.html 文件内容', '<h1>Second draft</h1>');
   mock.emit('bridge/status', { connected: false }); mock.emit('bridge/status', { connected: true });
   await page.getByRole('navigation', { name: '已打开文件' }).getByRole('button', { name: 'README.md', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'README.md 文件内容' })).toHaveText('# Private draftUnsaved second line');
