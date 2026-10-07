@@ -219,6 +219,7 @@ const permissionLabel = computed(
 );
 const canSend = computed(
   () =>
+    !props.state.threadConflict &&
     props.state.connected &&
     !props.state.selectingThread &&
     !props.state.switchingHost &&
