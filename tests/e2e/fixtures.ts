@@ -88,6 +88,7 @@ export class MockCodex {
     },
   ];
   archivedThreads: any[] = [];
+  runtimeReleasedThreads: { hostId: string; threadId: string }[] = [];
   requirements: any = null;
   config: Record<string, unknown> = {
     model: "mock-model-a",
@@ -174,6 +175,7 @@ export class MockCodex {
         case "/api/bootstrap":
           return respond({
             hosts: this.hosts,
+            runtimeReleasedThreads: this.runtimeReleasedThreads,
             projects: this.projects,
             preferences: this.preferences,
             cwd: workspace,
@@ -260,6 +262,7 @@ export class MockCodex {
           method: "bridge/status",
           params: {
             connected: true,
+            releasedThreadIds: this.runtimeReleasedThreads.map(entry => entry.threadId),
             hostId,
             mode: "spawn",
             pendingRequests: [],

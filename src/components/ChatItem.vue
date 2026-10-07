@@ -3,9 +3,12 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import Icon from './Icon.vue'
+import ConversationImage from './ConversationImage.vue'
+import { diffStats } from '../lib/diff-stats'
 
 const props = defineProps<{
   item: any
+  hostId?: string
   busy?: boolean
   canFork?: boolean
   canEdit?: boolean
@@ -31,12 +34,16 @@ const text = computed(() => props.item.text || (props.item.content || []).filter
 const html = computed(() => DOMPurify.sanitize(marked.parse(text.value, { async: false }) as string, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'] }))
 const userImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')))
 const localImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'localImage' && c.path))
+const readActions = computed(() => (props.item.commandActions || []).filter((action: any) => action.type === 'read'))
 const toolTitle = computed(() => {
   const item = props.item
+  if (item.type === 'commandExecution' && readActions.value.length) return ['inProgress', 'running'].includes(item.status) ? '正在读取' : '已读取'
   const labels: Record<string, string> = { commandExecution: '运行命令', fileChange: '修改文件', mcpToolCall: `${item.server || 'MCP'} · ${item.tool || '工具'}`, dynamicToolCall: item.tool || '工具调用', collabAgentToolCall: '协作代理', subAgentActivity: '代理动态', webSearch: '搜索网页', imageView: '查看图片', imageGeneration: '生成图片', enteredReviewMode: '开始代码审查', exitedReviewMode: '代码审查完成', hookPrompt: '项目上下文', functionCallOutput: item.name || '工具结果' }
   return labels[item.type] || item.type
 })
-const toolIcon = computed(() => ({ commandExecution: 'Terminal', fileChange: 'GitCompareArrows', mcpToolCall: 'Package', dynamicToolCall: 'Zap', collabAgentToolCall: 'Bot', webSearch: 'Globe', imageView: 'Image', imageGeneration: 'Image', enteredReviewMode: 'Eye', exitedReviewMode: 'CheckCircle2' } as Record<string, string>)[props.item.type] || 'Code2')
+const toolSummary = computed(() => props.item.type === 'fileChange' ? (props.item.changes || []).map((change: any) => change.path.split('/').pop()).join('、') : readActions.value.length ? readActions.value.map((action: any) => action.name || action.path?.split('/').pop()).join('、') : props.item.command || props.item.query || props.item.path || '')
+const totalChanges = computed(() => (props.item.changes || []).reduce((sum: any, change: any) => { const count = diffStats(change.diff); return { added: sum.added + count.added, removed: sum.removed + count.removed } }, { added: 0, removed: 0 }))
+const toolIcon = computed(() => readActions.value.length ? 'BookOpen' : ({ commandExecution: 'Terminal', fileChange: 'GitCompareArrows', mcpToolCall: 'Package', dynamicToolCall: 'Zap', collabAgentToolCall: 'Bot', webSearch: 'Globe', imageView: 'Image', imageGeneration: 'Image', enteredReviewMode: 'Eye', exitedReviewMode: 'CheckCircle2' } as Record<string, string>)[props.item.type] || 'Code2')
 const toolOpenByDefault = computed(() => !!props.busy && !['commandExecution', 'fileChange'].includes(props.item.type))
 const status = computed(() => props.item.status === 'inProgress' || props.item.status === 'running' ? '处理中' : props.item.status === 'failed' ? '失败' : props.item.exitCode != null ? `退出 ${props.item.exitCode}` : '')
 const detailsText = computed(() => props.item.aggregatedOutput || props.item.review || props.item.prompt || (props.item.result ? JSON.stringify(props.item.result, null, 2) : props.item.arguments ? JSON.stringify(props.item.arguments, null, 2) : props.item.output ? JSON.stringify(props.item.output, null, 2) : JSON.stringify(props.item, null, 2)))
@@ -89,7 +96,7 @@ function onLink(event: MouseEvent) {
 <template>
   <article v-if="item.type === 'userMessage'" class="message user-message">
     <div v-if="userImages.length" class="message-images"><img v-for="(img, index) in userImages" :key="index" :src="img.url" alt="上传的图片" loading="lazy" /></div>
-    <div v-if="localImages.length" class="message-images"><button v-for="(img, index) in localImages" :key="index" class="button button-secondary" @click="emit('openFile', img.path)"><Icon name="Image" :size="16" />{{ img.path.split('/').pop() }}<Icon name="Eye" :size="14" /></button></div>
+    <div v-if="localImages.length" class="message-images"><ConversationImage v-for="(img, index) in localImages" :key="img.path + index" :path="img.path" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
     <form v-if="editorOpen" class="message-editor" @submit.prevent="saveEdit">
       <textarea ref="editInput" v-model="editDraft" aria-label="编辑消息内容" rows="3" :disabled="editPending" @input="resizeEditor" @keydown="onEditKeydown"></textarea>
       <p class="message-edit-note">重新发送会替换本轮回复，已执行的文件修改不会撤销。</p>
@@ -121,13 +128,14 @@ function onLink(event: MouseEvent) {
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon name="RefreshCw" :size="13" />上下文已压缩<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
   <details v-else class="tool-item" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
-    <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><code v-if="item.command" class="tool-command">{{ item.command }}</code><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
+    <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <div v-if="item.type === 'fileChange'" class="file-changes">
       <details v-for="change in item.changes" :key="change.path" class="file-diff">
-        <summary class="file-diff-heading"><Icon name="FileText" :size="15" /><span class="file-diff-path" :title="change.path">{{ change.path }}</span><span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="emit('openFile', change.path)"><Icon name="ArrowUpRight" :size="14" /></button><Icon name="ChevronDown" :size="14" /></summary>
+        <summary class="file-diff-heading"><Icon name="FileText" :size="15" /><span class="file-diff-path" :title="change.path">{{ change.path }}</span><span class="diff-stats"><span class="diff-count-add">+{{ diffStats(change.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(change.diff).removed }}</span></span><span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="emit('openFile', change.path)"><Icon name="ArrowUpRight" :size="14" /></button><Icon name="ChevronDown" :size="14" /></summary>
         <pre class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </details>
     </div>
+    <div v-else-if="item.type === 'imageView' && item.path" class="tool-content"><ConversationImage :path="item.path" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
     <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>
   </details>
 </template>

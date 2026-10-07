@@ -134,11 +134,11 @@ const welcome = computed(() => !state.activeThread && !state.items.length);
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.loading || !state.online ||
   state.selectingThread || state.switchingHost || state.changingContext ||
-  state.runtimePaused || (state.activeThread && !state.threadReady),
+  state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady),
 );
 const threadActionsDisabled = computed(() =>
   !state.activeThread || state.busy || !state.connected || !state.online ||
-  !state.threadReady || state.runtimePaused || state.selectingThread,
+  !state.threadReady || state.runtimePaused || state.threadReleased || state.selectingThread,
 );
 const editableItemId = computed(() => {
   if (editDisabled.value) return undefined;
@@ -943,6 +943,7 @@ watch(() => [state.authenticated, state.loading], () => {
         <Icon name="Server" :size="15" />Web Codex 已释放，可切换桌面端。
         <button class="button button-small button-secondary" @click="openResources">资源管理中恢复连接</button>
       </div>
+      <div v-else-if="state.threadReleased" class="connection-banner" role="status"><Icon name="Server" :size="15" />此会话的 Web 连接已关闭，可切换桌面端。<button class="button button-small button-secondary" :disabled="!state.connected || !state.online" @click="api.resumeThreadConnection(state.hostId, state.activeThread.id)">重新连接会话</button></div>
       <div v-else-if="state.error || state.threadConflict" class="global-error" :class="{ 'thread-conflict': state.threadConflict }" role="alert">
         <Icon name="AlertCircle" :size="16" /><span>{{ state.error || state.threadConflict?.message }}</span
         ><button
@@ -1065,6 +1066,7 @@ watch(() => [state.authenticated, state.loading], () => {
             </div>
             <ConversationOutput
               :key="`${state.hostId}:${state.activeThread?.id || 'new'}`"
+              :host-id="state.hostId"
               :items="state.items"
               :turns="state.turns"
               :busy="state.busy"

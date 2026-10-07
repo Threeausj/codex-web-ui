@@ -69,7 +69,7 @@ function titleText(value: unknown) {
   if (typeof value !== 'string') return undefined
   return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') || undefined
 }
-type ThreadTitle = { name?: string; preview?: string }
+type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
 
 async function atomicPrivateJson(file: string, value: unknown) {
   const temporary = `${file}.${randomUUID()}.tmp`
@@ -239,9 +239,12 @@ export class PushService {
 
   private rememberThread(host: Host, raw: unknown) {
     const thread = record(raw); const threadId = id(thread?.id)
-    if (!thread || !threadId || (!('name' in thread) && !('preview' in thread))) return
+    if (!thread || !threadId) return
     const key = JSON.stringify([host.id, threadId])
+    const source = record(thread.source)
+    const child = !!thread.parentThreadId || !!(source && ('subagent' in source || 'subAgent' in source)) || ['subagent', 'subAgent'].includes(String(thread.source))
     const title = { ...this.threadTitles.get(key),
+      ...(child ? { subagent: true, sourceKnown: true } : 'source' in thread ? { sourceKnown: true } : {}),
       ...('name' in thread ? { name: titleText(thread.name) } : {}),
       ...('preview' in thread ? { preview: titleText(thread.preview) } : {}),
     }
@@ -256,6 +259,9 @@ export class PushService {
     if (message.method === 'thread/name/updated' && params) this.rememberThread(host, {
       id: params.threadId, name: 'threadName' in params ? params.threadName : params.name,
     })
+    const item = record(params?.item)
+    if (['item/started', 'item/completed'].includes(message.method || '') && item?.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' && Array.isArray(item.receiverThreadIds))
+      for (const childId of item.receiverThreadIds) if (id(childId) && childId !== params?.threadId) this.rememberThread(host, { id: childId, parentThreadId: params?.threadId || 'subagent' })
     if (message.error) return
     const result = record(message.result)
     const readId = id(record(result?.thread)?.id)
@@ -265,11 +271,11 @@ export class PushService {
       for (const thread of result.data) this.rememberThread(host, thread)
   }
 
-  private threadTitle(host: Host, threadId: string): Promise<string> {
+  private threadTitle(host: Host, threadId: string, needSource = false): Promise<string> {
     const key = JSON.stringify([host.id, threadId])
     const cached = this.threadTitles.get(key)
     const title = cached?.name || cached?.preview
-    if (title || !this.options.resolveThread) return Promise.resolve(title || '未命名对话')
+    if (title && (!needSource || (cached?.sourceKnown || cached?.sourceChecked)) || !this.options.resolveThread) return Promise.resolve(title || '未命名对话')
     const pending = this.threadLookups.get(key)
     if (pending) return pending
     const lookup = (async () => {
@@ -280,9 +286,12 @@ export class PushService {
           new Promise<undefined>(resolve => { deadline = setTimeout(() => resolve(undefined), 3000); deadline.unref() }),
         ])
         // A rename received during the lookup is newer than its response.
-        if (id(record(raw)?.id) === threadId && this.threadTitles.get(key) === cached) this.rememberThread(host, raw)
+        if (id(record(raw)?.id) === threadId) {
+          if (this.threadTitles.get(key) === cached) this.rememberThread(host, raw)
+          else { const thread = record(raw)!; this.rememberThread(host, { id: threadId, ...('source' in thread ? { source: thread.source } : {}), ...('parentThreadId' in thread ? { parentThreadId: thread.parentThreadId } : {}) }) }
+        }
       } catch { /* Missing metadata never prevents delivery of the event. */ }
-      finally { clearTimeout(deadline) }
+      finally { clearTimeout(deadline); const latest = this.threadTitles.get(key); this.threadTitles.set(key, { ...latest, sourceChecked: true }); while (this.threadTitles.size > MAX_THREAD_TITLES) this.threadTitles.delete(this.threadTitles.keys().next().value!) }
       const current = this.threadTitles.get(key)
       return current?.name || current?.preview || '未命名对话'
     })()
@@ -335,7 +344,11 @@ export class PushService {
 
   private async notify(host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
     await this.save()
-    notice.title = await this.threadTitle(host, threadId)
+    if (kind !== 'approval' && this.threadTitles.get(JSON.stringify([host.id, threadId]))?.subagent) return
+    notice.title = await this.threadTitle(host, threadId, kind !== 'approval')
+    // Child turns stream through the same host transport as their parent. Their
+    // completion does not mean the user's overall task has finished.
+    if (kind !== 'approval' && this.threadTitles.get(JSON.stringify([host.id, threadId]))?.subagent) return
     let pruned = false
     const jobs: Promise<void>[] = []
     for (const [endpoint, device] of this.devices) {

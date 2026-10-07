@@ -86,6 +86,24 @@ async function runtimeAction(resume: boolean) {
     if (operation === generation) { pending.value = false; void refresh(); }
   }
 }
+async function threadAction(thread: any, resume: boolean) {
+  const selected = hostId.value;
+  if (pending.value || !props.state.online) return;
+  if (!resume && !window.confirm(`关闭“${thread.name}”的 Web 会话？\n\n该会话及其子智能体将停止，历史和草稿保留。其他会话继续运行，可切换桌面端或 CLI。`)) return;
+  stopPolling(); ++generation; const operation = generation; loading.value = false; pending.value = true;
+  error.value = ''; notice.value = '';
+  try {
+    if (resume) await props.api.resumeThreadConnection(selected, thread.id);
+    else {
+      const result = await props.api.http(`/hosts/${encodeURIComponent(selected)}/runtime/threads/${encodeURIComponent(thread.id)}/close`, { method: 'POST', body: JSON.stringify({ confirmed: true }) }, false);
+      props.api.updateReleasedThreads(selected, (result.runtime.threads || []).filter((entry: any) => entry.released).map((entry: any) => entry.id));
+      if (!disposed && operation === generation) snapshot.value = { ...snapshot.value, runtime: result.runtime };
+    }
+    if (!disposed && operation === generation) notice.value = resume ? '会话已允许重新连接。' : `已关闭“${thread.name}”的 Web 连接。`;
+  } catch (cause: any) {
+    if (!disposed && operation === generation) error.value = cause?.message || '会话操作失败，请重试。';
+  } finally { if (operation === generation) { pending.value = false; void refresh(); } }
+}
 function visibilityChanged() { if (document.hidden) stopPolling(); else void refresh(); }
 watch(hostId, () => {
   ++generation; stopPolling(); loading.value = false; pending.value = false;
@@ -136,8 +154,16 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
             </header>
             <div class="runtime-summary"><span>已加载会话 <strong>{{ snapshot.runtime.loadedThreadCount }}</strong></span><span>运行中 <strong>{{ snapshot.runtime.activeThreadCount }}</strong></span><span>交互进程 <strong>{{ snapshot.runtime.activeProcesses?.length || 0 }}</strong></span></div>
             <div v-for="process in snapshot.runtime.processes || []" :key="`${process.local}:${process.pid}`" class="runtime-process"><Icon name="Terminal" :size="14" /><span>{{ process.role === 'app-server' ? 'Codex app-server' : 'SSH 连接' }}</span><code>PID {{ process.pid }}</code><small>{{ process.local ? '服务所在主机' : '远程主机' }}</small></div>
+            <div class="runtime-threads" aria-label="Web 会话连接">
+              <div v-for="thread in snapshot.runtime.threads || []" :key="thread.id" class="runtime-thread">
+                <div><strong :title="thread.name">{{ thread.name }}</strong><small>{{ thread.restoring ? '历史恢复待完成' : thread.released ? '已关闭' : thread.active ? '运行中' : '空闲' }}<code v-if="thread.pid"> · PID {{ thread.pid }}</code></small></div>
+                <button v-if="thread.released && !thread.loaded" :disabled="pending || !state.online || snapshot.runtime.paused" :aria-label="`重新连接会话 ${thread.name}`" @click="threadAction(thread, true)">重新连接</button>
+                <button v-else class="runtime-close" :disabled="pending || !state.online || snapshot.runtime.managed === false" :aria-label="`关闭会话 ${thread.name}`" @click="threadAction(thread, false)">关闭会话</button>
+              </div>
+            </div>
+            <p v-if="snapshot.runtime.threads?.length" class="resource-message muted">同一主机的会话共享 Codex PID；关闭会话只停止该会话及其子智能体，保留历史。</p>
             <p class="resource-message muted">关闭连接会中断此主机上所有 Web 页面的任务，并保持暂停；重新连接后可继续原会话。</p>
-            <p v-if="snapshot.runtime.mode === 'proxy'" class="resource-message muted">共享桌面进程模式：仅释放网页订阅和连接。</p>
+            <p v-if="snapshot.runtime.managed === false" class="resource-message muted">共享桌面进程模式：仅释放网页订阅和连接。</p>
           </section>
         </main>
       </div>
@@ -176,6 +202,12 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
 .runtime-summary { margin-top: 16px; }
 .runtime-process { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; }
 .runtime-process small { color: var(--muted); }
+.runtime-threads { margin-top: 12px; }
+.runtime-thread { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+.runtime-thread > div { flex: 1; min-width: 0; }
+.runtime-thread strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
+.runtime-thread small { display: block; color: var(--muted); margin-top: 4px; }
+.runtime-thread button { padding: 5px 8px; }
 .runtime-close { color: var(--danger, #dc4545); }
 @media (max-width: 760px) {
   .resource-backdrop { padding: 10px; }

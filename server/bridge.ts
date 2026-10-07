@@ -15,6 +15,7 @@ export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?
 type Pending = { originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
+export type ReleasedThread = { name: string; restoreThreadIds: string[] }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
 
 export function normalizeCodexClientName(value?: string): string {
@@ -76,20 +77,32 @@ export class Bridge {
   private pausing?: Promise<void>
   private subscribedThreads = new Set<string>()
   private activeThreads = new Set<string>()
+  private threadNames = new Map<string, string>()
+  private releasing = new Set<string>()
+  private hiddenArchiveEvents = new Set<string>()
+  private archiveCapture?: ReleasedThread
+  readonly releasedThreads: Map<string, ReleasedThread>
   paused = false
   connected = false
   userAgent?: string
   codexHome?: string
   lastError?: string
   private readonly clientName: string
-  constructor(readonly host: Host, readonly options: BridgeOptions = {}) {
+  constructor(readonly host: Host, readonly options: BridgeOptions = {}, releasedThreads = new Map<string, ReleasedThread>()) {
     this.clientName = normalizeCodexClientName(options.clientName)
+    this.releasedThreads = releasedThreads
   }
   get mode() { return this.host.kind === 'ssh' ? 'ssh' : this.options.mode || 'spawn' }
   get runtime() {
     return { connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
       ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
       loadedThreadCount: this.subscribedThreads.size, activeThreadCount: this.activeThreads.size,
+      threads: [...new Set([...this.subscribedThreads, ...this.releasedThreads.keys()])].map(id => ({ id,
+        name: this.threadNames.get(id) || this.releasedThreads.get(id)?.name || '未命名对话',
+        loaded: this.subscribedThreads.has(id), active: this.activeThreads.has(id), released: this.releasedThreads.has(id),
+        restoring: !!this.releasedThreads.get(id)?.restoreThreadIds.length,
+        pid: this.subscribedThreads.has(id) ? this.transport?.pid : undefined,
+      })),
       activeProcesses: [...this.processes.values()].map(({ processId, tty, cwd, startedAt }) => ({ processId, tty, cwd, startedAt })),
       processes: this.transport?.pid ? [{ pid: this.transport.pid, role: this.host.kind === 'ssh' || this.options.mode === 'proxy' ? 'transport' : 'app-server', local: true }] : [],
     }
@@ -178,7 +191,15 @@ export class Bridge {
     })
   }
 
-  async request(method: string, params?: unknown, timeout = 120000): Promise<unknown> { await this.connect(); return this.rawRequest(method, params, undefined, undefined, timeout) }
+  private checkThreadRequest(method: string, params: unknown) {
+    if (this.releasing.size && ['thread/archive', 'thread/unarchive'].includes(method))
+      throw Object.assign(new Error('会话正在关闭，请稍后再归档或恢复'), { status: 409 })
+    const id = (params as { threadId?: string } | undefined)?.threadId
+    if (id && !['thread/read', 'thread/turns/list', 'thread/goal/get'].includes(method) &&
+      (this.releasing.has(id) || this.releasedThreads.has(id) || [...this.releasedThreads.values()].some(entry => entry.restoreThreadIds.includes(id))))
+      throw Object.assign(new Error('此会话的 Web 连接已关闭，请在资源管理中重新连接会话'), { code: 'thread_released', status: 409 })
+  }
+  async request(method: string, params?: unknown, timeout = 120000): Promise<unknown> { await this.connect(); this.checkThreadRequest(method, params); return this.rawRequest(method, params, undefined, undefined, timeout) }
 
   attach(key: string, socket: WebSocket, clientId: string, isAuthenticated = () => true) {
     const previous = this.clients.get(key)
@@ -205,7 +226,7 @@ export class Bridge {
   }
 
   private status(key: string, clientId?: string) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, hostId: this.host.id, mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
+    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
   }
 
   private finishProcess(requestId: string, result?: unknown, error?: RpcMessage['error']) {
@@ -298,17 +319,23 @@ export class Bridge {
         if (params?.disableTimeout === true) timeout = 2 * 60 * 60 * 1000
         else if (typeof params?.timeoutMs === 'number') timeout = Math.min(2 * 60 * 60 * 1000, Math.max(timeout, params.timeoutMs + 30000))
       }
+      this.checkThreadRequest(message.method, message.params)
       // Keep the socket which submitted the request, even if it reconnects
       // while initialization is pending. Its replacement needs the broadcast.
       const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient)
       reply({ id: message.id, result })
     } catch (error) {
-      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : (error as { code?: string }).code === 'runtime_paused' ? { data: { code: 'runtime_paused' } } : {}) } })
+      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : ['runtime_paused', 'thread_released'].includes((error as { code?: string }).code || '') ? { data: { code: (error as { code?: string }).code } } : {}) } })
     }
   }
 
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
+    if (message.method === 'thread/archived' && this.archiveCapture) {
+      const id = (message.params as { threadId?: string })?.threadId
+      if (id && !this.archiveCapture.restoreThreadIds.includes(id)) this.archiveCapture.restoreThreadIds.push(id)
+      if (id) this.hiddenArchiveEvents.add(id)
+    }
     const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
     // Observers must not stall or break RPC, even when a notification provider is offline.
     try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message, pending?.method)).catch(() => {}) } catch {}
@@ -319,13 +346,15 @@ export class Bridge {
       if (message.error) pending.reject(new RpcFailure(message.error))
       else {
         const params = pending.params as { threadId?: string } | undefined
-        const result = message.result as { thread?: { id?: string; status?: { type?: string } } } | undefined
+        const result = message.result as { thread?: { id?: string; name?: string; preview?: string; status?: { type?: string } } } | undefined
+        if (result?.thread?.id && (result.thread.name || result.thread.preview)) this.threadNames.set(result.thread.id, (result.thread.name || result.thread.preview || '').slice(0, 160))
+        if (pending.method === 'thread/name/set' && params?.threadId && (pending.params as any)?.name) this.threadNames.set(params.threadId, (pending.params as any).name.slice(0, 160))
         if (['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
           this.subscribedThreads.add(result.thread.id)
           if (result.thread.status?.type === 'active') this.activeThreads.add(result.thread.id)
         }
         if (pending.method === 'thread/unsubscribe' && params?.threadId) { this.subscribedThreads.delete(params.threadId); this.activeThreads.delete(params.threadId) }
-        this.broadcastThreadChange(pending, message.result, String(message.id))
+        if (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method)) this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
       return
@@ -338,6 +367,9 @@ export class Bridge {
       return
     }
     if (message.method) {
+      const p = message.params as any
+      if (message.method === 'thread/name/updated' && p?.threadId) this.threadNames.set(p.threadId, String(p.threadName || p.name || '').slice(0, 160))
+      if (['thread/archived', 'thread/unarchived'].includes(message.method) && this.hiddenArchiveEvents.has(p?.threadId)) return
       const event = message.params as { threadId?: string; turn?: { status?: string }; status?: { type?: string } } | undefined
       if (event?.threadId && this.subscribedThreads.has(event.threadId)) {
         if (message.method === 'turn/started' && event.turn?.status === 'inProgress') this.activeThreads.add(event.threadId)
@@ -380,6 +412,87 @@ export class Bridge {
     this.subscribedThreads.clear()
     this.activeThreads.clear()
     for (const key of this.clients.keys()) this.status(key)
+  }
+
+  /** Unsubscribe retains a native writer for 30 minutes. Archive shuts down
+   * just this thread family, then unarchive restores its durable history without
+   * reacquiring writers. Journal the restoration set before moving any logs. */
+  async releaseThread(threadId: string, persist: () => Promise<void>) {
+    if (!this.subscribedThreads.has(threadId) && !this.releasedThreads.has(threadId))
+      throw Object.assign(new Error('此会话没有由 Web 持有的连接'), { status: 404 })
+    if (this.options.mode === 'proxy') throw Object.assign(new Error('共享桌面进程模式请使用“关闭 Web Codex”释放网页连接'), { status: 409 })
+    await this.connect()
+    if (this.releasing.size) throw Object.assign(new Error('会话正在关闭'), { status: 409 })
+    this.releasing.add(threadId)
+    try {
+      await this.restoreReleasedThread(threadId, persist)
+      const ids = new Set([threadId])
+      let cursor: string | null = null
+      const cursors = new Set<string>()
+      do {
+        const page = await this.rawRequest('thread/list', { ancestorThreadId: threadId, archived: false, limit: 100, cursor }, undefined, undefined, 10000) as { data: { id: string }[]; nextCursor?: string | null }
+        for (const thread of page.data) ids.add(thread.id)
+        cursor = page.nextCursor || null
+        if (ids.size > 10000 || cursor && cursors.has(cursor)) throw new Error('子会话列表无法完整读取，请稍后重试')
+        if (cursor) cursors.add(cursor)
+      } while (cursor)
+      for (const id of ids) this.releasing.add(id)
+      // A resume already in flight must settle before shutting down the writer.
+      const deadline = Date.now() + 5000
+      while ([...this.pending.values()].some(p => ids.has((p.params as { threadId?: string })?.threadId || '') && !['thread/read', 'thread/turns/list'].includes(p.method))) {
+        if (Date.now() > deadline) throw new Error('此会话仍有请求未完成，请稍后重试关闭')
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      const entry: ReleasedThread = { name: this.threadNames.get(threadId) || this.releasedThreads.get(threadId)?.name || '未命名对话', restoreThreadIds: [...ids] }
+      const previous = this.releasedThreads.get(threadId)
+      this.releasedThreads.set(threadId, entry)
+      try { await persist() }
+      catch (error) { if (previous) this.releasedThreads.set(threadId, previous); else this.releasedThreads.delete(threadId); throw error }
+      for (const id of ids) this.hiddenArchiveEvents.add(id)
+      for (const key of this.clients.keys()) this.status(key)
+      try {
+        this.archiveCapture = entry
+        await this.rawRequest('thread/archive', { threadId }, undefined, undefined, 30000)
+        for (const id of entry.restoreThreadIds) { this.subscribedThreads.delete(id); this.activeThreads.delete(id) }
+      } finally {
+        this.archiveCapture = undefined
+        // Native archive events also identify descendants which were created
+        // while listing the family. Restore exactly the logs actually moved.
+        try { await persist() } finally { await this.restoreReleasedThread(threadId, persist) }
+      }
+    } finally {
+      this.releasing.clear()
+      this.hiddenArchiveEvents.clear()
+      for (const key of this.clients.keys()) this.status(key)
+    }
+  }
+
+  async restoreReleasedThread(threadId: string, persist: () => Promise<void>) {
+    const entry = this.releasedThreads.get(threadId)
+    if (!entry?.restoreThreadIds.length) return
+    await this.connect()
+    for (const id of [...entry.restoreThreadIds]) {
+      const alreadyHidden = this.hiddenArchiveEvents.has(id)
+      this.hiddenArchiveEvents.add(id)
+      try { await this.rawRequest('thread/unarchive', { threadId: id }, undefined, undefined, 10000) }
+      catch (error) { if (!(error instanceof RpcFailure && /^no archived rollout found for thread id /.test(error.message))) throw error }
+      finally { if (!alreadyHidden) this.hiddenArchiveEvents.delete(id) }
+      entry.restoreThreadIds = entry.restoreThreadIds.filter(value => value !== id)
+      await persist()
+    }
+  }
+
+  async reconnectThread(threadId: string, persist: () => Promise<void>) {
+    const entry = this.releasedThreads.get(threadId)
+    if (!entry) return
+    try {
+      await this.restoreReleasedThread(threadId, persist)
+      this.releasedThreads.delete(threadId)
+      try { await persist() } catch (error) { this.releasedThreads.set(threadId, entry); throw error }
+    } finally {
+      this.hiddenArchiveEvents.clear()
+      for (const key of this.clients.keys()) this.status(key)
+    }
   }
 
   /** Release only this bridge's subscriptions and child transport. Keep sockets

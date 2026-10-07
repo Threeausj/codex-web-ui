@@ -13,6 +13,7 @@ const props = defineProps<{
   items: DisplayItem[];
   turns: any[];
   busy: boolean;
+  hostId?: string;
   editableItemId?: string;
   editing?: boolean;
   editDisabled?: boolean;
@@ -103,6 +104,7 @@ function activityLabel(block: any) {
   <template v-for="block in blocks" :key="block.id">
     <ChatItem
       v-if="block.kind === 'message'"
+      :host-id="hostId"
       :item="block.item"
       :busy="busy"
       :can-fork="!busy && !editing && !!block.item.turnId"
@@ -121,6 +123,7 @@ function activityLabel(block: any) {
       <ChatItem
         v-for="item in block.users"
         :key="item.id"
+        :host-id="hostId"
         :item="item"
         :busy="running(block)"
         :can-fork="!busy && !editing && !!item.turnId"
@@ -161,6 +164,7 @@ function activityLabel(block: any) {
           <ChatItem
             v-for="item in block.activity"
             :key="item.id"
+            :host-id="hostId"
             :item="item"
             :busy="running(block)"
             :can-fork="false"
@@ -182,6 +186,7 @@ function activityLabel(block: any) {
       <ChatItem
         v-for="item in block.outputs"
         :key="item.id"
+        :host-id="hostId"
         :item="item"
         :busy="running(block)"
         :can-fork="item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
@@ -195,6 +200,7 @@ function activityLabel(block: any) {
        the editor mounted at the history tail so failures retain the draft. -->
   <ChatItem
     v-if="editSession && editingItem && !items.some((item) => item.id === editSession?.itemId)"
+    :host-id="hostId"
     :item="editingItem"
     :editing="editing"
     :edit-disabled="editDisabled"
@@ -248,8 +254,7 @@ function activityLabel(block: any) {
 }
 .turn-activity-content {
   margin: 4px 0 16px;
-  padding: 12px 14px;
-  border-left: 1px solid var(--border);
+  padding: 0;
 }
 .turn-activity-content :deep(.agent-message) {
   color: var(--muted);
@@ -273,7 +278,7 @@ function activityLabel(block: any) {
     font-size: 12px;
   }
   .turn-activity-content {
-    padding: 10px 12px;
+    padding: 0;
   }
 }
 </style>

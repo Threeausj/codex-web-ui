@@ -86,6 +86,7 @@ const state = reactive({
   selectingThread: false,
   threadReady: true,
   runtimePaused: false,
+  threadReleased: false,
   switchingHost: false,
   runtimePolicy: null as { sandboxPolicy: any; approvalPolicy: any } | null,
   items: [] as DisplayItem[],
@@ -178,6 +179,26 @@ const tokenUsages = new Map<string, any>();
 const tokenUsageRevisions = new Map<string, number>();
 const compactionUsageRevisions = new Map<string, number>();
 const pausedHosts = new Set<string>();
+const releasedThreads = new Map<string, Set<string>>();
+function updateReleasedThreads(hostId: string, ids: string[]) {
+  releasedThreads.set(hostId, new Set(ids));
+  if (hostId !== state.hostId) return;
+  const released = !!state.activeThread?.id && ids.includes(state.activeThread.id);
+  if (released && !state.threadReleased) {
+    saveConversationSnapshot(); ++selectionGeneration; state.selectingThread = false;
+    state.threadReady = false; state.busy = false; state.threadConflict = null;
+    state.pendingRequests = state.pendingRequests.filter(request => request.params?.threadId !== state.activeThread?.id);
+  }
+  state.threadReleased = released;
+}
+async function resumeThreadConnection(hostId: string, threadId: string) {
+  const authentication = authenticationGeneration;
+  await http(`/hosts/${encodeURIComponent(hostId)}/runtime/threads/${encodeURIComponent(threadId)}/resume`, { method: "POST", body: "{}" });
+  if (authentication !== authenticationGeneration) return;
+  const ids = [...(releasedThreads.get(hostId) || [])].filter(id => id !== threadId);
+  updateReleasedThreads(hostId, ids);
+  if (state.hostId === hostId && state.activeThread?.id === threadId) await selectThread(threadId);
+}
 let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let cacheActivation: Promise<void> = Promise.resolve();
 const activeTurns = new Map<string, string>();
@@ -963,6 +984,7 @@ function receive(message: any) {
         clearTimeout(reconnectTimer);
       } else pausedHosts.delete(state.hostId);
     }
+    if (Array.isArray(p.releasedThreadIds)) updateReleasedThreads(state.hostId, p.releasedThreadIds);
     state.connectionMode = p.mode ?? state.connectionMode;
     if (p.error) state.error = p.error;
     if (p.connected && !state.runtimePaused) {
@@ -1292,6 +1314,11 @@ async function bootstrap() {
   state.projects = data.projects;
   state.connectionMode = data.connectionMode;
   pausedHosts.clear();
+  releasedThreads.clear();
+  for (const entry of data.runtimeReleasedThreads || []) {
+    if (!releasedThreads.has(entry.hostId)) releasedThreads.set(entry.hostId, new Set());
+    releasedThreads.get(entry.hostId)!.add(entry.threadId);
+  }
   for (const id of data.runtimePausedHostIds || []) if (typeof id === 'string') pausedHosts.add(id);
   if (data.preferences)
     state.preferences = { ...state.preferences, ...data.preferences };
@@ -1328,6 +1355,7 @@ async function bootstrap() {
   const hostId = state.hostId;
   if (preferredThread) {
     state.activeThread = state.threads.find(thread => thread.id === preferredThread) || { id: preferredThread };
+    state.threadReleased = releasedThreads.get(hostId)?.has(preferredThread) || false;
     state.threadReady = false;
     state.selectingThread = true;
     await cacheActivation;
@@ -1659,7 +1687,20 @@ async function selectThread(id: string) {
         applyConversationSnapshot(snapshot, id);
     });
   }
+  state.threadReleased = releasedThreads.get(hostId)?.has(id) || false;
   if (state.runtimePaused) { state.selectingThread = false; return; }
+  if (state.threadReleased) {
+    state.busy = false;
+    try {
+      const page = await history(id, null, hostId);
+      if (!current()) return;
+      state.turns = [...page.data].reverse();
+      state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
+      itemCache.set(id, state.items); turnCursor = page.nextCursor; state.moreTurns = !!turnCursor;
+    } catch (error) { if (current()) fail(error); }
+    finally { if (current()) state.selectingThread = false; }
+    return;
+  }
   try {
     const resumeRequest = rpc("thread/resume", {
       threadId: id,
@@ -1789,7 +1830,10 @@ async function selectThread(id: string) {
         state.busy = false;
         rememberThread(id);
       } else {
-        if ((error as any)?.data?.code === 'runtime_paused' || (error as any)?.code === 'runtime_paused') {
+        if ((error as any)?.data?.code === 'thread_released' || (error as any)?.code === 'thread_released') {
+          updateReleasedThreads(hostId, [...new Set([...(releasedThreads.get(hostId) || []), id])]);
+          state.error = '';
+        } else if ((error as any)?.data?.code === 'runtime_paused' || (error as any)?.code === 'runtime_paused') {
           state.runtimePaused = true;
           pausedHosts.add(hostId);
           state.error = '此主机的 Web Codex 已释放，请在资源管理中恢复连接。';
@@ -2199,7 +2243,7 @@ async function send(text: string, editedInput?: any[]) {
   }
 }
 function canEditMessage(itemId: string) {
-  const blocked = !state.threadReady || state.runtimePaused || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
+  const blocked = !state.threadReady || state.runtimePaused || state.threadReleased || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
   if (blocked) return false;
   if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
     if (pendingMessageEdit.blocked) return false;
@@ -3257,7 +3301,7 @@ async function mutateGoal(hostId: string, threadId: string, patch: { objective?:
   return goals.get(key) || null;
 }
 async function modeAction(action: (hostId: string, threadId: string | undefined, selected: () => boolean) => Promise<void>) {
-  if (state.runtimePaused || (state.activeThread && !state.threadReady)) throw new Error('请先恢复当前会话连接。');
+  if (state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady)) throw new Error('请先恢复当前会话连接。');
   if (state.modeBusy || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext)
     throw new Error('正在提交或加载会话，请稍候');
   if (!state.connected || !state.online) throw new Error('请先连接工作站');
@@ -3617,6 +3661,8 @@ export function useCodex() {
     loadMoreThreads,
     loadProjectThreads,
     selectThread,
+    resumeThreadConnection,
+    updateReleasedThreads,
     takeoverThread,
     loadOlderTurns,
     newThread,

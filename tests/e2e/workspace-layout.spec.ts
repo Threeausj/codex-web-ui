@@ -103,7 +103,8 @@ for (const viewport of [
     await expect(view.getByText("本次对话 · 45 个文件", { exact: true })).toBeVisible();
     await expect(cards).toHaveCount(45);
     const heights = await cards.evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
-    expect(Math.min(...heights), "Each collapsed file retains a usable heading").toBeGreaterThan(40);
+    expect(Math.min(...heights), "Compact headings retain usable controls").toBeGreaterThanOrEqual(viewport.label === "phone" ? 40 : 32);
+    expect(Math.max(...heights), "Collapsed headings stay compact").toBeLessThanOrEqual(viewport.label === "phone" ? 44 : 38);
     await expect(cards.first()).not.toHaveAttribute("open", "");
     await expect(cards.first().locator(".diff-code")).toBeHidden();
     await cards.first().locator("summary").click();
