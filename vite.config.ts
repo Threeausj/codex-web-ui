@@ -16,7 +16,18 @@ function appServiceWorker(): Plugin {
       const template = await readFile(path.join(outputDirectory, 'sw.js'), 'utf8');
       const revision = createHash('sha256').update(template);
       for (const file of files) revision.update(file).update(await readFile(path.join(outputDirectory, file)));
-      const worker = template.replace('__CODEX_BUILD__', revision.digest('hex').slice(0, 16)).replace('__CODEX_PRECACHE__', JSON.stringify(files.map((file) => `/${file}`)));
+      const core = new Set(publicFiles);
+      const visit = (name: string) => {
+        if (core.has(name)) return;
+        core.add(name);
+        const chunk = bundle[name];
+        if (chunk?.type === 'chunk') {
+          for (const dependency of chunk.imports) visit(dependency);
+          for (const stylesheet of (chunk as any).viteMetadata?.importedCss || []) core.add(stylesheet);
+        }
+      };
+      for (const chunk of Object.values(bundle)) if (chunk.type === 'chunk' && chunk.isEntry) visit(chunk.fileName);
+      const worker = template.replace('__CODEX_BUILD__', revision.digest('hex').slice(0, 16)).replace('__CODEX_PRECACHE__', JSON.stringify([...core].sort().map(file => `/${file}`))).replace('__CODEX_PUBLIC_ASSETS__', JSON.stringify(files.map(file => `/${file}`)));
       await writeFile(path.join(outputDirectory, 'sw.js'), worker);
     },
   };

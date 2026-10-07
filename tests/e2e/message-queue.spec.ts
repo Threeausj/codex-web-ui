@@ -11,14 +11,18 @@ async function install(page: Page, mock: MockCodex, supported = true, shared?: {
     reorder: ['threadId', 'queuedSubmissionIds'], start: ['threadId', 'queuedSubmissionId'],
   };
   await page.route('**/api/hosts/*/native-capabilities*', route => route.fulfill({ json: {
-    status: 'known', checkedAt: Date.now(), methods: Object.fromEntries(Object.entries(fields).map(([name, params]) =>
-      [`thread/queue/${name}`, { available: supported, params, required: ['threadId'] }])),
+    status: 'known', checkedAt: Date.now(), methods: { ...Object.fromEntries(Object.entries(fields).map(([name, params]) =>
+      [`thread/queue/${name}`, { available: supported, params, required: ['threadId'] }])), 'thread/settings/update': { available: supported, params: ['threadId','cwd','model','effort','sandboxPolicy','approvalPolicy','collaborationMode'], required: ['threadId'] } },
   } }));
   if (!(mock.turns.get(threadId) || []).some(turn => turn.id === running.id))
     mock.turns.set(threadId, [...(mock.turns.get(threadId) || []), running]);
   const queue = shared || { items: [] as any[], uncertain: false, failNext: false };
   const original = (mock as any).receive.bind(mock);
   (mock as any).receive = (socket: WebSocketRoute, request: any) => {
+    if (request.method === 'thread/settings/update') {
+      mock.requests.push(request);
+      return socket.send(JSON.stringify({ id: request.id, result: {} }));
+    }
     if (!request.method.startsWith('thread/queue/')) return original(socket, request);
     mock.requests.push(request);
     const p = request.params;
@@ -72,6 +76,10 @@ test('a busy composer explicitly chooses native next-turn delivery; accepted inp
   await expect(page.getByText('sample.png', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '加入下一轮队列', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '消息输入框' })).toHaveValue('');
+  const settingsIndex = mock.requests.findIndex(request => request.method === 'thread/settings/update');
+  expect(settingsIndex).toBeGreaterThanOrEqual(0);
+  expect(settingsIndex).toBeLessThan(mock.requests.findIndex(request => request.method === 'thread/queue/add'));
+  expect(mock.requests[settingsIndex].params).toEqual(expect.objectContaining({ threadId, sandboxPolicy: expect.any(Object), approvalPolicy: expect.any(String), model: expect.any(String), effort: expect.any(String) }));
   expect(queue.items[0].input.map((input: any) => input.type)).toEqual(['text', 'localImage', 'text']);
   expect(mock.requests.some(request => request.method === 'turn/start' || request.method === 'turn/steer')).toBe(false);
   await page.getByRole('button', { name: /运行中 · 下一轮队列 1/ }).click();
@@ -119,6 +127,10 @@ test('queue failure preserves the draft, and an unknown outcome blocks blind dup
   await expect(page.getByRole('textbox', { name: '消息输入框' })).toHaveValue('必须保留的排队草稿');
   await expect(page.locator('.queue-notice')).toContainText('已保留草稿，不会自动重复提交');
   await page.getByRole('combobox', { name: '消息发送方式' }).selectOption('immediate');
+  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toHaveCount(0);
+  expect(mock.requests.filter(request => request.method === 'thread/queue/add')).toHaveLength(1);
+  await page.reload(); await open(page);
+  await expect(page.locator('.queue-notice')).toContainText('核对队列和对话后再恢复发送，避免重复');
   await expect(page.getByRole('button', { name: '追加指令', exact: true })).toHaveCount(0);
   expect(mock.requests.filter(request => request.method === 'thread/queue/add')).toHaveLength(1);
   await page.getByRole('button', { name: '已核对，恢复发送' }).click();

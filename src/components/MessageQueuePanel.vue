@@ -29,7 +29,7 @@ watch(() => queue.value.items.map((item: any) => item.id).join('\n'), () => {
       <Icon :name="open ? 'ChevronUp' : 'ChevronDown'" :size="14" />
     </button>
     <div v-if="open" class="queue-body">
-      <div class="queue-note">队列保存在 Codex 中，任务结束后继续执行，沿用该对话已保存的模型、模式和权限。停止当前任务会保留队列。</div>
+      <div class="queue-note">队列保存在 Codex 中，任务结束后继续执行，沿用该对话已保存的模型、模式和权限。停止当前任务会保留队列。队列非空时锁定模型和权限；请清空队列后调整。</div>
       <div v-if="queue.status !== 'supported'" class="queue-note" role="status">{{ queue.reason }} <button class="text-button" @click="controller.checkCapabilities(true)">重新检查</button></div>
       <div v-else-if="!queue.items.length && !queue.loading" class="queue-note">没有等待执行的消息。</div>
       <ol v-if="queue.items.length" class="queue-list">
@@ -55,7 +55,7 @@ watch(() => queue.value.items.map((item: any) => item.id).join('\n'), () => {
     </div>
     <div v-if="queue.error || queue.uncertain || queue.notice" class="queue-notice" :role="queue.error || queue.uncertain ? 'alert' : 'status'">
       {{ queue.error || queue.notice }}
-      <template v-if="queue.uncertain"><span>核对队列和对话后再恢复发送，避免重复。</span><button class="text-button" :disabled="queue.loading || !main.connected" @click="controller.refresh()">核对队列</button><button class="text-button" :disabled="queue.loading || !main.connected || main.online === false" @click="controller.acknowledgeUncertain()">已核对，恢复发送</button></template>
+      <template v-if="queue.uncertain"><span>核对队列和对话后再恢复发送，避免重复。</span><button class="text-button" :disabled="queue.loading || !main.connected" @click="controller.refresh()">核对队列</button><button class="text-button" :disabled="queue.loading || !main.connected || main.online === false" @click="action(() => controller.acknowledgeUncertain())">已核对，恢复发送</button></template>
     </div>
   </section>
 </template>

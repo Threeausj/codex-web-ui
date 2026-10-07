@@ -56,6 +56,19 @@ let signedOutAuthentication: number | undefined;
 let retiredEndpoint = '';
 try { retiredEndpoint = localStorage.getItem(retiredEndpointKey) || ''; } catch { /* Device storage may be unavailable. */ }
 
+/** Browser APIs can hang without rejecting when Android suspends networking. */
+function deadline<T>(promise: Promise<T>, milliseconds = 15000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('通知操作超时，请检查网络后重试')), milliseconds);
+    promise.then(value => { clearTimeout(timer); resolve(value); }, cause => { clearTimeout(timer); reject(cause); });
+  });
+}
+function pushHttp(api: HttpApi, path: string, init: RequestInit = {}, reportError = false) {
+  const controller = new AbortController();
+  const signal = init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
+  return deadline(api.requestHttp(path, { ...init, signal }, reportError)).finally(() => controller.abort());
+}
+
 function installListeners() {
   if (listenersInstalled) return;
   listenersInstalled = true;
@@ -106,7 +119,7 @@ export function initPwa(): Promise<ServiceWorkerRegistration | null> {
     if (!window.isSecureContext || !('serviceWorker' in navigator)) { pwaState.registrationStatus = 'unavailable'; return null; }
     pwaState.registrationStatus = 'registering';
     try {
-      const result = await navigator.serviceWorker.register(`/sw.js?build=${import.meta.env.VITE_BUILD_ID}`, { scope: '/', updateViaCache: 'none' });
+      const result = await deadline(navigator.serviceWorker.register(`/sw.js?build=${import.meta.env.VITE_BUILD_ID}`, { scope: '/', updateViaCache: 'none' }));
       if (result.waiting) pwaState.updateAvailable = true;
       result.addEventListener('updatefound', () => {
         const worker = result.installing;
@@ -174,7 +187,7 @@ function postSubscription(api: HttpApi, subscription: PushSubscription, generati
   if (generation !== deviceAuthGeneration) throw new Error('通知操作所属登录已退出');
   // Refresh right before serializing, so a dormant tab cannot restore old device preferences.
   pwaState.pushPreferences = readPreferences(pwaState.pushPreferences);
-  return api.requestHttp('/push/subscription', {
+  return pushHttp(api, '/push/subscription', {
     method: 'POST',
     body: JSON.stringify({ subscription: subscription.toJSON(), preferences: pwaState.pushPreferences }),
   }, false);
@@ -196,7 +209,7 @@ async function retireSubscription(subscription: PushSubscription, message: strin
   try { localStorage.setItem(retiredEndpointKey, retiredEndpoint); } catch { /* The current tab retains the tombstone. */ }
   pwaState.pushSubscribed = false;
   pwaState.pushError = message;
-  try { await subscription.unsubscribe(); }
+  try { await deadline(subscription.unsubscribe()); }
   catch { throw new Error('本机通知订阅清理失败，请刷新重试后重新启用通知。'); }
 }
 export function initializeDevicePush(api: HttpApi): Promise<void> {
@@ -212,14 +225,14 @@ export function initializeDevicePush(api: HttpApi): Promise<void> {
     pwaState.pushReady = false;
     try {
       // Restore only after a current test, unsubscribe or preference save has completed.
-      if (deviceOperation) await deviceOperation;
+      if (deviceOperation) await deadline(deviceOperation);
       if (!current()) return;
-      const [config, worker] = await Promise.all([api.requestHttp('/push/config', undefined, false), initPwa()]);
+      const [config, worker] = await Promise.all([pushHttp(api, '/push/config', undefined, false), initPwa()]);
       if (!current()) return;
       pwaState.pushConfig = config;
       pwaState.pushPermission = 'Notification' in window ? Notification.permission : 'unsupported';
       if (!worker || !pwaState.pushSupported) return;
-      const subscription = await worker.pushManager.getSubscription();
+      const subscription = await deadline(worker.pushManager.getSubscription());
       if (!current()) return;
       pwaState.pushSubscribed = !!subscription;
       // Restore only an existing, authorized device. Never subscribe or prompt on page load.
@@ -262,7 +275,7 @@ export async function enableDevicePush(api: HttpApi) {
     if (!current()) return;
     pwaState.pushPermission = permission;
     if (permission !== 'granted') throw new Error(permission === 'denied' ? '通知已被拒绝，请在系统或浏览器设置中允许后重试。' : '尚未允许通知，你可以稍后再次启用。');
-    let subscription = await registration.pushManager.getSubscription();
+    let subscription = await deadline(registration.pushManager.getSubscription());
     if (!current()) return;
     if (subscription && (endpointRetired(subscription) || !matchesServerKey(subscription, pwaState.pushConfig.publicKey))) {
       const message = '设备通知订阅已失效或服务器密钥已更新，旧订阅已清理，请重新启用通知。';
@@ -270,7 +283,7 @@ export async function enableDevicePush(api: HttpApi) {
       throw new Error(message);
     }
     if (!subscription) {
-      subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: applicationServerKey(pwaState.pushConfig.publicKey) });
+      subscription = await deadline(registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: applicationServerKey(pwaState.pushConfig.publicKey) }));
       created = subscription;
     }
     if (!current()) { if (created) void created.unsubscribe().catch(() => {}); return; }
@@ -283,7 +296,7 @@ export async function enableDevicePush(api: HttpApi) {
     pwaState.pushSubscribed = true;
     rememberPreferences(pwaState.pushPreferences);
   } catch (cause: any) {
-    if (created) await created.unsubscribe().catch(() => {});
+    if (created) await deadline(created.unsubscribe()).catch(() => {});
     if (!current()) return;
     pwaState.pushError = cause.message || '无法启用通知';
     throw cause;
@@ -310,13 +323,13 @@ export async function revokeDevicePush(api: HttpApi, options: { logout?: boolean
     try {
       const worker = registration || await initPwa();
       if (generation !== deviceAuthGeneration) return;
-      const subscription = await worker?.pushManager.getSubscription();
+      const subscription = await deadline(worker ? worker.pushManager.getSubscription() : Promise.resolve(null));
       if (!subscription || generation !== deviceAuthGeneration) return;
       retiredEndpoint = subscription.endpoint;
       try { localStorage.setItem(retiredEndpointKey, retiredEndpoint); } catch { /* Server-side revocation remains authoritative. */ }
       // Retaining the tombstone also prevents a failed unsubscribe from silently
       // reauthorizing this endpoint on the next page load.
-      if (!await subscription.unsubscribe() && generation === deviceAuthGeneration)
+      if (!await deadline(subscription.unsubscribe()) && generation === deviceAuthGeneration)
         pwaState.pushError = '已退出登录；浏览器通知订阅清理未完成。';
     } catch {
       if (generation === deviceAuthGeneration) pwaState.pushError = '已退出登录；浏览器通知订阅清理未完成。';
@@ -333,13 +346,13 @@ export async function revokeDevicePush(api: HttpApi, options: { logout?: boolean
   const finishDeviceOperation = beginDeviceOperation();
   try {
     const worker = registration || await initPwa();
-    const subscription = await worker?.pushManager.getSubscription();
+    const subscription = await deadline(worker ? worker.pushManager.getSubscription() : Promise.resolve(null));
     if (!current()) return;
     if (subscription) {
       // First revoke the authenticated server registration. A failure keeps the UI enabled.
-      await api.requestHttp('/push/subscription', { method: 'DELETE', body: JSON.stringify({ endpoint: subscription.endpoint }) }, false);
+      await pushHttp(api, '/push/subscription', { method: 'DELETE', body: JSON.stringify({ endpoint: subscription.endpoint }) }, false);
       if (!current()) return;
-      if (!await subscription.unsubscribe()) throw new Error('服务器已关闭通知，但本机订阅清理失败，请重试。');
+      if (!await deadline(subscription.unsubscribe())) throw new Error('服务器已关闭通知，但本机订阅清理失败，请重试。');
     }
     if (current()) pwaState.pushSubscribed = false;
   } catch (cause: any) {
@@ -362,9 +375,9 @@ export async function saveDevicePushPreferences(api: HttpApi, preferences: PushP
   let finishPreferenceWrite: () => void = () => {};
   preferenceWrite = new Promise<void>((resolve) => { finishPreferenceWrite = resolve; });
   try {
-    const subscription = await registration?.pushManager.getSubscription();
+    const subscription = await deadline(registration ? registration.pushManager.getSubscription() : Promise.resolve(null));
     if (!current()) return;
-    if (subscription) await api.requestHttp('/push/subscription', { method: 'PATCH', body: JSON.stringify({ endpoint: subscription.endpoint, preferences }) }, false);
+    if (subscription) await pushHttp(api, '/push/subscription', { method: 'PATCH', body: JSON.stringify({ endpoint: subscription.endpoint, preferences }) }, false);
     if (current()) rememberPreferences(preferences);
   } catch (cause: any) {
     if (!current()) return;
@@ -392,10 +405,10 @@ export async function testDevicePush(api: HttpApi) {
   const finishDeviceOperation = beginDeviceOperation();
   let subscription: PushSubscription | null | undefined;
   try {
-    subscription = await registration?.pushManager.getSubscription();
+    subscription = await deadline(registration ? registration.pushManager.getSubscription() : Promise.resolve(null));
     if (!current()) return;
     if (!subscription) throw new Error('先在这台设备启用通知');
-    return await api.requestHttp('/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
+    return await pushHttp(api, '/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
   } catch (cause: any) {
     if (!current()) return;
     if (cause.status === 410 && subscription) {

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
+import VirtualHistoryBlock from "./VirtualHistoryBlock.vue";
+import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
 import ActivityBatch from './ActivityBatch.vue';
 import Icon from "./Icon.vue";
@@ -75,6 +77,7 @@ const blocks = computed(() =>
       : { ...block, ...turnPresentation(block.items) },
   ),
 );
+provideHistoryDisclosures();
 const expandedTurns = reactive(new Set<string>());
 function toggleTurn(event: Event, id: string) {
   if ((event.currentTarget as HTMLDetailsElement).open) expandedTurns.add(id);
@@ -92,7 +95,12 @@ const runningTurnId = computed(() => {
 // An idle notification can end work before its turn-completed metadata arrives.
 // A later busy notification belongs to new work, so keep the old turn settled.
 watch(runningTurnId, (current, previous) => {
-  if (previous && previous !== current) finishedTurns.add(previous);
+  if (previous && previous !== current) {
+    finishedTurns.add(previous);
+    // Automatic live expansion is not an instruction to keep a finished turn
+    // open. Explicitly opened older turns still survive virtual unmounts.
+    expandedTurns.delete(previous);
+  }
 }, { flush: "sync" });
 function running(block: any) {
   return block.id === runningTurnId.value;
@@ -109,7 +117,7 @@ function activityLabel(block: any) {
 </script>
 
 <template>
-  <template v-for="block in blocks" :key="block.id">
+  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
     <ChatItem
       v-if="block.kind === 'message'"
       :host-id="hostId" :cwd="cwd"
@@ -156,7 +164,7 @@ function activityLabel(block: any) {
         "
         class="turn-activity"
         @toggle="toggleTurn($event, block.id)"
-        :open="running(block)"
+        :open="running(block) || expandedTurns.has(block.id)"
       >
         <summary
           :aria-label="
@@ -213,7 +221,7 @@ function activityLabel(block: any) {
         @error="emit('error', $event)"
       />
     </section>
-  </template>
+  </VirtualHistoryBlock>
   <!-- Revert removes the original turn before the replacement starts. Keep
        the editor mounted at the history tail so failures retain the draft. -->
   <ChatItem

@@ -17,12 +17,9 @@ export function conversationBlocks(
     Extract<ConversationBlock, { kind: "turn" }>
   >();
   const blocks: ConversationBlock[] = [];
+  const canonical = new Set<string>();
   const insertTurn = (block: Extract<ConversationBlock, { kind: "turn" }>) => {
-    const position = order.get(block.id);
-    const following = position == null ? -1 : blocks.findIndex((entry) =>
-      entry.kind === "turn" && (order.get(entry.id) ?? -1) > position);
-    if (following < 0) blocks.push(block);
-    else blocks.splice(following, 0, block);
+    blocks.push(block); groups.set(block.id, block); if (order.has(block.id)) canonical.add(block.id);
   };
   for (const item of items) {
     if (
@@ -57,7 +54,12 @@ export function conversationBlocks(
     };
     insertTurn(block);
   }
-  return blocks;
+  // Replace only canonical-turn slots; standalone optimistic messages and
+  // unknown turns retain their original anchors. Map-based grouping avoids
+  // scanning and splicing an ever-growing array for every history item.
+  const ordered: ConversationBlock[] = turns.filter(turn => canonical.has(turn.id)).map(turn => groups.get(turn.id)!);
+  let index = 0;
+  return blocks.map(block => block.kind === "turn" && canonical.has(block.id) ? ordered[index++]! : block);
 }
 
 /** Providers may omit phase. In that case keep their last answer visible,

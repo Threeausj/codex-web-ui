@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { nextTick, reactive } from 'vue';
+import { PrivateState } from '../src/lib/private-state';
 import { editedQueueInput, queuedText, useMessageQueue } from '../src/lib/message-queue';
 
 const fields: Record<string, string[]> = {
@@ -17,6 +18,9 @@ function fixture(options: { capability?: any } = {}) {
     threadReady: true, busy: true, permission: 'danger-full-access', items: [], online: true });
   const identity = { authenticationGeneration: 1, engineId: 'engine-a' };
   const methods = Object.fromEntries(Object.entries(fields).map(([key, params]) => [`thread/queue/${key}`, { available: true, params, required: params.filter(value => !['limit', 'cursor', 'queuedSubmissionId'].includes(value)) }]));
+  methods['thread/settings/update'] = { available: true, params: ['threadId', 'cwd', 'model', 'effort', 'sandboxPolicy', 'approvalPolicy'], required: ['threadId'] };
+  const rows = new Map<string, any>();
+  const journal = new PrivateState({ read: async key => rows.get(key), write: async row => { rows.set(row.key, structuredClone(row)); }, remove: async key => { rows.delete(key); }, clear: async () => { rows.clear(); } }); journal.activate('hashed-test-session');
   let capability: any = options.capability || { status: 'known', checkedAt: 1, methods };
   const callbacks = new Set<(host: string, event: any) => void>();
   const calls: any[] = [];
@@ -24,6 +28,7 @@ function fixture(options: { capability?: any } = {}) {
   let items: any[] = [];
   const accepted: any[] = [];
   const api = {
+    operationJournal: journal, prepareQueuedSettings: async () => { calls.push({ method: 'thread/settings/update' }); },
     runtimeIdentity: () => ({ ...identity }),
     requestHttp: async (path: string) => { calls.push({ method: 'capability', path }); return capability; },
     subscribeProtocol: (callback: any) => { callbacks.add(callback); return () => callbacks.delete(callback); },
@@ -40,7 +45,7 @@ function fixture(options: { capability?: any } = {}) {
     acceptQueuedTurn: (...args: any[]) => accepted.push(args),
   };
   const controller = useMessageQueue(api, main);
-  return { main, identity, calls, overrides, accepted, controller,
+  return { main, identity, calls, overrides, accepted, controller, api, rows, journal,
     setItems(value: any[]) { items = value; }, setCapability(value: any) { capability = value; },
     emit(method: string, params: any) { for (const callback of callbacks) callback(main.hostId, { method, params }); },
   };
@@ -99,7 +104,7 @@ test('unknown queue-add outcome is never blindly resent; a later native client i
     f.setItems([{ ...entry('accepted'), clientUserMessageId: 'unknown-client' }]); await f.controller.refresh();
     assert.match(f.controller.state.notice, /已确认/);
     assert.equal(f.controller.canMutate.value, false, 'Keep the retained draft protected until explicitly reviewed');
-    f.controller.acknowledgeUncertain(); assert.equal(f.controller.canMutate.value, true);
+    await f.controller.acknowledgeUncertain(); assert.equal(f.controller.canMutate.value, true);
   } finally { f.controller.dispose(); }
 });
 
@@ -143,6 +148,7 @@ test('unsupported queue discovery is read-only; an upgraded engine reloads capab
     assert.equal(f.controller.state.status, 'unsupported');
     assert.equal(f.calls.filter(call => call.method?.startsWith('thread/queue')).length, 0);
     const methods = Object.fromEntries(Object.entries(fields).map(([key, params]) => [`thread/queue/${key}`, { available: true, params, required: ['threadId'] }]));
+    methods['thread/settings/update'] = { available: true, params: ['threadId', 'cwd', 'model', 'effort', 'sandboxPolicy', 'approvalPolicy'], required: ['threadId'] };
     f.setCapability({ status: 'known', methods });
     f.emit('bridge/status', { engineId: 'engine-b' }); f.identity.engineId = 'engine-b';
     f.overrides.set('thread/queue/list', params => params.cursor ? { data: [entry('page2')], nextCursor: null } : { data: [entry('page1')], nextCursor: 'next' });
@@ -180,4 +186,32 @@ test('a native mutation acknowledgement immediately releases the composer while 
     assert.equal(f.controller.state.items[0].clientUserMessageId, 'ack-client');
     delayed.resolve({ data: f.controller.state.items, nextCursor: null }); await request;
   } finally { delayed.resolve({ data: [], nextCursor: null }); f.controller.dispose(); }
+});
+
+test('a controller recreated after ACK loss restores the original private receipt and blocks a new client id', async () => {
+  const f = fixture(); let reloaded: ReturnType<typeof useMessageQueue> | undefined;
+  try {
+    await f.controller.checkCapabilities(); await settle();
+    f.overrides.set('thread/queue/add', () => { throw Object.assign(new Error('ACK lost'), { uncertain: true }); });
+    await assert.rejects(f.controller.add(entry('draft').input, 'original-client'), /ACK lost/);
+    f.controller.dispose(); reloaded = useMessageQueue(f.api, f.main);
+    await reloaded.checkCapabilities(); await settle();
+    assert.equal(reloaded.state.uncertain?.clientId, 'original-client');
+    await assert.rejects(reloaded.add(entry('draft').input, 'new-client'), /尚未确认/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/queue/add').length, 1);
+  } finally { reloaded?.dispose(); f.controller.dispose(); }
+});
+test('queue add and manual start verify subsequent-turn settings before dispatch; failures never enqueue', async () => {
+  const f = fixture(); try {
+    await f.controller.checkCapabilities(); await settle();
+    f.api.prepareQueuedSettings = async () => { throw new Error('settings not confirmed'); };
+    await assert.rejects(f.controller.add(entry('draft').input, 'client'), /settings not confirmed/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/queue/add').length, 0);
+    assert.equal(f.rows.size, 0);
+    f.api.prepareQueuedSettings = async () => { f.calls.push({ method: 'confirmed-settings' }); };
+    await f.controller.add(entry('draft').input, 'client');
+    const settings = f.calls.findIndex(call => call.method === 'confirmed-settings');
+    assert.ok(settings >= 0 && settings < f.calls.findIndex(call => call.method === 'thread/queue/add'));
+    assert.equal(f.controller.settingsLocked.value, true);
+  } finally { f.controller.dispose(); }
 });

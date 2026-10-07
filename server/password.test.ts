@@ -299,6 +299,7 @@ test('persisted push generations retain the current device and cannot restore re
     const firstRestart = await PushService.create(app.dataDir, new Set([origin]), { ...pushOptions, credentialVersion: app.auth.pushCredentialVersion })
     try {
       await firstRestart.test(currentId, retained.endpoint)
+      await firstRestart.flush()
       assert.deepEqual(sent, [retained.endpoint])
       await assert.rejects(firstRestart.test(otherId, revoked.endpoint), (error: { status?: number }) => error.status === 404)
     } finally { await firstRestart.close() }

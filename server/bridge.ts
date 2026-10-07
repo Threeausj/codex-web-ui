@@ -150,7 +150,7 @@ export class Bridge {
     if (this.contexts.size > 1000) this.contexts.delete(this.contexts.keys().next().value!)
   }
   get runtime() {
-    return { connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
+    return { engineId: this.engineId, connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
       ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
       loadedThreadCount: this.subscribedThreads.size, activeThreadCount: this.activeThreads.size,
       threads: [...new Set([...this.subscribedThreads, ...this.releasedThreads.keys()])].map(id => ({ id,
@@ -380,6 +380,11 @@ export class Bridge {
       case 'thread/name/set':
         if (typeof params?.name !== 'string') return
         request.name = params.name
+        changed = {}
+        break
+      case 'thread/settings/update':
+        for (const field of ['model', 'effort', 'cwd', 'sandboxPolicy', 'approvalPolicy', 'collaborationMode', 'serviceTier'])
+          if (params && Object.prototype.hasOwnProperty.call(params, field)) request[field] = params[field]
         changed = {}
         break
       case 'thread/archive':

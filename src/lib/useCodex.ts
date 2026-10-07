@@ -13,6 +13,8 @@ import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thr
 import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
 import { revokeDevicePush } from "./pwa";
 import { useMessageQueue } from "./message-queue";
+import { clearConversationMarkdownCache } from "./conversation-markdown";
+import { privateState } from "./private-state";
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -278,12 +280,15 @@ function activateConversationCache() {
   const authentication = authenticationGeneration;
   const credential = csrfToken;
   cacheActivation = conversationSessionScope(credential).then(scope => {
-    if (authentication === authenticationGeneration && state.authenticated && csrfToken === credential)
+    if (authentication === authenticationGeneration && state.authenticated && csrfToken === credential) {
       conversationCache.activate(scope);
+      privateState.activate(scope);
+    }
   }).catch(() => {});
   return cacheActivation;
 }
 function clearConversationCaches() {
+  clearConversationMarkdownCache();
   clearTimeout(snapshotTimer);
   itemCache.clear();
   historyRestoration = null;
@@ -328,6 +333,7 @@ function clearConversationCaches() {
   for (const host of state.hosts) navigationRevisions.set(host.id, (navigationRevisions.get(host.id) || 0) + 1);
   navigationRequests.clear();
   void conversationCache.clear();
+  void privateState.clear();
 }
 function saveConversationSnapshot() {
   const thread = state.activeThread;
@@ -1020,6 +1026,20 @@ function receiveThreadChange(change: any) {
     resetEditedHistory(threadId, removed);
     updateThread(result.thread);
     if (state.activeThread?.id === threadId) void selectThread(threadId);
+    return;
+  }
+  if (method === 'thread/settings/update' && state.activeThread?.id === threadId) {
+    if (request.model) state.model = request.model;
+    if (request.effort) state.effort = request.effort;
+    if (request.sandboxPolicy) {
+      state.permission = sandboxName(request.sandboxPolicy.type);
+      state.runtimePolicy = { sandboxPolicy: request.sandboxPolicy, approvalPolicy: request.approvalPolicy ?? approvalPolicy(state.permission) };
+      state.activePermissionProfileId = '';
+      permissionSelections.set(recencyKey(state.hostId, threadId), { mode: state.permission, profileId: '' });
+    }
+    if (request.collaborationMode?.mode) state.collaborationMode = request.collaborationMode.mode;
+    if ('serviceTier' in request) state.nativeServiceTier = request.serviceTier;
+    state.permissionChangePending = state.busy;
     return;
   }
   if (method === 'turn/start') {
@@ -3340,8 +3360,8 @@ async function readDirectory(path: string) {
         a.name.localeCompare(b.name),
     );
 }
-async function readFile(path: string, options: { silentError?: boolean } = {}) {
-  const result = await http(`/hosts/${encodeURIComponent(state.hostId)}/files?path=${encodeURIComponent(path)}`, {}, !options.silentError);
+async function readFile(path: string, options: { silentError?: boolean; hostId?: string } = {}) {
+  const result = await http(`/hosts/${encodeURIComponent(options.hostId || state.hostId)}/files?path=${encodeURIComponent(path)}`, {}, !options.silentError);
   if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024 * 4) / 3))
     throw (options.silentError ? new Error("文件超过 8 MB，请使用终端读取") : fail(new Error("文件超过 8 MB，请使用终端读取")));
   const extensions: Record<string, string> = {
@@ -3354,6 +3374,7 @@ async function readFile(path: string, options: { silentError?: boolean } = {}) {
     bmp: "image/bmp",
     ico: "image/x-icon",
     avif: "image/avif",
+    pdf: "application/pdf",
   };
   const mime =
     extensions[path.split(".").pop()?.toLowerCase() ?? ""] ?? "text/plain";
@@ -3381,6 +3402,7 @@ async function readFile(path: string, options: { silentError?: boolean } = {}) {
     mime,
     content,
     binary,
+    dataBase64: mime === 'application/pdf' ? result.dataBase64 : undefined,
     dataUrl: mime.startsWith("image/")
       ? `data:${mime};base64,${result.dataBase64}`
       : undefined,
@@ -3416,6 +3438,7 @@ async function writeFile(path: string, content: string, expectedVersion: string,
   return result;
 }
 async function setServiceTier(value: string | null) {
+  requireQueueSettingsUnlocked();
   if (value !== null && !modelServiceTiers(state).some(tier => tier.id === value)) throw new Error("当前主机的模型目录未提供此服务层级");
   if (!state.connected || state.switchingHost || state.selectingThread || state.changingContext || state.modeBusy || state.busy || state.editingMessage || sendInFlight)
     throw new Error("请等待当前会话连接就绪且任务完成");
@@ -4052,6 +4075,7 @@ function projectRoots(cwd = state.projectPath, hostId = state.hostId) {
   ];
 }
 async function selectPermissionProfile(id: string) {
+  requireQueueSettingsUnlocked();
   const profile = availablePermissionProfiles(
     state.preferences.permissionProfiles,
   ).find((profile) => profile.id === id);
@@ -4068,6 +4092,7 @@ async function selectPermissionProfile(id: string) {
   await updatePreferences({ activePermissionProfileId: id });
 }
 function setPermission(mode: string) {
+  requireQueueSettingsUnlocked();
   try {
     resolvePermissionProfile(
       {
@@ -4091,6 +4116,7 @@ function setPermission(mode: string) {
     return updatePreferences({ activePermissionProfileId: "" });
 }
 async function selectDefaultPermission(mode: string) {
+  requireQueueSettingsUnlocked();
   try {
     resolvePermissionProfile({ id: 'global', name: '全局默认权限', sandboxMode: mode as any, approvalPolicy: approvalPolicy(mode), networkAccess: mode === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
     await updatePreferences({ defaultPermission: mode, activePermissionProfileId: "" });
@@ -4243,10 +4269,25 @@ async function exportThread(
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function requireQueueSettingsUnlocked() {
+  if (messageQueue?.settingsLocked.value) throw new Error('队列中的消息会自动执行；请先清空队列再调整模型或权限');
+}
+async function prepareQueuedSettings(hostId: string, threadId: string, capabilities: any) {
+  if (hostId !== state.hostId || threadId !== state.activeThread?.id) throw new Error('队列上下文已变化');
+  const profile = state.activePermissionProfileId ? availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === state.activePermissionProfileId) : undefined;
+  const policy = profile ? resolvePermissionProfile(profile, { cwd: state.projectPath, requirements: state.requirements }) : resolveWebPermissionSelection(state.permission as any, { cwd: state.projectPath, requirements: state.requirements });
+  const params: any = { threadId, cwd: state.projectPath, model: state.model || undefined, effort: state.effort,
+    sandboxPolicy: profile ? policy.sandboxPolicy : sandboxPolicy(), approvalPolicy: profile ? policy.approvalPolicy : state.runtimePolicy?.approvalPolicy ?? policy.approvalPolicy };
+  if (state.modeCapabilities.plan) params.collaborationMode = nativeCollaborationMode(state.collaborationMode, state.model, state.effort);
+  if (!methodAccepts(capabilities, 'thread/settings/update', Object.keys(params))) throw new Error('当前 Codex 无法保存下一轮设置，请更新 Codex 后使用队列');
+  await sideChatRpc(hostId, 'thread/settings/update', params);
+  state.permissionChangePending = state.busy;
+}
+
 let messageQueue: ReturnType<typeof useMessageQueue> | null = null;
 export function useCodex() {
   messageQueue ??= useMessageQueue({
-    sideChatRpc, subscribeProtocol, runtimeIdentity, requestHttp: http,
+    sideChatRpc, subscribeProtocol, runtimeIdentity, requestHttp: http, privateSessionReady: () => cacheActivation, prepareQueuedSettings,
     acceptQueuedTurn: (threadId: string, turn: any, request: any) =>
       receiveThreadChange({ threadId, method: 'turn/start', result: { turn }, request }),
   }, state);
@@ -4263,6 +4304,7 @@ export function useCodex() {
     sideChatRpc,
     subscribeProtocol,
     runtimeIdentity,
+    privateSessionReady: () => cacheActivation,
     listSubagents,
     readSubagent,
     getSubagentSnapshot,

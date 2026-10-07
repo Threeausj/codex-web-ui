@@ -1,3 +1,4 @@
+import { privateState } from './private-state';
 import { getCurrentScope, onScopeDispose, reactive, watch } from 'vue';
 import { resolvePermissionProfile } from './configuration';
 import { nativeCollaborationMode } from './conversation-modes';
@@ -41,6 +42,9 @@ export function useSideChat(api: any, mainState: any) {
   const turnRevisions = new Map<string, number>();
   const ownedThreads = new Set<string>();
   const savedMessages = new Map<string, string>();
+  const journal = api.operationJournal || privateState;
+  let restoringSave: Promise<void> | null = null;
+  const journalKey = (source: SelectedConversationText) => JSON.stringify([source.hostId, source.threadId]);
   const unknownForks = new Set<string>();
   const saveScope = (source: SelectedConversationText) => JSON.stringify([source.hostId, source.threadId, runtimeIdentity().authenticationGeneration]);
   let pendingSaveBatch: { marker: string; text: string; entries: { key: string; text: string }[] } | null = null;
@@ -109,6 +113,7 @@ export function useSideChat(api: any, mainState: any) {
     turnRevisions.clear();
   }
   async function close() {
+    if (state.saving) { state.open = false; return; }
     const hostId = state.source?.hostId;
     const threadId = state.threadId;
     const turnId = activeTurnId;
@@ -125,6 +130,8 @@ export function useSideChat(api: any, mainState: any) {
     const source = normalizeConversationSelection(value);
     if (!source || !mainState.authenticated || source.hostId !== mainState.hostId || source.threadId !== mainState.activeThread?.id)
       throw new Error('请在当前对话中重新选择文本');
+    if (state.saving && state.source && (state.source.hostId !== source.hostId || state.source.threadId !== source.threadId))
+      throw new Error('侧边分支正在保存，请等待保存回执后再打开新的侧边聊天');
     if (state.source && (state.source.hostId !== source.hostId || state.source.threadId !== source.threadId)) void close();
     if (!state.source) {
       ++generation;
@@ -132,6 +139,22 @@ export function useSideChat(api: any, mainState: any) {
       if (unknownForks.has(saveScope(source))) state.saveUncertain = 'fork';
     }
     state.source = source;
+    if (!state.threadId && !restoringSave) {
+      const version = generation;
+      restoringSave = (async () => {
+        await api.privateSessionReady?.();
+        const receipt = await journal.read('side-branch-save', journalKey(source));
+        if (!receipt || !stillCurrent(version, source) || state.threadId || !receipt.anchor) return;
+        state.anchor = receipt.anchor; state.boundary = receipt.boundary || {};
+        state.threadId = receipt.threadId || ''; state.items = receipt.items || []; state.turns = receipt.turns || [];
+        state.saveTargetThreadId = receipt.saved || ''; savedBranchPath = receipt.path || '';
+        inheritedGoalCleared = !!receipt.goalCleared; pendingSaveBatch = receipt.batch || null;
+        for (const [key, text] of receipt.messages || []) savedMessages.set(key, text);
+        emptyAnchorTail = receipt.emptyAnchorTail || null;
+        state.saveUncertain = !receipt.saved ? 'fork' : receipt.phase === 'inject' ? 'inject' : '';
+        state.notice = receipt.saved ? `已恢复保存记录，正式分支 ${receipt.saved} 可核对并继续保存。` : '已恢复未确认的分支创建记录，请先核对原生对话 ID。';
+      })().catch((cause: any) => { if (stillCurrent(version, source)) state.error = `无法恢复分支保存记录：${cause.message}`; }).finally(() => { restoringSave = null; });
+    }
     state.open = true;
     state.connected = canConnect();
     state.error = '';
@@ -190,6 +213,9 @@ export function useSideChat(api: any, mainState: any) {
     }
   }
   async function send(question: string) {
+    const preparedGeneration = generation;
+    if (restoringSave) await restoringSave;
+    if (preparedGeneration !== generation || disposed) return;
     const source = state.source && { ...state.source };
     if (!source || !sourceScope()) throw new Error('请在当前对话中重新选择文本');
     if (!question.trim()) return;
@@ -310,6 +336,7 @@ export function useSideChat(api: any, mainState: any) {
     });
   }
   async function saveBranch(name?: string) {
+    if (restoringSave) await restoringSave;
     const source = state.anchor && { ...state.anchor };
     if (!source || !state.threadId || !canConnect()) throw new Error('请先完成侧边提问并连接主机');
     if (state.busy || state.loading || requestPending || state.saving) throw new Error('请等待侧边任务完成');
@@ -331,24 +358,31 @@ export function useSideChat(api: any, mainState: any) {
     })();
     state.saving = true; state.error = '';
     let saved = state.saveTargetThreadId;
+    let forkDispatched = false;
     let phase: 'fork' | 'goal' | 'inject' | 'name' = saved ? 'goal' : 'fork';
+    const receipt: any = { anchor: source, boundary: { ...state.boundary }, threadId: state.threadId, items: JSON.parse(JSON.stringify(state.items)), turns: JSON.parse(JSON.stringify(state.turns)), emptyAnchorTail, messages: [...savedMessages], saved, path: savedBranchPath, goalCleared: inheritedGoalCleared, batch, phase };
+    const persist = () => journal.write('side-branch-save', journalKey(source), { ...receipt, saved, phase }, true);
     try {
+      await api.privateSessionReady?.(); await persist();
+      if (!current()) throw new Error('侧边聊天已切换，保存操作尚未发送');
       if (!saved) {
+        forkDispatched = true;
         const result = await call(source.hostId, 'thread/fork', {
           threadId: source.threadId, ...state.boundary, ephemeral: false, excludeTurns: true, deferGoalContinuation: true,
           sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy, cwd: mainState.activeThread?.cwd || mainState.projectPath,
         });
         saved = result?.thread?.id;
-        if (!saved || saved === source.threadId || result.thread.ephemeral) throw new Error('服务器未创建正式分支');
+        if (!saved || saved === source.threadId || result.thread.ephemeral) { saved = ''; throw Object.assign(new Error('服务器未返回可核对的正式分支 ID'), { uncertain: true }); }
+        receipt.path = typeof result.thread.path === 'string' ? result.thread.path : '';
+        if (current()) { state.saveTargetThreadId = saved; savedBranchPath = receipt.path; }
+        phase = 'goal'; await persist();
         if (!current()) return saved;
-        state.saveTargetThreadId = saved;
-        savedBranchPath = typeof result.thread.path === 'string' ? result.thread.path : '';
       }
       if (!current()) return saved;
       if (!inheritedGoalCleared) {
         phase = 'goal'; await clearInheritedGoal(source.hostId, saved);
         if (!current()) return saved;
-        inheritedGoalCleared = true;
+        inheritedGoalCleared = true; receipt.goalCleared = true;
       }
       phase = 'inject';
       if (state.saveUncertain === 'inject') {
@@ -358,14 +392,14 @@ export function useSideChat(api: any, mainState: any) {
         if (!confirmed) throw Object.assign(new Error('问答追加结果尚未确认，不能重复追加；请检查已创建分支'), { uncertain: true });
         state.saveUncertain = '';
       } else if (batch.entries.length) {
-        pendingSaveBatch = batch;
+        pendingSaveBatch = batch; await persist();
         await call(source.hostId, 'thread/inject_items', { threadId: saved, items: [{ type: 'message', role: 'user',
           content: [{ type: 'input_text', text: batch.text }] }] });
         if (!current()) return saved;
       }
       for (const item of batch.entries) savedMessages.set(item.key, item.text);
       pendingSaveBatch = null;
-      phase = 'name';
+      phase = 'name'; receipt.batch = null; receipt.messages = [...savedMessages]; await persist();
       const label = (name?.trim() || `${source.threadName || '对话'} · 侧边问答`).slice(0, 160);
       await call(source.hostId, 'thread/name/set', { threadId: saved, name: label });
       if (!current()) return saved;
@@ -375,16 +409,24 @@ export function useSideChat(api: any, mainState: any) {
         state.savedThreadId = hasUnsavedMessages() ? '' : saved;
         state.notice = '已保存并置顶正式分支：继承首次历史锚点，并追加新增可见问答作为上下文。';
       }
+      await journal.remove('side-branch-save', journalKey(source));
       return saved;
     } catch (cause: any) {
+      // Only a confirmed pre-fork failure permits a new creation attempt.
+      const failedPhase = phase;
+      // A known formal ID is retained even when saving its receipt fails.
+      if (!saved && (!forkDispatched || !cause?.uncertain)) await journal.remove('side-branch-save', journalKey(source)).catch(() => {});
+      if (saved && phase === 'inject' && !cause?.uncertain) {
+        phase = 'goal'; receipt.batch = null;
+        await persist().catch(() => {});
+      }
       if (cause?.uncertain && phase === 'fork') {
         unknownForks.add(savedScopeKey);
-        while (unknownForks.size > 32) unknownForks.delete(unknownForks.values().next().value!);
       }
       if (current()) {
         if (cause?.uncertain && phase === 'fork') state.saveUncertain = 'fork';
         if (cause?.uncertain && phase === 'inject') state.saveUncertain = 'inject';
-        if (!cause?.uncertain && phase === 'inject') pendingSaveBatch = null;
+        if (!cause?.uncertain && failedPhase === 'inject') pendingSaveBatch = null;
         state.savedThreadId = '';
         state.error = saved ? `分支已创建（${saved}），保存尚未完成：${cause?.message || String(cause)}；重试会核对并继续此分支。` :
           cause?.uncertain ? '创建分支的结果尚未确认；请先核对原生对话 ID，已阻止重复创建。' : cause?.message || String(cause);
@@ -412,6 +454,13 @@ export function useSideChat(api: any, mainState: any) {
         throw new Error('此对话不是从当前父对话创建的正式分支');
       if (metadata.thread.status?.type === 'active') throw new Error('此分支正在运行，请先等待其任务完成');
       verified = true;
+      // Record the verified ID before any further native mutation. A refresh
+      // during goal/settings cleanup must continue this branch, never fork again.
+      await api.privateSessionReady?.();
+      const recovered = { anchor: source, boundary: { ...state.boundary }, threadId: state.threadId,
+        items: JSON.parse(JSON.stringify(state.items)), turns: JSON.parse(JSON.stringify(state.turns)),
+        emptyAnchorTail, messages: [], saved: threadId, path: metadata.thread.path || '', goalCleared: false, batch: null, phase: 'goal' };
+      await journal.write('side-branch-save', journalKey(source), recovered, true);
       // Resume can continue an inherited goal before its response. Both native
       // goal clearing and settings updates work directly on unloaded threads.
       await clearInheritedGoal(source.hostId, threadId);
@@ -421,6 +470,7 @@ export function useSideChat(api: any, mainState: any) {
       state.saveTargetThreadId = threadId; state.savedThreadId = ''; state.saveUncertain = '';
       savedBranchPath = metadata.thread.path || '';
       inheritedGoalCleared = true; savedMessages.clear(); pendingSaveBatch = null;
+      await journal.write('side-branch-save', journalKey(source), { ...recovered, goalCleared: true }, true);
       unknownForks.delete(saveScope(source));
       state.notice = '已核对正式分支来源；后续保存将继续此分支，并保持只读权限。';
     } catch (cause: any) {
@@ -500,7 +550,7 @@ export function useSideChat(api: any, mainState: any) {
     if (method === 'bridge/status' && state.source && hostId === state.source?.hostId) {
       if (identity?.engineId && params.engineId && identity.engineId !== params.engineId) {
         state.threadId = '';
-        resetSavedBranch();
+        if (!state.saveTargetThreadId) resetSavedBranch();
         if (state.source && unknownForks.has(saveScope(state.source))) state.saveUncertain = 'fork';
         state.items = [];
         state.turns = [];

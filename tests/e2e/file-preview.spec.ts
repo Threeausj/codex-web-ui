@@ -44,7 +44,7 @@ test("Markdown defaults to rendered content and source/preview preserve the draf
   await expect(page.getByText("未保存", { exact: true })).toBeVisible();
   expect(fixture.writes).toHaveLength(0);
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
-  await expect(source).toHaveValue("# Draft heading\n\n尚未保存");
+  await expect(source).toHaveText("# Draft heading\n\n尚未保存", { useInnerText: true });
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => fixture.writes).toEqual([{ path: "/workspace/demo/README.md", text: "# Draft heading\n\n尚未保存" }]);
   await expect(page.getByText("已保存", { exact: true })).toBeVisible();
@@ -224,7 +224,7 @@ test("Markdown preview/source work on dark mobile screens under read-only permis
   await expect(rendered.getByRole("heading", { name: "手机预览" })).toBeVisible();
   expect(await rendered.evaluate((element: HTMLElement) => getComputedStyle(element).backgroundColor)).not.toBe("rgb(250, 250, 249)");
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "README.md 文件内容" })).toHaveAttribute("readonly", "");
+  await expect(page.getByRole("textbox", { name: "README.md 文件内容" })).toHaveAttribute("aria-readonly", "true");
   await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

@@ -145,5 +145,5 @@ test("changed files start folded in chat and workspace and streaming updates pre
   await expect(cards.first().locator(".diff-code")).toBeVisible();
   await expect(cards.last().locator(".diff-code")).toBeHidden();
   await cards.last().getByRole("button", { name: `打开文件 ${paths[2]}`, exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "c.ts 文件内容", exact: true })).toHaveValue(/文件读取正常/);
+  await expect(page.getByRole("textbox", { name: "c.ts 文件内容", exact: true })).toHaveText(/文件读取正常/);
 });

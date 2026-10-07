@@ -6,6 +6,9 @@ export type ConversationSelectionSource = {
   itemId?: string;
   threadName?: string;
   text: string;
+  path?: string;
+  startLine?: number;
+  endLine?: number;
 };
 
 export const MAX_CONVERSATION_SELECTION = 16_000;
@@ -30,6 +33,11 @@ export function normalizeConversationSelection(value: unknown): ConversationSele
   const itemId = identifier(input.itemId);
   if (turnId) result.turnId = turnId;
   if (itemId) result.itemId = itemId;
+  if (typeof input.path === 'string' && input.path.startsWith('/') && input.path.length <= 4096 && !/[\x00-\x1f\x7f]/.test(input.path)) {
+    result.path = input.path;
+    if (Number.isSafeInteger(input.startLine) && input.startLine! > 0) result.startLine = input.startLine;
+    if (Number.isSafeInteger(input.endLine) && input.endLine! >= (result.startLine || 1)) result.endLine = input.endLine;
+  }
   if (typeof input.threadName === 'string' && input.threadName.trim()) result.threadName = input.threadName.replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 160);
   return result;
 }
@@ -63,9 +71,10 @@ export function captureConversationSelection(
 export function formatConversationQuote(source: ConversationSelectionSource): string {
   const normalized = normalizeConversationSelection(source);
   if (!normalized) return '';
-  return `[引用对话：${normalized.threadName || normalized.threadId}]\n` + normalized.text.split('\n').map(line => `> ${line}`).join('\n');
+  const origin = normalized.path ? `引用文件：${normalized.path}${normalized.startLine ? ':' + normalized.startLine + (normalized.endLine && normalized.endLine !== normalized.startLine ? '–' + normalized.endLine : '') : ''}` : `引用对话：${normalized.threadName || normalized.threadId}`;
+  return `[${origin}]\n` + normalized.text.split('\n').map(line => `> ${line}`).join('\n');
 }
 
 export function conversationSelectionKey(source: ConversationSelectionSource | null | undefined): string {
-  return source ? JSON.stringify([source.hostId, source.threadId, source.turnId || '', source.itemId || '', source.text]) : '';
+  return source ? JSON.stringify([source.hostId, source.threadId, source.turnId || '', source.itemId || '', source.path || '', source.startLine || '', source.endLine || '', source.text]) : '';
 }

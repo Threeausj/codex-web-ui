@@ -120,7 +120,7 @@ for (const viewport of [
     await actualDiffLines(last.locator(".diff-code"), changes.at(-1)!.diff);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
     await last.getByRole("button", { name: `打开文件 ${changes.at(-1)!.path}`, exact: true }).click();
-    await expect(panel(page).getByRole("textbox", { name: "long-component-name-45.vue 文件内容" })).toHaveValue(/文件读取正常/);
+    await expect(panel(page).getByRole("textbox", { name: "long-component-name-45.vue 文件内容" })).toHaveText(/文件读取正常/);
     expect(mock.request("fs/readFile")?.params.path).toBe(changes.at(-1)!.path);
   });
 }

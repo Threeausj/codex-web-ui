@@ -1,3 +1,5 @@
+import { nativeWorktreeWriters } from './worktree-writers.js';
+import { AutomationService, registerAutomations } from './automations.js';
 import express, { type ErrorRequestHandler, type RequestHandler } from 'express'
 import multer from 'multer'
 import http from 'node:http'
@@ -76,9 +78,11 @@ export async function createApp(options: AppOptions = {}) {
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
   bridgeOptions.resolveSshHostKeyPin ??= async host => (await sshHostKeys.connectionKnownHosts(host)) ?? bridgeOptions.sshHostKeyPin
+  let automations: AutomationService | undefined;
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
     push.observe(host, message, responseMethod)
+    automations?.observe(host, message)
     return externalProtocolObserver?.(host, message, responseMethod)
   }
   const bridges = new Map<string, Bridge>()
@@ -110,6 +114,9 @@ export async function createApp(options: AppOptions = {}) {
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
   app.use('/api', auth.requireAuth, auth.requireCsrf)
   registerPush(app, push)
+  automations = new AutomationService(dataDir, { getBridge, getHost: id => storage.host(id) })
+  await automations.initialize()
+  registerAutomations(app, automations)
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
   registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions,
@@ -122,7 +129,10 @@ export async function createApp(options: AppOptions = {}) {
         if (!result.thread?.cwd) throw Object.assign(new Error('无法确认运行中会话的工作目录，请稍后重试'), { status: 409 })
         if (result.thread.cwd === directory || result.thread.cwd.startsWith(directory + '/')) matched.push(entry.id)
       }
-      return matched
+      const host = storage.host(hostId)
+      if (!host) throw Object.assign(new Error('主机不存在'), { status: 404 })
+      try { return [...new Set([...matched, ...await nativeWorktreeWriters(host, bridge, directory, bridgeOptions)])] }
+      catch { throw Object.assign(new Error('无法核对 CLI／桌面 Codex 的工作树占用；为保留运行中的目录，已停止清理。请关闭占用客户端后重试。'), { status: 409 }) }
     },
   })
   registerNavigation(app, getBridge)
@@ -255,7 +265,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -302,12 +312,15 @@ export async function createServer(options: AppOptions = {}) {
     stopListeningForRevocation()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
+    let automationFailure: unknown
+    try { await context.automations.close() } catch (cause) { automationFailure = cause }
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
     for (const ws of wss.clients) ws.terminate()
     wss.close()
     await context.push.close()
     if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    if (automationFailure) throw automationFailure
   }
   return { ...context, server, wss, close }
 }

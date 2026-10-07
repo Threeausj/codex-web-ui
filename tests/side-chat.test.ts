@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { nextTick, reactive } from 'vue';
+import { PrivateState } from '../src/lib/private-state';
 import { useSideChat } from '../src/lib/side-chat';
 
 const selected = { hostId: 'local', threadId: 'parent', turnId: 'parent-turn', itemId: 'parent-answer', text: 'NAS Git 读取不再依赖 bwrap；$dangerous', threadName: '部署项目' };
@@ -56,7 +57,10 @@ function fixture() {
   const overrides = new Map<string, (params: any) => any>();
   const identity = { authenticationGeneration: 1, engineId: 'engine-a' };
   const emit = (method: string, params: any, id?: string) => [...listeners].map(listener => listener('local', { method, params, ...(id ? { id } : {}) }));
+  const rows = new Map<string, any>();
+  const journal = new PrivateState({ read: async key => rows.get(key), write: async row => { rows.set(row.key, structuredClone(row)); }, remove: async key => { rows.delete(key); }, clear: async () => { rows.clear(); } }); journal.activate('hashed-test-session');
   const api = {
+    operationJournal: journal,
     runtimeIdentity: () => ({ ...identity }),
     subscribeProtocol: (listener: any) => { listeners.add(listener); return () => listeners.delete(listener); },
     async sideChatRpc(hostId: string, method: string, params: any) {
@@ -71,8 +75,56 @@ function fixture() {
     },
   };
   const controller = useSideChat(api, main);
-  return { controller, main, api, calls, overrides, identity, emit };
+  return { controller, main, api, calls, overrides, identity, emit, rows, journal };
 }
+
+test('closing the panel during formal branch creation finishes the save without duplicating its fork', async () => {
+  const f = fixture(); const held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    f.overrides.set('thread/fork', () => held.promise);
+    const saved = f.controller.saveBranch(); await new Promise(resolve => setImmediate(resolve));
+    await f.controller.close(); assert.equal(f.controller.state.open, false); assert.equal(f.controller.state.saving, true);
+    held.resolve({ thread: { id: 'formal', ephemeral: false, path: '/sessions/formal.jsonl' } });
+    assert.equal(await saved, 'formal'); assert.equal(f.controller.state.saving, false);
+    assert.equal(f.calls.filter(call => call.method === 'thread/inject_items').length, 1);
+    f.controller.prepare(selected); assert.equal(await f.controller.saveBranch(), 'formal');
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2, 'One ephemeral question fork and one formal save fork');
+    assert.equal(f.rows.size, 0);
+  } finally { held.resolve({ thread: { id: 'formal', ephemeral: false } }); f.controller.dispose(); }
+});
+
+test('a verified formal ID survives controller replacement before goal cleanup finishes', async () => {
+  const f = fixture(); let reloaded: ReturnType<typeof useSideChat> | undefined;
+  try {
+    f.controller.prepare(selected); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    f.overrides.set('thread/fork', () => { throw Object.assign(new Error('ACK lost'), { uncertain: true }); });
+    await assert.rejects(f.controller.saveBranch(), /ACK lost/);
+    f.overrides.set('thread/read', () => ({ thread: { id: 'formal-recovered', forkedFromId: 'parent', ephemeral: false, path: '/sessions/formal.jsonl', status: { type: 'idle' } } }));
+    f.overrides.set('thread/goal/get', () => { throw new Error('cleanup offline'); });
+    await assert.rejects(f.controller.resumeSavedBranch('formal-recovered'), /cleanup offline/);
+    f.controller.dispose(); reloaded = useSideChat(f.api, f.main); reloaded.prepare(selected);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reloaded.state.saveTargetThreadId, 'formal-recovered'); assert.equal(reloaded.state.saveUncertain, '');
+    f.overrides.delete('thread/goal/get'); await reloaded.saveBranch();
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2);
+    assert.equal(f.calls.find(call => call.method === 'thread/inject_items')?.params.threadId, 'formal-recovered');
+  } finally { reloaded?.dispose(); f.controller.dispose(); }
+});
+
+test('a confirmed failed formal fork clears its receipt so a refresh can safely retry once', async () => {
+  const f = fixture(); let reloaded: ReturnType<typeof useSideChat> | undefined;
+  try {
+    f.controller.prepare(selected); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    f.overrides.set('thread/fork', () => { throw new Error('native rejection'); });
+    await assert.rejects(f.controller.saveBranch(), /native rejection/); assert.equal(f.rows.size, 0);
+    f.controller.dispose(); reloaded = useSideChat(f.api, f.main); reloaded.prepare(selected); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reloaded.state.saveUncertain, '');
+  } finally { reloaded?.dispose(); f.controller.dispose(); }
+});
 
 test('selection opens without inference; explicit question forks an isolated readonly branch and clears only its inherited goal', async () => {
   const value = fixture();
@@ -149,6 +201,7 @@ test('a late fork after close is unsubscribed and never starts a model turn', as
     value.overrides.set('thread/fork', () => held.promise);
     value.controller.prepare(selected);
     const send = value.controller.send('解释');
+    await new Promise(resolve => setImmediate(resolve));
     await value.controller.close();
     held.resolve({ thread: { id: 'late-side', ephemeral: true } });
     await send;

@@ -3656,3 +3656,9 @@ textarea.file-editor {
 .diff-stats .diff-count-add { color: var(--green); }
 .diff-stats .diff-count-remove { color: var(--red); }
 .tool-failed > summary, .tool-failed .tool-status { color: var(--red); }
+
+.file-tab-bar { display:flex; flex-shrink:0; overflow-x:auto; border-bottom:1px solid var(--border); padding:0 6px; gap:2px }
+.file-tab-bar > div { display:flex; align-items:center; border-bottom:2px solid transparent; min-width:0 }
+.file-tab-bar > div.active { border-color:var(--accent); background:var(--surface) }
+.file-tab-bar > div > button:first-child { display:flex; align-items:center; gap:5px; max-width:180px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:9px 5px; font-size:11px; color:var(--text) }
+.file-tab-bar .icon-button { width:24px; height:24px; flex-shrink:0 }

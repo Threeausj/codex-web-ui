@@ -1,6 +1,8 @@
 <script setup lang="ts">
+import { historyDisclosures } from "../lib/history-disclosures";
+import { fileLinkLocation } from "../lib/file-preview";
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { conversationMarkdown } from '../lib/conversation-markdown'
+import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/conversation-markdown'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
 import { reviewFindings } from '../lib/review'
@@ -43,10 +45,17 @@ watch(text, value => {
 })
 watch(() => props.busy, busy => { if (!busy) renderedText.value = text.value })
 onBeforeUnmount(() => { if (markdownFrame != null) cancelAnimationFrame(markdownFrame) })
+const markdownBlocks = computed(() => props.item.type === 'agentMessage' ? conversationMarkdownBlocks(renderedText.value, props.hostId, props.cwd || props.item.cwd) : []);
 const html = computed(() => conversationMarkdown(renderedText.value, props.hostId, props.cwd || props.item.cwd))
 const findings = computed(() => props.item.type === 'exitedReviewMode' ? reviewFindings(props.item.review) : []);
-const toolExpanded = ref(false)
-const expandedFiles = ref(new Set<string>())
+const disclosures = historyDisclosures();
+const reasoningExpanded = ref(disclosures?.reasoning.get(props.item.id) ?? !!props.busy);
+watch(reasoningExpanded, value => disclosures?.reasoning.set(props.item.id, value));
+watch(() => props.busy, (current, previous) => { if (previous && !current) reasoningExpanded.value = false; });
+const toolExpanded = ref(disclosures?.tools.has(props.item.id) || false)
+watch(toolExpanded, value => { if (value) disclosures?.tools.add(props.item.id); else disclosures?.tools.delete(props.item.id); })
+const expandedFiles = ref(disclosures?.files.get(props.item.id) || new Set<string>())
+if (disclosures) disclosures.files.set(props.item.id, expandedFiles.value)
 function toggleFile(event: Event, path: string) {
   if ((event.currentTarget as HTMLDetailsElement).open) expandedFiles.value.add(path)
   else expandedFiles.value.delete(path)
@@ -111,7 +120,7 @@ function onLink(event: MouseEvent) {
   const anchor = (event.target as Element).closest('a')
   if (!anchor) return
   const href = anchor.getAttribute('href') || ''
-  if (href.startsWith('/') && !href.startsWith('//')) { event.preventDefault(); emit('openFile', href.replace(/:\d+(?::\d+)?$/, '')) }
+  if (href.startsWith('/') && !href.startsWith('//')) { event.preventDefault(); const location = fileLinkLocation(href); if (location) emit('openFile', location.path, location.line); }
   else { anchor.setAttribute('target', '_blank'); anchor.setAttribute('rel', 'noopener noreferrer') }
 }
 </script>
@@ -137,7 +146,7 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" v-html="html" @click="onLink"></div>
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
     <div v-else class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
     <div v-if="text && (!busy || canFork)" class="message-actions">
       <button class="icon-button" @click="copy" :title="copied ? '已复制' : '复制回复'" aria-label="复制回复"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
@@ -145,18 +154,18 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <template v-else-if="item.type === 'reasoning'">
-    <details v-if="reasoningSummary" class="reasoning-item" :open="!!busy">
+    <details v-if="reasoningSummary" class="reasoning-item" :open="reasoningExpanded" @toggle="reasoningExpanded = ($event.currentTarget as HTMLDetailsElement).open">
       <summary><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
       <div class="reasoning-content">{{ reasoningSummary }}</div>
     </details>
   </template>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon :name="item.status === 'inProgress' ? 'LoaderCircle' : 'RefreshCw'" :size="13" :class="{ spin: item.status === 'inProgress' }" />{{ item.status === 'inProgress' ? '正在压缩上下文…' : item.status === 'failed' ? '上下文压缩失败' : item.status === 'interrupted' ? '上下文压缩已取消' : '上下文已压缩' }}<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
-  <details v-else class="tool-item" @toggle="toolExpanded = ($event.currentTarget as HTMLDetailsElement).open" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
+  <details v-else class="tool-item" @toggle="toolExpanded = ($event.currentTarget as HTMLDetailsElement).open" :open="toolOpenByDefault || toolExpanded" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
     <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <template v-if="toolExpanded">
     <div v-if="item.type === 'fileChange'" class="file-changes">
-      <details v-for="change in item.changes" :key="change.path" class="file-diff" @toggle="toggleFile($event, change.path)">
+      <details v-for="change in item.changes" :key="change.path" class="file-diff" :open="expandedFiles.has(change.path)" @toggle="toggleFile($event, change.path)">
         <summary class="file-diff-heading"><Icon name="FileText" :size="15" /><span class="file-diff-path" :title="change.path">{{ change.path }}</span><span class="diff-stats"><span class="diff-count-add">+{{ diffStats(change.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(change.diff).removed }}</span></span><span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="emit('openFile', change.path)"><Icon name="ArrowUpRight" :size="14" /></button><Icon name="ChevronDown" :size="14" /></summary>
         <pre v-if="expandedFiles.has(change.path)" class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </details>

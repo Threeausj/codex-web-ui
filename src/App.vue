@@ -22,6 +22,7 @@ import WorkspacePanel from "./components/WorkspacePanel.vue";
 import ReviewPanel from "./components/ReviewPanel.vue";
 import ResizableWorkspace from "./components/ResizableWorkspace.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
 import ProjectDialog from "./components/ProjectDialog.vue";
@@ -50,6 +51,7 @@ const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
 const settingsOpen = ref(false);
 const resourcesOpen = ref(false);
+const automationsOpen = ref(false);
 const reviewOpen = ref(false);
 const settingsTab = ref("general");
 const paletteOpen = ref(false);
@@ -428,6 +430,7 @@ async function projectAction({
   }
 }
 function openSettings(tab = "general") {
+  automationsOpen.value = false;
   resourcesOpen.value = false;
   settingsTab.value = tab;
   settingsOpen.value = true;
@@ -435,6 +438,7 @@ function openSettings(tab = "general") {
   sidebarOpen.value = false;
 }
 function openResources() {
+  automationsOpen.value = false;
   resourcesOpen.value = true;
   settingsOpen.value = false;
   sidebarOpen.value = false;
@@ -833,6 +837,7 @@ watch(() => [state.authenticated, state.loading], () => {
           ></span
           ><Icon name="ChevronDown" :size="12" />
         </div>
+        <button class="sidebar-action automations-button" @click="automationsOpen = true; settingsOpen = resourcesOpen = sidebarOpen = false"><Icon name="Clock" :size="17" /><span>自动化</span><Icon name="ChevronRight" :size="14" /></button>
         <button class="sidebar-action resources-button" @click="openResources">
           <Icon name="Server" :size="17" /><span>资源管理</span><Icon name="ChevronRight" :size="14" />
         </button>
@@ -1203,6 +1208,8 @@ watch(() => [state.authenticated, state.loading], () => {
         :open-line="workspaceLine"
         @close="workspaceOpen = false"
         @error="showError"
+        @add="addToConversation"
+        @ask="askInSideChat"
       />
     </ResizableWorkspace>
     <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" panel-id="side-chat-panel">
@@ -1216,6 +1223,7 @@ watch(() => [state.authenticated, state.loading], () => {
       :state="state"
       @close="editingProject = null"
     />
+    <AutomationsPanel v-if="automationsOpen && state.authenticated" :api="api" :state="state" @close="automationsOpen = false" @open="(hostId, threadId) => { automationsOpen = false; selectThread({ hostId, id: threadId }); }" />
     <ResourcePanel
       v-if="resourcesOpen"
       :api="api"
