@@ -259,7 +259,7 @@ test('thread RPC responses provide notification titles without an extra metadata
   const observedResponses: string[] = []
   const app = await application({}, undefined, (_message, responseMethod) => { if (responseMethod) observedResponses.push(responseMethod) }, message => {
     if (!methods.includes(message.method!)) return {}
-    const thread = { id: message.method!, name: `${message.method} 的对话`, preview: 'Unused initial prompt' }
+    const thread = { id: message.method!, source: 'cli', name: `${message.method} 的对话`, preview: 'Unused initial prompt' }
     return ['thread/list', 'thread/search'].includes(message.method!) ? { data: [thread], nextCursor: null } : { thread }
   })
   try {
@@ -324,7 +324,7 @@ test('notification titles normalize whitespace, fall back to preview and fit the
 
 test('new unnamed threads resolve persisted metadata through a read-only RPC and reuse it', async () => {
   const app = await application({}, undefined, undefined, message => {
-    if (message.method === 'thread/read') return { thread: { id: 'fresh-thread', name: null, preview: '新会话第一条消息' } }
+    if (message.method === 'thread/read') return { thread: { id: 'fresh-thread', source: 'cli', name: null, preview: '新会话第一条消息' } }
     return {}
   })
   try {
@@ -402,7 +402,7 @@ test('a live rename received during a metadata lookup wins over its older RPC re
     fixture.receive({ method: 'turn/completed', params: { threadId: 'renaming-thread', turn: { id: 'before-read-returned', status: 'completed' } } })
     await started
     fixture.receive({ method: 'thread/name/updated', params: { threadId: 'renaming-thread', threadName: '刚修改的对话名' } })
-    finishRead!({ thread: { id: 'renaming-thread', name: '旧响应中的名称', preview: '' } })
+    finishRead!({ thread: { id: 'renaming-thread', source: 'cli', name: '旧响应中的名称', preview: '' } })
     await app.push.flush()
     fixture.receive({ method: 'turn/completed', params: { threadId: 'renaming-thread', turn: { id: 'after-read-returned', status: 'completed' } } })
     await app.push.flush()
@@ -559,4 +559,28 @@ test('delivery concurrency is bounded and slow or failed push delivery does not 
     assert.equal(peak, 4)
     assert.equal(push.hasActiveSubscriptions, true)
   } finally { await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('subagent completion and failure never notify, including cold metadata and renamed lookup races; main completion still does', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-child-'))
+  const sent: any[] = []; let resolve: (value: unknown) => void = () => {}; let lookups = 0
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async (_subscription, payload) => { sent.push(JSON.parse(payload)) }, resolveThread: async (_host, id) => { lookups++; if (id === 'cold-child') return new Promise(done => { resolve = done }); return { id, source: 'cli', name: '主任务' } } })
+  try {
+    await service.subscribe('child-test-session', subscription('child-notifications'))
+    const host = { id: 'local', name: 'Fixture', kind: 'local' } as const
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'child', name: '子任务', source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } } } })
+    const done = (threadId: string, turn: string, status = 'completed') => service.observe(host, { method: 'turn/completed', params: { threadId, turn: { id: turn, status } } })
+    done('child', 'a'); done('child', 'b', 'failed')
+    service.observe(host, { method: 'item/completed', params: { threadId: 'parent', item: { type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['spawn-child'] } } })
+    done('spawn-child', 'c')
+    done('cold-child', 'd')
+    while (!lookups) await new Promise<void>(done => setImmediate(done))
+    service.observe(host, { method: 'thread/name/updated', params: { threadId: 'cold-child', threadName: '重命名子任务' } })
+    resolve({ id: 'cold-child', name: '旧名称', source: { subagent: 'review' } })
+    await service.flush(); assert.equal(sent.length, 0)
+    done('parent', 'e'); await service.flush(); assert.equal(sent.length, 1); assert.equal(sent[0].title, '主任务')
+    done('parent', 'e'); await service.flush(); assert.equal(sent.length, 1)
+    const other = { id: 'remote', name: 'Other', kind: 'local' } as const
+    done('child', 'again'); service.observe(other, { method: 'thread/started', params: { thread: { id: 'child', name: '另一主机主任务', source: 'cli' } } }); service.observe(other, { method: 'turn/completed', params: { threadId: 'child', turn: { id: 'a', status: 'completed' } } }); await service.flush(); assert.equal(sent.length, 2)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })

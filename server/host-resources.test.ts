@@ -178,3 +178,87 @@ test('isolated real Web Codex releases native writer locks so another client can
   await assert.rejects(web.request('thread/resume', { threadId }), /已释放/)
   assert.equal(web.runtime.pid, undefined)
 })
+
+test('isolated session close releases one writer, preserves another writer and PID, and retains history', { skip: !hasCodex, timeout: 30_000 }, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-session-close-')); const home = path.join(directory, 'home'); await fs.mkdir(home)
+  await fs.writeFile(path.join(home, 'config.toml'), 'model="offline-test"\nmodel_provider="offline-test"\n[model_providers.offline-test]\nname="No model calls"\nbase_url="http://127.0.0.1:9/v1"\nwire_api="responses"\nrequires_openai_auth=false\n')
+  const web = new Bridge(host, { codexBin, codexHome: home, cwd: directory }); const desktop = new Bridge(host, { codexBin, codexHome: home, cwd: directory })
+  t.after(async () => { await Promise.all([web.pause(), desktop.pause()]); web.close(); desktop.close(); await fs.rm(directory, { recursive: true, force: true }) })
+  const threads: string[] = []
+  for (const name of ['关闭测试会话', '保持连接的会话']) {
+    const response = await web.request('thread/start', { cwd: directory }) as any
+    threads.push(response.thread.id)
+    await web.request('thread/inject_items', { threadId: response.thread.id, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: name }] }] })
+    await web.request('thread/name/set', { threadId: response.thread.id, name })
+  }
+  const [first, second] = threads as [string, string]; const pid = web.runtime.pid
+  const journal: unknown[] = []; const persist = async () => { journal.push(JSON.parse(JSON.stringify([...web.releasedThreads]))) }
+  await web.releaseThread(first, persist)
+  assert.equal(web.runtime.pid, pid); assert.equal(web.connected, true); assert.equal(web.runtime.loadedThreadCount, 1)
+  assert.equal(web.runtime.threads.find(thread => thread.id === first)?.released, true)
+  assert.equal(web.runtime.threads.find(thread => thread.id === second)?.name, '保持连接的会话')
+  assert.equal(web.releasedThreads.get(first)?.restoreThreadIds.length, 0)
+  assert.ok(journal.length >= 2)
+  await assert.rejects(web.request('thread/resume', { threadId: first }), /已关闭/)
+  await assert.rejects(web.request('turn/start', { threadId: first, input: [] }), /已关闭/)
+  const resumed = await desktop.request('thread/resume', { threadId: first, excludeTurns: true }) as any
+  assert.equal(resumed.thread.name, '关闭测试会话')
+  await assert.rejects(desktop.request('thread/resume', { threadId: second, excludeTurns: true }), /active writer/)
+  const history = await desktop.request('thread/read', { threadId: first, includeTurns: true }) as any
+  assert.match(JSON.stringify(history.thread), /关闭测试会话/)
+  await web.reconnectThread(first, persist)
+  await assert.rejects(web.request('thread/resume', { threadId: first }), /active writer/)
+})
+
+test('session close journals and restores descendants, blocks stale writes, and recovers partial restoration failures', async t => {
+  const input = new PassThrough(), output = new PassThrough(); const methods: string[] = []; let buffer = ''; let failChild = true
+  input.on('data', chunk => { buffer += chunk; let end: number; while ((end = buffer.indexOf('\n')) >= 0) {
+    const request = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1); if (request.id === undefined) continue
+    const id = request.params?.threadId; methods.push(`${request.method}:${id || ''}`)
+    let result: any = {}; let error: any
+    if (request.method === 'thread/resume') result = { thread: { id, name: `Name ${id}` } }
+    if (request.method === 'thread/list') result = { data: [{ id: 'child' }], nextCursor: null }
+    if (request.method === 'thread/archive') for (const threadId of ['parent', 'child', 'late-child']) output.write(JSON.stringify({ method: 'thread/archived', params: { threadId } }) + '\n')
+    if (request.method === 'thread/unarchive' && id === 'child' && failChild) error = { code: -32000, message: 'Fixture disk failure' }
+    queueMicrotask(() => output.write(JSON.stringify({ id: request.id, ...(error ? { error } : { result }) }) + '\n'))
+  } })
+  const bridge = new Bridge(host, { transportFactory: () => ({ input, output, events: new EventEmitter(), dispose: () => { input.destroy(); output.destroy() } }) }); t.after(() => bridge.close())
+  await bridge.request('thread/resume', { threadId: 'parent' }); await bridge.request('thread/resume', { threadId: 'other' })
+  const saved: any[] = []; const persist = async () => { saved.push(JSON.parse(JSON.stringify([...bridge.releasedThreads]))) }
+  await assert.rejects(bridge.releaseThread('parent', persist), /disk failure/)
+  assert.deepEqual(bridge.releasedThreads.get('parent')?.restoreThreadIds, ['child', 'late-child'])
+  await assert.rejects(bridge.request('thread/resume', { threadId: 'parent' }), /已关闭/)
+  await assert.rejects(bridge.request('turn/start', { threadId: 'child' }), /已关闭/)
+  assert.equal(bridge.runtime.threads.find(thread => thread.id === 'other')?.loaded, true)
+  assert.ok(saved.some(snapshot => snapshot[0]?.[1].restoreThreadIds.includes('late-child')))
+  failChild = false; await bridge.reconnectThread('parent', persist)
+  assert.equal(bridge.releasedThreads.size, 0)
+  assert.ok(methods.includes('thread/unarchive:late-child'))
+  assert.ok(!methods.some(method => method.includes('thread/unarchive:already-archived')))
+  const fresh = new Bridge(host, {}, new Map([['parent', { name: 'Persistent released name', restoreThreadIds: [] }]])); t.after(() => fresh.close())
+  assert.equal(fresh.runtime.threads[0]!.name, 'Persistent released name')
+  await assert.rejects(bridge.releaseThread('unknown', persist), /没有由 Web/)
+})
+
+test('persisted session release journals restore history on startup without reacquiring its writer', async t => {
+  const { createServer } = await import('./app.js')
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-release-recovery-'))
+  await fs.writeFile(path.join(directory, 'runtime-state.json'), JSON.stringify({ pausedHostIds: [], releasedThreads: [{ hostId: 'local', threadId: 'parent', name: '已释放会话', restoreThreadIds: ['parent', 'child'] }] }), { mode: 0o600 })
+  const sent: any[] = []
+  const context = await createServer({ dataDir: directory, codexHome: directory, cwd: directory, password: 'release-recovery-test', secureCookie: false, serveStatic: false, bridgeOptions: { transportFactory: () => {
+    const input = new PassThrough(), output = new PassThrough(); let buffer = ''
+    input.on('data', chunk => { buffer += chunk; let end: number; while ((end = buffer.indexOf('\n')) >= 0) { const request = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1); sent.push(request); if (request.id !== undefined) queueMicrotask(() => output.write(JSON.stringify({ id: request.id, result: {} }) + '\n')) } })
+    return { input, output, events: new EventEmitter(), dispose: () => { input.destroy(); output.destroy() } }
+  } } })
+  t.after(async () => { await context.close(); await fs.rm(directory, { recursive: true, force: true }) })
+  const bridge = await context.getBridge('local')
+  assert.deepEqual(sent.filter(request => request.method === 'thread/unarchive').map(request => request.params.threadId), ['parent', 'child'])
+  assert.equal(bridge.runtime.threads[0]!.released, true)
+  assert.equal(bridge.runtime.threads[0]!.name, '已释放会话')
+  assert.equal(bridge.runtime.threads[0]!.loaded, false)
+  await assert.rejects(bridge.request('thread/resume', { threadId: 'parent' }), /已关闭/)
+  const saved = JSON.parse(await fs.readFile(path.join(directory, 'runtime-state.json'), 'utf8'))
+  assert.deepEqual(saved.releasedThreads[0].restoreThreadIds, [])
+  assert.equal((await fs.stat(path.join(directory, 'runtime-state.json'))).mode & 0o777, 0o600)
+  assert.ok(!sent.some(request => request.method === 'thread/archive' || request.method === 'thread/resume'))
+})

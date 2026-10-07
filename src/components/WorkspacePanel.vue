@@ -8,6 +8,7 @@ import {
   watch,
 } from "vue";
 import Icon from "./Icon.vue";
+import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
 import { isImagePath, isMarkdownPath } from "../lib/file-preview";
 const InteractiveTerminal = defineAsyncComponent(
@@ -37,6 +38,8 @@ const tabs = [
   { id: "git", name: "Git", icon: "GitBranch" },
   { id: "changes", name: "变更", icon: "GitCompareArrows" },
 ];
+const fileSearch = ref("");
+const changeSearch = ref("");
 const directory = ref("");
 const directoryInput = ref("");
 const entries = ref<any[]>([]);
@@ -70,8 +73,10 @@ const changes = computed(() => {
       for (const change of item.changes || []) map.set(change.path, change);
   return [...map.values()];
 });
+const filteredChanges = computed(() => changes.value.filter(change => change.path.toLocaleLowerCase().includes(changeSearch.value.trim().toLocaleLowerCase())));
+const changeTotals = computed(() => changes.value.reduce((sum, change) => { const count = diffStats(change.diff); return { added: sum.added + count.added, removed: sum.removed + count.removed } }, { added: 0, removed: 0 }));
 const sortedEntries = computed(() =>
-  [...entries.value].sort(
+  [...entries.value].filter(entry => (entry.fileName || entry.name).toLocaleLowerCase().includes(fileSearch.value.trim().toLocaleLowerCase())).sort(
     (a, b) =>
       Number(b.isDirectory || b.type === "directory") -
         Number(a.isDirectory || a.type === "directory") ||
@@ -516,6 +521,8 @@ defineExpose({
         </div>
       </template>
       <div v-else class="file-tree">
+        <label class="workspace-file-search"><Icon name="Search" :size="14" /><input v-model="fileSearch" aria-label="搜索文件名" placeholder="搜索当前目录文件名" /><button v-if="fileSearch" class="icon-button" aria-label="清除文件名搜索" @click="fileSearch = ''"><Icon name="X" :size="13" /></button></label>
+        <p v-if="entries.length && !sortedEntries.length" class="file-search-empty">没有匹配的文件</p>
         <div
           v-for="entry in sortedEntries"
           :key="entry.fileName || entry.name"
@@ -774,14 +781,16 @@ defineExpose({
     </div>
     <div v-else class="workspace-body changes-view">
       <div class="changes-heading">
-        <span>本次对话 · {{ changes.length }} 个文件</span>
+        <span>本次对话 · {{ changes.length }} 个文件</span><span class="diff-stats"><span class="diff-count-add">+{{ changeTotals.added }}</span><span class="diff-count-remove">−{{ changeTotals.removed }}</span></span>
       </div>
-      <details v-for="change in changes" :key="`${state.hostId}:${state.activeThread?.id || ''}:${change.path}`" class="change-card">
+      <label class="workspace-file-search"><Icon name="Search" :size="14" /><input v-model="changeSearch" aria-label="搜索变更文件名" placeholder="搜索变更文件名" /><button v-if="changeSearch" class="icon-button" aria-label="清除变更搜索" @click="changeSearch = ''"><Icon name="X" :size="13" /></button></label>
+      <p v-if="changes.length && !filteredChanges.length" class="file-search-empty">没有匹配的变更文件</p>
+      <details v-for="change in filteredChanges" :key="`${state.hostId}:${state.activeThread?.id || ''}:${change.path}`" class="change-card">
         <summary class="file-diff-heading" :title="change.path">
-          <Icon name="FileText" :size="15" /><span>{{
+          <Icon name="FileText" :size="15" /><span class="change-path">{{
             change.path.replace(state.projectPath + "/", "")
           }}</span
-          ><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="openFile(change.path)"><Icon name="ArrowUpRight" :size="14" /></button
+          ><span class="diff-stats"><span class="diff-count-add">+{{ diffStats(change.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(change.diff).removed }}</span></span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="openFile(change.path)"><Icon name="ArrowUpRight" :size="14" /></button
           ><Icon name="ChevronDown" :size="14" />
         </summary>
         <pre
@@ -798,6 +807,12 @@ defineExpose({
 </template>
 
 <style scoped>
+.changes-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.workspace-file-search { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); }
+.workspace-file-search input { min-width: 0; width: 100%; border: 0; background: transparent; font-size: 12px; padding: 4px 0; }
+.workspace-file-search .icon-button { width: 24px; height: 24px; flex-shrink: 0; }
+.file-search-empty { padding: 12px 8px; color: var(--muted); font-size: 12px; }
+
 .change-card > summary { list-style: none; cursor: pointer; }
 .change-card > summary::-webkit-details-marker { display: none; }
 .change-card > summary > svg:last-child { transition: transform .15s; }

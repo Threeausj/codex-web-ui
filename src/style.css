@@ -998,12 +998,11 @@ hr {
   padding: 14px 0;
 }
 .tool-item {
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  margin: 10px 0 16px;
-  font-size: 10px;
-  overflow: hidden;
-  background: var(--surface);
+  border: 0;
+  margin: 2px 0;
+  font-size: 12px;
+  min-width: 0;
+  background: transparent;
 }
 .tool-item summary {
   list-style: none;
@@ -1011,16 +1010,17 @@ hr {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  padding: 11px 13px;
+  padding: 5px 0;
   min-width: 0;
   color: var(--muted);
 }
 .tool-title {
   flex-shrink: 0;
-  color: var(--text);
-  font-size: 11px;
+  color: var(--muted);
+  font-size: 12px;
 }
 .tool-command {
+  font-family: inherit;
   flex: 1;
   overflow: hidden;
   white-space: nowrap;
@@ -1030,6 +1030,7 @@ hr {
   color: var(--muted);
 }
 .tool-status {
+  flex-shrink: 0;
   margin-left: auto;
   font-size: 9px;
   white-space: nowrap;
@@ -1039,7 +1040,10 @@ hr {
 }
 .tool-content {
   border-top: 1px solid var(--border);
-  padding: 13px;
+  padding: 10px 12px;
+  margin: 4px 0 8px 24px;
+  background: var(--soft);
+  border-radius: 6px;
   max-height: 420px;
   overflow: auto;
 }
@@ -2652,13 +2656,14 @@ hr {
   .message {
     margin-bottom: 22px;
   }
-  .tool-item summary {
-    padding: 10px;
+  .tool-item > summary {
+    padding: 4px 0;
   }
   .tool-title {
     font-size: 12px;
   }
   .tool-command {
+    font-family: inherit;
     font-size: 11px;
   }
   .composer-container {
@@ -3098,17 +3103,23 @@ textarea.file-editor {
   min-width: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 4px;
   overflow: hidden;
 }
 .change-card .file-diff-heading {
-  min-height: 42px;
+  min-height: 32px;
+  padding: 4px 8px;
   font-size: 12px;
+}
+.change-card .icon-button { width: 24px; height: 24px; }
+@media (max-width: 760px) {
+  .change-card .file-diff-heading { min-height: 40px; }
+  .change-card .icon-button { width: 28px; height: 28px; }
 }
 .change-card .diff-code {
   font-size: 12px;
 }
-.change-card .file-diff-heading span {
+.change-card .file-diff-heading > .change-path {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -3632,3 +3643,8 @@ textarea.file-editor {
   resize: vertical;
   min-height: 75px;
 }
+
+.diff-stats { display: inline-flex; gap: 6px; flex: 0 0 auto; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; }
+.diff-stats .diff-count-add { color: var(--green); }
+.diff-stats .diff-count-remove { color: var(--red); }
+.tool-failed > summary, .tool-failed .tool-status { color: var(--red); }

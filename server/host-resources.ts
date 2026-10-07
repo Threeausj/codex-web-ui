@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { Express } from 'express'
 import { z } from 'zod'
-import { Bridge, type BridgeOptions } from './bridge.js'
+import { Bridge, type ReleasedThread, type BridgeOptions } from './bridge.js'
 import { shellQuote, sshKnownHostsArgs } from './ssh.js'
 import { writePrivateJson } from './storage.js'
 import type { Host } from './types.js'
@@ -193,6 +193,15 @@ export function resourceRates(hostId: string, next: RawHostResources, previous?:
   }
 }
 
+export async function readRuntimeReleasedThreads(dataDir: string) {
+  try {
+    const saved = z.object({ releasedThreads: z.array(z.object({ hostId: z.string().min(1).max(200), threadId: z.string().min(1).max(256), name: z.string().max(160), restoreThreadIds: z.array(z.string().min(1).max(256)).max(10000) })).max(10000).default([]) }).parse(JSON.parse(await fs.readFile(path.join(dataDir, 'runtime-state.json'), 'utf8')))
+    const hosts = new Map<string, Map<string, ReleasedThread>>()
+    for (const entry of saved.releasedThreads) { if (!hosts.has(entry.hostId)) hosts.set(entry.hostId, new Map()); hosts.get(entry.hostId)!.set(entry.threadId, { name: entry.name, restoreThreadIds: entry.restoreThreadIds }) }
+    return hosts
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Map<string, Map<string, ReleasedThread>>(); throw error }
+}
+
 export async function readRuntimePausedHosts(dataDir: string) {
   try { return new Set(z.object({ pausedHostIds: z.array(z.string().min(1).max(200)).max(1000) }).parse(JSON.parse(await fs.readFile(path.join(dataDir, 'runtime-state.json'), 'utf8'))).pausedHostIds) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set<string>(); throw error }
@@ -200,7 +209,7 @@ export async function readRuntimePausedHosts(dataDir: string) {
 
 type Dependencies = {
   getHost: (id: string) => Host | undefined; getBridge: (id: string) => Promise<Bridge>; getExistingBridge: (id: string) => Bridge | undefined
-  pausedHosts: Set<string>; dataDir: string; bridgeOptions?: BridgeOptions; collect?: (host: Host) => Promise<RawHostResources>; now?: () => number
+  persistRuntime?: () => Promise<void>; releasedThreads?: Map<string, Map<string, ReleasedThread>>; pausedHosts: Set<string>; dataDir: string; bridgeOptions?: BridgeOptions; collect?: (host: Host) => Promise<RawHostResources>; now?: () => number
 }
 
 export function registerHostResources(app: Express, dependencies: Dependencies) {
@@ -208,10 +217,12 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
   const ownedPids = new WeakMap<Bridge, { transportPid?: number; startedAt?: number; pid?: number; attempted: boolean }>()
   let mutations: Promise<unknown> = Promise.resolve()
   const now = dependencies.now || Date.now
+  const released = dependencies.releasedThreads || new Map<string, Map<string, ReleasedThread>>()
+  const persist = dependencies.persistRuntime || (() => writePrivateJson(path.join(dependencies.dataDir, 'runtime-state.json'), { pausedHostIds: [...dependencies.pausedHosts], releasedThreads: [...released].flatMap(([hostId, threads]) => [...threads].map(([threadId, entry]) => ({ hostId, threadId, ...entry }))) }))
   const getHost = (id: string) => { const host = dependencies.getHost(id); if (!host) throw Object.assign(new Error('Host not found'), { status: 404 }); return host }
   const runtime = async (host: Host, probe = true) => {
     const bridge = dependencies.getExistingBridge(host.id)
-    if (!bridge) return { connected: false, paused: dependencies.pausedHosts.has(host.id), managed: dependencies.bridgeOptions?.mode !== 'proxy', mode: host.kind === 'ssh' ? 'ssh' : dependencies.bridgeOptions?.mode || 'spawn', loadedThreadCount: 0, activeThreadCount: 0, activeProcesses: [], processes: [] }
+    if (!bridge) return { connected: false, paused: dependencies.pausedHosts.has(host.id), managed: dependencies.bridgeOptions?.mode !== 'proxy', mode: host.kind === 'ssh' ? 'ssh' : dependencies.bridgeOptions?.mode || 'spawn', loadedThreadCount: 0, activeThreadCount: 0, activeProcesses: [], processes: [], threads: [...(released.get(host.id) || [])].map(([id, entry]) => ({ id, name: entry.name, loaded: false, active: false, released: true, restoring: !!entry.restoreThreadIds.length })) }
     const info = bridge.runtime
     let owned = ownedPids.get(bridge)
     if (owned?.transportPid !== info.pid || owned?.startedAt !== info.startedAt) { owned = undefined; ownedPids.delete(bridge) }
@@ -226,7 +237,7 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
     const current = bridge.runtime
     const processes = [...current.processes]
     if (current.connected && owned?.pid && !processes.some(entry => entry.pid === owned!.pid)) processes.push({ pid: owned.pid, role: 'app-server', local: host.kind === 'local' })
-    return { ...current, ...(current.connected && owned?.pid ? { pid: owned.pid } : {}), processes }
+    return { ...current, threads: current.threads.map(thread => ({ ...thread, pid: thread.loaded ? owned?.pid || thread.pid : undefined })), ...(current.connected && owned?.pid ? { pid: owned.pid } : {}), processes }
   }
   const sample = async (host: Host) => {
     let entry = cache.get(host.id)
@@ -245,13 +256,29 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
   app.get('/api/hosts/:id/resources', (req, res, next) => {
     void (async () => { const host = getHost(String(req.params.id)); const [value, info] = await Promise.all([sample(host), runtime(host)]); res.json({ ...value, runtime: info }) })().catch(next)
   })
+  for (const action of ['close', 'resume'] as const) app.post(`/api/hosts/:id/runtime/threads/:threadId/${action}`, (req, res, next) => {
+    void (async () => {
+      const host = getHost(String(req.params.id)); const threadId = z.string().min(1).max(256).parse(req.params.threadId)
+      if (action === 'close') z.object({ confirmed: z.literal(true) }).strict().parse(req.body)
+      else z.object({}).strict().parse(req.body)
+      const operation = mutations.then(async () => {
+        const bridge = action === 'close' ? dependencies.getExistingBridge(host.id) : await dependencies.getBridge(host.id)
+        if (!bridge) throw Object.assign(new Error('此会话没有由 Web 持有的连接'), { status: 404 })
+        released.set(host.id, bridge.releasedThreads)
+        if (action === 'close') await bridge.releaseThread(threadId, persist)
+        else await bridge.reconnectThread(threadId, persist)
+        return { ok: true, runtime: await runtime(host, false) }
+      })
+      mutations = operation.catch(() => {}); res.json(await operation)
+    })().catch(next)
+  })
   app.post('/api/hosts/:id/runtime/close', (req, res, next) => {
     void (async () => {
       const host = getHost(String(req.params.id)); z.object({ confirmed: z.literal(true) }).strict().parse(req.body)
       const operation = mutations.then(async () => {
         const previous = dependencies.pausedHosts.has(host.id)
         dependencies.pausedHosts.add(host.id)
-        try { await writePrivateJson(path.join(dependencies.dataDir, 'runtime-state.json'), { pausedHostIds: [...dependencies.pausedHosts] }) }
+        try { await persist() }
         catch (error) { if (!previous) dependencies.pausedHosts.delete(host.id); throw error }
         const bridge = dependencies.getExistingBridge(host.id)
         await bridge?.pause()
@@ -268,7 +295,7 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
         try { await bridge.resume() }
         catch (error) { await bridge.pause(); throw error }
         dependencies.pausedHosts.delete(host.id)
-        try { await writePrivateJson(path.join(dependencies.dataDir, 'runtime-state.json'), { pausedHostIds: [...dependencies.pausedHosts] }) }
+        try { await persist() }
         catch (error) { dependencies.pausedHosts.add(host.id); await bridge.pause(); throw error }
         return { ok: true, runtime: await runtime(host, false) }
       })

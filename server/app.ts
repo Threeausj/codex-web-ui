@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { z } from 'zod'
 import { Auth, trustedOrigins } from './auth.js'
-import { Storage, hostInput } from './storage.js'
+import { Storage, hostInput, writePrivateJson } from './storage.js'
 import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
 import { registerGit } from './git.js'
@@ -19,8 +19,9 @@ import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
+import { registerConversationImages } from './conversation-images.js'
 import { registerHostConnection } from './host-connection.js'
-import { readRuntimePausedHosts, registerHostResources } from './host-resources.js'
+import { readRuntimePausedHosts, readRuntimeReleasedThreads, registerHostResources } from './host-resources.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
 import { registerProjectDirectories } from './project-directories.js'
@@ -45,6 +46,14 @@ export async function createApp(options: AppOptions = {}) {
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
   const runtimePausedHosts = await readRuntimePausedHosts(dataDir)
+  const runtimeReleasedThreads = await readRuntimeReleasedThreads(dataDir)
+  const recoverAtStartup = new Map([...runtimeReleasedThreads].map(([hostId, entries]) => [hostId, [...entries].filter(([, entry]) => entry.restoreThreadIds.length).map(([id]) => id)]))
+  const recovering = new Map<string, Promise<void>>()
+  let runtimeWrites: Promise<void> = Promise.resolve()
+  const persistRuntime = () => {
+    const writing = runtimeWrites.then(() => writePrivateJson(path.join(dataDir, 'runtime-state.json'), { pausedHostIds: [...runtimePausedHosts], releasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads].map(([threadId, entry]) => ({ hostId, threadId, ...entry }))) }))
+    runtimeWrites = writing.catch(() => {}); return writing
+  }
   const sshHostKeys = new SSHHostKeyService({ ...options.sshHostKeyOptions, dataDir })
   const configuredOrigins = options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean)
   const origins = trustedOrigins(configuredOrigins, options.port || Number(process.env.PORT) || 8787)
@@ -73,7 +82,12 @@ export async function createApp(options: AppOptions = {}) {
     const host = storage.host(hostId)
     if (!host) throw Object.assign(new Error('Host not found'), { status: 404 })
     let bridge = bridges.get(hostId)
-    if (!bridge) { bridge = new Bridge(host, bridgeOptions); bridges.set(hostId, bridge); if (runtimePausedHosts.has(hostId)) void bridge.pause() }
+    if (!bridge) { if (!runtimeReleasedThreads.has(hostId)) runtimeReleasedThreads.set(hostId, new Map()); bridge = new Bridge(host, bridgeOptions, runtimeReleasedThreads.get(hostId)); bridges.set(hostId, bridge); if (runtimePausedHosts.has(hostId)) void bridge.pause() }
+    if (!bridge.paused && recoverAtStartup.get(hostId)?.length) {
+      let recovery = recovering.get(hostId)
+      if (!recovery) { const current = bridge; recovery = (async () => { for (const id of recoverAtStartup.get(hostId) || []) await current.restoreReleasedThread(id, persistRuntime); recoverAtStartup.delete(hostId) })().finally(() => recovering.delete(hostId)); recovering.set(hostId, recovery) }
+      await recovery
+    }
     return bridge
   }
   const app = express()
@@ -98,10 +112,11 @@ export async function createApp(options: AppOptions = {}) {
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
-  registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, bridgeOptions })
+  registerConversationImages(app, getBridge)
+  registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
-    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), runtimePausedHostIds: [...runtimePausedHosts] })
+    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
   }))
   app.get('/api/hosts', (_req, res) => res.json({ hosts: storage.hosts }))
   registerHostConnection(app, bridgeOptions)
