@@ -1,15 +1,19 @@
 import path from "node:path";
 import type { Express, RequestHandler } from "express";
 import { z } from "zod";
-import type { Bridge } from "./bridge.js";
+import type { Bridge, BridgeOptions } from "./bridge.js";
+import type { Host } from "./types.js";
+import { readHostGit } from "./git-read.js";
 import type { CommandExecResponse } from "../shared/protocol/v2/CommandExecResponse.js";
 
 type GitBridge = Pick<Bridge, "request">;
 export type GitDependencies = {
   getBridge: (hostId?: string) => Promise<GitBridge>;
+  getHost?: (hostId: string) => Host | undefined;
+  bridgeOptions?: BridgeOptions;
 };
 type Permission = "read-only" | "workspace-write" | "danger-full-access";
-type Context = { bridge: GitBridge; cwd: string; permission: Permission };
+type Context = { bridge: GitBridge; cwd: string; permission: Permission; read?: (cwd: string, args: string[]) => Promise<CommandExecResponse> };
 export type GitFile = {
   path: string;
   originalPath?: string;
@@ -83,48 +87,59 @@ const error = (message: string, status = 400) =>
   Object.assign(new Error(message), { status });
 const MAX_OUTPUT = 2 * 1024 * 1024;
 
-/** Execute only argv vectors through app-server. Literal pathspecs disable Git's :(...) magic. */
+/** Fixed read queries use the backend reader; native writes retain the selected sandbox. */
 async function git(
   context: Context,
   args: string[],
   writableRoots?: string[],
   acceptedCodes = [0],
 ): Promise<CommandExecResponse> {
-  const sandboxPolicy = writableRoots
-    ? context.permission === "danger-full-access"
+  const sandboxPolicy =
+    context.permission === "danger-full-access"
       ? { type: "dangerFullAccess" }
-      : {
+      : writableRoots
+        ? {
           type: "workspaceWrite",
           writableRoots,
           networkAccess: false,
           excludeTmpdirEnvVar: true,
           excludeSlashTmp: true,
-        }
-    : { type: "readOnly", networkAccess: false };
-  const result = (await context.bridge.request("command/exec", {
-    command: [
-      "git",
-      "--no-pager",
-      "-c",
-      "core.quotePath=false",
-      "-c",
-      "core.fsmonitor=false",
-      ...args,
-    ],
-    cwd: context.cwd,
-    timeoutMs: 30000,
-    outputBytesCap: MAX_OUTPUT,
-    env: {
-      GIT_OPTIONAL_LOCKS: "0",
-      GIT_LITERAL_PATHSPECS: "1",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_DIR: null,
-      GIT_WORK_TREE: null,
-      GIT_INDEX_FILE: null,
-      GIT_EXTERNAL_DIFF: null,
-    },
-    sandboxPolicy,
-  })) as CommandExecResponse;
+          }
+        : { type: "readOnly", networkAccess: false };
+  let result: CommandExecResponse;
+  try {
+    result =
+      !writableRoots && context.read && context.permission !== "danger-full-access"
+        ? await context.read(context.cwd, args)
+        : (await context.bridge.request("command/exec", {
+            command: [
+              "git",
+              "--no-pager",
+              "-c",
+              "core.quotePath=false",
+              "-c",
+              "core.fsmonitor=false",
+              ...args,
+            ],
+            cwd: context.cwd,
+            timeoutMs: 30000,
+            outputBytesCap: MAX_OUTPUT,
+            env: {
+              GIT_OPTIONAL_LOCKS: "0",
+              GIT_LITERAL_PATHSPECS: "1",
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_DIR: null,
+              GIT_WORK_TREE: null,
+              GIT_INDEX_FILE: null,
+              GIT_EXTERNAL_DIFF: null,
+            },
+            sandboxPolicy,
+          })) as CommandExecResponse;
+  } catch (cause) {
+    throwSandboxError(cause, context.permission);
+    throw cause;
+  }
+  if (!acceptedCodes.includes(result.exitCode)) throwSandboxError(result.stderr || result.stdout, context.permission);
   if (!acceptedCodes.includes(result.exitCode))
     throw error(
       result.stderr.trim() ||
@@ -135,6 +150,14 @@ async function git(
   if (Buffer.byteLength(result.stdout) >= MAX_OUTPUT)
     throw error("Git 输出超过 2 MB，请缩小变更范围后重试", 413);
   return result;
+}
+
+function throwSandboxError(cause: unknown, permission: Permission) {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  if (!/bwrap.*(?:namespace|operation not permitted|permission)|non-privileged user namespaces|unprivileged_userns_clone/i.test(message)) return;
+  throw error(permission === "danger-full-access"
+    ? "此主机仍无法执行完全访问的 Git 命令，请检查 Codex 的主机管理策略"
+    : "此主机不支持 Codex 的隔离写入沙箱；读取 Git 不受影响，写入需明确切换到完全访问，或由管理员启用用户命名空间", 403);
 }
 
 export function parseStatus(source: string): GitFile[] {
@@ -231,6 +254,11 @@ async function contextFor(
     cwd: path.posix.normalize(parsed.cwd),
     permission: parsed.permission,
   };
+  if (deps.getHost) {
+    const host = deps.getHost(parsed.hostId);
+    if (!host) throw error("主机不存在", 404);
+    context.read = (cwd, args) => readHostGit(host, cwd, args, deps.bridgeOptions);
+  }
   await repository(context);
   return context;
 }

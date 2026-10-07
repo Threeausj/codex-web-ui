@@ -45,7 +45,7 @@ export function sshKnownHostsArgs(pin?: SSHHostKeyPin) {
 }
 
 export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, knownHostsFile?: SSHHostKeyPin) {
-  const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR']
+  const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-o', 'LogLevel=ERROR']
   args.push(...sshKnownHostsArgs(knownHostsFile))
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)

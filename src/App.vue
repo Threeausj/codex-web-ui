@@ -8,6 +8,7 @@ import {
   watch,
 } from "vue";
 import { useCodex } from "./lib/useCodex";
+import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
 import ConversationOutput from "./components/ConversationOutput.vue";
@@ -25,6 +26,7 @@ import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navig
 
 const api = useCodex();
 const state = api.state;
+useSubagentPrefetch(api, state);
 let pendingPushTarget: PushTarget | null = pushTargetFromUrl(new URL(location.href));
 let openingPushTarget = false;
 let stopPushNavigation: (() => void) | undefined;
@@ -132,12 +134,12 @@ watch(() => [state.authenticated, choiceRequests.value.length, threadTitle.value
 }, { immediate: true });
 const welcome = computed(() => !state.activeThread && !state.items.length);
 const editDisabled = computed(() =>
-  actionBusy.value || state.busy || state.loading || !state.online ||
+  actionBusy.value || state.busy || state.compacting || state.loading || !state.online ||
   state.selectingThread || state.switchingHost || state.changingContext ||
   state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady),
 );
 const threadActionsDisabled = computed(() =>
-  !state.activeThread || state.busy || !state.connected || !state.online ||
+  !state.activeThread || state.busy || state.compacting || !state.connected || !state.online ||
   !state.threadReady || state.runtimePaused || state.threadReleased || state.selectingThread,
 );
 const editableItemId = computed(() => {
@@ -1109,6 +1111,9 @@ watch(() => [state.authenticated, state.loading], () => {
           <Icon name="ArrowDown" :size="18" />
         </button>
         <div class="composer-container">
+          <div v-if="state.compacting" class="compaction-progress compaction-status" role="status" aria-live="polite">
+            <Icon name="LoaderCircle" :size="14" class="spin" />正在压缩上下文…
+          </div>
           <div v-if="state.plan?.length" class="turn-plan">
             <details>
               <summary>
@@ -1281,4 +1286,5 @@ watch(() => [state.authenticated, state.loading], () => {
 .global-error.thread-conflict { flex-wrap: wrap; }
 .global-error.thread-conflict > span { flex: 1 1 240px; }
 .global-error.thread-conflict > button { white-space: nowrap; }
+.compaction-progress { display: flex; align-items: center; gap: 7px; padding: 6px 4px; color: var(--muted); font-size: 12px; }
 </style>

@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
+import { randomUUID } from 'node:crypto'
+import type { ThreadTokenUsage } from './context-types.js'
 import type { WebSocket } from 'ws'
 import type { Host, RpcId, RpcMessage } from './types.js'
 import { rpcError } from './types.js'
@@ -73,6 +75,10 @@ export class Bridge {
   private processes = new Map<string, ActiveProcess>()
   private counter = 0
   private generation = 0
+  private engineId?: string
+  private eventSequence = 0
+  private contexts = new Map<string, { tokenUsage: ThreadTokenUsage | null; compacting: boolean }>()
+  private compactions = new Map<string, { requests: Set<string>; items: Map<string, string | undefined> }>()
   private disposed = false
   private pausing?: Promise<void>
   private subscribedThreads = new Set<string>()
@@ -93,6 +99,50 @@ export class Bridge {
     this.releasedThreads = releasedThreads
   }
   get mode() { return this.host.kind === 'ssh' ? 'ssh' : this.options.mode || 'spawn' }
+  threadContext(threadId: string) { return this.contexts.get(threadId) ?? { tokenUsage: null, compacting: false } }
+  private compaction(threadId: string) {
+    let state = this.compactions.get(threadId)
+    if (!state) { state = { requests: new Set(), items: new Map() }; this.compactions.set(threadId, state) }
+    return state
+  }
+  private updateCompaction(threadId: string) {
+    const state = this.compactions.get(threadId)
+    const compacting = !!state && (state.requests.size > 0 || state.items.size > 0)
+    this.contexts.set(threadId, { ...this.threadContext(threadId), compacting })
+    if (!compacting) this.compactions.delete(threadId)
+  }
+  private removeCompactionRequest(threadId: string | undefined, requestId: string) {
+    if (!threadId) return
+    this.compactions.get(threadId)?.requests.delete(requestId)
+    this.updateCompaction(threadId)
+  }
+  private observeContext(message: RpcMessage) {
+    const p = message.params as any
+    if (typeof p?.threadId !== 'string') return
+    const previous = this.threadContext(p.threadId)
+    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage: { ...p.tokenUsage, modelContextWindow: p.tokenUsage.modelContextWindow ?? previous.tokenUsage?.modelContextWindow ?? null } })
+    if (p.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
+      const state = this.compaction(p.threadId)
+      state.requests.clear()
+      if (message.method === 'item/started') state.items.set(p.item.id, p.turnId)
+      else state.items.delete(p.item.id)
+      this.updateCompaction(p.threadId)
+    }
+    if (message.method === 'turn/completed') {
+      const state = this.compactions.get(p.threadId)
+      if (state && (!state.items.size || [...state.items.values()].some(turnId => !turnId || turnId === p.turn?.id))) {
+        state.requests.clear()
+        for (const [id, turnId] of state.items) if (!turnId || turnId === p.turn?.id) state.items.delete(id)
+        this.updateCompaction(p.threadId)
+      }
+    }
+    if (['thread/compacted', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '')) {
+      this.compactions.delete(p.threadId)
+      this.contexts.set(p.threadId, { ...this.threadContext(p.threadId), compacting: false })
+    }
+    if (['thread/archived', 'thread/deleted'].includes(message.method || '')) this.contexts.delete(p.threadId)
+    if (this.contexts.size > 1000) this.contexts.delete(this.contexts.keys().next().value!)
+  }
   get runtime() {
     return { connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
       ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
@@ -132,6 +182,8 @@ export class Bridge {
       throw error
     }
     this.transport = transport
+    this.engineId = randomUUID()
+    this.eventSequence = 0
     const decoder = new StringDecoder('utf8')
     let buffer = ''
     transport.output.on('data', (chunk: Buffer) => {
@@ -172,6 +224,8 @@ export class Bridge {
 
   private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket) {
     const id = `web:${++this.counter}`
+    const compactThread = method === 'thread/compact/start' ? (params as { threadId?: string })?.threadId : undefined
+    if (typeof compactThread === 'string') { this.compaction(compactThread).requests.add(id); this.updateCompaction(compactThread) }
     const command = params as { processId?: string; tty?: boolean; cwd?: string } | undefined
     const processId = method === 'command/exec' && typeof command?.processId === 'string' ? command.processId : undefined
     if (processId && !this.processes.has(processId)) {
@@ -183,11 +237,12 @@ export class Bridge {
         // A client timeout cannot establish that a long-lived process stopped.
         // Retain its response mapping so completion can still reach reconnected tabs.
         if (!processId || this.processes.get(processId)?.requestId !== id) this.pending.delete(id)
+        this.removeCompactionRequest(compactThread, id)
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
       this.pending.set(id, { method, params, clientKey, clientSocket, originalId, resolve, reject, timer })
-      try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
+      try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { this.removeCompactionRequest(compactThread, id); clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
 
@@ -225,8 +280,14 @@ export class Bridge {
     if (client?.readyState === 1) client.send(JSON.stringify(message))
   }
 
+  private broadcast(message: RpcMessage) {
+    const event = { ...message, bridgeEventSequence: ++this.eventSequence }
+    for (const key of this.clients.keys()) this.clientSend(key, event)
+    return event
+  }
+
   private status(key: string, clientId?: string) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
+    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
   }
 
   private finishProcess(requestId: string, result?: unknown, error?: RpcMessage['error']) {
@@ -291,8 +352,11 @@ export class Bridge {
       threadId, method: pending.method, result: changed, request, changeId,
       ...(originClientId ? { originClientId } : {}),
     } }
+    const sequence = ++this.eventSequence
     for (const [key, socket] of this.clients)
-      if (key !== pending.clientKey || socket !== pending.clientSocket) this.clientSend(key, message)
+      this.clientSend(key, key !== pending.clientKey || socket !== pending.clientSocket
+        ? { ...message, bridgeEventSequence: sequence }
+        : { method: 'bridge/event/ack', bridgeEventSequence: sequence })
   }
 
   private async fromClient(key: string, message: RpcMessage) {
@@ -311,6 +375,10 @@ export class Bridge {
     }
     if (!validId || typeof message.method !== 'string' || !/^[a-zA-Z][a-zA-Z0-9_/.]*$/.test(message.method)) throw new Error('A request requires a valid id and method')
     if (['initialize', 'initialized'].includes(message.method)) { reply(rpcError(message.id!, 'The bridge owns initialization', -32600)); return }
+    if (message.method === 'bridge/ping') {
+      reply({ id: message.id, result: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, loadedThreadIds: [...this.subscribedThreads] } })
+      return
+    }
     try {
       await this.connect()
       const params = message.params as Record<string, unknown> | undefined
@@ -331,6 +399,7 @@ export class Bridge {
 
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
+    this.observeContext(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
       const id = (message.params as { threadId?: string })?.threadId
       if (id && !this.archiveCapture.restoreThreadIds.includes(id)) this.archiveCapture.restoreThreadIds.push(id)
@@ -343,7 +412,11 @@ export class Bridge {
       if (!pending) return
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
       if (pending.method === 'command/exec') this.finishProcess(String(message.id), message.result, message.error)
-      if (message.error) pending.reject(new RpcFailure(message.error))
+      if (message.error) {
+        const threadId = pending.method === 'thread/compact/start' ? (pending.params as { threadId?: string })?.threadId : undefined
+        this.removeCompactionRequest(threadId, String(message.id))
+        pending.reject(new RpcFailure(message.error))
+      }
       else {
         const params = pending.params as { threadId?: string } | undefined
         const result = message.result as { thread?: { id?: string; name?: string; preview?: string; status?: { type?: string } } } | undefined
@@ -363,7 +436,7 @@ export class Bridge {
       // This application has one authenticated user. Their desktop and phone may
       // both review a request; only the first response to a pending server ID wins.
       this.approvals.set(JSON.stringify(message.id), { message })
-      for (const client of this.clients.keys()) this.clientSend(client, message)
+      this.broadcast(message)
       return
     }
     if (message.method) {
@@ -394,7 +467,7 @@ export class Bridge {
         const params = message.params as { requestId?: RpcId } | undefined
         if (params?.requestId !== undefined) this.approvals.delete(JSON.stringify(params.requestId))
       }
-      for (const key of this.clients.keys()) this.clientSend(key, message)
+      this.broadcast(message)
     }
   }
 
@@ -411,6 +484,8 @@ export class Bridge {
     this.approvals.clear()
     this.subscribedThreads.clear()
     this.activeThreads.clear()
+    this.contexts.clear()
+    this.compactions.clear()
     for (const key of this.clients.keys()) this.status(key)
   }
 

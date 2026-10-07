@@ -19,7 +19,7 @@ type Call = {
   env: Record<string, string | null>;
 };
 
-async function fixture(useAppServer = false) {
+async function fixture(useAppServer = false, options: { directRead?: boolean; unavailableSandbox?: boolean } = {}) {
   const directory = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "codex-git-workflow-")),
   );
@@ -46,6 +46,7 @@ async function fixture(useAppServer = false) {
   const app = express();
   app.use(express.json());
   registerGit(app, {
+    ...(options.directRead ? { getHost: (id: string) => id === "local" ? { id, name: "Test", kind: "local" as const } : undefined } : {}),
     getBridge: async () =>
       bridge ||
       ({
@@ -57,6 +58,8 @@ async function fixture(useAppServer = false) {
           assert.equal(method, "command/exec");
           const input = params as Call;
           calls.push(input);
+          if (options.unavailableSandbox && input.sandboxPolicy.type !== "dangerFullAccess")
+            return { exitCode: 1, stdout: "", stderr: "bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces." };
           assert.equal(input.command[0], "git");
           assert.ok(!input.command.includes("/bin/sh"));
           const env = { ...process.env };
@@ -181,6 +184,44 @@ test("Git status/diff/stage and explicit-file commit preserve unrelated staged c
   } finally {
     await f.close();
   }
+});
+
+test("full-access Git uses its selected policy for repository discovery, reads and writes on hosts without namespaces", async () => {
+  const f = await fixture(false, { unavailableSandbox: true });
+  try {
+    await fs.writeFile(path.join(f.root, "one.txt"), "full access change\n");
+    assert.equal((await f.get("status", { permission: "danger-full-access" })).code, 200);
+    assert.match((await f.get("diff", { file: "one.txt", permission: "danger-full-access" })).body.diff, /\+full access change/);
+    assert.equal((await f.post("stage", { files: ["one.txt"], permission: "danger-full-access" })).code, 200);
+    assert.ok(f.calls.length > 10);
+    assert.ok(f.calls.every(call => call.sandboxPolicy.type === "dangerFullAccess"));
+  } finally { await f.close(); }
+});
+
+test("backend Git reads work without namespaces while workspace writes fail honestly and readonly mutations stay forbidden", async () => {
+  const f = await fixture(false, { directRead: true, unavailableSandbox: true });
+  try {
+    await fs.writeFile(path.join(f.root, "one.txt"), "read safely\n");
+    for (const permission of ["read-only", "workspace-write"]) {
+      const status = await f.get("status", { permission });
+      assert.equal(status.code, 200, JSON.stringify(status.body));
+      assert.equal(status.body.branch, "main");
+      const diff = await f.get("diff", { permission, file: "one.txt" });
+      assert.equal(diff.code, 200, JSON.stringify(diff.body));
+      assert.match(diff.body.diff, /\+read safely/);
+    }
+    assert.equal(f.calls.length, 0, "fixed backend queries do not create native command/exec jobs");
+    const readonly = await f.post("stage", { permission: "read-only", files: ["one.txt"] });
+    assert.equal(readonly.code, 403);
+    assert.equal(f.calls.length, 0);
+    const workspace = await f.post("stage", { files: ["one.txt"] });
+    assert.equal(workspace.code, 403);
+    assert.match(workspace.body.error, /明确切换到完全访问/);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0]!.sandboxPolicy.type, "workspaceWrite");
+    assert.equal((await f.run("diff", "--cached", "--name-only")).trim(), "");
+    assert.equal((await f.get("status", { hostId: "missing" })).code, 404);
+  } finally { await f.close(); }
 });
 
 test("Git branches and independent worktrees support paths with spaces", async () => {

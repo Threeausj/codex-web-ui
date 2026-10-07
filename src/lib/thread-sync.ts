@@ -8,7 +8,7 @@ export function writerConflict(error: unknown): boolean {
 
 /** A start acknowledgement can arrive after streamed or completed items. */
 export function mergeAcceptedTurnItems(
-  items: DisplayItem[], turn: { id: string; items?: DisplayItem[] },
+  items: DisplayItem[], turn: { id: string; items?: DisplayItem[]; status?: string },
   accepted?: { input?: any[]; clientUserMessageId?: string; placement?: 'start' | 'steer' },
   preserveLive = true,
 ): string[] {
@@ -20,6 +20,7 @@ export function mergeAcceptedTurnItems(
     const knownUser = incoming.type === 'userMessage' && items.some(item => item.id === incoming.id || (incoming.clientId && item.clientId === incoming.clientId));
     upsertItem(items, { ...incoming,
       ...(preserveLive && incoming.type !== 'userMessage' ? previous : {}),
+      ...(!preserveLive && incoming.type === 'contextCompaction' ? { status: turn.status || 'completed' } : {}),
       turnId: turn.id,
     });
     if (incoming.type === 'userMessage' && !knownUser) {
@@ -54,6 +55,16 @@ export function mergeAcceptedTurnItems(
       }
       touched.push(clientId);
     }
+  }
+  // Completion snapshots contain the native item order. A delayed compaction
+  // completion must move back before answers emitted after it in the same turn.
+  // Replace only this turn's slots, preserving other turns and live-only items.
+  if (!preserveLive && snapshot.length > 1) {
+    const rank = new Map(snapshot.map((item, index) => [item.id, index]));
+    const positions = items.flatMap((item, index) => item.turnId === turn.id ? [index] : []);
+    const ordered = positions.map(index => items[index]).sort((left, right) =>
+      (rank.get(left.id) ?? snapshot.length) - (rank.get(right.id) ?? snapshot.length));
+    positions.forEach((position, index) => { items[position] = ordered[index]; });
   }
   return touched;
 }

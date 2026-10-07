@@ -1,4 +1,5 @@
 // app-server items are authoritative on completion. Deltas only extend in-flight items.
+import { contextUsage } from './context-usage';
 export type DisplayItem = { id: string; type: string; turnId?: string; [key: string]: any };
 export function upsertItem(items: DisplayItem[], incoming: DisplayItem): void {
   let index = items.findIndex(item => item.id === incoming.id);
@@ -28,7 +29,8 @@ export function mergeSnapshotItems(snapshot: DisplayItem[], live: DisplayItem[],
 }
 export function applyItemEvent(items: DisplayItem[], method: string, params: any): void {
   if (method === 'item/started' || method === 'item/completed') {
-    upsertItem(items, { ...params.item, turnId: params.turnId });
+    upsertItem(items, { ...params.item, turnId: params.turnId,
+      ...(params.item?.type === 'contextCompaction' ? { status: method === 'item/started' ? 'inProgress' : 'completed' } : {}) });
     return;
   }
   const kinds: Record<string, string> = {
@@ -54,6 +56,5 @@ export function applyItemEvent(items: DisplayItem[], method: string, params: any
   }
 }
 export function contextPercent(usage: any): number {
-  if (!usage?.modelContextWindow || !usage?.last) return 0;
-  return Math.min(100, Math.max(0, Math.round(100 * usage.last.totalTokens / usage.modelContextWindow)));
+  return contextUsage(usage)?.percent ?? 0;
 }

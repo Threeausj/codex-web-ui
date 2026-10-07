@@ -71,6 +71,20 @@ export function resolvePermissionProfile(profile: WebPermissionProfile, context:
   return { sandbox: profile.sandboxMode, approvalPolicy: profile.approvalPolicy, sandboxPolicy }
 }
 
+/** Bare Web modes are explicit choices; a desktop thread's saved approvals do not override them. */
+export function resolveWebPermissionSelection(mode: SandboxMode, context: {
+  profile?: WebPermissionProfile | null
+  cwd?: string
+  requirements?: ConfigRequirements | null
+} = {}): ReturnType<typeof resolvePermissionProfile> {
+  const profile = context.profile?.sandboxMode === mode ? context.profile : {
+    id: 'web-selection', name: '网页权限', sandboxMode: mode,
+    approvalPolicy: mode === 'danger-full-access' ? 'never' as const : 'on-request' as const,
+    networkAccess: mode === 'danger-full-access',
+  }
+  return resolvePermissionProfile(profile, context)
+}
+
 export function configLayerLabel(source: ConfigLayerSource): string {
   switch (source.type) {
     case 'packagedDefaults': return `内置默认 · ${source.file}`

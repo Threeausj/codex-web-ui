@@ -114,7 +114,8 @@ test('unselected token usage is cached by conversation and fresh usage arriving 
   await open(page, '已有测试历史');
   await expect(page.locator('.context-usage')).toContainText('25%');
   mock.emit('item/started', { threadId: first, turnId: 'turn-compact', item: { id: 'compact-item', type: 'contextCompaction' } });
-  await expect(page.locator('.context-usage')).toContainText('—');
+  await expect(page.locator('.context-usage')).toContainText('正在压缩');
+  await expect(page.locator('.context-usage')).toHaveAttribute('title', /250 \/ 1,000 tokens/);
   mock.emit('thread/tokenUsage/updated', { threadId: first, tokenUsage: { last: { totalTokens: 100 }, modelContextWindow: 1000 } });
   mock.emit('item/completed', { threadId: first, turnId: 'turn-compact', item: { id: 'compact-item', type: 'contextCompaction' } });
   await expect(page.locator('.context-usage')).toContainText('10%');

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextUsage } from "../src/lib/context-usage";
+import { contextUsage, mergeContextUsage } from "../src/lib/context-usage";
 
 test("context usage measures the latest context instead of cumulative billed tokens", () => {
   assert.deepEqual(contextUsage({ last: { totalTokens: 25000 }, total: { totalTokens: 2000000 }, modelContextWindow: 100000 }), {
@@ -8,6 +8,16 @@ test("context usage measures the latest context instead of cumulative billed tok
   });
   assert.equal(contextUsage({ last: { totalTokens: 3000 }, modelContextWindow: 100000 })?.percent, 3);
   assert.deepEqual(contextUsage({ last: { totalTokens: 0 }, modelContextWindow: 100000 }), { used: 0, limit: 100000, percent: 0 });
+});
+
+test("partial native reports retain a known per-thread window without substituting billing totals", () => {
+  const previous = { last: { totalTokens: 25000 }, total: { totalTokens: 2000000 }, modelContextWindow: 100000 };
+  const current = mergeContextUsage(previous, { last: { totalTokens: 3000 }, modelContextWindow: null });
+  assert.equal(contextUsage(current)?.percent, 3);
+  assert.equal(mergeContextUsage(current, null), current);
+  assert.equal(mergeContextUsage(current, { last: { totalTokens: -5 }, modelContextWindow: null }), current);
+  assert.equal(contextUsage(mergeContextUsage(null, { total: { totalTokens: 100 }, modelContextWindow: 1000 })), null);
+  assert.equal(contextUsage(mergeContextUsage(current, { last: { totalTokens: 0 } }))?.percent, 0);
 });
 
 test("unknown or malformed context measurements are not presented as zero; ring percentages are bounded", () => {

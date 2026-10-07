@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availablePermissionProfiles, configEditRestriction, configLayerLabel, DEFAULT_PERMISSION_PROFILES, permissionProfileProblems, resolvePermissionProfile, validatePermissionProfile } from '../src/lib/configuration.js'
+import { availablePermissionProfiles, configEditRestriction, configLayerLabel, DEFAULT_PERMISSION_PROFILES, permissionProfileProblems, resolvePermissionProfile, resolveWebPermissionSelection, validatePermissionProfile } from '../src/lib/configuration.js'
 import type { ConfigRequirements } from '../shared/protocol/v2/ConfigRequirements.js'
 
 test('named Web profiles resolve to actual protocol sandbox fields without inventing native ids', () => {
@@ -14,6 +14,17 @@ test('named Web profiles resolve to actual protocol sandbox fields without inven
   assert.deepEqual(resolvePermissionProfile(DEFAULT_PERMISSION_PROFILES[0]).sandboxPolicy, { type: 'readOnly', networkAccess: false })
   assert.deepEqual(resolvePermissionProfile(DEFAULT_PERMISSION_PROFILES[2]).sandboxPolicy, { type: 'dangerFullAccess' })
   assert.throws(() => resolvePermissionProfile(profile, { cwd: './project' }), /绝对路径/)
+})
+
+test('bare full access resolves never approvals while explicit named presets and managed requirements remain authoritative', () => {
+  assert.deepEqual(resolveWebPermissionSelection('danger-full-access'), {
+    sandbox: 'danger-full-access', approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+  })
+  const reviewedFullAccess = { ...DEFAULT_PERMISSION_PROFILES[2], approvalPolicy: 'on-request' as const }
+  assert.equal(resolveWebPermissionSelection('danger-full-access', { profile: reviewedFullAccess }).approvalPolicy, 'on-request')
+  assert.equal(resolveWebPermissionSelection('workspace-write', { profile: reviewedFullAccess, cwd: '/project' }).approvalPolicy, 'on-request')
+  assert.throws(() => resolveWebPermissionSelection('danger-full-access', { requirements: { allowedApprovalPolicies: ['on-request'] } as ConfigRequirements }), /不允许此审批策略/)
+  assert.deepEqual(resolveWebPermissionSelection('read-only').sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
 test('profiles enforce current schema and managed empty allow lists rather than treating them as unrestricted', () => {

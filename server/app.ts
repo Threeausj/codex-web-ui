@@ -6,6 +6,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, type WebSocket } from 'ws'
+import { WebSocketHeartbeat } from './websocket-heartbeat.js'
 import { z } from 'zod'
 import { Auth, trustedOrigins } from './auth.js'
 import { Storage, hostInput, writePrivateJson } from './storage.js'
@@ -20,6 +21,7 @@ import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerConversationImages } from './conversation-images.js'
+import { registerThreadContext } from './thread-context.js'
 import { registerHostConnection } from './host-connection.js'
 import { readRuntimePausedHosts, readRuntimeReleasedThreads, registerHostResources } from './host-resources.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
@@ -108,10 +110,11 @@ export async function createApp(options: AppOptions = {}) {
   registerPush(app, push)
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
-  registerGit(app, { getBridge })
+  registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
+  registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions })
   registerProjectDirectories(app, { getBridge, storage, cwd })
@@ -244,6 +247,7 @@ export async function createServer(options: AppOptions = {}) {
   const server = http.createServer(context.app)
   const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024, perMessageDeflate: false })
   const sessionSockets = new Map<string, Set<WebSocket>>()
+  const socketHeartbeat = new WebSocketHeartbeat()
   const stopListeningForRevocation = context.auth.onSessionRevoked(sessionId => {
     for (const ws of sessionSockets.get(sessionId) || []) ws.close(4003, 'Session expired')
   })
@@ -260,6 +264,9 @@ export async function createServer(options: AppOptions = {}) {
     const proposedId = url.searchParams.get('clientId') || ''
     const clientId = /^[a-zA-Z0-9_-]{8,128}$/.test(proposedId) ? proposedId : randomUUID()
     wss.handleUpgrade(req, socket, head, ws => {
+      req.socket.setKeepAlive(true, 30000)
+      req.socket.setNoDelay(true)
+      socketHeartbeat.track(ws)
       let sockets = sessionSockets.get(session.id)
       if (!sockets) { sockets = new Set(); sessionSockets.set(session.id, sockets) }
       sockets.add(ws)
@@ -268,16 +275,10 @@ export async function createServer(options: AppOptions = {}) {
       const validateSession = setInterval(() => { if (!context.auth.getSession(req.headers.cookie)) ws.close(4003, 'Session expired') }, 15000)
       validateSession.unref()
       ws.on('close', () => { clearInterval(validateSession); sockets!.delete(ws); if (!sockets!.size) sessionSockets.delete(session.id) })
-      ws.on('pong', () => { (ws as unknown as { isAlive: boolean }).isAlive = true })
-      ;(ws as unknown as { isAlive: boolean }).isAlive = true
     })
   })
   const heartbeat = setInterval(() => {
-    for (const ws of wss.clients) {
-      const state = ws as unknown as { isAlive: boolean }
-      if (!state.isAlive) { ws.terminate(); continue }
-      state.isAlive = false; ws.ping()
-    }
+    socketHeartbeat.sweep(wss.clients)
   }, 30000)
   heartbeat.unref()
   const close = async () => {

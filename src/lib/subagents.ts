@@ -108,7 +108,7 @@ export function mergeSubagents(rootThreadId: string, threads: any[], items: any[
         if (!entry) continue
         const state = item.agentsStates?.[id]
         if (state?.status) latestCollabStates.set(id, subagentStatus(state.status))
-        if (state?.message) entry.summary = state.message
+        if (state?.message && !lastOutput(entry.thread)) entry.summary = state.message
         else if (!entry.summary && item.prompt) entry.summary = item.prompt
         if (!entry.thread && state?.status) entry.status = subagentStatus(state.status)
         if (!entry.thread && item.tool === 'spawnAgent' && !state?.status) entry.status = 'pendingInit'
