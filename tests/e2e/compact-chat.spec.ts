@@ -28,6 +28,7 @@ test('tool output is a compact expandable row and changes expose counts, filenam
     { id: 'compact-change', type: 'fileChange', changes: [{ path: '/workspace/demo/alpha.ts', kind: 'update', diff: '--- a/alpha.ts\n+++ b/alpha.ts\n@@ -1 +1,2 @@\n-before\n+after\n+extra' }, { path: '/workspace/demo/beta.md', kind: 'update', diff: '@@ -1 +1 @@\n-old\n+new' }] });
   await login(page); await page.locator('[data-section="recent"] .thread-row').first().click();
   await page.locator('.turn-activity > summary').click();
+  await page.locator('.activity-batch > summary').click();
   const row = page.locator('.tool-item').filter({ hasText: 'printf compact' });
   await expect(row.locator('.tool-content')).toBeHidden();
   const appearance = await row.evaluate(element => ({ border: getComputedStyle(element).borderTopWidth, height: element.getBoundingClientRect().height }));

@@ -66,6 +66,7 @@ test("desktop-style output collapses process history behind elapsed time and kee
   await expect(
     group.getByText("公开的思考摘要", { exact: true }),
   ).toBeVisible();
+  await group.locator(".activity-batch > summary").click();
   await group.locator(".tool-item > summary").click();
   await expect(group.locator(".command-code")).toContainText("pwd");
   await page.reload();
@@ -131,6 +132,8 @@ test("live process keeps commands and file changes collapsed by default while pr
   await expect(group.getByText("过程摘要", { exact: true })).toBeVisible();
   const command = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "运行命令" }) });
   const changes = group.locator(".tool-item").filter({ has: page.locator(".tool-title", { hasText: "修改文件" }) });
+  await expect(group.locator(".activity-batch > summary")).toContainText("正在运行 1 条命令、修改 1 个文件");
+  await group.locator(".activity-batch > summary").click();
   await expect(command.locator("summary")).toBeVisible();
   await expect(changes.locator(":scope > summary")).toBeVisible();
   await expect(command).not.toHaveAttribute("open", "");
@@ -224,6 +227,7 @@ test("manual process and reasoning toggles survive new deltas, while completed h
   await expect(group.locator(".turn-activity")).not.toHaveAttribute("open", "");
   await group.locator(".turn-activity > summary").click();
   await group.locator(".reasoning-item > summary").click();
+  await group.locator(".activity-batch > summary").click();
   await group.locator(".tool-item > summary").click();
   await expect(group.getByText("manual-turn 工具输出", { exact: true })).toBeVisible();
   await group.locator(".tool-item > summary").click();
@@ -251,7 +255,8 @@ for (const status of ["failed", "interrupted"]) {
     const group = page.locator(`.conversation-turn[data-turn-id="${turn.id}"]`);
     await expect(group.getByText(`${turn.id} 公开摘要`, { exact: true })).toBeVisible();
     await expect(group.getByText(`${turn.id} 工具输出`, { exact: true })).toBeHidden();
-    await expect(group.locator(".tool-item > summary")).toBeVisible();
+    await expect(group.locator(".activity-batch > summary")).toBeVisible();
+    await expect(group.locator(".tool-item > summary")).toBeHidden();
     const final = { id: `${turn.id}-final`, type: "agentMessage", phase: "final_answer", text: "直接可见的最终答复" };
     mock.emit("item/completed", { threadId: "thread-existing", turnId: turn.id, item: final });
     await expect(group.getByText(final.text, { exact: true })).toBeVisible();

@@ -69,7 +69,7 @@ function titleText(value: unknown) {
   if (typeof value !== 'string') return undefined
   return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') || undefined
 }
-type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
+type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; ephemeral?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
 
 async function atomicPrivateJson(file: string, value: unknown) {
   const temporary = `${file}.${randomUUID()}.tmp`
@@ -245,6 +245,7 @@ export class PushService {
     const child = !!thread.parentThreadId || !!(source && ('subagent' in source || 'subAgent' in source)) || ['subagent', 'subAgent'].includes(String(thread.source))
     const title = { ...this.threadTitles.get(key),
       ...(child ? { subagent: true, sourceKnown: true } : 'source' in thread ? { sourceKnown: true } : {}),
+      ...(typeof thread.ephemeral === 'boolean' ? { ephemeral: thread.ephemeral } : {}),
       ...('name' in thread ? { name: titleText(thread.name) } : {}),
       ...('preview' in thread ? { preview: titleText(thread.preview) } : {}),
     }
@@ -288,7 +289,7 @@ export class PushService {
         // A rename received during the lookup is newer than its response.
         if (id(record(raw)?.id) === threadId) {
           if (this.threadTitles.get(key) === cached) this.rememberThread(host, raw)
-          else { const thread = record(raw)!; this.rememberThread(host, { id: threadId, ...('source' in thread ? { source: thread.source } : {}), ...('parentThreadId' in thread ? { parentThreadId: thread.parentThreadId } : {}) }) }
+          else { const thread = record(raw)!; this.rememberThread(host, { id: threadId, ...('source' in thread ? { source: thread.source } : {}), ...('parentThreadId' in thread ? { parentThreadId: thread.parentThreadId } : {}), ...('ephemeral' in thread ? { ephemeral: thread.ephemeral } : {}) }) }
         }
       } catch { /* Missing metadata never prevents delivery of the event. */ }
       finally { clearTimeout(deadline); const latest = this.threadTitles.get(key); this.threadTitles.set(key, { ...latest, sourceChecked: true }); while (this.threadTitles.size > MAX_THREAD_TITLES) this.threadTitles.delete(this.threadTitles.keys().next().value!) }
@@ -344,11 +345,12 @@ export class PushService {
 
   private async notify(host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
     await this.save()
-    if (kind !== 'approval' && this.threadTitles.get(JSON.stringify([host.id, threadId]))?.subagent) return
+    const auxiliary = () => { const metadata = this.threadTitles.get(JSON.stringify([host.id, threadId])); return metadata?.subagent || metadata?.ephemeral }
+    if (kind !== 'approval' && auxiliary()) return
     notice.title = await this.threadTitle(host, threadId, kind !== 'approval')
     // Child turns stream through the same host transport as their parent. Their
     // completion does not mean the user's overall task has finished.
-    if (kind !== 'approval' && this.threadTitles.get(JSON.stringify([host.id, threadId]))?.subagent) return
+    if (kind !== 'approval' && auxiliary()) return
     let pruned = false
     const jobs: Promise<void>[] = []
     for (const [endpoint, device] of this.devices) {

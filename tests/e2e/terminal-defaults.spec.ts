@@ -119,6 +119,7 @@ test("changed files start folded in chat and workspace and streaming updates pre
   await page.locator('[data-section="recent"] .thread-row').first().click();
   const turn = page.locator('.conversation-turn[data-turn-id="turn-history"]');
   await turn.locator(".turn-activity > summary").click();
+  await turn.locator(".activity-batch > summary").click();
   await turn.locator(".tool-item > summary").click();
   const chatFiles = turn.locator(".file-diff");
   await expect(chatFiles.first().locator(".diff-code")).toBeHidden();

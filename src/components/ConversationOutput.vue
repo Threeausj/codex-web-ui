@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
 import ChatItem from "./ChatItem.vue";
+import ActivityBatch from './ActivityBatch.vue';
 import Icon from "./Icon.vue";
 import {
   conversationBlocks,
@@ -13,6 +14,7 @@ const props = defineProps<{
   items: DisplayItem[];
   turns: any[];
   busy: boolean;
+  hideFork?: boolean;
   hostId?: string;
   editableItemId?: string;
   editing?: boolean;
@@ -107,7 +109,7 @@ function activityLabel(block: any) {
       :host-id="hostId"
       :item="block.item"
       :busy="busy"
-      :can-fork="!busy && !editing && !!block.item.turnId"
+      :can-fork="!hideFork && !busy && !editing && !!block.item.turnId"
       :can-edit="!editSession && block.item.id === editableItemId"
       :editing="editing"
       :edit-disabled="editDisabled"
@@ -126,7 +128,7 @@ function activityLabel(block: any) {
         :host-id="hostId"
         :item="item"
         :busy="running(block)"
-        :can-fork="!busy && !editing && !!item.turnId"
+        :can-fork="!hideFork && !busy && !editing && !!item.turnId"
         :can-edit="!editSession && item.id === editableItemId"
         :editing="editing"
         :edit-disabled="editDisabled"
@@ -161,16 +163,25 @@ function activityLabel(block: any) {
           <Icon name="ChevronRight" :size="14" />
         </summary>
         <div v-if="block.activity.length" class="turn-activity-content">
-          <ChatItem
-            v-for="item in block.activity"
-            :key="item.id"
-            :host-id="hostId"
-            :item="item"
-            :busy="running(block)"
-            :can-fork="false"
-            @open-file="emit('openFile', $event)"
-            @error="emit('error', $event)"
-          />
+          <template v-for="entry in block.activityBlocks" :key="entry.id">
+            <ActivityBatch
+              v-if="entry.kind === 'batch'"
+              :host-id="hostId"
+              :items="entry.items"
+              :busy="running(block)"
+              @open-file="emit('openFile', $event)"
+              @error="emit('error', $event)"
+            />
+            <ChatItem
+              v-else
+              :host-id="hostId"
+              :item="entry.item"
+              :busy="running(block)"
+              :can-fork="false"
+              @open-file="emit('openFile', $event)"
+              @error="emit('error', $event)"
+            />
+          </template>
         </div>
         <p v-else class="activity-empty">
           {{
@@ -189,7 +200,7 @@ function activityLabel(block: any) {
         :host-id="hostId"
         :item="item"
         :busy="running(block)"
-        :can-fork="item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
+        :can-fork="!hideFork && item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
         @fork="emit('fork', $event)"
         @open-file="emit('openFile', $event)"
         @error="emit('error', $event)"

@@ -584,3 +584,35 @@ test('subagent completion and failure never notify, including cold metadata and 
     done('child', 'again'); service.observe(other, { method: 'thread/started', params: { thread: { id: 'child', name: '另一主机主任务', source: 'cli' } } }); service.observe(other, { method: 'turn/completed', params: { threadId: 'child', turn: { id: 'a', status: 'completed' } } }); await service.flush(); assert.equal(sent.length, 2)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
+
+test('ephemeral side chat completion and failures do not notify; metadata races and host isolation preserve main notices', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-side-'))
+  const sent: any[] = []
+  let resolve: (value: unknown) => void = () => {}
+  let lookupStarted = false
+  const service = await PushService.create(directory, new Set([origin]), {
+    sendNotification: async (_subscription, payload) => { sent.push(JSON.parse(payload)) },
+    resolveThread: async (_host, threadId) => {
+      if (threadId === 'cold-side') { lookupStarted = true; return new Promise(done => { resolve = done }) }
+      return { id: threadId, source: 'cli', name: '主对话', ephemeral: false }
+    },
+  })
+  try {
+    await service.subscribe('side-test-session', subscription('side-notifications'))
+    const done = (threadId: string, turnId: string, status = 'completed') => service.observe(host, { method: 'turn/completed', params: { threadId, turn: { id: turnId, status } } })
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'side', name: '侧边提问', source: 'cli', ephemeral: true } } })
+    done('side', 'complete'); done('side', 'failure', 'failed')
+    done('cold-side', 'cold')
+    while (!lookupStarted) await tick()
+    service.observe(host, { method: 'thread/name/updated', params: { threadId: 'cold-side', threadName: '后来修改的侧边标题' } })
+    resolve({ id: 'cold-side', name: '旧标题', source: 'cli', ephemeral: true })
+    await service.flush(); assert.equal(sent.length, 0)
+    done('parent', 'main'); await service.flush(); assert.equal(sent.length, 1)
+    const other = { ...host, id: 'other' }
+    service.observe(other, { method: 'thread/started', params: { thread: { id: 'side', name: '另一台主机的主对话', source: 'cli', ephemeral: false } } })
+    service.observe(other, { method: 'turn/completed', params: { threadId: 'side', turn: { id: 'complete', status: 'completed' } } })
+    await service.flush(); assert.equal(sent.length, 2)
+    service.observe(host, { id: 'side-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'side', turnId: 'approval-turn' } })
+    await service.flush(); assert.equal(sent.length, 3); assert.equal(sent[2].data.kind, 'approval')
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
