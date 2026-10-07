@@ -142,7 +142,7 @@ watch(() => [state.authenticated, choiceRequests.value.length, threadTitle.value
   const reminder = choiceRequests.value.length ? `（${choiceRequests.value.length} 待选择）` : '';
   document.title = state.authenticated ? `${reminder}${threadTitle.value} · Codex Web` : 'Codex Web';
 }, { immediate: true });
-const welcome = computed(() => !state.activeThread && !state.items.length);
+const welcome = computed(() => !state.activeThread && !state.items.length && !state.selectingThread && !state.switchingHost);
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.compacting || state.loading || !state.online ||
   state.selectingThread || state.switchingHost || state.changingContext ||
@@ -288,9 +288,9 @@ async function selectThread(
   showScrollBottom.value = true;
   await action(async () => {
     try {
-      if (hostId !== state.hostId) await api.setHost(hostId);
-      if (generation !== navigationSelection || hostId !== state.hostId) return;
-      await api.selectThread(id);
+      if (hostId !== state.hostId || state.switchingHost || !state.connected)
+        await api.setHost(hostId, { threadId: id });
+      else await api.selectThread(id);
     } catch (error) {
       if (generation === navigationSelection) throw error;
     }
@@ -1076,6 +1076,14 @@ watch(() => [state.authenticated, state.loading], () => {
             </div>
           </div>
           <div v-else class="message-list">
+            <div
+              v-if="!state.items.length && !state.turns.length && (state.selectingThread || state.switchingHost)"
+              class="conversation-loading"
+              role="status"
+              aria-live="polite"
+            >
+              <Icon name="LoaderCircle" :size="16" class="spin" />正在加载会话…
+            </div>
             <button
               v-if="state.moreTurns"
               class="load-older"
@@ -1117,6 +1125,8 @@ watch(() => [state.authenticated, state.loading], () => {
               v-if="
                 !state.items.length &&
                 !state.turns.length &&
+                !state.selectingThread &&
+                !state.switchingHost &&
                 !state.busy &&
                 !activeRequests.length
               "

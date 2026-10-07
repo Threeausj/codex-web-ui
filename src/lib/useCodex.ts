@@ -167,6 +167,8 @@ let eventGapRevision = 0;
 let writerAttachment: { hostId: string; threadId: string; engineId: string | null } | null = null;
 let listGeneration = 0;
 let configGeneration = 0;
+let configurationRequest: { scope: string; socket: WebSocket | null; promise: Promise<void> } | null = null;
+let verifiedConfiguration: { scope: string; socket: WebSocket | null } | null = null;
 let integrationGeneration = 0;
 let skillsGeneration = 0;
 let skillsRequest: { scope: string; promise: Promise<any> } | null = null;
@@ -1923,6 +1925,10 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     return;
   }
   try {
+    if (!preserveWriter) {
+      await ensureConfiguration();
+      if (!current()) return;
+    }
     if (!preserveWriter) applyPermissionDefault();
     const resumeProfile = availablePermissionProfiles(state.preferences.permissionProfiles)
       .find(profile => profile.id === state.activePermissionProfileId);
@@ -2071,7 +2077,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     }
     if (state.projectPath !== previousProject) {
       rememberProject();
-      void readConfig();
+      void readConfig().catch(fail);
       state.selectedSkills = [];
       void loadSkills().catch(() => {});
     }
@@ -3075,10 +3081,13 @@ async function archiveProject(project: any) {
   }
   toast(`已归档 ${archived} 个对话，可在已归档对话中恢复`);
 }
-async function setHost(id: string) {
+async function setHost(id: string, options: { threadId?: string } = {}) {
   if (!state.hosts.some((host) => host.id === id))
     throw fail(new Error("主机不存在"));
-  if (id === state.hostId && state.connected) return;
+  if (id === state.hostId && state.connected && !state.switchingHost) {
+    if (options.threadId) await selectThread(options.threadId);
+    return;
+  }
   const hostGeneration = ++hostSelectionGeneration;
   state.switchingHost = true;
   const previous = hostNavigation(state.hostId);
@@ -3089,7 +3098,6 @@ async function setHost(id: string) {
   previous.loaded = state.connected || previous.loaded;
   previous.projectPages = { ...state.projectThreadPages };
   closeConnection();
-  itemCache.clear();
   discardedTurns.clear();
   completedTurns.clear();
   seenThreadChanges.clear();
@@ -3115,6 +3123,9 @@ async function setHost(id: string) {
   ++integrationGeneration;
   ++searchGeneration;
   newThread(false);
+  // newThread saves the outgoing selection into this host-local cache. Clear
+  // afterwards so equal native IDs on different hosts cannot share live arrays.
+  itemCache.clear();
   state.threads = [...(state.navigation[id]?.threads ?? [])];
   state.projectThreadPages = {};
   state.pendingRequests = [];
@@ -3147,15 +3158,56 @@ async function setHost(id: string) {
     saved<Record<string, string>>("codex.projectPaths", {})[id] ??
     state.hosts.find((host) => host.id === id)?.cwd ??
     (id === "local" ? localCwd : "/tmp");
+  const target = options.threadId;
+  const authentication = authenticationGeneration;
+  const selection = selectionGeneration;
+  const current = () => id === state.hostId && hostGeneration === hostSelectionGeneration &&
+    authentication === authenticationGeneration;
+  const previewCurrent = () => current() && selection === selectionGeneration &&
+    state.activeThread?.id === target && !state.threadReady;
+  if (target) {
+    // Select before the first await: switching transports must never briefly
+    // present a new-chat welcome screen or the previous host's conversation.
+    const cached = conversationCache.peek(id, target);
+    state.activeThread = state.threads.find(thread => thread.id === target) ?? cached?.thread ?? { id: target };
+    if (state.activeThread.cwd) state.projectPath = state.activeThread.cwd;
+    state.threadReady = false;
+    state.selectingThread = true;
+    state.threadReleased = releasedThreads.get(id)?.has(target) || false;
+    rememberThread(target);
+    if (cached) applyConversationSnapshot(cached, target);
+    else void conversationCache.read(id, target).then(snapshot => {
+      if (snapshot && previewCurrent() && !state.items.length)
+        applyConversationSnapshot(snapshot, target);
+    });
+  }
   startNavigationRefresh();
   try {
     await connect();
-    if (id !== state.hostId || hostGeneration !== hostSelectionGeneration)
-      return;
+    if (!current()) return;
     if (state.runtimePaused) return;
-    await sync();
+    if (!target) { await sync(); return; }
+    // A read-only first page can paint while managed permissions are loading.
+    // Resume still performs its own fresh read before confirming a writer.
+    if (!state.items.length) {
+      const revision = itemEventSequence;
+      void history(target, null, id).then(page => {
+        if (!previewCurrent() || state.items.length || revision !== itemEventSequence) return;
+        state.turns = [...page.data].reverse();
+        state.items = state.turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })));
+        turnCursor = page.nextCursor;
+        state.moreTurns = !!turnCursor;
+      }).catch(() => {});
+    }
+    void Promise.allSettled([refreshThreads(), loadModeCapabilities(), loadSkills()]);
+    await readConfig();
+    if (!previewCurrent()) return;
+    await selectThread(target);
   } finally {
-    if (hostGeneration === hostSelectionGeneration) state.switchingHost = false;
+    if (current()) {
+      state.switchingHost = false;
+      if (target && state.activeThread?.id === target) state.selectingThread = false;
+    }
   }
 }
 async function testHost(host: any) {
@@ -3575,34 +3627,63 @@ function respond(id: string | number, result: any) {
     (request) => request.id !== id,
   );
 }
-async function readConfig() {
+function readConfig(force = false): Promise<void> {
+  const requestScope = scope();
+  const requestSocket = socket;
+  if (!force && configurationRequest?.scope === requestScope && configurationRequest.socket === requestSocket)
+    return configurationRequest.promise;
+  const operation = loadConfig().finally(() => {
+    if (configurationRequest?.promise === operation) configurationRequest = null;
+  });
+  configurationRequest = { scope: requestScope, socket: requestSocket, promise: operation };
+  return operation;
+}
+async function ensureConfiguration() {
+  if (configurationRequest?.scope === scope() && configurationRequest.socket === socket)
+    await configurationRequest.promise;
+  else if (verifiedConfiguration?.scope !== scope() || verifiedConfiguration.socket !== socket)
+    await readConfig();
+  if (verifiedConfiguration?.scope !== scope() || verifiedConfiguration.socket !== socket)
+    throw new Error('主机配置尚未确认，请同步后重试。');
+}
+async function loadConfig() {
   const generation = ++configGeneration;
   const requestScope = scope();
+  const requestSocket = socket;
+  verifiedConfiguration = null;
+  const current = () => generation === configGeneration && requestScope === scope() && requestSocket === socket;
+  const optional = (method: Method, params: any, apply: (value: any) => void) =>
+    rpc(method, params, 45000, { silentError: true }).then(value => {
+      if (current()) apply(value);
+    }).catch(() => {});
+  // Account and quota endpoints can wait on a provider's network. They are
+  // useful metadata, but never prerequisites for reading or resuming a thread.
+  void optional("account/read", { refreshToken: false }, value => { state.account = value.account; });
+  void optional("account/rateLimits/read", {}, value => { state.rateLimits = value; });
+  void optional("permissionProfile/list", { cwd: state.projectPath || undefined }, value => {
+    state.nativePermissionProfiles = value.data || [];
+  });
+  // Start the model catalogue concurrently, but apply it after configuration
+  // so the provider's default cannot override the user's configured model.
+  const modelsRequest = rpc("model/list", { limit: 100, includeHidden: false }, 45000, { silentError: true })
+    .then(value => ({ value }), () => ({ value: null }));
   const results = await Promise.allSettled([
     rpc("config/read", {
       includeLayers: true,
       cwd: state.projectPath || undefined,
     }),
-    rpc("model/list", { limit: 100, includeHidden: false }),
-    rpc("account/read", { refreshToken: false }, 45000, { silentError: true }),
-    rpc("account/rateLimits/read", {}, 45000, { silentError: true }),
     rpc("configRequirements/read", undefined, 45000, { silentError: true }),
-    rpc(
-      "permissionProfile/list",
-      { cwd: state.projectPath || undefined },
-      45000,
-      { silentError: true },
-    ),
   ]);
-  if (generation !== configGeneration || requestScope !== scope()) return;
+  if (!current()) return;
   const config = results[0];
-  const models = results[1];
-  const account = results[2];
-  const limits = results[3];
+  const requirements = results[1];
+  if (config.status === "rejected") throw config.reason;
+  // Older Codex versions do not expose managed requirements. A network or
+  // runtime failure is different: do not resume with an unverified policy.
+  if (requirements.status === "rejected" && requirements.reason?.code !== -32601)
+    throw requirements.reason;
   state.requirements =
-    results[4].status === "fulfilled" ? results[4].value.requirements : null;
-  state.nativePermissionProfiles =
-    results[5].status === "fulfilled" ? results[5].value.data || [] : [];
+    requirements.status === "fulfilled" ? requirements.value.requirements : null;
   if (config.status === "fulfilled") {
     state.config = config.value;
     const settings = config.value.config;
@@ -3631,8 +3712,10 @@ async function readConfig() {
       }
     }
   }
-  if (models.status === "fulfilled") {
-    state.models = models.value.data;
+  verifiedConfiguration = { scope: requestScope, socket: requestSocket };
+  void modelsRequest.then(({ value }) => {
+    if (!current() || !value) return;
+    state.models = value.data;
     if (!state.model)
       state.model =
         (state.models.find((model) => model.isDefault) ?? state.models[0])
@@ -3647,13 +3730,11 @@ async function readConfig() {
         displayName: `${state.model} · 当前配置`,
         supportedReasoningEfforts: [],
       });
-  }
-  if (account.status === "fulfilled") state.account = account.value.account;
-  if (limits.status === "fulfilled") state.rateLimits = limits.value;
+  });
 }
 async function saveConfig(edits: any[]) {
   await rpc("config/batchWrite", { edits });
-  await readConfig();
+  await readConfig(true);
   toast("已保存到 Codex 配置");
 }
 function invalidateRuntimeCapabilities() {
