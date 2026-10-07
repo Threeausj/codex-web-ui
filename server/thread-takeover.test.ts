@@ -22,9 +22,9 @@ const runHelper = (home: string, mode = 'inspect', snapshot?: unknown, script = 
   return JSON.parse(result.stdout)
 }
 
-async function holder(t: import('node:test').TestContext, options: { codex?: boolean; threads?: string[]; ignoreTerm?: boolean } = {}) {
+async function holder(t: import('node:test').TestContext, options: { codex?: boolean; threads?: string[]; ignoreTerm?: boolean; waitForProbeOnTerm?: boolean; sharedHome?: string; readyBeforeLock?: boolean } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-takeover-lock-'))
-  const home = path.join(directory, 'home')
+  const home = options.sharedHome || path.join(directory, 'home')
   const locks = path.join(home, 'thread-writer-locks')
   await fs.mkdir(locks, { recursive: true })
   await fs.writeFile(path.join(locks, '.coordination.lock'), '')
@@ -32,19 +32,25 @@ async function holder(t: import('node:test').TestContext, options: { codex?: boo
   const binary = options.codex === false ? executable : path.join(directory, 'codex')
   if (options.codex !== false) { await fs.copyFile(executable, binary); await fs.chmod(binary, 0o700) }
   const child = spawn(binary, ['-c', String.raw`
-import fcntl,json,os,signal,sys
+import fcntl,json,os,signal,sys,time
 if sys.argv[2] == 'ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if sys.argv[2] == 'wait-probe':
+    def release_after_probe(signum, frame):
+        while not os.path.exists(os.path.join(sys.argv[1],'release-after-probe')): time.sleep(0.01)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, release_after_probe)
 files=[]
+if sys.argv[4] == 'before-lock': print('ready',flush=True)
 def add(thread):
     file=open(os.path.join(sys.argv[1],thread+'.lock'),'a+')
     fcntl.flock(file,fcntl.LOCK_EX)
     files.append(file)
 for thread in json.loads(sys.argv[3]): add(thread)
-print('ready',flush=True)
+print('acquired' if sys.argv[4] == 'before-lock' else 'ready',flush=True)
 for line in sys.stdin:
     add(line.strip())
     print('added',flush=True)
-`, locks, options.ignoreTerm ? 'ignore' : 'normal', JSON.stringify(options.threads || [thread])], { env: { ...process.env, PYTHONHOME: prefix }, stdio: ['pipe', 'pipe', 'pipe'] })
+`, locks, options.waitForProbeOnTerm ? 'wait-probe' : options.ignoreTerm ? 'ignore' : 'normal', JSON.stringify(options.threads || [thread]), options.readyBeforeLock ? 'before-lock' : 'after-lock'], { env: { ...process.env, PYTHONHOME: prefix }, stdio: ['pipe', 'pipe', 'pipe'] })
   child.stderr.resume()
   await once(child.stdout, 'data')
   t.after(async () => {
@@ -151,6 +157,109 @@ test('older NAS kernel fallback revalidates and escalates only the exact synthet
   const result = runHelper(fixture.home, 'takeover', inspection.snapshot, script)
   assert.deepEqual(result, { ok: true, released: true, terminated: true })
   assert.equal(runHelper(fixture.home).locked, false)
+})
+
+test('filesystem lock device and inode translations still require exact FD identity and preserve the complete affected thread set', { skip: !canRunHelper }, async t => {
+  const fixture = await holder(t, { threads: [thread, otherThread], ignoreTerm: true })
+  // Simulate the kernel's backing-file identity differing from the visible
+  // overlay stat. Both /proc/locks and native fdinfo still describe the same
+  // kernel lock, while actual FD stat remains the original visible identity.
+  const translated = THREAD_WRITER_HELPER.replace(
+    'key = (int(major, 16), int(minor, 16), int(inode))',
+    'key = (int(major, 16), int(minor, 16) + 1, int(inode) + 1000000)',
+  )
+  const inspected = runHelper(fixture.home, 'inspect', undefined, translated)
+  const actual = await fs.stat(path.join(fixture.locks, `${thread}.lock`))
+  assert.equal(inspected.ok, true)
+  assert.equal(inspected.snapshot.pid, fixture.child.pid)
+  assert.equal(inspected.snapshot.inode, String(actual.ino))
+  assert.deepEqual(inspected.snapshot.threads, [thread, otherThread])
+  // Exercise this same verified mapping before TERM/KILL and while waiting for
+  // release, using only the synthetic owner created for this test.
+  assert.deepEqual(runHelper(fixture.home, 'takeover', inspected.snapshot, translated), { ok: true, released: true, terminated: true })
+})
+
+test('a writer exiting between the busy flock probe and FD scan releases normally without a false owner-change failure', { skip: !canRunHelper }, async t => {
+  const fixture = await holder(t, { waitForProbeOnTerm: true })
+  const inspected = runHelper(fixture.home)
+  const raced = THREAD_WRITER_HELPER.replace('try: print(json.dumps(main(),', String.raw`
+original_owners = flock_owners
+wait_scans = 0
+def exit_between_probe_and_scan(key):
+    global wait_scans
+    if sys._getframe(1).f_code.co_name != 'await_release': return original_owners(key)
+    wait_scans += 1
+    if wait_scans == 1:
+        # The genuine writer still owns the native flock and waits for our
+        # marker. An indeterminate FD scan alone must not authorize a signal.
+        return {}
+    open(os.path.join(sys.argv[3],'thread-writer-locks','release-after-probe'),'w').close()
+    fd = os.open(os.path.join(sys.argv[3],'thread-writer-locks',sys.argv[2]+'.lock'),os.O_RDONLY)
+    try:
+        deadline = time.monotonic() + 1
+        while locked(fd) and time.monotonic() < deadline: time.sleep(0.01)
+        if locked(fd): refuse('writer_timeout')
+    finally: os.close(fd)
+    # Now the process has actually exited after await_release's busy check;
+    # its disappeared FD ownership must cause another native release probe.
+    return original_owners(key)
+flock_owners = exit_between_probe_and_scan
+try: print(json.dumps(main(),`)
+  assert.deepEqual(runHelper(fixture.home, 'takeover', inspected.snapshot, raced), { ok: true, released: true, terminated: true })
+  await fs.access(path.join(fixture.locks, 'release-after-probe'))
+  assert.equal(runHelper(fixture.home).locked, false)
+  if (fixture.child.exitCode === null && fixture.child.signalCode === null) await once(fixture.child, 'exit')
+  assert.equal(fixture.child.exitCode, 0)
+  assert.equal(fixture.child.signalCode, null)
+})
+
+test('a real replacement writer acquiring the released native flock during the wait is never followed or signalled', { skip: !canRunHelper }, async t => {
+  const original = await holder(t, { waitForProbeOnTerm: true })
+  const inspected = runHelper(original.home)
+  const replacement = await holder(t, { sharedHome: original.home, readyBeforeLock: true })
+  const raced = THREAD_WRITER_HELPER.replace('try: print(json.dumps(main(),', `
+original_owners = flock_owners
+def replace_after_busy_probe(key):
+    if sys._getframe(1).f_code.co_name != 'await_release': return original_owners(key)
+    open(os.path.join(sys.argv[3],'thread-writer-locks','release-after-probe'),'w').close()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        owners = original_owners(key)
+        if owners.get(key) == {${replacement.child.pid}}: return owners
+        time.sleep(0.01)
+    refuse('writer_timeout')
+flock_owners = replace_after_busy_probe
+try: print(json.dumps(main(),`)
+  assert.deepEqual(runHelper(original.home, 'takeover', inspected.snapshot, raced), { ok: false, code: 'writer_changed' })
+  assert.equal(runHelper(original.home).snapshot.pid, replacement.child.pid)
+  assert.equal(replacement.child.signalCode, null)
+  if (original.child.exitCode === null && original.child.signalCode === null) await once(original.child, 'exit')
+  assert.equal(original.child.exitCode, 0)
+  assert.equal(original.child.signalCode, null)
+})
+
+test('global flock candidates cannot identify a writer through same-inode different-device descriptors or unproven fdinfo', { skip: !canRunHelper }, async t => {
+  const fixture = await holder(t)
+  const wrongDevice = THREAD_WRITER_HELPER.replace('try: print(json.dumps(main(),', String.raw`
+from types import SimpleNamespace
+original_stat = os.stat
+def descriptor_device_collision(path, *args, **kwargs):
+    info = original_stat(path, *args, **kwargs)
+    if isinstance(path, str) and path.startswith('/proc/') and '/fd/' in path:
+        return SimpleNamespace(st_dev=info.st_dev + 1, st_ino=info.st_ino, st_mode=info.st_mode)
+    return info
+os.stat = descriptor_device_collision
+try: print(json.dumps(main(),`)
+  assert.equal(runHelper(fixture.home, 'inspect', undefined, wrongDevice).code, 'writer_unidentified')
+  for (const replacement of [
+    "locks = [flock_record(line.replace('FLOCK', 'POSIX')) for line in stream if line.startswith('lock:')]",
+    "locks = [(record[0], record[1] + 1000000) if record else None for record in [flock_record(line) for line in stream if line.startswith('lock:')]]",
+  ]) {
+    const unproven = THREAD_WRITER_HELPER.replace("locks = [flock_record(line) for line in stream if line.startswith('lock:')]", replacement)
+    assert.equal(runHelper(fixture.home, 'inspect', undefined, unproven).code, 'writer_unidentified')
+  }
+  assert.equal(fixture.child.signalCode, null)
+  assert.equal(runHelper(fixture.home).snapshot.pid, fixture.child.pid)
 })
 
 const codexBin = process.env.CODEX_BIN || 'codex'

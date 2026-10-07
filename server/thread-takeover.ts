@@ -65,17 +65,55 @@ def ancestors():
 def file_key(info):
     return (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
 
-def flock_owners():
+def flock_record(line):
+    fields = line.split()
+    if fields and fields[0] == 'lock:': fields = fields[1:]
+    if len(fields) != 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE'] or fields[6:] != ['0', 'EOF']: return None
+    try:
+        major, minor, inode = fields[5].split(':')
+        key = (int(major, 16), int(minor, 16), int(inode))
+        pid = int(fields[4])
+    except ValueError: refuse('writer_unidentified')
+    return (key, pid) if pid > 1 else None
+
+def descriptor_owners(pid, records):
     owners = {}
-    for line in open('/proc/locks'):
-        fields = line.split()
-        if len(fields) != 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']: continue
+    try: descriptors = os.listdir('/proc/%d/fd' % pid)
+    except (FileNotFoundError, PermissionError): return owners
+    if len(descriptors) > 10000: refuse('writer_too_many_locks')
+    for descriptor in descriptors:
+        file_path = '/proc/%d/fd/%s' % (pid, descriptor)
         try:
-            major, minor, inode = fields[5].split(':')
-            key = (int(major, 16), int(minor, 16), int(inode))
-            pid = int(fields[4])
-        except ValueError: refuse('writer_unidentified')
-        owners.setdefault(key, set()).add(pid)
+            info = os.stat(file_path)
+            if not stat.S_ISREG(info.st_mode): continue
+            with open('/proc/%d/fdinfo/%s' % (pid, descriptor)) as stream:
+                locks = [flock_record(line) for line in stream if line.startswith('lock:')]
+            # A descriptor may close and be reused while /proc is being read.
+            # Verify its file identity on both sides of the fdinfo snapshot.
+            if file_key(os.stat(file_path)) != file_key(info): continue
+        except (FileNotFoundError, PermissionError): continue
+        for record in locks:
+            if record is not None and record[1] == pid and record in records:
+                owners.setdefault(file_key(info), set()).add(pid)
+    return owners
+
+def flock_owners(target_key):
+    records = set()
+    for line in open('/proc/locks'):
+        record = flock_record(line)
+        if record is not None: records.add(record)
+    if len(records) > 10000: refuse('writer_too_many_locks')
+    owners = {}
+    # Overlay mounts and some subvolumes expose a different st_dev (and may
+    # translate inode numbers) from the native lock's backing filesystem.
+    # Global locks nominate candidates only. A holder's real FD stat must match
+    # the complete target device/inode, and that same FD's kernel fdinfo must
+    # prove its exclusive flock ownership. Never identify a holder by inode alone.
+    candidates = {pid for key, pid in records}
+    preferred = {pid for key, pid in records if key[2] == target_key[2]}
+    for pid in sorted(candidates, key=lambda value: value not in preferred):
+        for key, pids in descriptor_owners(pid, records).items():
+            owners.setdefault(key, set()).update(pids)
     return owners
 
 def open_lock(directory, name):
@@ -98,7 +136,7 @@ def inspect(directory, thread):
     try:
         if not locked(fd): return None
         info = os.fstat(fd)
-        owners = flock_owners()
+        owners = flock_owners(file_key(info))
         pids = owners.get(file_key(info), set())
         # /proc/locks filters owners outside this PID namespace. A lock can be
         # busy even though its host owner cannot safely be signalled here.
@@ -165,7 +203,15 @@ def await_release(directory, thread, expected, seconds):
             if '%d:%d' % (os.major(info.st_dev), os.minor(info.st_dev)) != expected['device'] or str(info.st_ino) != expected['inode']:
                 refuse('writer_changed')
             if not locked(fd): return True
-            if flock_owners().get(file_key(info), set()) != {expected['pid']}: refuse('writer_changed')
+            owners = flock_owners(file_key(info)).get(file_key(info), set())
+            if owners != {expected['pid']}:
+                # The original process can exit between the busy probe and its
+                # FD scan. Recheck the real flock before treating an empty scan
+                # as failure, and allow a bounded wait while /proc is changing.
+                # A verified replacement owner always cancels this takeover;
+                # later signals still require the complete original identity.
+                if owners: refuse('writer_changed')
+                if not locked(fd): return True
         finally: os.close(fd)
         time.sleep(0.05)
     return False
