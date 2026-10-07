@@ -131,8 +131,16 @@ test("built PWA installs its real worker, caches public resources only and start
     return result;
   });
   expect(cached).toContain("/index.html");
-  expect(cached.some((pathname) => pathname.includes("InteractiveTerminal"))).toBe(true);
+  expect(cached.some((pathname) => /InteractiveTerminal|CodeEditor|pdf\.worker/.test(pathname))).toBe(false);
   expect(cached.some((pathname) => pathname.startsWith("/api/") || pathname.includes("thread-existing"))).toBe(false);
+  // Large feature bundles cache on first use instead of delaying installation.
+  await page.getByRole("button", { name: "关闭设置", exact: true }).click();
+  await page.getByRole("button", { name: "切换工作区", exact: true }).click();
+  await page.getByRole("button", { name: "终端", exact: true }).click();
+  await expect.poll(() => page.evaluate(async () => {
+    for (const name of await caches.keys()) for (const request of await (await caches.open(name)).keys()) if (request.url.includes("InteractiveTerminal")) return true;
+    return false;
+  })).toBe(true);
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByText("目前离线，联网后即可登录工作区。", { exact: true })).toBeVisible();

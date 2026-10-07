@@ -18,7 +18,19 @@ async function fixture() {
   } };
   const dependencies = { getBridge: async () => bridge, getHost: (id: string) => id === 'local' ? host : undefined, now: () => clock };
   let service = new AutomationService(directory, dependencies); await service.initialize(false);
-  const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setTimeout(resolve, 10)); };
+  const settle = async () => {
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      await (service as any).writes;
+      if (!(service as any).ticking) {
+        await Promise.all((service as any).operations.values());
+        await (service as any).writes;
+        if (!(service as any).ticking && !(service as any).operations.size) return;
+      }
+      assert.ok(Date.now() < deadline, 'Automation fixture did not become idle');
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  };
   return { directory, calls, bridge, service, settle, setFailure: (value: any) => { failure = value; }, advance: (ms: number) => { clock += ms; }, clock: () => clock,
     async restart() { await service.close(); service = new AutomationService(directory, dependencies); await service.initialize(false); return service; },
     async close() { await service.close(); await fs.rm(directory, { recursive: true, force: true }); } };
@@ -97,4 +109,38 @@ test('shutdown during a native fork receipt retains its ID and never dispatches 
     assert.equal(restarted.list().runs[0]!.threadId, 'late-formal');
     assert.equal(f.calls.filter(call => call.method === 'thread/start').length, 1);
   } finally { await f.close(); }
+});
+
+test('automation HTTP controls enforce login, CSRF and input limits and persist disabled tasks without launching Codex', async () => {
+  const { createServer } = await import('./app.js');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-automation-http-'));
+  const origin = 'http://127.0.0.1:8787';
+  let launches = 0;
+  const options = { cwd: directory, dataDir: path.join(directory, 'data'), codexHome: path.join(directory, 'codex'), password: 'isolated-automation-password', origins: [origin], secureCookie: false, serveStatic: false,
+    bridgeOptions: { transportFactory: () => { launches++; throw new Error('This test must never launch Codex'); } } };
+  let app = await createServer(options);
+  const listen = async () => { await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve)); return `http://127.0.0.1:${(app.server.address() as any).port}`; };
+  try {
+    let base = await listen();
+    const input = { ...spec, cwd: directory, enabled: false };
+    assert.equal((await fetch(base + '/api/automations')).status, 401);
+    const login = await fetch(base + '/api/auth/login', { method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: JSON.stringify({ password: options.password }) });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+    const { csrfToken } = await login.json();
+    const headers = { cookie, origin, 'content-type': 'application/json', 'x-csrf-token': csrfToken };
+    const post = (value: unknown, auth = headers) => fetch(base + '/api/automations', { method: 'POST', headers: auth, body: JSON.stringify(value) });
+    assert.equal((await post(input, { ...headers, 'x-csrf-token': '' })).status, 403);
+    assert.equal((await post(input, { ...headers, origin: 'https://untrusted.example' })).status, 403);
+    assert.equal((await post({ ...input, cadence: { kind: 'interval', minutes: 1 } })).status, 400);
+    const created = await post(input); assert.equal(created.status, 201); const task = await created.json();
+    assert.equal(task.enabled, false); assert.equal(task.nextAt, null);
+    assert.equal((await fs.stat(path.join(options.dataDir, 'automations.json'))).mode & 0o777, 0o600);
+    await app.close(); app = await createServer(options); base = await listen();
+    const response = await fetch(base + '/api/automations', { headers: { cookie } });
+    assert.equal(response.status, 200); assert.match(response.headers.get('cache-control')!, /no-store/);
+    const restored = await response.json(); assert.equal(restored.tasks[0].id, task.id); assert.deepEqual(restored.runs, []);
+    assert.equal((await fetch(base + '/api/automations/' + task.id, { method: 'DELETE', headers })).status, 200);
+    assert.equal(launches, 0);
+  } finally { await app.close(); await fs.rm(directory, { recursive: true, force: true }); }
 });

@@ -24,7 +24,7 @@ async function render() {
     canvas.value.style.width = `${viewport.width}px`; canvas.value.style.height = `${viewport.height}px`;
     renderTask = pdfPage.render({ canvas: canvas.value, viewport, transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0] });
     await renderTask.promise;
-  } catch (cause: any) { if (current === generation && cause.name !== 'RenderingCancelledException') error.value = cause.message || 'PDF 渲染失败'; }
+  } catch (cause: any) { if (current === generation && cause.name !== 'RenderingCancelledException') error.value = `PDF 预览失败，可下载文件查看：${cause.message || '渲染失败'}`; }
   finally { if (current === generation) busy.value = false; }
 }
 async function load() {
@@ -40,7 +40,7 @@ async function load() {
     const loaded = await loading.promise;
     if (current !== generation) { await loading.destroy(); return; }
     document = loaded; count.value = loaded.numPages; await render();
-  } catch (cause: any) { if (current === generation) { error.value = cause.message || 'PDF 读取失败，可下载查看'; busy.value = false; } }
+  } catch (cause: any) { if (current === generation) { error.value = `PDF 预览失败，可下载文件查看：${cause.message || '读取失败'}`; busy.value = false; } }
 }
 watch(() => props.dataBase64, () => void load());
 watch([page, zoom], () => { if (document) void render(); });

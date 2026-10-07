@@ -49,6 +49,9 @@ const markdownBlocks = computed(() => props.item.type === 'agentMessage' ? conve
 const html = computed(() => conversationMarkdown(renderedText.value, props.hostId, props.cwd || props.item.cwd))
 const findings = computed(() => props.item.type === 'exitedReviewMode' ? reviewFindings(props.item.review) : []);
 const disclosures = historyDisclosures();
+const reasoningExpanded = ref(disclosures?.reasoning.get(props.item.id) ?? !!props.busy);
+watch(reasoningExpanded, value => disclosures?.reasoning.set(props.item.id, value));
+watch(() => props.busy, (current, previous) => { if (previous && !current) reasoningExpanded.value = false; });
 const toolExpanded = ref(disclosures?.tools.has(props.item.id) || false)
 watch(toolExpanded, value => { if (value) disclosures?.tools.add(props.item.id); else disclosures?.tools.delete(props.item.id); })
 const expandedFiles = ref(disclosures?.files.get(props.item.id) || new Set<string>())
@@ -151,7 +154,7 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <template v-else-if="item.type === 'reasoning'">
-    <details v-if="reasoningSummary" class="reasoning-item" :open="!!busy">
+    <details v-if="reasoningSummary" class="reasoning-item" :open="reasoningExpanded" @toggle="reasoningExpanded = ($event.currentTarget as HTMLDetailsElement).open">
       <summary><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
       <div class="reasoning-content">{{ reasoningSummary }}</div>
     </details>

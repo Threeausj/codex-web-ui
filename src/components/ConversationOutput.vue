@@ -95,7 +95,12 @@ const runningTurnId = computed(() => {
 // An idle notification can end work before its turn-completed metadata arrives.
 // A later busy notification belongs to new work, so keep the old turn settled.
 watch(runningTurnId, (current, previous) => {
-  if (previous && previous !== current) finishedTurns.add(previous);
+  if (previous && previous !== current) {
+    finishedTurns.add(previous);
+    // Automatic live expansion is not an instruction to keep a finished turn
+    // open. Explicitly opened older turns still survive virtual unmounts.
+    expandedTurns.delete(previous);
+  }
 }, { flush: "sync" });
 function running(block: any) {
   return block.id === runningTurnId.value;

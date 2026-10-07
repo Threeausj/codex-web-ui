@@ -70,9 +70,7 @@ test("binary download preserves every byte and is not exposed as an editable tex
     .locator(".file-tree-row")
     .filter({ hasText: "数据 报告.pdf" })
     .click();
-  await expect(
-    page.getByText("此文件可下载后查看", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("PDF 预览失败，可下载文件查看");
   await expect(page.locator(".code-editor")).toHaveCount(0);
   const pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();

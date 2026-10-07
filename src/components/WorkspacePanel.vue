@@ -401,18 +401,23 @@ watch(
         if (restored && Array.isArray(restored.tabs)) { editorTabs.value = restored.tabs.slice(0, 16).filter(entry => typeof entry.file?.path === "string" && typeof entry.content === "string" && typeof entry.original === "string"); activePath.value = restored.activePath; }
       } catch { if (current()) draftWarning.value = "无法读取持久化草稿，请检查网站存储权限"; }
       if (props.state.connected && props.state.projectPath) await readDirectory(props.state.projectPath, false);
-      if (!current()) return;
-      if (props.openPath) await revealPath(props.openPath, props.openLine);
-      else if (file.value?.binary || /^image\//.test(file.value?.mime || "")) await openFile(activePath.value);
     })();
+    // Restoration must finish independently of metadata/file reads. A held
+    // first link must not make the next link wait for its response.
+    void workspaceReady.then(() => {
+      if (current() && !props.openPath && (file.value?.binary || /^image\//.test(file.value?.mime || ""))) void openFile(activePath.value);
+    });
   }, { immediate: true },
 );
 watch(() => props.state.connected, connected => {
   if (connected && props.state.projectPath) void workspaceReady.then(() => readDirectory(directory.value || props.state.projectPath, false));
 });
-watch(() => [props.openPath, props.openLine] as const, ([value, line]) => {
-  if (value) void workspaceReady.then(() => revealPath(value, line));
-});
+watch(() => [props.openPath, props.openLine, fileScope()] as const, ([value, line]) => {
+  const version = workspaceGeneration;
+  if (value) void workspaceReady.then(() => {
+    if (version === workspaceGeneration && props.openPath === value && props.openLine === line) void revealPath(value, line);
+  });
+}, { immediate: true });
 if (typeof window !== "undefined") window.addEventListener("pagehide", persistDrafts);
 onBeforeUnmount(() => {
   persistDrafts(); window.removeEventListener("pagehide", persistDrafts); clearTimeout(draftTimer);

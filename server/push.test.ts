@@ -539,10 +539,14 @@ test('expired upstream subscriptions are removed and provider errors never expos
 
 test('delivery concurrency is bounded and slow or failed push delivery does not block protocol observers', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-concurrency-'))
-  let active = 0; let peak = 0; let delivered = 0
+  let active = 0; let peak = 0; let delivered = 0; let started = 0
+  let releaseFirstBatch!: () => void
+  const firstBatch = new Promise<void>(resolve => { releaseFirstBatch = resolve })
   const push = await PushService.create(directory, new Set([origin]), { sendNotification: async () => {
     active++; peak = Math.max(peak, active)
-    await new Promise(resolve => setTimeout(resolve, 15))
+    // Hold the first batch until every delivery slot is occupied. Disk speed
+    // must not determine whether this test exercises the concurrency limit.
+    if (++started <= 4) { if (started === 4) releaseFirstBatch(); await firstBatch }
     active--; delivered++
     if (delivered === 2) throw new Error('A provider can fail independently')
   } })

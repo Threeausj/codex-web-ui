@@ -78,6 +78,7 @@ test('an invalid cached anchor confirms the latest writer before older revalidat
 test('long history bounds mounted bodies while preserving selections and expanded operation state across scrolling', async ({ page, mock }) => {
   const { turns } = pagedHistory(mock, 120);
   turns[0]!.items.unshift({ id: 'old-command', type: 'commandExecution', command: 'echo old', aggregatedOutput: 'Original command output', status: 'completed', exitCode: 0 });
+  turns[0]!.items.unshift({ id: 'old-summary', type: 'reasoning', summary: ['Retained public summary'], content: [] });
   await login(page); await open(page);
   for (let index = 0; index < 3; index++) {
     await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
@@ -87,6 +88,8 @@ test('long history bounds mounted bodies while preserving selections and expande
   const old = page.locator('.conversation-turn[data-turn-id="history-0"]'); await expect(old).toBeVisible();
   await old.locator('.turn-activity > summary').click(); await old.locator('.activity-batch > summary').click();
   await old.locator('.tool-item > summary').click(); await expect(old).toContainText('Original command output');
+  await old.locator('.reasoning-item > summary').click();
+  await expect(old.getByText('Retained public summary', { exact: true })).toBeVisible();
   await old.locator('[data-selection-item-id="answer-0"]').evaluate(element => {
     const range = document.createRange(); range.selectNodeContents(element); const selection = window.getSelection()!;
     selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event('selectionchange'));
@@ -98,6 +101,7 @@ test('long history bounds mounted bodies while preserving selections and expande
   await expect(old).toHaveCount(0);
   await scroll.evaluate(element => { element.scrollTop = 0; });
   await expect(old).toContainText('Original command output');
+  await expect(old.getByText('Retained public summary', { exact: true })).toBeVisible();
   await expect(old.locator('.turn-activity')).toHaveAttribute('open', '');
 });
 
