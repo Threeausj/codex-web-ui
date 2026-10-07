@@ -17,6 +17,42 @@ class Browser extends EventEmitter {
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
+test('same-engine reconnect replays missed events before status and never replays private RPC responses', async () => {
+  const value = fixture();
+  const first = new Browser(); value.bridge.attach('session:first', first.ws(), 'first');
+  try {
+    await value.bridge.connect();
+    const engineId = (first.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as any).engineId;
+    value.receive({ method: 'thread/name/updated', params: { threadId: 't', name: 'Before' } });
+    first.close();
+    value.receive({ method: 'item/agentMessage/delta', params: { threadId: 't', itemId: 'answer', delta: 'missed' } });
+    value.receive({ method: 'turn/completed', params: { threadId: 't', turn: { id: 'turn', status: 'completed' } } });
+    const next = new Browser(); value.bridge.attach('session:first', next.ws(), 'first', () => true, { engineId, afterSequence: 1 });
+    assert.deepEqual(next.sent.slice(0, 2).map(message => message.bridgeEventSequence), [2, 3]);
+    assert.equal((next.sent.find(message => message.method === 'bridge/status')!.params as any).replayComplete, true);
+    assert.equal(next.sent.some(message => message.id !== undefined && !message.method), false);
+    const wrong = new Browser(); value.bridge.attach('session:wrong', wrong.ws(), 'wrong', () => true, { engineId: 'old-engine', afterSequence: 1 });
+    assert.equal(wrong.sent.some(message => message.bridgeEventSequence), false);
+    assert.equal((wrong.sent[0]!.params as any).replayComplete, false);
+  } finally { value.bridge.close(); }
+});
+
+test('event replay has a bounded window and reports unavailable old cursors', async () => {
+  const value = fixture();
+  try {
+    await value.bridge.connect();
+    const first = new Browser(); value.bridge.attach('session:first', first.ws(), 'first');
+    const engineId = (first.sent[0]!.params as any).engineId;
+    first.close();
+    for (let i = 0; i < 4100; i++) value.receive({ method: 'thread/name/updated', params: { threadId: 't', name: String(i) } });
+    const old = new Browser(); value.bridge.attach('session:old', old.ws(), 'old', () => true, { engineId, afterSequence: 0 });
+    assert.equal((old.sent[0]!.params as any).replayComplete, false);
+    assert.equal(old.sent.some(message => message.bridgeEventSequence), false);
+    const recent = new Browser(); value.bridge.attach('session:recent', recent.ws(), 'recent', () => true, { engineId, afterSequence: 4098 });
+    assert.deepEqual(recent.sent.filter(message => message.bridgeEventSequence).map(message => message.bridgeEventSequence), [4099, 4100]);
+  } finally { value.bridge.close(); }
+});
+
 test('bridge continuity identifies an engine, sequences notifications and acknowledges a sender without repeating its mutation', async () => {
   const value = fixture()
   const first = new Browser(); const second = new Browser()
@@ -33,6 +69,7 @@ test('bridge continuity identifies an engine, sequences notifications and acknow
     const request = value.sent.find(message => message.method === 'thread/name/set')!
     value.receive({ id: request.id, result: {} }); await tick()
     assert.equal(first.sent.find(message => message.method === 'bridge/event/ack')?.bridgeEventSequence, 3)
+    assert.ok(first.sent.findIndex(message => message.id === 'rename') < first.sent.findIndex(message => message.method === 'bridge/event/ack'), 'An accepted RPC result must reach its origin before its cursor advances')
     assert.equal(first.sent.some(message => message.method === 'bridge/thread/changed'), false)
     assert.equal(second.sent.find(message => message.method === 'bridge/thread/changed')?.bridgeEventSequence, 3)
     first.request({ id: 'ping', method: 'bridge/ping', params: {} }); await tick()
@@ -45,6 +82,58 @@ test('bridge continuity identifies an engine, sequences notifications and acknow
     assert.equal(recovered.engineId, initial.engineId); assert.equal(recovered.eventSequence, 3)
   } finally { value.bridge.close() }
 })
+
+test('a client disconnected after its accepted response still gets the missing mutation during replay', async () => {
+  const value = fixture();
+  const first = new Browser(); value.bridge.attach('session:first', first.ws(), 'first');
+  try {
+    await value.bridge.connect();
+    const engineId = (first.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as any).engineId;
+    const send = first.send.bind(first);
+    first.send = raw => { send(raw); if (JSON.parse(raw).id === 'rename') first.close(); };
+    first.request({ id: 'rename', method: 'thread/name/set', params: { threadId: 't', name: 'Accepted rename' } });
+    await tick();
+    value.receive({ id: value.sent.find(message => message.method === 'thread/name/set')!.id, result: {} }); await tick();
+    assert.equal(first.sent.filter(message => message.id === 'rename').length, 1);
+    assert.equal(first.sent.some(message => message.bridgeEventSequence), false);
+    const next = new Browser(); value.bridge.attach('session:first', next.ws(), 'first', () => true, { engineId, afterSequence: 0 });
+    assert.equal(next.sent[0]!.method, 'bridge/thread/changed');
+    assert.equal((next.sent[0]!.params as any).request.name, 'Accepted rename');
+    assert.equal((next.sent.find(message => message.method === 'bridge/status')!.params as any).replayComplete, true);
+  } finally { value.bridge.close(); }
+});
+
+test('replay acknowledges resolved approvals instead of displaying old decisions again', async () => {
+  const value = fixture();
+  try {
+    await value.bridge.connect();
+    const first = new Browser(); value.bridge.attach('session:first', first.ws(), 'first');
+    const engineId = (first.sent[0]!.params as any).engineId;
+    first.close();
+    value.receive({ id: 'approval-old', method: 'item/commandExecution/requestApproval', params: { threadId: 't' } });
+    value.receive({ method: 'serverRequest/resolved', params: { requestId: 'approval-old' } });
+    const next = new Browser(); value.bridge.attach('session:next', next.ws(), 'next', () => true, { engineId, afterSequence: 0 });
+    assert.equal(next.sent[0]!.method, 'bridge/event/ack');
+    assert.equal(next.sent[0]!.bridgeEventSequence, 1);
+    assert.equal(next.sent.some(message => message.id === 'approval-old'), false);
+  } finally { value.bridge.close(); }
+});
+
+test('a native queue-start accepted turn shares otherwise-unbroadcast input with other browsers', async () => {
+  const value = fixture();
+  const origin = new Browser(); const other = new Browser();
+  value.bridge.attach('session:origin', origin.ws(), 'origin'); value.bridge.attach('session:other', other.ws(), 'other');
+  try {
+    await value.bridge.connect();
+    origin.request({ id: 'queue-start', method: 'thread/queue/start', params: { threadId: 't', queuedSubmissionId: 'q' } });
+    await tick();
+    const turn = { id: 'queued-turn', status: 'inProgress', items: [{ id: 'queued-user', type: 'userMessage', content: [{ type: 'text', text: 'Queued input' }] }] };
+    value.receive({ id: value.sent.find(message => message.method === 'thread/queue/start')!.id, result: { turn, queuedSubmissionId: 'q' } }); await tick();
+    const change = other.sent.find(message => message.method === 'bridge/thread/changed')!.params as any;
+    assert.equal(change.method, 'turn/start'); assert.deepEqual(change.result.turn, turn);
+    assert.equal(origin.sent.filter(message => message.id === 'queue-start').length, 1);
+  } finally { value.bridge.close(); }
+});
 
 test('a second compaction rejection cannot clear running progress; a timed out request cannot leave sticky progress', async () => {
   const value = fixture()

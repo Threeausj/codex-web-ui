@@ -170,9 +170,10 @@ test("live process keeps commands and file changes collapsed by default while pr
   ).toBeHidden();
   await expect(approval).toHaveCount(0);
   await expect(group.locator(".turn-activity")).not.toHaveAttribute("open", "");
-  await expect(group.locator(".reasoning-item")).not.toHaveAttribute("open", "");
+  await expect(group.locator(".reasoning-item")).toHaveCount(0);
   await expect(group.locator(".tool-item[open]")).toHaveCount(0);
   await group.locator(".turn-activity > summary").click();
+  await expect(group.locator(".reasoning-item")).not.toHaveAttribute("open", "");
   await expect(
     group.getByText("一大段中间进展说明", { exact: true }),
   ).toBeVisible();
@@ -266,8 +267,8 @@ for (const status of ["failed", "interrupted"]) {
     if (status === "failed") turn.error = { message: "这一轮执行失败的原因" };
     mock.emit("turn/completed", { threadId: "thread-existing", turn });
     await expect(group.locator(".turn-activity")).not.toHaveAttribute("open", "");
-    await expect(group.locator(".reasoning-item")).not.toHaveAttribute("open", "");
-    await expect(group.locator(".tool-item")).not.toHaveAttribute("open", "");
+    await expect(group.locator(".reasoning-item")).toHaveCount(0);
+    await expect(group.locator(".tool-item")).toHaveCount(0);
     await expect(group.getByText(`${turn.id} 进展说明`, { exact: true })).toBeHidden();
     await expect(group.getByText(final.text, { exact: true })).toBeVisible();
     if (status === "failed") await expect(group.getByRole("alert")).toHaveText("这一轮执行失败的原因");
@@ -285,7 +286,7 @@ test("busy fallback folds a turn without completion metadata and another running
   await expect(oldGroup.getByText("missing-completion 公开摘要", { exact: true })).toBeVisible();
   mock.emit("thread/status/changed", { threadId: "thread-existing", status: { type: "idle" } });
   await expect(oldGroup.locator(".turn-activity")).not.toHaveAttribute("open", "");
-  await expect(oldGroup.locator(".reasoning-item")).not.toHaveAttribute("open", "");
+  await expect(oldGroup.locator(".reasoning-item")).toHaveCount(0);
   // The server may mark the chat busy before announcing its next turn.
   mock.emit("thread/status/changed", { threadId: "thread-existing", status: { type: "active" } });
   await expect(page.locator(".working-indicator")).toBeVisible();

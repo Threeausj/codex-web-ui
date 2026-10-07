@@ -11,6 +11,7 @@ export type GitDependencies = {
   getBridge: (hostId?: string) => Promise<GitBridge>;
   getHost?: (hostId: string) => Host | undefined;
   bridgeOptions?: BridgeOptions;
+  busyWorktreeThreads?: (hostId: string, directory: string) => Promise<string[]>;
 };
 type Permission = "read-only" | "workspace-write" | "danger-full-access";
 type Context = { bridge: GitBridge; cwd: string; permission: Permission; read?: (cwd: string, args: string[]) => Promise<CommandExecResponse> };
@@ -465,6 +466,7 @@ export function registerGit(app: Express, deps: GitDependencies) {
           path: absolute,
           branch,
           mode: z.enum(["new", "existing"]).default("new"),
+          startPoint: branch.optional(),
         })
         .parse(req.body);
       const destination = path.posix.normalize(input.path);
@@ -479,6 +481,7 @@ export function registerGit(app: Express, deps: GitDependencies) {
         path.posix.dirname(destination),
       ]);
       await assertBranch(context, input.branch);
+      if (input.startPoint) await assertBranch(context, input.startPoint);
       const parent = (await context.bridge.request("fs/getMetadata", {
         path: path.posix.dirname(destination),
       })) as { isDirectory?: boolean };
@@ -491,7 +494,7 @@ export function registerGit(app: Express, deps: GitDependencies) {
           ...(input.mode === "new" ? ["-b", input.branch] : []),
           "--",
           destination,
-          input.mode === "new" ? "HEAD" : input.branch,
+          input.mode === "new" ? input.startPoint || "HEAD" : input.branch,
         ],
         roots,
       );
@@ -500,4 +503,30 @@ export function registerGit(app: Express, deps: GitDependencies) {
         .json({ ...(await status(context)), projectPath: destination });
     }),
   );
+  app.get('/api/git/review-options', route(async (req, res) => {
+    const context = await contextFor(deps, req.query);
+    const [branches, commits] = await Promise.all([
+      git(context, ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes']),
+      git(context, ['log', '-30', '--format=%H%x00%s', '--no-decorate'], undefined, [0, 128]),
+    ]);
+    res.json({ root: context.cwd, branches: branches.stdout.split('\n').filter(value => value && !value.endsWith('/HEAD')), commits: commits.exitCode === 0 ? commits.stdout.split('\n').filter(Boolean).map(value => { const [sha, ...title] = value.split('\0'); return { sha, title: title.join('\0') }; }) : [] });
+  }));
+  app.post('/api/git/worktree/remove', route(async (req, res) => {
+    const context = await contextFor(deps, req.body);
+    const input = z.object({ path: absolute }).parse(req.body);
+    const destination = path.posix.normalize(input.path);
+    const trees = parseWorktrees((await git(context, ['worktree', 'list', '--porcelain', '-z'])).stdout);
+    const tree = trees.find(entry => entry.path === destination);
+    if (!tree) throw error('工作树不存在或已被其他程序移除', 404);
+    if (destination === context.cwd || destination === trees[0]?.path) throw error('请切换到主仓库后清理其他工作树；不能删除主仓库或当前目录', 409);
+    if (tree.locked || tree.prunable) throw error('工作树已锁定或状态异常，请先在终端检查', 409);
+    const active = await deps.busyWorktreeThreads?.(scope.parse(req.body).hostId, destination) || [];
+    if (active.length) throw error('此工作树仍有正在运行的 Web 会话，请等待完成或先释放会话', 409);
+    const changed = await git({ ...context, cwd: destination }, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
+    if (changed.stdout) throw error('工作树有未提交或未跟踪文件，清理前请提交或另行保留这些改动', 409);
+    const roots = await mutationRoots(context, [path.posix.dirname(destination)]);
+    // No --force: Git rechecks dirty/locked state at removal time.
+    await git(context, ['worktree', 'remove', '--', destination], roots);
+    res.json({ ...(await status(context)), removedPath: destination });
+  }));
 }

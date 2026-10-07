@@ -2,6 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
+import MessageQueuePanel from "./MessageQueuePanel.vue";
+import ModelServiceOptions from "./ModelServiceOptions.vue";
 import { clipboardFiles } from "../lib/clipboard";
 import { contextUsage } from "../lib/context-usage";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
@@ -27,6 +29,11 @@ const dropping = ref(false);
 const uploadCount = ref(0);
 const uploading = computed(() => uploadCount.value > 0);
 const submitting = ref(false);
+const delivery = ref<"immediate" | "queue">("immediate");
+const queue = computed(() => props.api.messageQueue);
+watch(() => [props.state.hostId, props.state.activeThread?.id], () => { delivery.value = "immediate"; });
+watch(() => props.state.busy, (busy, previous) => { if (!busy && previous && !submitting.value) delivery.value = "immediate"; });
+const sendLabel = computed(() => delivery.value === "queue" ? "加入下一轮队列" : props.state.busy ? "追加指令" : "发送消息");
 let pendingDraftSubmission: {
   key: string; hostId: string; projectPath: string; threadId?: string; targetKey?: string;
 } | undefined;
@@ -238,6 +245,8 @@ const compactDisabled = computed(() => !props.state.activeThread || !props.state
 const canSend = computed(
   () =>
     !props.state.threadConflict &&
+    !queue.value?.state.uncertain &&
+    (delivery.value !== "queue" || queue.value?.canMutate.value) &&
     (!props.state.activeThread || props.state.threadReady !== false) &&
     !props.state.runtimePaused &&
     !props.state.compacting &&
@@ -404,7 +413,7 @@ async function send() {
   pendingDraftSubmission = { key: submittedKey, hostId: props.state.hostId,
     projectPath: props.state.projectPath, threadId: props.state.activeThread?.id };
   try {
-    await props.api.send(text, undefined, submittedContexts);
+    await props.api.send(text, undefined, submittedContexts, delivery.value);
     clearSubmittedDraft(submittedKey, submittedDraft);
     const sentKeys = new Set(submittedContexts.map(conversationSelectionKey));
     if (draftKey.value === submittedKey)
@@ -430,6 +439,7 @@ async function send() {
     emit("error", cause.message || "发送消息失败");
   } finally {
     submitting.value = false;
+    if (!props.state.busy) delivery.value = "immediate";
     pendingDraftSubmission = undefined;
   }
 }
@@ -608,6 +618,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
       @host="emit('host', $event)"
       @manage-projects="emit('command', 'settings-projects')"
     />
+    <MessageQueuePanel v-if="queue" :controller="queue" :main="state" />
     <div
       v-if="picker"
       ref="pickerElement"
@@ -760,7 +771,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           !state.connected
             ? '连接 Codex 后即可开始对话'
             : state.busy
-              ? '追加指令，调整当前任务…'
+              ? delivery === 'queue' ? '输入下一轮要执行的任务…' : '追加指令，调整当前任务…'
               : welcome
                 ? conversationMode === 'goal' && !state.goal ? '输入希望 Codex 持续完成的目标…' : '描述一个任务，让 Codex 帮你完成'
                 : '继续对话，/ 选择技能、@ 选择模式或引用文件'
@@ -859,8 +870,15 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               </option></select
             ><Icon name="ChevronDown" :size="12"
           /></label>
+          <ModelServiceOptions :api="api" :state="state" :disabled="contextDisabled || state.busy || state.modeBusy" />
         </div>
         <div class="composer-submit">
+          <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : '立即补充到当前任务'">
+            <select v-model="delivery" aria-label="消息发送方式" :disabled="submitting || contextBusy">
+              <option value="immediate">立即补充</option>
+              <option value="queue" :disabled="!queue?.canMutate.value">下一轮排队</option>
+            </select><Icon name="ChevronDown" :size="11" />
+          </label>
           <button
             class="context-usage"
             :class="{ 'context-high': context && context.percent >= 80 }"
@@ -945,8 +963,8 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
             class="send-button"
             :disabled="!canSend"
             @click="send"
-            :title="state.busy ? '追加指令' : '发送消息'"
-            :aria-label="state.busy ? '追加指令' : '发送消息'"
+            :title="sendLabel"
+            :aria-label="sendLabel"
           >
             <Icon
               :name="submitting ? 'LoaderCircle' : 'ArrowUp'"

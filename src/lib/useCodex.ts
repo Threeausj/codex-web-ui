@@ -1,14 +1,18 @@
+import { methodAccepts } from "./integration-capabilities";
+import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
+import type { ReviewTarget } from "../../shared/protocol/v2/ReviewTarget";
 import { subagentStatus } from "./subagents";
 import { mergeContextUsage } from "./context-usage";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
-import { ConversationCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
+import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
 import { revokeDevicePush } from "./pwa";
+import { useMessageQueue } from "./message-queue";
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -123,6 +127,9 @@ const state = reactive({
   mcpServers: [] as any[],
   account: null as any,
   rateLimits: null as any,
+  serviceTier: undefined as string | null | undefined,
+  serviceTierScope: "",
+  nativeServiceTier: null as string | null,
   searchResults: [] as any[],
   toast: "",
   terminalOutput: "",
@@ -166,6 +173,8 @@ let skillsRequest: { scope: string; promise: Promise<any> } | null = null;
 let skillsLoadedScope = "";
 let capabilityGeneration = 0;
 let capabilityRequest: { hostId: string; promise: Promise<void> } | null = null;
+let capabilityRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let capabilityRetryAttempts = 0;
 let modeOperation = 0;
 const goals = new Map<string, ThreadGoal | null>();
 const goalRevisions = new Map<string, number>();
@@ -183,8 +192,13 @@ const pending = new Map<string | number, Pending>();
 const attachmentOriginals = new WeakMap<object, File>();
 const terminalSessionNames = new Map<string, string>();
 let terminalSelectionGeneration = 0;
-const itemCache = new Map<string, DisplayItem[]>();
+const itemCache = new ConversationMemoryCache(() => [
+  ...(state.activeThread?.id ? [state.activeThread.id] : []),
+  ...activeTurns.keys(), ...[...threadBusy].filter(([, busy]) => busy).map(([id]) => id),
+]);
 const conversationCache = new ConversationCache();
+let historyWindowTruncated = false;
+let historyRestoration: { threadId: string; generation: number; promise: Promise<void> } | null = null;
 const tokenUsages = new Map<string, any>();
 const tokenUsageRevisions = new Map<string, number>();
 const compactionRevisions = new Map<string, number>();
@@ -270,6 +284,8 @@ function activateConversationCache() {
 function clearConversationCaches() {
   clearTimeout(snapshotTimer);
   itemCache.clear();
+  historyRestoration = null;
+  historyWindowTruncated = false;
   tokenUsages.clear();
   tokenUsageRevisions.clear();
   compactionRevisions.clear();
@@ -314,11 +330,15 @@ function clearConversationCaches() {
 function saveConversationSnapshot() {
   const thread = state.activeThread;
   if (!state.authenticated || !thread?.id || !state.threadReady || state.threadConflict || revertedTurnCandidates.has(thread.id)) return;
+  itemCache.set(thread.id, state.items);
+  itemCache.rememberHistory(thread.id, { turns: state.turns, cursor: turnCursor, engineId,
+    eventGapRevision, historyTruncated: historyWindowTruncated });
   conversationCache.write({
     hostId: state.hostId, threadId: thread.id, thread,
     items: state.items.filter(item => item.status !== 'sending'),
     turns: state.turns.map(turn => ({ ...turn, items: [] })),
     tokenUsage: state.tokenUsage, cursor: turnCursor,
+    ...(historyWindowTruncated ? { historyTruncated: true } : {}),
   });
 }
 function scheduleConversationSnapshot(threadId?: string) {
@@ -340,6 +360,7 @@ function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
   state.activeThread = { ...snapshot.thread, ...metadata, id };
   state.items = itemCache.get(id) ?? snapshot.items;
   state.turns = snapshot.turns;
+  historyWindowTruncated = snapshot.historyTruncated === true;
   const key = recencyKey(state.hostId, id);
   if (!tokenUsages.has(key)) tokenUsages.set(key, snapshot.tokenUsage);
   state.tokenUsage = tokenUsages.get(key) ?? null;
@@ -906,6 +927,7 @@ function noteRuntime(threadId: string, busy: boolean, turnId?: string) {
   if (turnId) activeTurns.set(threadId, turnId);
   else if (!busy) activeTurns.delete(threadId);
   if (state.activeThread?.id === threadId) state.busy = busy;
+  if (!busy) itemCache.refresh(threadId);
 }
 function noteItem(threadId: string, itemId: string) {
   let revisions = itemRevisions.get(threadId);
@@ -1016,6 +1038,7 @@ function receiveThreadChange(change: any) {
 }
 function receive(message: any) {
   if (typeof message.bridgeEventSequence === 'number') {
+    if (eventSequence !== null && message.bridgeEventSequence <= eventSequence) return;
     if (eventSequence !== null && message.bridgeEventSequence > eventSequence + 1) { socketHasEventGap = true; ++eventGapRevision; }
     eventSequence = Math.max(eventSequence ?? 0, message.bridgeEventSequence);
   }
@@ -1048,6 +1071,7 @@ function receive(message: any) {
     const changedEngine = !!engineId && typeof p.engineId === 'string' && engineId !== p.engineId;
     if (typeof p.engineId === 'string') {
       if (engineId !== p.engineId) {
+        if (changedEngine) invalidateRuntimeCapabilities();
         if (changedEngine && state.activeThread) {
           state.threadReady = false;
           ++selectionGeneration;
@@ -1070,6 +1094,7 @@ function receive(message: any) {
     const reconnecting = !state.connected && p.connected;
     if (reconnecting) seenThreadChanges.clear();
     state.connected = p.connected;
+    if (reconnecting) startNavigationRefresh();
     if (typeof p.paused === 'boolean') {
       state.runtimePaused = p.paused;
       if (p.paused) {
@@ -1096,6 +1121,7 @@ function receive(message: any) {
     if (p.connected && !state.runtimePaused) {
       state.error = state.threadConflict?.message || "";
       if (p.pendingRequests) state.pendingRequests = p.pendingRequests;
+      if (changedEngine) void Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
     }
     if (p.connected && !state.runtimePaused && Array.isArray(p.activeProcesses)) {
       state.terminalProcesses = p.activeProcesses;
@@ -1317,8 +1343,10 @@ function connect(): Promise<void> {
   const host = state.hostId;
   seenThreadChanges.clear();
   const attempt = new Promise<void>((resolve, reject) => {
+    const resumeEvents = engineId && eventSequence !== null && !socketHasEventGap
+      ? `&engineId=${encodeURIComponent(engineId)}&afterSequence=${eventSequence}` : '';
     const ws = new WebSocket(
-      `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/rpc?host=${encodeURIComponent(host)}&clientId=${clientId}`,
+      `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/rpc?host=${encodeURIComponent(host)}&clientId=${clientId}${resumeEvents}`,
     );
     socket = ws;
     const timer = setTimeout(() => {
@@ -1562,7 +1590,7 @@ function startNavigationRefresh() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
     if (state.authenticated && !document.hidden) void refreshNavigation();
-  }, 15000);
+  }, state.connected ? 60000 : 15000);
 }
 async function initialize() {
   state.loading = true;
@@ -1611,7 +1639,8 @@ async function login(password: string) {
 async function logout() {
   authenticationGeneration++;
   if (typeof window !== "undefined" && "serviceWorker" in navigator) {
-    await revokeDevicePush({ requestHttp: http });
+    // Server logout is authoritative; an unavailable browser unsubscribe cannot block it.
+    void revokeDevicePush({ requestHttp: http, runtimeIdentity }, { logout: true });
   }
   await http("/auth/logout", { method: "POST" });
   authenticationGeneration++;
@@ -1856,9 +1885,11 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
   const continuityRevision = eventGapRevision;
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   const cached = conversationCache.peek(hostId, id);
+  const loadedHistory = itemCache.history(id);
   state.activeThread = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
   state.items = itemCache.get(id) ?? cached?.items ?? [];
-  state.turns = cached?.turns ?? (previousId === id ? state.turns : []);
+  state.turns = loadedHistory?.turns ?? cached?.turns ?? (previousId === id ? state.turns : []);
+  historyWindowTruncated = (loadedHistory?.historyTruncated ?? cached?.historyTruncated) === true;
   if (previousId !== id) clearAttachments();
   state.tokenUsage = tokenUsages.has(modeKey) ? tokenUsages.get(modeKey) : cached?.tokenUsage ?? null;
   if (cached && !tokenUsages.has(modeKey)) tokenUsages.set(modeKey, cached.tokenUsage);
@@ -1866,7 +1897,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
   state.plan = [];
   state.busy = activeTurns.has(id);
   state.compacting = compactions.has(modeKey);
-  turnCursor = cached?.cursor ?? null;
+  turnCursor = loadedHistory ? loadedHistory.cursor : cached?.cursor ?? null;
   state.moreTurns = !!turnCursor;
   rememberThread(id);
   // IndexedDB is a painting aid only. Its delayed answer cannot overwrite live
@@ -1908,28 +1939,23 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     // History reads do not acquire a writer, so they can run beside resume.
     // Neither cached content nor this read authorizes sending until both finish.
     const [result, initialPage] = await Promise.all([resumeRequest, history(id, null, hostId)]);
-    let page = initialPage;
+    const page = initialPage;
     if (!current()) return;
     if (!result.thread?.id) throw new Error('无法恢复此对话，请同步后重试。');
-    const requestedDepth = Math.min(
-      10,
-      Math.max(
-        1,
-        Number(
-          sessionStorage.getItem(`codex.historyDepth.${state.hostId}.${id}`),
-        ) || 1,
-      ),
-    );
-    for (let depth = 1; depth < requestedDepth && page.nextCursor; depth++) {
-      const olderPage = await history(id, page.nextCursor, hostId);
-      if (!current()) return;
-      page = {
-        data: [...page.data, ...olderPage.data],
-        nextCursor: olderPage.nextCursor,
-      };
-      if (!current()) return;
-    }
-    if (!current()) return;
+    const depthValue = Number(sessionStorage.getItem(`codex.historyDepth.${hostId}.${id}`));
+    const requestedTurns = Math.max(30, state.turns.length,
+      (Number.isFinite(depthValue) ? Math.max(1, Math.min(1000, depthValue)) : 1) * 30);
+    // Only reuse a previously validated window on the same continuous engine.
+    // A latest-page anchor also proves that an unnoticed native truncation did
+    // not remove its prefix. Painting cached history never confirms a writer.
+    const cachedTail = loadedHistory?.turns.at(-1)?.id;
+    const recentIds = new Set<string>(page.data.map((turn: any) => turn.id));
+    const reuseHistory = !!loadedHistory && !loadedHistory.historyTruncated &&
+      loadedHistory.engineId === selectionEngine && loadedHistory.eventGapRevision === continuityRevision &&
+      !!cachedTail && recentIds.has(cachedTail) && !revertedTurnCandidates.has(id);
+    const firstOverlap = reuseHistory ? loadedHistory!.turns.findIndex(turn => recentIds.has(turn.id)) : 0;
+    const prefixTurns = reuseHistory && firstOverlap > 0 ? loadedHistory!.turns.slice(0, firstOverlap) : [];
+    const prefixIds = new Set<string>(prefixTurns.map(turn => turn.id));
     // Native revert notifications precede their acknowledgement on some Codex
     // versions. The acknowledgement's thread.turns is always empty; confirm the
     // retained prefix from a fresh history read, keeping removed IDs blocked.
@@ -1973,6 +1999,14 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
       if (state.collaborationMode === 'plan') state.goalMode = false;
     }
     state.model = result.model ?? result.thread.model ?? state.model;
+    if ('serviceTier' in result) {
+      state.nativeServiceTier = result.serviceTier ?? null;
+      state.serviceTier = state.nativeServiceTier;
+      state.serviceTierScope = serviceTierScope(state);
+    } else if (previousId !== id) {
+      state.nativeServiceTier = null;
+      state.serviceTierScope = '';
+    }
     state.effort =
       result.reasoningEffort ?? result.thread.reasoningEffort ?? state.effort;
     if (result.sandbox?.type) {
@@ -1988,7 +2022,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     applyPermissionDefault();
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
-    state.turns = [...page.data].reverse();
+    state.turns = [...prefixTurns, ...[...page.data].reverse()];
     for (const turn of liveTurns) updateTurn(id, turn);
     const running = state.turns.find((turn) => turn.status === "inProgress");
     if (!runtimeChanged) {
@@ -1997,9 +2031,8 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
       threadBusy.set(id, !!running || result.thread.status?.type === "active");
     }
     state.busy = threadBusy.get(id) ?? activeTurns.has(id);
-    const loaded = state.turns.flatMap((turn) =>
-      turn.items.map((item: any) => ({ ...item, turnId: turn.id })),
-    );
+    const loaded = [...live.filter(item => !!item.turnId && prefixIds.has(item.turnId)),
+      ...state.turns.flatMap((turn) => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })))];
     const changedIds = new Set(
       [...(itemRevisions.get(id)?.entries() ?? [])]
         .filter(([, revision]) => revision > itemRevision)
@@ -2013,7 +2046,8 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
       state.turns.some(turn => turn.id === item.turnId) &&
       !state.items.some(entry => entry.type === 'contextCompaction' && entry.turnId === item.turnId)) upsertItem(state.items, item);
     itemCache.set(id, state.items);
-    turnCursor = page.nextCursor;
+    turnCursor = prefixTurns.length ? loadedHistory!.cursor : page.nextCursor;
+    historyWindowTruncated = false;
     state.moreTurns = !!turnCursor;
     state.threadReady = true;
     writerAttachment = { hostId, threadId: id, engineId };
@@ -2027,6 +2061,14 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     void refreshContextUsage(hostId, id);
     rememberThread(id);
     saveConversationSnapshot();
+    // Revalidate missing older pages in the background; latest native history
+    // and a confirmed writer are sufficient to send a new message. A rollback,
+    // archive, host change or newer selection cancels the older-window read.
+    if (!reuseHistory && page.nextCursor && requestedTurns > page.data.length) {
+      const promise = restoreHistoryWindow(id, hostId, generation, page, requestedTurns, itemRevision, current);
+      historyRestoration = { threadId: id, generation, promise };
+      void promise.finally(() => { if (historyRestoration?.promise === promise) historyRestoration = null; });
+    }
     if (state.projectPath !== previousProject) {
       rememberProject();
       void readConfig();
@@ -2095,7 +2137,48 @@ async function takeoverThread(confirmOwner: (owner: { pid: number; affectedThrea
     if (operation === takeoverOperation) state.takingOverThread = false;
   }
 }
+async function restoreHistoryWindow(id: string, hostId: string, generation: number, initialPage: any,
+  requestedTurns: number, itemRevision: number, current: () => boolean) {
+  const turns = new Map<string, any>(initialPage.data.map((turn: any) => [turn.id, turn]));
+  let cursor = initialPage.nextCursor;
+  const cursors = new Set<string>();
+  try {
+    while (current() && cursor && turns.size < requestedTurns) {
+      if (cursors.has(cursor)) throw new Error('历史分页游标重复，请重新同步对话。');
+      cursors.add(cursor);
+      const page = await history(id, cursor, hostId);
+      if (!current()) return;
+      for (const turn of page.data) if (!turns.has(turn.id)) turns.set(turn.id, turn);
+      cursor = page.nextCursor;
+    }
+    if (!current() || generation !== selectionGeneration) return;
+    const live = [...state.items];
+    const liveTurns = [...state.turns];
+    state.turns = [...turns.values()].reverse();
+    for (const turn of state.turns) discardedTurns.delete(turn.id);
+    for (const turn of liveTurns) updateTurn(id, turn);
+    const loaded = state.turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })));
+    const changedIds = new Set([...(itemRevisions.get(id)?.entries() || [])]
+      .filter(([, revision]) => revision > itemRevision).map(([itemId]) => itemId));
+    state.items = mergeSnapshotItems(loaded, live, changedIds);
+    const turnIds = new Set(state.turns.map(turn => turn.id));
+    const compactionIds = new Set(state.items.filter(item => item.type === 'contextCompaction').map(item => item.turnId));
+    for (const item of live) if (item.legacyCompaction && item.turnId && turnIds.has(item.turnId) && !compactionIds.has(item.turnId))
+      upsertItem(state.items, item);
+    turnCursor = cursor;
+    state.moreTurns = !!cursor;
+    historyWindowTruncated = false;
+    saveConversationSnapshot();
+  } catch (error) {
+    // Older-page recovery must not revoke a successfully confirmed writer or
+    // replay an uncertain turn/start. The user can retry loading older history.
+    if (current()) fail(error);
+  }
+}
 async function loadOlderTurns() {
+  const restoring = historyRestoration;
+  if (restoring && restoring.threadId === state.activeThread?.id && restoring.generation === selectionGeneration)
+    await restoring.promise;
   const id = state.activeThread?.id;
   const cursor = turnCursor;
   const generation = selectionGeneration;
@@ -2108,6 +2191,7 @@ async function loadOlderTurns() {
   )
     return;
   const older = [...page.data].reverse();
+  const knownTurns = new Set(state.turns.map(turn => turn.id));
   const known = new Set(state.items.map((item) => item.id));
   state.items.unshift(
     ...older
@@ -2116,14 +2200,14 @@ async function loadOlderTurns() {
       )
       .filter((item: any) => !known.has(item.id)),
   );
-  state.turns.unshift(...older);
+  state.turns.unshift(...older.filter(turn => !knownTurns.has(turn.id)));
   turnCursor = page.nextCursor;
   state.moreTurns = !!turnCursor;
   saveConversationSnapshot();
   const depthKey = `codex.historyDepth.${state.hostId}.${id}`;
   sessionStorage.setItem(
     depthKey,
-    String(Math.min(10, (Number(sessionStorage.getItem(depthKey)) || 1) + 1)),
+    String(Math.max(1, Math.ceil(state.turns.length / 30))),
   );
 }
 function newThread(remember = true) {
@@ -2239,7 +2323,8 @@ function sandboxPolicy(
 function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
-async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = []) {
+async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = [], delivery: "immediate" | "queue" = "immediate") {
+  if (messageQueue?.state.uncertain) throw fail(new Error('上一项队列操作尚未确认，请先核对队列和对话后恢复发送。'));
   if (state.compacting) throw fail(new Error('正在压缩上下文，请等待压缩完成后发送。'));
   if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
   if (state.activeThread && !state.threadReady) throw fail(new Error('正在加载会话，请先同步对话后发送。'));
@@ -2258,13 +2343,20 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   const supportsCollaborationModes = state.modeCapabilities.plan;
   const goalBudget = state.goalTokenBudget;
   const selectedSkills = editedInput ? [] : [...state.selectedSkills];
-  const createGoal = goalMode && (!state.goal || state.goal.status === 'complete');
+  if (delivery === 'queue') {
+    if (editedInput) throw fail(new Error('编辑重发不能加入队列，请先完成消息编辑'));
+    if (!state.activeThread?.id) throw fail(new Error('请先打开一个已有对话再排队'));
+    if (!messageQueue || !messageQueue.canMutate.value) throw fail(new Error(messageQueue?.blockedReason.value || '原生消息队列尚未准备好'));
+    if (goalMode && (!state.goal || state.goal.status === 'complete')) throw fail(new Error('请先发送并创建目标，再添加后续排队消息'));
+  }
+  const createGoal = delivery !== 'queue' && goalMode && (!state.goal || state.goal.status === 'complete');
   if (createGoal && (!text.trim() || text.trim().length > 4000))
     throw fail(new Error("Goal 目标需要 1–4000 个字符，请填写目标后发送"));
   const hostId = state.hostId;
   const generation = selectionGeneration;
   const cwd = state.projectPath;
   const model = state.model;
+  const serviceTier = serviceTierParams(state);
   const effort = state.effort;
   const permission = state.permission;
   const profile = availablePermissionProfiles(
@@ -2319,6 +2411,8 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   for (const file of attachments) {
     if (file.mime?.startsWith("image/"))
       inputs.push({ type: "localImage", path: file.path });
+    else if (delivery === "queue")
+      inputs.push({ type: "text", text: `附件文件：${file.path}（${file.name}）`, text_elements: [] });
     else inputs[0].text += `\n\n附件文件：${file.path}（${file.name}）`;
   }
   // Explicit skill/app selections are persisted as structured protocol inputs.
@@ -2337,9 +2431,22 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   let id = state.activeThread?.id as string | undefined;
   const messageId = randomUUID();
   let activateGoal: ThreadGoal | null = null;
+  if (delivery === 'queue') {
+    try {
+      await messageQueue!.add(inputs, messageId);
+      releaseAttachments(attachments);
+      if (generation === selectionGeneration && hostId === state.hostId) {
+        state.attachments = state.attachments.filter(file => !attachments.includes(file));
+        state.selectedSkills = state.selectedSkills.filter(skill => !selectedSkills.some(sent => sent.path === skill.path));
+      }
+      return;
+    } catch (error) { throw fail(error); }
+    finally { sendInFlight = false; }
+  }
   try {
     if (!id) {
       const result = await rpc("thread/start", {
+        ...serviceTier,
         cwd,
         runtimeWorkspaceRoots: workspaceRoots,
         model: model || undefined,
@@ -2400,6 +2507,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       threadBusy.set(id!, true);
       if (state.activeThread?.id === id) state.busy = true;
       const result = await rpc("turn/start", {
+      ...serviceTier,
         threadId: id!,
         clientUserMessageId: messageId,
         input: inputs,
@@ -2699,6 +2807,106 @@ async function setProject(path: string) {
   rememberProject();
   await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills()]);
 }
+/** Native thread configuration for explicitly started review workflows. */
+function workflowThreadOptions() {
+  const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(entry => entry.id === state.activePermissionProfileId);
+  const resolved = resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
+  return {
+    cwd: state.projectPath,
+    runtimeWorkspaceRoots: projectRoots(),
+    model: state.model || undefined,
+    ...serviceTierParams(state),
+    sandbox: resolved.sandbox,
+    approvalPolicy: resolved.approvalPolicy,
+    config: {
+      'features.default_mode_request_user_input': true,
+      'model_reasoning_effort': state.effort,
+      ...(resolved.sandboxPolicy.type === 'workspaceWrite' ? { sandbox_workspace_write: {
+        writable_roots: projectRoots(), network_access: resolved.sandboxPolicy.networkAccess,
+        exclude_tmpdir_env_var: resolved.sandboxPolicy.excludeTmpdirEnvVar,
+        exclude_slash_tmp: resolved.sandboxPolicy.excludeSlashTmp,
+      } } : {}),
+    },
+  };
+}
+async function startWorkflowThread() {
+  if (state.activeThread) return state.activeThread.id;
+  const hostId = state.hostId;
+  const generation = selectionGeneration;
+  const authentication = authenticationGeneration;
+  const result = await rpc('thread/start', {
+    ...workflowThreadOptions(),
+    historyMode: 'paginated',
+  });
+  if (hostId !== state.hostId || generation !== selectionGeneration || authentication !== authenticationGeneration)
+    throw new Error('工作区已切换，原主机的新会话已创建；请返回原主机确认。');
+  updateThread(result.thread);
+  state.activeThread = result.thread;
+  state.items = currentItems(result.thread.id);
+  state.threadReady = true;
+  permissionSelections.set(recencyKey(hostId, result.thread.id), { mode: state.permission, profileId: state.activePermissionProfileId });
+  rememberThread(result.thread.id);
+  saveConversationSnapshot();
+  return result.thread.id as string;
+}
+async function newThreadInWorktree(path: string) {
+  if (state.busy || state.selectingThread || state.switchingHost || state.changingContext || sendInFlight)
+    throw new Error('请等待当前操作完成后创建工作树会话');
+  if (!state.connected || !state.online || state.runtimePaused) throw new Error('请先连接当前主机');
+  sendInFlight = true;
+  try {
+    const existing = state.projects.find(project => project.hostId === state.hostId && project.path === path);
+    if (existing) await setProject(path);
+    else await addProject(path);
+    // Native blank threads are not written to rollout history until the first
+    // real message. Prepare the existing new-chat flow and let send bind cwd.
+    return true;
+  } finally { sendInFlight = false; }
+}
+async function startReview(target: ReviewTarget) {
+  if (!state.connected || !state.online || state.runtimePaused || state.threadReleased || state.threadConflict || (state.activeThread && !state.threadReady)) throw new Error('请先恢复当前会话连接');
+  if (state.busy || state.selectingThread || state.switchingHost || state.changingContext || state.modeBusy || sendInFlight) throw new Error('请等待当前任务或操作完成后开始审阅');
+  if (state.goal?.status === 'active' || messageQueue?.state.items.length) throw new Error('请先暂停 Goal 并处理排队消息后开始审阅');
+  const hostId = state.hostId;
+  const authentication = authenticationGeneration;
+  const generation = selectionGeneration;
+  sendInFlight = true;
+  try {
+    const capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false);
+    if (hostId !== state.hostId || authentication !== authenticationGeneration || generation !== selectionGeneration) throw new Error('工作区已切换，请重新确认审阅范围');
+    if (!methodAccepts(capabilities, 'thread/settings/update', ['threadId', 'cwd', 'sandboxPolicy', 'approvalPolicy', 'model', 'effort'])) throw new Error('当前 Codex 的原生审阅权限设置尚未确认，请更新 Codex 或稍后重试。');
+    const id = await startWorkflowThread();
+    if (hostId !== state.hostId || authentication !== authenticationGeneration || id !== state.activeThread?.id) throw new Error('会话已切换，请重新确认审阅范围');
+    const revision = turnRevisions.get(id) || 0;
+    const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(entry => entry.id === state.activePermissionProfileId);
+    const permission = resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
+    const policy = permission.sandboxPolicy;
+    if (policy.type === 'workspaceWrite') policy.writableRoots = projectRoots();
+    // Resume ignores overrides for an already loaded thread. Update future
+    // settings in place, so review retains the existing connection and writer.
+    try {
+      await rpc('thread/settings/update', { threadId: id, cwd: state.projectPath, sandboxPolicy: policy,
+        approvalPolicy: permission.approvalPolicy, model: state.model || undefined, effort: state.effort as any, ...serviceTierParams(state) }, 15000, { silentError: true });
+    } catch (error: any) {
+      if (error.code === -32601 || /method not found|unknown method|unsupported method/i.test(error.message || '')) throw new Error('当前 Codex 不支持原生审阅权限设置，请更新 Codex 后重试。');
+      throw error;
+    }
+    if (hostId !== state.hostId || authentication !== authenticationGeneration || generation !== selectionGeneration || id !== state.activeThread?.id) throw new Error('会话已切换，审阅尚未启动');
+    if (activeTurns.has(id) || state.busy) throw new Error('此会话已开始其他任务，请等待结束后再审阅');
+    const result = await rpc('review/start', { threadId: id, target, delivery: 'inline' });
+    if (hostId === state.hostId && authentication === authenticationGeneration) {
+      hydrateTurnItems(id, result.turn);
+      if (revision === (turnRevisions.get(id) || 0)) noteRuntime(id, result.turn.status === 'inProgress', result.turn.status === 'inProgress' ? result.turn.id : undefined);
+      if (id === state.activeThread?.id) {
+        const index = state.turns.findIndex(turn => turn.id === result.turn.id);
+        if (index >= 0) state.turns[index] = mergeTurnSnapshot(state.turns[index], result.turn);
+        else state.turns.push(result.turn);
+      }
+      saveConversationSnapshot();
+    }
+    return result;
+  } finally { sendInFlight = false; }
+}
 function rememberProject() {
   const paths = saved<Record<string, string>>("codex.projectPaths", {});
   paths[state.hostId] = state.projectPath;
@@ -2923,6 +3131,7 @@ async function setHost(id: string) {
   state.mcpServers = [];
   state.integrationErrors = [];
   state.rateLimits = null;
+  state.nativeServiceTier = null;
   state.searchResults = [];
   state.permission = "workspace-write";
   state.activePermissionProfileId = "";
@@ -3080,7 +3289,7 @@ async function readDirectory(path: string) {
     );
 }
 async function readFile(path: string, options: { silentError?: boolean } = {}) {
-  const result = await rpc("fs/readFile", { path }, 45000, options);
+  const result = await http(`/hosts/${encodeURIComponent(state.hostId)}/files?path=${encodeURIComponent(path)}`, {}, !options.silentError);
   if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024 * 4) / 3))
     throw (options.silentError ? new Error("文件超过 8 MB，请使用终端读取") : fail(new Error("文件超过 8 MB，请使用终端读取")));
   const extensions: Record<string, string> = {
@@ -3116,6 +3325,7 @@ async function readFile(path: string, options: { silentError?: boolean } = {}) {
   }
   return {
     path,
+    version: result.version,
     mime,
     content,
     binary,
@@ -3142,12 +3352,35 @@ async function downloadFile(path: string) {
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-async function writeFile(path: string, content: string) {
+async function writeFile(path: string, content: string, expectedVersion: string, hostId = state.hostId) {
   const bytes = new TextEncoder().encode(content);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  await rpc("fs/writeFile", { path, dataBase64: btoa(binary) });
+  if (bytes.length > 8 * 1024 * 1024) throw new Error("文件超过 8 MB，请使用终端保存");
+  const body = new FormData();
+  body.set("path", path);
+  body.set("expectedVersion", expectedVersion);
+  body.set("file", new Blob([bytes], { type: "application/octet-stream" }), "content");
+  const result = await http(`/hosts/${encodeURIComponent(hostId)}/files`, { method: "POST", body });
   toast("文件已保存");
+  return result;
+}
+async function setServiceTier(value: string | null) {
+  if (value !== null && !modelServiceTiers(state).some(tier => tier.id === value)) throw new Error("当前主机的模型目录未提供此服务层级");
+  if (!state.connected || state.switchingHost || state.selectingThread || state.changingContext || state.modeBusy || state.busy || state.editingMessage || sendInFlight)
+    throw new Error("请等待当前会话连接就绪且任务完成");
+  if (state.activeThread && (!state.threadReady || state.threadReleased || state.threadConflict)) throw new Error("请先恢复当前会话连接");
+  const hostId = state.hostId;
+  const selection = serviceTierScope(state);
+  const selectedEngine = engineId;
+  const capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false);
+  if (hostId !== state.hostId || selection !== serviceTierScope(state) || selectedEngine !== engineId || !state.connected || state.busy || (state.activeThread && !state.threadReady)) throw new Error("会话状态已变化，请重新选择服务层级");
+  const supported = state.activeThread ? methodAccepts(capabilities, "thread/settings/update", ["threadId", "serviceTier"]) :
+    methodAccepts(capabilities, "thread/start", ["serviceTier"]) && methodAccepts(capabilities, "turn/start", ["threadId", "input", "serviceTier"]);
+  if (!supported) throw new Error("当前 Codex 的原生服务层级协议尚未确认，请更新 Codex 或稍后重试");
+  if (state.activeThread) await rpc("thread/settings/update", { threadId: state.activeThread.id, serviceTier: value }, 15000, { silentError: true });
+  if (hostId !== state.hostId || selection !== serviceTierScope(state)) return;
+  state.serviceTier = value;
+  state.serviceTierScope = selection;
+  state.nativeServiceTier = value;
 }
 async function runTerminal(command: string) {
   if (state.terminalRunning) throw fail(new Error("已有终端命令正在运行"));
@@ -3423,13 +3656,35 @@ async function saveConfig(edits: any[]) {
   await readConfig();
   toast("已保存到 Codex 配置");
 }
-function resetModeContext(clearGoals = false) {
+function invalidateRuntimeCapabilities() {
+  clearTimeout(capabilityRetryTimer);
+  capabilityRetryTimer = undefined;
+  capabilityRetryAttempts = 0;
   ++skillsGeneration;
   ++capabilityGeneration;
-  ++modeOperation;
   skillsRequest = null;
   capabilityRequest = null;
   skillsLoadedScope = "";
+  state.skillsLoading = false;
+  state.skillsError = "";
+  state.modeCapabilities = { plan: false, goal: false, loaded: false };
+}
+function scheduleCapabilityRetry() {
+  if (capabilityRetryTimer || capabilityRetryAttempts >= 5 || !state.authenticated || !state.connected || state.runtimePaused) return;
+  if (state.modeCapabilities.loaded && skillsLoadedScope === scope()) return;
+  const hostId = state.hostId;
+  const engine = engineId;
+  const authentication = authenticationGeneration;
+  capabilityRetryTimer = setTimeout(() => {
+    capabilityRetryTimer = undefined;
+    if (hostId !== state.hostId || engine !== engineId || authentication !== authenticationGeneration || !state.connected || state.runtimePaused) return;
+    capabilityRetryAttempts++;
+    void Promise.allSettled([loadModeCapabilities(), loadSkills()]).then(scheduleCapabilityRetry);
+  }, Math.min(30000, 2500 * 2 ** capabilityRetryAttempts));
+}
+function resetModeContext(clearGoals = false) {
+  invalidateRuntimeCapabilities();
+  ++modeOperation;
   state.skills = [];
   state.skillsLoading = false;
   state.skillsError = "";
@@ -3467,7 +3722,7 @@ async function loadSkills(options: { forceReload?: boolean } = {}) {
       if (generation === skillsGeneration && requestScope === scope() && auth === authenticationGeneration) state.skillsError = error.message;
       throw error;
     }).finally(() => {
-      if (generation === skillsGeneration) { state.skillsLoading = false; skillsRequest = null; }
+      if (generation === skillsGeneration) { state.skillsLoading = false; skillsRequest = null; scheduleCapabilityRetry(); }
     });
   skillsRequest = { scope: requestScope, promise };
   return promise;
@@ -3490,12 +3745,17 @@ async function loadModeCapabilities() {
       rpc('thread/goal/get', { threadId: '00000000-0000-0000-0000-000000000000' }, 8000, { silentError: true }),
     ]);
     if (hostId !== state.hostId || generation !== capabilityGeneration || auth !== authenticationGeneration) return;
+    // Method-not-found is a capability answer. Transport errors, timeouts and
+    // arbitrary protocol failures remain unknown and get a bounded retry.
+    const unsupported = (result: PromiseSettledResult<any>) => result.status === 'rejected' && result.reason?.code === -32601;
+    const knownPlan = plan.status === 'fulfilled' || unsupported(plan);
+    const knownGoal = goal.status === 'fulfilled' || (goal.status === 'rejected' && goalMethodSupported(goal.reason)) || unsupported(goal);
     state.modeCapabilities = {
-      loaded: true,
+      loaded: knownPlan && knownGoal,
       plan: plan.status === 'fulfilled' && plan.value.data?.some((entry: any) => entry.mode === 'plan'),
       goal: goal.status === 'fulfilled' || goalMethodSupported(goal.reason),
     };
-  })().finally(() => { if (generation === capabilityGeneration) capabilityRequest = null; });
+  })().finally(() => { if (generation === capabilityGeneration) { capabilityRequest = null; scheduleCapabilityRetry(); } });
   capabilityRequest = { hostId, promise };
   return promise;
 }
@@ -3682,6 +3942,20 @@ async function pin(
       label,
     }),
   });
+}
+async function rememberSideBranch(hostId: string, id: string, label: string) {
+  const authentication = authenticationGeneration;
+  const result = await sideChatRpc(hostId, 'thread/read', { threadId: id, includeTurns: false });
+  if (authentication !== authenticationGeneration || state.hostId !== hostId || !state.authenticated)
+    throw new Error('主机或登录状态已变化，请重新核对保存的分支');
+  if (!result?.thread || result.thread.id !== id || result.thread.ephemeral)
+    throw new Error('无法确认已保存的正式分支');
+  // A native fork with injected context can remain absent from thread/list
+  // until its first explicit turn. Pins hydrate metadata by ID after reload.
+  if (!state.preferences.pins.some(pin => pin.kind === 'thread' && pin.hostId === hostId && pin.id === id))
+    await updatePreferences({ pins: [...state.preferences.pins, { kind: 'thread', hostId, id, label }] });
+  if (authentication === authenticationGeneration && state.hostId === hostId)
+    updateThread(result.thread);
 }
 function setCollapsed(key: string, collapsed: boolean) {
   return updatePreferences({ collapsed: { [key]: collapsed } });
@@ -3888,8 +4162,15 @@ async function exportThread(
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+let messageQueue: ReturnType<typeof useMessageQueue> | null = null;
 export function useCodex() {
+  messageQueue ??= useMessageQueue({
+    sideChatRpc, subscribeProtocol, runtimeIdentity, requestHttp: http,
+    acceptQueuedTurn: (threadId: string, turn: any, request: any) =>
+      receiveThreadChange({ threadId, method: 'turn/start', result: { turn }, request }),
+  }, state);
   return {
+    messageQueue,
     state,
     initialize,
     resumeConnection,
@@ -3913,6 +4194,8 @@ export function useCodex() {
     takeoverThread,
     loadOlderTurns,
     newThread,
+    newThreadInWorktree,
+    startReview,
     send,
     canEditMessage,
     resendEditedMessage,
@@ -3948,7 +4231,9 @@ export function useCodex() {
     writeFile,
     http,
     requestHttp: http,
+    setServiceTier,
     updatePreferences,
+    rememberSideBranch,
     pin,
     setCollapsed,
     queryThreads,

@@ -11,6 +11,11 @@ const EVENT_TTL = 24 * 60 * 60 * 1000
 const MAX_DEVICES = 64
 const MAX_EVENTS = 2000
 const MAX_THREAD_TITLES = 2000
+const DELIVERY_TTL = 60 * 60 * 1000
+const MAX_OUTBOX = 1024
+const MAX_ATTEMPTS = 8
+type DeliveryFailure = 'provider_unavailable' | 'rate_limited' | 'timeout' | 'rejected' | 'metadata_pending' | 'expired'
+type DeliveryHealth = { delivered: number; failed: number; expired: number; lastDeliveredAt?: number; lastFailureAt?: number; lastFailure?: DeliveryFailure }
 const preferencesSchema = z.object({ completed: z.boolean(), approval: z.boolean(), errors: z.boolean() }).strict()
 export type PushPreferences = z.infer<typeof preferencesSchema>
 const defaultPreferences: PushPreferences = { completed: true, approval: true, errors: true }
@@ -19,8 +24,10 @@ const subscriptionSchema = z.object({
   expirationTime: z.number().nonnegative().nullable().optional(),
   keys: z.object({ p256dh: z.string().max(128), auth: z.string().max(64) }).strict(),
 }).strict()
-type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string }
+type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string; grantId: string; delivery: DeliveryHealth }
 type PushNotice = { title: string; body: string; tag: string; data: { hostId?: string; threadId?: string; url: string; kind: 'completed' | 'approval' | 'errors' | 'test' } }
+type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure }
+type DeliveryOutcome = { ok: true; queued?: true; retryAt?: number } | { error: Error }
 export type PushOptions = {
   vapidPublicKey?: string; vapidPrivateKey?: string; subject?: string
   sendNotification?: (subscription: PushSubscription, payload: string, options: RequestOptions) => Promise<unknown>
@@ -29,6 +36,10 @@ export type PushOptions = {
   credentialVersion?: string
   /** Read thread metadata without loading turns or starting a model request. */
   resolveThread?: (host: Host, threadId: string) => Promise<unknown>
+  /** Durable auth logout tombstones take precedence even if the push store write failed. */
+  isSessionRevoked?: (sessionHash: string) => boolean
+  /** Test hooks; production uses a one-hour TTL, 1,024 deliveries and five-second initial backoff. */
+  retryBaseMs?: number; deliveryTtlMs?: number; maxQueuedDeliveries?: number
 }
 
 /** Only browser-owned push infrastructure is a valid destination, never an arbitrary URL. */
@@ -70,6 +81,12 @@ function titleText(value: unknown) {
   return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') || undefined
 }
 type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; ephemeral?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
+const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired'])
+const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
+const noticeSchema = z.object({ title: z.string().max(100), body: z.string().max(100), tag: z.string().max(100), data: z.object({ hostId: z.string().max(256).optional(), threadId: z.string().max(256).optional(), url: z.string().max(4096), kind: z.enum(['completed', 'approval', 'errors', 'test']) }).strict() }).strict()
+const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional() }).strict()
+function emptyHealth(): DeliveryHealth { return { delivered: 0, failed: 0, expired: 0 } }
+function providerError(expired = false) { return Object.assign(new Error(expired ? 'This device subscription expired; enable notifications again' : 'Unable to deliver the notification; check server access to the push provider'), { status: expired ? 410 : 502 }) }
 
 async function atomicPrivateJson(file: string, value: unknown) {
   const temporary = `${file}.${randomUUID()}.tmp`
@@ -95,8 +112,12 @@ export class PushService {
   private threadLookups = new Map<string, Promise<string>>()
   private writes: Promise<void> = Promise.resolve()
   private pending = new Set<Promise<void>>()
-  private deliveries: { run: () => Promise<void>; resolve: () => void; reject: (error: unknown) => void }[] = []
-  private activeDeliveries = 0
+  private outbox = new Map<string, OutboxDelivery>()
+  private uncommitted = new Set<string>()
+  private pendingEvents = new Set<string>()
+  private active = new Map<string, Promise<void>>()
+  private outcomes = new Map<string, (outcome: DeliveryOutcome) => void>()
+  private retryTimer?: ReturnType<typeof setTimeout>
   private closed = false
   private readonly file: string
   private readonly now: () => number
@@ -146,33 +167,54 @@ export class PushService {
     } catch { throw new Error('Web Push VAPID keys are invalid or do not form a matching pair') }
     this.keys = { ...pair, subject }
     try {
-      const saved = JSON.parse(await fs.readFile(this.file, 'utf8')) as { version?: number; subscriptions?: unknown[]; events?: unknown[] }
-      if ((saved.version !== 1 && saved.version !== 2) || !Array.isArray(saved.subscriptions) || saved.subscriptions.length > MAX_DEVICES) throw new Error('Invalid subscription storage')
+      const saved = JSON.parse(await fs.readFile(this.file, 'utf8')) as { version?: number; subscriptions?: unknown[]; events?: unknown[]; outbox?: unknown[] }
+      if (![1, 2, 3].includes(saved.version || 0) || !Array.isArray(saved.subscriptions) || saved.subscriptions.length > MAX_DEVICES) throw new Error('Invalid subscription storage')
       for (const raw of saved.subscriptions) {
         const device = record(raw)
         if (!device || typeof device.expiresAt !== 'number' || device.expiresAt <= this.now() || typeof device.sessionHash !== 'string' || !/^[a-zA-Z0-9_-]{43}$/.test(device.sessionHash)) continue
         // Grants from older releases have no provable credential generation. Require
         // re-registration rather than restoring them after a password reset or backup.
         if (this.credentialVersion && device.credentialVersion !== this.credentialVersion) continue
+        if (this.options.isSessionRevoked?.(device.sessionHash)) continue
         try {
           const subscription = validateSubscription(device.subscription)
           if (subscription.expirationTime && subscription.expirationTime <= this.now()) continue
-          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt, ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : typeof device.credentialVersion === 'string' ? { credentialVersion: device.credentialVersion } : {}) })
+          const grantId = z.string().uuid().safeParse(device.grantId)
+          const health = healthSchema.safeParse(device.delivery)
+          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt, grantId: grantId.success ? grantId.data : randomUUID(), delivery: health.success ? health.data : emptyHealth(), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : typeof device.credentialVersion === 'string' ? { credentialVersion: device.credentialVersion } : {}) })
         } catch { /* Invalid or unsupported saved device data is never sent to the network. */ }
       }
       if (Array.isArray(saved.events)) for (const raw of saved.events.slice(-MAX_EVENTS)) {
         const event = record(raw)
         if (event && typeof event.key === 'string' && event.key.length <= 1200 && typeof event.expiresAt === 'number' && event.expiresAt > this.now()) this.events.set(event.key, event.expiresAt)
       }
+      if (saved.version === 3 && Array.isArray(saved.outbox)) for (const raw of saved.outbox.slice(0, this.maxOutbox)) {
+        const parsed = outboxSchema.safeParse(raw)
+        if (!parsed.success) continue
+        const job = parsed.data
+        if (!job.notice.data.url.startsWith('/?') && job.notice.data.url !== '/') continue
+        if (job.expiresAt <= this.now() || job.attempts >= MAX_ATTEMPTS || !this.liveDevice(job)) continue
+        this.outbox.set(job.id, job)
+      }
       await this.save()
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Unable to read persisted Web Push subscriptions') }
+    this.runDeliveries()
   }
 
   config() { return { enabled: true, publicKey: this.keys.publicKey } }
-  get hasActiveSubscriptions() { return [...this.devices.values()].some(device => device.expiresAt > this.now()) }
+  get hasActiveSubscriptions() { return [...this.devices.values()].some(device => this.authorized(device)) }
+  private get maxOutbox() { return Math.max(1, Math.min(MAX_OUTBOX, this.options.maxQueuedDeliveries || MAX_OUTBOX)) }
+  private get deliveryTtl() { return Math.max(1000, Math.min(DELIVERY_TTL, this.options.deliveryTtlMs || DELIVERY_TTL)) }
+  private authorized(device: Device) { return device.expiresAt > this.now() && (!this.credentialVersion || device.credentialVersion === this.credentialVersion) && !this.options.isSessionRevoked?.(device.sessionHash) }
+  private liveDevice(job: OutboxDelivery) {
+    const device = this.devices.get(job.endpoint)
+    if (!device || !this.authorized(device) || device.grantId !== job.grantId || device.sessionHash !== job.sessionHash || device.credentialVersion !== job.credentialVersion || (job.notice.data.kind !== 'test' && !device.preferences[job.notice.data.kind])) return undefined
+    return device
+  }
 
   private save() {
-    const snapshot = { version: 2, subscriptions: [...this.devices.values()], events: [...this.events].map(([key, expiresAt]) => ({ key, expiresAt })) }
+    // Clone now: later mutations must never sneak into a queued snapshot before its commit.
+    const snapshot = structuredClone({ version: 3, subscriptions: [...this.devices.values()], events: [...this.events].map(([key, expiresAt]) => ({ key, expiresAt })), outbox: [...this.outbox.values()] })
     const writing = this.writes.then(() => atomicPrivateJson(this.file, snapshot))
     this.writes = writing.catch(() => {})
     return writing
@@ -180,33 +222,41 @@ export class PushService {
 
   async subscribe(sessionId: string, raw: unknown, preferences: PushPreferences = defaultPreferences) {
     const subscription = validateSubscription(raw)
+    const sessionHash = hash(sessionId)
+    if (this.options.isSessionRevoked?.(sessionHash)) throw Object.assign(new Error('Sign in again before enabling notifications'), { status: 401 })
+    this.prune()
     if (subscription.expirationTime && subscription.expirationTime <= this.now()) throw Object.assign(new Error('Push subscription has expired'), { status: 400 })
     if (!this.devices.has(subscription.endpoint) && this.devices.size >= MAX_DEVICES) {
       for (const [endpoint, device] of this.devices) if (device.expiresAt <= this.now()) { this.devices.delete(endpoint); this.testTimes.delete(endpoint) }
       if (this.devices.size >= MAX_DEVICES) throw Object.assign(new Error('Too many push devices; remove an existing device first'), { status: 409 })
     }
     const expiresAt = Math.min(this.now() + GRANT_TTL, subscription.expirationTime || Infinity)
-    this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(preferences), sessionHash: hash(sessionId), expiresAt, ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : {}) })
+    const previous = this.devices.get(subscription.endpoint)
+    const sameGrant = previous?.sessionHash === sessionHash && previous.credentialVersion === this.credentialVersion && previous.subscription.keys.auth === subscription.keys.auth && previous.subscription.keys.p256dh === subscription.keys.p256dh
+    this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(preferences), sessionHash, expiresAt, grantId: sameGrant ? previous.grantId : randomUUID(), delivery: sameGrant ? previous.delivery : emptyHealth(), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : {}) })
+    this.prune()
     await this.save()
+    this.runDeliveries()
     return { ok: true, expiresAt }
   }
 
   private ownedDevice(sessionId: string, endpoint: string) {
     validatePushEndpoint(endpoint)
     const device = this.devices.get(endpoint)
-    if (!device || device.expiresAt <= this.now()) throw Object.assign(new Error('This device is not subscribed; enable notifications again'), { status: 404 })
+    if (!device || !this.authorized(device)) throw Object.assign(new Error('This device is not subscribed; enable notifications again'), { status: 404 })
     if (device.sessionHash !== hash(sessionId)) throw Object.assign(new Error('Re-enable notifications for the current login before changing this device'), { status: 403 })
     return device
   }
 
   async unsubscribe(sessionId: string, endpoint: string) {
     validatePushEndpoint(endpoint)
-    if (this.devices.has(endpoint)) { this.ownedDevice(sessionId, endpoint); this.devices.delete(endpoint); this.testTimes.delete(endpoint); await this.save() }
+    if (this.devices.has(endpoint)) { this.ownedDevice(sessionId, endpoint); this.devices.delete(endpoint); this.testTimes.delete(endpoint); this.prune(); await this.save() }
     return { ok: true }
   }
 
   async updatePreferences(sessionId: string, endpoint: string, preferences: PushPreferences) {
     this.ownedDevice(sessionId, endpoint).preferences = preferencesSchema.parse(preferences)
+    this.prune()
     await this.save()
     return { ok: true }
   }
@@ -215,7 +265,7 @@ export class PushService {
     const sessionHash = hash(sessionId)
     let changed = false
     for (const [endpoint, device] of this.devices) if (device.sessionHash === sessionHash) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); changed = true }
-    if (changed) await this.save()
+    if (changed) { this.prune(); await this.save() }
   }
 
   async changeCredentialVersion(credentialVersion: string, retainedSessionId: string) {
@@ -225,6 +275,8 @@ export class PushService {
       if (device.sessionHash !== retainedHash) { this.devices.delete(endpoint); this.testTimes.delete(endpoint) }
       else device.credentialVersion = credentialVersion
     }
+    for (const job of this.outbox.values()) if (job.sessionHash === retainedHash) job.credentialVersion = credentialVersion
+    this.prune()
     await this.save()
   }
 
@@ -233,8 +285,52 @@ export class PushService {
     const recent = (this.testTimes.get(endpoint) || []).filter(time => time > this.now() - 60000)
     if (recent.length >= 5) throw Object.assign(new Error('Wait a minute before sending another test notification'), { status: 429 })
     this.testTimes.set(endpoint, [...recent, this.now()])
-    await this.enqueue(() => this.deliver(device, { title: 'Codex', body: '后台通知已开启。', tag: `codex-push-test-${randomUUID()}`, data: { url: '/', kind: 'test' } }))
-    return { ok: true }
+    this.prune()
+    if (this.closed || this.outbox.size >= this.maxOutbox) throw Object.assign(new Error('Push delivery queue is full; try again shortly'), { status: 503 })
+    const job = this.newDelivery(device, { title: 'Codex', body: '后台通知已开启。', tag: `codex-push-test-${randomUUID()}`, data: { url: '/', kind: 'test' } })
+    this.outbox.set(job.id, job)
+    this.uncommitted.add(job.id)
+    const firstAttempt = new Promise<DeliveryOutcome>(resolve => this.outcomes.set(job.id, resolve))
+    try { await this.save() } catch (error) { this.outbox.delete(job.id); this.outcomes.delete(job.id); throw error }
+    finally { this.uncommitted.delete(job.id) }
+    this.runDeliveries()
+    const result = await firstAttempt
+    if ('error' in result) throw result.error
+    return result
+  }
+
+  /** Own-device aggregate health only: no endpoint, keys, conversation text or credential hashes. */
+  status(sessionId: string) {
+    const own = [...this.devices.values()].filter(device => device.sessionHash === hash(sessionId) && this.authorized(device))
+    const grants = new Set(own.map(device => device.grantId))
+    const queued = [...this.outbox.values()].filter(job => grants.has(job.grantId) && job.expiresAt > this.now() && this.liveDevice(job))
+    const recent = own.map(device => device.delivery).sort((a, b) => (b.lastFailureAt || 0) - (a.lastFailureAt || 0))
+    return { devices: own.length, queued: queued.length, retrying: queued.filter(job => job.attempts > 0 || job.failure).length,
+      delivered: own.reduce((sum, device) => sum + device.delivery.delivered, 0), failed: own.reduce((sum, device) => sum + device.delivery.failed, 0), expired: own.reduce((sum, device) => sum + device.delivery.expired, 0),
+      nextRetryAt: queued.length ? Math.min(...queued.map(job => job.nextAttemptAt)) : null,
+      lastDeliveredAt: Math.max(0, ...own.map(device => device.delivery.lastDeliveredAt || 0)) || null,
+      lastFailureAt: recent[0]?.lastFailureAt || null, lastFailure: recent[0]?.lastFailure || null }
+  }
+
+  private newDelivery(device: Device, notice: PushNotice, metadataHost?: Host): OutboxDelivery {
+    return { id: randomUUID(), endpoint: device.subscription.endpoint, grantId: device.grantId, sessionHash: device.sessionHash, ...(device.credentialVersion ? { credentialVersion: device.credentialVersion } : {}), notice: structuredClone(notice), createdAt: this.now(), expiresAt: Math.min(this.now() + this.deliveryTtl, device.expiresAt), attempts: 0, nextAttemptAt: this.now(), ...(metadataHost ? { metadataHost: { id: metadataHost.id, name: metadataHost.name.slice(0, 256), kind: metadataHost.kind } } : {}) }
+  }
+
+  private finish(job: OutboxDelivery, outcome: DeliveryOutcome) {
+    const resolve = this.outcomes.get(job.id); this.outcomes.delete(job.id); resolve?.(outcome)
+  }
+
+  private prune() {
+    let changed = false
+    for (const [endpoint, device] of this.devices) if (!this.authorized(device)) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); changed = true }
+    for (const [key, expiry] of this.events) if (expiry <= this.now()) { this.events.delete(key); changed = true }
+    for (const [key, job] of this.outbox) {
+      const device = this.liveDevice(job)
+      if (device && job.expiresAt > this.now()) continue
+      if (device) { device.delivery.expired++; device.delivery.lastFailure = 'expired'; device.delivery.lastFailureAt = this.now() }
+      this.outbox.delete(key); this.finish(job, { error: providerError() }); changed = true
+    }
+    return changed
   }
 
   private rememberThread(host: Host, raw: unknown) {
@@ -244,7 +340,7 @@ export class PushService {
     const source = record(thread.source)
     const child = !!thread.parentThreadId || !!(source && ('subagent' in source || 'subAgent' in source)) || ['subagent', 'subAgent'].includes(String(thread.source))
     const title = { ...this.threadTitles.get(key),
-      ...(child ? { subagent: true, sourceKnown: true } : 'source' in thread ? { sourceKnown: true } : {}),
+      ...(child ? { subagent: true, sourceKnown: true } : typeof thread.source === 'string' && ['cli', 'vscode', 'exec', 'appServer'].includes(thread.source) || source && typeof source.custom === 'string' ? { sourceKnown: true } : {}),
       ...(typeof thread.ephemeral === 'boolean' ? { ephemeral: thread.ephemeral } : {}),
       ...('name' in thread ? { name: titleText(thread.name) } : {}),
       ...('preview' in thread ? { preview: titleText(thread.preview) } : {}),
@@ -276,7 +372,7 @@ export class PushService {
     const key = JSON.stringify([host.id, threadId])
     const cached = this.threadTitles.get(key)
     const title = cached?.name || cached?.preview
-    if (title && (!needSource || (cached?.sourceKnown || cached?.sourceChecked)) || !this.options.resolveThread) return Promise.resolve(title || '未命名对话')
+    if ((title || cached?.sourceChecked) && (!needSource || cached?.sourceKnown) || !this.options.resolveThread) return Promise.resolve(title || '未命名对话')
     const pending = this.threadLookups.get(key)
     if (pending) return pending
     const lookup = (async () => {
@@ -291,7 +387,7 @@ export class PushService {
           if (this.threadTitles.get(key) === cached) this.rememberThread(host, raw)
           else { const thread = record(raw)!; this.rememberThread(host, { id: threadId, ...('source' in thread ? { source: thread.source } : {}), ...('parentThreadId' in thread ? { parentThreadId: thread.parentThreadId } : {}), ...('ephemeral' in thread ? { ephemeral: thread.ephemeral } : {}) }) }
         }
-      } catch { /* Missing metadata never prevents delivery of the event. */ }
+      } catch { /* Defer completion until source metadata can exclude auxiliary threads. */ }
       finally { clearTimeout(deadline); const latest = this.threadTitles.get(key); this.threadTitles.set(key, { ...latest, sourceChecked: true }); while (this.threadTitles.size > MAX_THREAD_TITLES) this.threadTitles.delete(this.threadTitles.keys().next().value!) }
       const current = this.threadTitles.get(key)
       return current?.name || current?.preview || '未命名对话'
@@ -334,76 +430,120 @@ export class PushService {
     if (!kind || !identity || !body) return
     const key = JSON.stringify([host.id, threadId, identity])
     for (const [key, expiry] of this.events) if (expiry <= this.now()) this.events.delete(key)
-    if (this.events.has(key)) return
-    this.events.set(key, this.now() + EVENT_TTL)
-    while (this.events.size > MAX_EVENTS) this.events.delete(this.events.keys().next().value!)
+    if (this.events.has(key) || this.pendingEvents.has(key)) return
+    this.pendingEvents.add(key)
     const notice: PushNotice = { title: 'Codex', body, tag: `codex-${hash(key).slice(0, 24)}`, data: { hostId: host.id, threadId, url: `/?host=${encodeURIComponent(host.id)}&thread=${encodeURIComponent(threadId)}`, kind } }
-    const task = this.notify(host, threadId, kind, notice).catch(() => {})
+    const task = this.notify(key, host, threadId, kind, notice).catch(() => {}).finally(() => this.pendingEvents.delete(key))
     this.pending.add(task)
     void task.finally(() => this.pending.delete(task))
   }
 
-  private async notify(host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
-    await this.save()
+  private async notify(key: string, host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
     const auxiliary = () => { const metadata = this.threadTitles.get(JSON.stringify([host.id, threadId])); return metadata?.subagent || metadata?.ephemeral }
-    if (kind !== 'approval' && auxiliary()) return
-    notice.title = await this.threadTitle(host, threadId, kind !== 'approval')
-    // Child turns stream through the same host transport as their parent. Their
-    // completion does not mean the user's overall task has finished.
-    if (kind !== 'approval' && auxiliary()) return
-    let pruned = false
-    const jobs: Promise<void>[] = []
-    for (const [endpoint, device] of this.devices) {
-      if (device.expiresAt <= this.now()) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); pruned = true; continue }
-      if (device.preferences[kind]) jobs.push(this.enqueue(() => this.deliver(device, notice)).catch(() => {}))
-    }
-    if (pruned) await this.save()
-    await Promise.all(jobs)
-  }
-
-  private enqueue(run: () => Promise<void>) {
-    if (this.closed || this.deliveries.length >= 256) return Promise.reject(new Error('Push delivery queue is unavailable'))
-    return new Promise<void>((resolve, reject) => {
-      this.deliveries.push({ run, resolve, reject })
-      this.runDeliveries()
-    })
+    this.prune()
+    const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => this.newDelivery(device, notice, host))
+    // Persist all eligible devices together with dedupe. Never record an event that
+    // cannot fit; a later protocol replay may enqueue it once pressure subsides.
+    if (this.outbox.size + jobs.length > this.maxOutbox) return
+    for (const job of jobs) { this.outbox.set(job.id, job); this.uncommitted.add(job.id) }
+    this.events.set(key, this.now() + EVENT_TTL)
+    while (this.events.size > MAX_EVENTS) this.events.delete(this.events.keys().next().value!)
+    try { await this.save() } catch (error) { this.events.delete(key); for (const job of jobs) this.outbox.delete(job.id); throw error }
+    finally { for (const job of jobs) this.uncommitted.delete(job.id) }
+    this.runDeliveries()
   }
 
   private runDeliveries() {
-    while (this.activeDeliveries < 4 && this.deliveries.length) {
-      const job = this.deliveries.shift()!
-      this.activeDeliveries++
-      void job.run().then(job.resolve, job.reject).finally(() => { this.activeDeliveries--; this.runDeliveries() })
+    clearTimeout(this.retryTimer); this.retryTimer = undefined
+    if (this.closed) return
+    if (this.prune()) void this.save().catch(() => {})
+    for (const job of this.outbox.values()) {
+      if (this.active.size >= 4) break
+      if (this.active.has(job.id) || this.uncommitted.has(job.id) || job.nextAttemptAt > this.now()) continue
+      const running = this.deliver(job).catch(() => {
+        // Keep the last committed state for recovery, and avoid a hot loop if disk
+        // writes fail. Never report success before recording the acknowledgement.
+        job.nextAttemptAt = this.now() + 5000; this.finish(job, { error: providerError() })
+      }).finally(() => { this.active.delete(job.id); this.runDeliveries() })
+      this.active.set(job.id, running)
     }
+    const waiting = [...this.outbox.values()].filter(job => !this.active.has(job.id) && !this.uncommitted.has(job.id))
+    if (!waiting.length || this.active.size >= 4 && waiting.some(job => job.nextAttemptAt <= this.now())) return
+    const next = Math.min(...waiting.map(job => Math.min(job.nextAttemptAt, job.expiresAt)))
+    this.retryTimer = setTimeout(() => this.runDeliveries(), Math.max(1, next - this.now())); this.retryTimer.unref()
   }
 
-  private async deliver(device: Device, notice: PushNotice) {
+  private async retry(job: OutboxDelivery, device: Device, failure: DeliveryFailure, retryAfter?: number) {
+    job.failure = failure
+    device.delivery.lastFailureAt = this.now(); device.delivery.lastFailure = failure
+    const delay = Math.min(10 * 60 * 1000, Math.max(retryAfter || 0, (this.options.retryBaseMs || 5000) * 2 ** Math.max(0, job.attempts - 1)))
+    job.nextAttemptAt = Math.min(job.expiresAt, this.now() + delay)
+    if (job.attempts >= MAX_ATTEMPTS || job.expiresAt <= this.now()) {
+      this.outbox.delete(job.id); device.delivery.failed++
+    }
+    await this.save()
+    this.finish(job, this.outbox.has(job.id) ? { ok: true, queued: true, retryAt: job.nextAttemptAt } : { error: providerError() })
+  }
+
+  private async deliver(job: OutboxDelivery) {
+    let device = this.liveDevice(job)
+    if (!device || !this.outbox.has(job.id)) return
+    if (job.attempts >= MAX_ATTEMPTS) { this.outbox.delete(job.id); device.delivery.failed++; await this.save(); this.finish(job, { error: providerError() }); return }
+    job.attempts++
+    // Record attempts before dispatch, including metadata failures, so crashes and
+    // permanent upstream failures cannot cause unlimited restart retries.
+    await this.save()
+    if (job.metadataHost && job.notice.data.threadId) {
+      job.notice.title = await this.threadTitle(job.metadataHost, job.notice.data.threadId, job.notice.data.kind !== 'approval')
+      const metadata = this.threadTitles.get(JSON.stringify([job.metadataHost.id, job.notice.data.threadId]))
+      if (job.notice.data.kind !== 'approval') {
+        if (metadata?.subagent || metadata?.ephemeral) { this.outbox.delete(job.id); await this.save(); this.finish(job, { ok: true }); return }
+        if (!metadata?.sourceKnown) { await this.retry(job, device, 'metadata_pending'); return }
+      }
+    }
+    device = this.liveDevice(job)
+    if (!device || !this.outbox.has(job.id) || job.expiresAt <= this.now()) { this.prune(); await this.save(); return }
     const endpoint = device.subscription.endpoint
-    // A queued job may outlive a preference change, logout or subscription replacement.
-    if (this.devices.get(endpoint) !== device || device.expiresAt <= this.now() || (notice.data.kind !== 'test' && !device.preferences[notice.data.kind])) return
     validatePushEndpoint(endpoint)
     let deadline: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        this.send(device.subscription, JSON.stringify(notice), { vapidDetails: this.keys, TTL: 3600, timeout: 10000, contentEncoding: 'aes128gcm', urgency: 'high', topic: hash(notice.tag).slice(0, 32) }),
-        new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error('Push delivery timed out')), 12000); deadline.unref() }),
+        this.send(device.subscription, JSON.stringify(job.notice), { vapidDetails: this.keys, TTL: Math.max(1, Math.ceil((job.expiresAt - this.now()) / 1000)), timeout: 10000, contentEncoding: 'aes128gcm', urgency: 'high', topic: hash(job.notice.tag).slice(0, 32) }),
+        new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(Object.assign(new Error('Push delivery timed out'), { code: 'ETIMEDOUT' })), 12000); deadline.unref() }),
       ])
+      if (this.liveDevice(job) === device) { device.delivery.delivered++; device.delivery.lastDeliveredAt = this.now() }
     } catch (error) {
       const status = (error as { statusCode?: number })?.statusCode
-      if ((status === 404 || status === 410) && this.devices.get(endpoint) === device) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); await this.save() }
+      if (!this.outbox.has(job.id) || this.liveDevice(job) !== device) return
+      if (status === 404 || status === 410) { this.devices.delete(endpoint); this.testTimes.delete(endpoint); this.outbox.delete(job.id); this.prune(); await this.save(); this.finish(job, { error: providerError(true) }); return }
       // Upstream errors often contain endpoint tokens and must never reach HTTP clients or logs.
-      throw Object.assign(new Error(status === 404 || status === 410 ? 'This device subscription expired; enable notifications again' : 'Unable to deliver the notification; check server access to the push provider'), { status: status === 404 || status === 410 ? 410 : 502 })
+      if (status === undefined || status === 408 || status === 429 || status >= 500 && status < 600) {
+        const rawRetry = record((error as { headers?: unknown })?.headers)?.['retry-after']
+        const retryAfter = typeof rawRetry === 'string' ? /^\d+$/.test(rawRetry) ? Number(rawRetry) * 1000 : Math.max(0, Date.parse(rawRetry) - this.now()) : undefined
+        await this.retry(job, device, status === 429 ? 'rate_limited' : (error as { code?: string })?.code === 'ETIMEDOUT' ? 'timeout' : 'provider_unavailable', retryAfter)
+      } else {
+        this.outbox.delete(job.id); device.delivery.failed++; device.delivery.lastFailureAt = this.now(); device.delivery.lastFailure = 'rejected'; await this.save(); this.finish(job, { error: providerError() })
+      }
+      return
     } finally { clearTimeout(deadline) }
+    this.outbox.delete(job.id); await this.save(); this.finish(job, { ok: true })
   }
 
-  async flush() { while (this.pending.size) await Promise.allSettled([...this.pending]); await this.writes }
-  async close() { await this.flush(); this.closed = true }
+  /** Finish current attempts and writes; scheduled backoff is deliberately not awaited. */
+  async flush() {
+    while (this.pending.size) await Promise.allSettled([...this.pending])
+    this.runDeliveries()
+    while (this.active.size) await Promise.allSettled([...this.active.values()])
+    await this.writes
+  }
+  async close() { this.closed = true; clearTimeout(this.retryTimer); await this.flush() }
 }
 
 export function registerPush(app: Express, push: PushService) {
   const route = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
   const endpointBody = z.object({ endpoint: z.string().min(1).max(4096) }).strict()
   app.get('/api/push/config', (_req, res) => res.json(push.config()))
+  app.get('/api/push/status', (req: AuthenticatedRequest, res) => res.json(push.status(req.session!.id)))
   app.post('/api/push/subscription', route(async (req: AuthenticatedRequest, res) => {
     const body = z.object({ subscription: subscriptionSchema, preferences: preferencesSchema.optional() }).strict().parse(req.body)
     res.json(await push.subscribe(req.session!.id, body.subscription, body.preferences))
@@ -416,6 +556,7 @@ export function registerPush(app: Express, push: PushService) {
     res.json(await push.unsubscribe(req.session!.id, endpointBody.parse(req.body).endpoint))
   }))
   app.post('/api/push/test', route(async (req: AuthenticatedRequest, res) => {
-    res.json(await push.test(req.session!.id, endpointBody.parse(req.body).endpoint))
+    const result = await push.test(req.session!.id, endpointBody.parse(req.body).endpoint)
+    res.status(result.queued ? 202 : 200).json(result)
   }))
 }

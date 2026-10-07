@@ -13,3 +13,5 @@
 子智能体的最新对话在主对话打开后自动预读，最多同时读取三个，点击详情直接使用内存缓存。实时事件更新未选中子智能体的内容；切换主机、主对话或退出登录会清理缓存。预读只使用 `thread/read` 与历史分页，不会获取子智能体写入锁。
 
 协议依据：[OpenAI Docs：Codex App Server](https://learn.chatgpt.com/docs/app-server)。
+
+最新的事件补发、LRU／大快照处理与深历史恢复见 [可靠性与工作流](reliability-and-workflows.md)。

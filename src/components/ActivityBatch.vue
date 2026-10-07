@@ -1,25 +1,26 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import ChatItem from './ChatItem.vue';
 import Icon from './Icon.vue';
 import { activityBatchSummary } from '../lib/activity-presentation';
 import type { DisplayItem } from '../lib/events';
 
-const props = defineProps<{ items: DisplayItem[]; hostId?: string; busy?: boolean }>();
-const emit = defineEmits<{ openFile: [path: string]; error: [message: string] }>();
+const props = defineProps<{ items: DisplayItem[]; hostId?: string; cwd?: string; busy?: boolean }>();
+const emit = defineEmits<{ openFile: [path: string, line?: number]; error: [message: string] }>();
+const expanded = ref(false);
 const summary = computed(() => activityBatchSummary(props.items));
 </script>
 
 <template>
-  <details class="activity-batch" :open="false" :class="{ 'activity-batch-failed': summary.failed }">
+  <details class="activity-batch" :open="false" @toggle="expanded = ($event.currentTarget as HTMLDetailsElement).open" :class="{ 'activity-batch-failed': summary.failed }">
     <summary>
       <Icon :name="summary.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: summary.running }" />
       <span class="activity-batch-label">{{ summary.label }}</span>
       <span v-if="summary.status" class="activity-batch-status" aria-live="polite">{{ summary.status }}</span>
       <Icon name="ChevronDown" :size="13" />
     </summary>
-    <div class="activity-batch-items">
-      <ChatItem v-for="item in items" :key="item.id" :item="item" :host-id="hostId" :busy="busy" collapse-tools @open-file="emit('openFile', $event)" @error="emit('error', $event)" />
+    <div v-if="expanded" class="activity-batch-items">
+      <ChatItem v-for="item in items" :key="item.id" :item="item" :host-id="hostId" :cwd="cwd" :busy="busy" collapse-tools @open-file="(path, line) => emit('openFile', path, line)" @error="emit('error', $event)" />
     </div>
   </details>
 </template>

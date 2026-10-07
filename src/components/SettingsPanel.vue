@@ -6,6 +6,8 @@ import ConnectionDialog from "./ConnectionDialog.vue";
 import FolderPicker from "./FolderPicker.vue";
 import PwaSettings from "./PwaSettings.vue";
 import PasswordSettings from "./PasswordSettings.vue";
+import HostDiagnostics from "./HostDiagnostics.vue";
+import IntegrationsSettings from "./IntegrationsSettings.vue";
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -111,21 +113,6 @@ const account = computed(
 );
 const config = computed(
   () => props.state.config?.config || props.state.config || {},
-);
-const skillList = computed(() => {
-  const skills = props.state.skills || [];
-  const source = Array.isArray(skills) ? skills : skills.data || [];
-  return source.flatMap((entry: any) => entry.skills || [entry]);
-});
-const appList = computed(() =>
-  Array.isArray(props.state.apps)
-    ? props.state.apps
-    : props.state.apps?.data || [],
-);
-const mcpList = computed(() =>
-  Array.isArray(props.state.mcpServers)
-    ? props.state.mcpServers
-    : props.state.mcpServers?.data || [],
 );
 const currentHosts = computed(() => props.state.hosts || []);
 const projectHost = computed(() =>
@@ -697,6 +684,7 @@ watch(
               <p class="connection-footnote">
                 连接使用此主机的 SSH 配置、已有密钥与 known_hosts。
               </p>
+              <HostDiagnostics :api="api" :host-id="state.hostId" :host-name="currentHosts.find((host: any) => host.id === state.hostId)?.name" />
             </div>
           </template>
           <template v-else-if="section === 'permissions'">
@@ -976,95 +964,7 @@ watch(
             <PasswordSettings v-if="state.authRequired" :api="api" :state="state" />
           </template>
           <template v-else-if="section === 'integrations'">
-            <div class="settings-title-row">
-              <h3>技能与集成</h3>
-              <button
-                class="icon-button"
-                @click="action(() => api.loadIntegrations())"
-                title="刷新集成"
-                aria-label="刷新集成"
-              >
-                <Icon name="RefreshCw" :size="16" />
-              </button>
-            </div>
-            <p class="settings-description">
-              显示当前主机可用的技能、应用和 MCP 工具。
-            </p>
-            <div
-              v-for="notice in state.integrationErrors || []"
-              :key="notice.source"
-              class="setting-note"
-            >
-              <Icon name="CircleHelp" :size="16" />
-              <p>{{ notice.source }}：{{ notice.message }}</p>
-            </div>
-            <h4>
-              技能 <span class="count-badge">{{ skillList.length }}</span>
-            </h4>
-            <div class="settings-list">
-              <div
-                v-for="(skill, index) in skillList"
-                :key="skill.name || index"
-                class="integration-row"
-              >
-                <Icon name="Sparkles" :size="18" />
-                <div>
-                  <strong>{{ skill.name || skill.displayName }}</strong>
-                  <p>{{ skill.description || skill.shortDescription }}</p>
-                  <code v-if="skill.path">{{ skill.path }}</code>
-                </div>
-                <span class="integration-status">{{
-                  skill.enabled === false ? "已禁用" : "可用"
-                }}</span>
-              </div>
-              <p v-if="!skillList.length" class="settings-empty">
-                当前主机暂无可用技能。
-              </p>
-            </div>
-            <h4>
-              应用 <span class="count-badge">{{ appList.length }}</span>
-            </h4>
-            <div class="settings-list">
-              <div
-                v-for="(app, index) in appList"
-                :key="app.id || index"
-                class="integration-row"
-              >
-                <Icon name="Package" :size="18" />
-                <div>
-                  <strong>{{ app.name || app.id }}</strong>
-                  <p>{{ app.description }}</p>
-                </div>
-                <span class="integration-status">{{
-                  app.isAccessible === false ? "未连接" : "可用"
-                }}</span>
-              </div>
-              <p v-if="!appList.length" class="settings-empty">
-                当前主机暂无可用应用。
-              </p>
-            </div>
-            <h4>
-              MCP 服务器 <span class="count-badge">{{ mcpList.length }}</span>
-            </h4>
-            <div class="settings-list">
-              <div
-                v-for="(server, index) in mcpList"
-                :key="server.name || index"
-                class="integration-row"
-              >
-                <Icon name="Server" :size="18" />
-                <div>
-                  <strong>{{ server.name || server.id }}</strong>
-                  <p>
-                    {{ Object.keys(server.tools || {}).length }} 个工具 ·
-                    {{ server.authStatus || server.status || "已配置" }}
-                  </p>
-                </div>
-              </div>
-              <p v-if="!mcpList.length" class="settings-empty">
-                当前主机暂无 MCP 服务器。
-              </p>
-            </div>
+            <IntegrationsSettings :api="api" :state="state" />
           </template>
           <template v-else-if="section === 'config'">
             <div class="settings-title-row">

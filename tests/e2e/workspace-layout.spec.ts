@@ -100,7 +100,7 @@ for (const viewport of [
     await openWorkspace(page, "变更");
     const view = panel(page).locator(".changes-view");
     const cards = view.locator(".change-card");
-    await expect(view.getByText("本次对话 · 45 个文件", { exact: true })).toBeVisible();
+    await expect(view.getByText("已加载操作记录 · 45 个文件", { exact: true })).toBeVisible();
     await expect(cards).toHaveCount(45);
     const heights = await cards.evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
     expect(Math.min(...heights), "Compact headings retain usable controls").toBeGreaterThanOrEqual(viewport.label === "phone" ? 40 : 32);

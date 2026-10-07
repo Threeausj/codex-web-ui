@@ -3,7 +3,7 @@ import { reactive } from 'vue';
 export type PushPreferences = { completed: boolean; approval: boolean; errors: boolean };
 export type PushDestination = { hostId: string; threadId: string };
 type PushConfig = { enabled: boolean; publicKey: string; reason?: string };
-type HttpApi = { requestHttp(path: string, init?: RequestInit, reportError?: boolean): Promise<any> };
+type HttpApi = { requestHttp(path: string, init?: RequestInit, reportError?: boolean): Promise<any>; runtimeIdentity?(): { authenticationGeneration?: number } };
 type InstallPrompt = Event & { prompt(): Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }> };
 const preferenceKey = 'codex.devicePushPreferences';
 const retiredEndpointKey = 'codex.retiredPushEndpoint';
@@ -50,6 +50,9 @@ let wantsReload = false;
 let listenersInstalled = false;
 let preferenceWrite: Promise<void> | null = null;
 let externalPreferencesPending = false;
+let deviceAuthGeneration = 0;
+let deviceSignedOut = false;
+let signedOutAuthentication: number | undefined;
 let retiredEndpoint = '';
 try { retiredEndpoint = localStorage.getItem(retiredEndpointKey) || ''; } catch { /* Device storage may be unavailable. */ }
 
@@ -167,7 +170,8 @@ function beginDeviceOperation() {
     finish();
   };
 }
-function postSubscription(api: HttpApi, subscription: PushSubscription) {
+function postSubscription(api: HttpApi, subscription: PushSubscription, generation = deviceAuthGeneration) {
+  if (generation !== deviceAuthGeneration) throw new Error('通知操作所属登录已退出');
   // Refresh right before serializing, so a dormant tab cannot restore old device preferences.
   pwaState.pushPreferences = readPreferences(pwaState.pushPreferences);
   return api.requestHttp('/push/subscription', {
@@ -196,32 +200,41 @@ async function retireSubscription(subscription: PushSubscription, message: strin
   catch { throw new Error('本机通知订阅清理失败，请刷新重试后重新启用通知。'); }
 }
 export function initializeDevicePush(api: HttpApi): Promise<void> {
+  if (deviceSignedOut && signedOutAuthentication !== undefined && api.runtimeIdentity?.().authenticationGeneration === signedOutAuthentication) return Promise.resolve();
+  // A new authenticated initialization invalidates cleanup from the prior login.
+  if (deviceSignedOut) { deviceSignedOut = false; ++deviceAuthGeneration; }
   if (deviceInitialization) return deviceInitialization;
-  deviceInitialization = (async () => {
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
+  const initialization = (async () => {
     if (!navigator.onLine) return;
     pwaState.configError = '';
     pwaState.pushReady = false;
     try {
       // Restore only after a current test, unsubscribe or preference save has completed.
       if (deviceOperation) await deviceOperation;
+      if (!current()) return;
       const [config, worker] = await Promise.all([api.requestHttp('/push/config', undefined, false), initPwa()]);
+      if (!current()) return;
       pwaState.pushConfig = config;
       pwaState.pushPermission = 'Notification' in window ? Notification.permission : 'unsupported';
       if (!worker || !pwaState.pushSupported) return;
       const subscription = await worker.pushManager.getSubscription();
+      if (!current()) return;
       pwaState.pushSubscribed = !!subscription;
       // Restore only an existing, authorized device. Never subscribe or prompt on page load.
       if (subscription && config.enabled && config.publicKey) {
         if (endpointRetired(subscription) || !matchesServerKey(subscription, config.publicKey)) {
           await retireSubscription(subscription, '设备通知订阅已失效或服务器密钥已更新，请重新启用通知。');
         } else if (Notification.permission === 'granted') {
-          await postSubscription(api, subscription);
+          await postSubscription(api, subscription, generation);
         }
       }
       // UI actions become available only after restoration reaches the server.
-      pwaState.pushReady = !!config.enabled && !!config.publicKey;
-    } catch (cause: any) { pwaState.configError = cause.message || '无法读取通知配置'; }
-  })().finally(() => { deviceInitialization = null; });
+      if (current()) pwaState.pushReady = !!config.enabled && !!config.publicKey;
+    } catch (cause: any) { if (current()) pwaState.configError = cause.message || '无法读取通知配置'; }
+  })().finally(() => { if (deviceInitialization === initialization) deviceInitialization = null; });
+  deviceInitialization = initialization;
   return deviceInitialization;
 }
 
@@ -240,13 +253,17 @@ export async function enableDevicePush(api: HttpApi) {
   pwaState.pushError = '';
   const finishDeviceOperation = beginDeviceOperation();
   let created: PushSubscription | null = null;
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
   try {
     // Keep permission requesting in the original click gesture, before the first await.
     const permissionPromise = Notification.permission === 'granted' ? Promise.resolve('granted' as NotificationPermission) : Notification.requestPermission();
     const permission = await permissionPromise;
+    if (!current()) return;
     pwaState.pushPermission = permission;
     if (permission !== 'granted') throw new Error(permission === 'denied' ? '通知已被拒绝，请在系统或浏览器设置中允许后重试。' : '尚未允许通知，你可以稍后再次启用。');
     let subscription = await registration.pushManager.getSubscription();
+    if (!current()) return;
     if (subscription && (endpointRetired(subscription) || !matchesServerKey(subscription, pwaState.pushConfig.publicKey))) {
       const message = '设备通知订阅已失效或服务器密钥已更新，旧订阅已清理，请重新启用通知。';
       await retireSubscription(subscription, message);
@@ -256,7 +273,9 @@ export async function enableDevicePush(api: HttpApi) {
       subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: applicationServerKey(pwaState.pushConfig.publicKey) });
       created = subscription;
     }
-    await postSubscription(api, subscription);
+    if (!current()) { if (created) void created.unsubscribe().catch(() => {}); return; }
+    await postSubscription(api, subscription, generation);
+    if (!current()) return;
     if (created && created.endpoint === retiredEndpoint) {
       retiredEndpoint = '';
       try { localStorage.removeItem(retiredEndpointKey); } catch { /* A fresh, registered subscription is valid in this tab. */ }
@@ -265,13 +284,49 @@ export async function enableDevicePush(api: HttpApi) {
     rememberPreferences(pwaState.pushPreferences);
   } catch (cause: any) {
     if (created) await created.unsubscribe().catch(() => {});
+    if (!current()) return;
     pwaState.pushError = cause.message || '无法启用通知';
     throw cause;
-  } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
+  } finally { if (current()) pwaState.pushBusy = false; finishDeviceOperation(); }
 }
 
-export async function revokeDevicePush(api: HttpApi) {
+export async function revokeDevicePush(api: HttpApi, options: { logout?: boolean } = {}) {
+  if (options.logout) {
+    // The authenticated logout endpoint revokes server grants. Browser cleanup
+    // must neither block it nor allow a pending operation to restore the device.
+    const generation = ++deviceAuthGeneration;
+    deviceSignedOut = true;
+    signedOutAuthentication = api.runtimeIdentity?.().authenticationGeneration;
+    deviceInitialization = null;
+    deviceOperation = null;
+    preferenceWrite = null;
+    externalPreferencesPending = false;
+    pwaState.pushBusy = false;
+    pwaState.pushReady = false;
+    pwaState.pushSubscribed = false;
+    pwaState.pushConfig = null;
+    pwaState.pushError = '';
+    pwaState.configError = '';
+    try {
+      const worker = registration || await initPwa();
+      if (generation !== deviceAuthGeneration) return;
+      const subscription = await worker?.pushManager.getSubscription();
+      if (!subscription || generation !== deviceAuthGeneration) return;
+      retiredEndpoint = subscription.endpoint;
+      try { localStorage.setItem(retiredEndpointKey, retiredEndpoint); } catch { /* Server-side revocation remains authoritative. */ }
+      // Retaining the tombstone also prevents a failed unsubscribe from silently
+      // reauthorizing this endpoint on the next page load.
+      if (!await subscription.unsubscribe() && generation === deviceAuthGeneration)
+        pwaState.pushError = '已退出登录；浏览器通知订阅清理未完成。';
+    } catch {
+      if (generation === deviceAuthGeneration) pwaState.pushError = '已退出登录；浏览器通知订阅清理未完成。';
+    }
+    return;
+  }
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
   if (deviceInitialization) await deviceInitialization;
+  if (!current()) return;
   if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成后再退出');
   pwaState.pushBusy = true;
   pwaState.pushError = '';
@@ -279,21 +334,27 @@ export async function revokeDevicePush(api: HttpApi) {
   try {
     const worker = registration || await initPwa();
     const subscription = await worker?.pushManager.getSubscription();
+    if (!current()) return;
     if (subscription) {
       // First revoke the authenticated server registration. A failure keeps the UI enabled.
       await api.requestHttp('/push/subscription', { method: 'DELETE', body: JSON.stringify({ endpoint: subscription.endpoint }) }, false);
+      if (!current()) return;
       if (!await subscription.unsubscribe()) throw new Error('服务器已关闭通知，但本机订阅清理失败，请重试。');
     }
-    pwaState.pushSubscribed = false;
+    if (current()) pwaState.pushSubscribed = false;
   } catch (cause: any) {
+    if (!current()) return;
     pwaState.pushError = cause.message || '无法关闭本机通知';
     throw cause;
-  } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
+  } finally { if (current()) pwaState.pushBusy = false; finishDeviceOperation(); }
 }
 export const disableDevicePush = revokeDevicePush;
 
 export async function saveDevicePushPreferences(api: HttpApi, preferences: PushPreferences = pwaState.pushPreferences) {
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
   if (deviceInitialization) await deviceInitialization;
+  if (!current()) return;
   if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成');
   pwaState.pushBusy = true;
   pwaState.pushError = '';
@@ -302,15 +363,16 @@ export async function saveDevicePushPreferences(api: HttpApi, preferences: PushP
   preferenceWrite = new Promise<void>((resolve) => { finishPreferenceWrite = resolve; });
   try {
     const subscription = await registration?.pushManager.getSubscription();
+    if (!current()) return;
     if (subscription) await api.requestHttp('/push/subscription', { method: 'PATCH', body: JSON.stringify({ endpoint: subscription.endpoint, preferences }) }, false);
-    rememberPreferences(preferences);
+    if (current()) rememberPreferences(preferences);
   } catch (cause: any) {
+    if (!current()) return;
     pwaState.pushError = cause.message || '无法保存通知偏好';
     throw cause;
   } finally {
-    preferenceWrite = null;
-    pwaState.pushBusy = false;
-    if (externalPreferencesPending) {
+    if (current()) { preferenceWrite = null; pwaState.pushBusy = false; }
+    if (current() && externalPreferencesPending) {
       externalPreferencesPending = false;
       pwaState.pushPreferences = readPreferences(pwaState.pushPreferences);
     }
@@ -320,7 +382,10 @@ export async function saveDevicePushPreferences(api: HttpApi, preferences: PushP
 }
 
 export async function testDevicePush(api: HttpApi) {
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
   if (deviceInitialization) await deviceInitialization;
+  if (!current()) return;
   if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成');
   pwaState.pushBusy = true;
   pwaState.pushError = '';
@@ -328,9 +393,11 @@ export async function testDevicePush(api: HttpApi) {
   let subscription: PushSubscription | null | undefined;
   try {
     subscription = await registration?.pushManager.getSubscription();
+    if (!current()) return;
     if (!subscription) throw new Error('先在这台设备启用通知');
     return await api.requestHttp('/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
   } catch (cause: any) {
+    if (!current()) return;
     if (cause.status === 410 && subscription) {
       const message = '这台设备的通知订阅已失效，请重新启用通知。';
       await retireSubscription(subscription, message);
@@ -338,11 +405,14 @@ export async function testDevicePush(api: HttpApi) {
     }
     pwaState.pushError = cause.message || '无法发送测试通知';
     throw cause;
-  } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
+  } finally { if (current()) pwaState.pushBusy = false; finishDeviceOperation(); }
 }
 
 export async function testSystemNotification() {
+  const generation = deviceAuthGeneration;
+  const current = () => generation === deviceAuthGeneration;
   if (deviceInitialization) await deviceInitialization;
+  if (!current()) return;
   if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成');
   pwaState.pushBusy = true;
   pwaState.pushError = '';
@@ -350,6 +420,7 @@ export async function testSystemNotification() {
   try {
     if (Notification.permission !== 'granted') throw new Error('请先允许这台设备发送通知');
     const worker = await initPwa();
+    if (!current()) return;
     if (!worker) throw new Error('通知服务尚未就绪，请刷新后重试');
     await worker.showNotification('Codex 系统通知检查', {
       body: '收到这条通知表示应用的系统通知可以正常显示。',
@@ -359,7 +430,8 @@ export async function testSystemNotification() {
       data: {},
     });
   } catch (cause: any) {
+    if (!current()) return;
     pwaState.pushError = cause.message || '无法显示系统通知';
     throw cause;
-  } finally { pwaState.pushBusy = false; finishDeviceOperation(); }
+  } finally { if (current()) pwaState.pushBusy = false; finishDeviceOperation(); }
 }

@@ -47,6 +47,8 @@ const newBranch = ref("");
 const worktreePath = ref("");
 const worktreeBranch = ref("");
 const worktreeMode = ref("new");
+const worktreeStart = ref("");
+const startConversation = ref(false);
 let generation = 0;
 let diffGeneration = 0;
 const repositoryScope = computed(() => `${props.state.hostId}\0${props.state.projectPath}`);
@@ -252,18 +254,41 @@ async function openWorktree(path: string) {
   }
 }
 async function createWorktree() {
+  const createConversation = startConversation.value;
   const result = await mutate(
     "worktree",
     {
       path: worktreePath.value,
       branch: worktreeBranch.value,
       mode: worktreeMode.value,
+      ...(worktreeMode.value === 'new' && worktreeStart.value ? { startPoint: worktreeStart.value } : {}),
     },
     "工作树已创建，可在下方打开",
   );
   if (result) {
     worktreePath.value = "";
     worktreeBranch.value = "";
+    if (createConversation && result.projectPath) await openWorktreeConversation(result.projectPath);
+  }
+}
+function treeConversations(path: string) {
+  return props.state.threads.filter((thread: any) => (thread.hostId || props.state.hostId) === props.state.hostId && thread.cwd === path);
+}
+async function openWorktreeConversation(path: string) {
+  if (busy.value || props.state.busy) return;
+  busy.value = true; error.value = '';
+  try { await props.api.newThreadInWorktree(path); emit('project', path); }
+  catch (cause) { report(cause); }
+  finally { busy.value = false; }
+}
+async function removeWorktree(tree: Worktree) {
+  if (!canWrite.value || props.state.busy || tree.path === repository.value?.root || tree.locked || tree.prunable) return;
+  const count = treeConversations(tree.path).length;
+  if (!window.confirm(`移除工作树“${tree.path}”？仅清理目录，保留分支和 ${count} 个已加载对话。含未提交、未跟踪或忽略文件时会拒绝删除。`)) return;
+  const result = await mutate('worktree/remove', { path: tree.path }, '工作树目录已移除，分支和对话保留');
+  if (result) {
+    const project = props.state.projects.find((entry: any) => (entry.hostId || 'local') === props.state.hostId && entry.path === tree.path);
+    if (project) await props.api.removeProject(project);
   }
 }
 watch(
@@ -539,6 +564,9 @@ defineExpose({ refresh });
           >
             打开
           </button>
+          <span v-if="treeConversations(tree.path).length" class="git-note">{{ treeConversations(tree.path).length }} 个已加载对话</span>
+          <button class="icon-button" :aria-label="`在工作树新建对话 ${tree.path}`" title="创建独立对话" :disabled="busy || state.busy || tree.prunable || !state.connected" @click="openWorktreeConversation(tree.path)"><Icon name="MessagesSquare" :size="14" /></button>
+          <button v-if="tree.path !== repository.root && tree.path !== repository.worktrees[0]?.path" class="icon-button" :aria-label="`移除工作树 ${tree.path}`" title="安全移除工作树" :disabled="!canWrite || state.busy || tree.locked || tree.prunable" @click="removeWorktree(tree)"><Icon name="Trash2" :size="14" /></button>
         </div>
         <details class="git-create-worktree">
           <summary>创建独立工作树</summary>
@@ -579,6 +607,8 @@ defineExpose({ refresh });
                 </option>
               </select>
             </div>
+            <label v-if="worktreeMode === 'new'" class="git-note">起始分支<select v-model="worktreeStart" aria-label="工作树起始分支" :disabled="!canWrite"><option value="">当前 HEAD</option><option v-for="name in repository.branches" :key="name" :value="name">{{ name }}</option></select></label>
+            <label class="git-note"><input v-model="startConversation" type="checkbox" aria-label="创建工作树后新建对话" :disabled="!canWrite || state.busy" />创建后立即新建独立对话</label>
             <button
               class="button button-small button-secondary"
               :disabled="
@@ -588,7 +618,7 @@ defineExpose({ refresh });
               创建工作树
             </button>
             <p class="git-note">
-              从 HEAD 创建；不复制当前未提交改动。创建后可打开并开始独立对话。
+              从所选分支创建；不复制未提交改动，也不自动执行项目初始化脚本。
             </p>
           </form>
         </details>

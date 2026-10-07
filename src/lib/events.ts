@@ -16,14 +16,26 @@ export function upsertItem(items: DisplayItem[], incoming: DisplayItem): void {
 /** Hydrate history without overwriting events delivered after the history read began. */
 export function mergeSnapshotItems(snapshot: DisplayItem[], live: DisplayItem[], changedIds: ReadonlySet<string>): DisplayItem[] {
   const result = snapshot.map(item => ({ ...item }));
+  const ids = new Map(result.map((item, index) => [item.id, index]));
+  const clients = new Map(result.flatMap((item, index) => item.type === 'userMessage' && item.clientId ? [[item.clientId, index] as const] : []));
   for (const item of live) {
-    let index = result.findIndex(entry => entry.id === item.id);
-    if (index < 0 && item.type === 'userMessage' && item.clientId) index = result.findIndex(entry => entry.type === 'userMessage' && entry.clientId === item.clientId);
-    if (index >= 0) {
+    const index = ids.get(item.id) ?? (item.type === 'userMessage' && item.clientId ? clients.get(item.clientId) : undefined);
+    if (index !== undefined) {
       // A persisted user message replaces its optimistic alias, never the reverse.
       if (result[index].id !== item.id && ['sending', 'unconfirmed'].includes(item.status)) continue;
-      if (changedIds.has(item.id)) result[index] = { ...result[index], ...item };
-    } else if (changedIds.has(item.id) || ['sending', 'unconfirmed'].includes(item.status)) result.push(item);
+      if (changedIds.has(item.id)) {
+        const previous = result[index];
+        result[index] = { ...previous, ...item };
+        if (item.type === 'userMessage' && item.id !== previous.id && item.status === undefined) delete result[index].status;
+        if (previous.id !== item.id) ids.delete(previous.id);
+        ids.set(item.id, index);
+        if (item.type === 'userMessage' && item.clientId) clients.set(item.clientId, index);
+      }
+    } else if (changedIds.has(item.id) || ['sending', 'unconfirmed'].includes(item.status)) {
+      ids.set(item.id, result.length);
+      if (item.type === 'userMessage' && item.clientId) clients.set(item.clientId, result.length);
+      result.push(item);
+    }
   }
   return result;
 }

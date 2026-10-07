@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   test as base,
   expect,
@@ -128,6 +129,34 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      const fileRoute = /^\/api\/hosts\/([^/]+)\/files$/.exec(url.pathname);
+      if (fileRoute) {
+        const hostId = decodeURIComponent(fileRoute[1]!);
+        const target = hostId === "local" ? this : this.hostMocks.get(hostId);
+        if (!target) return respond({ error: "Host not found" }, 404);
+        const native = (method: string, params: any) => new Promise<any>((resolve, reject) => {
+          const sink = { send(raw: string) {
+            const message = JSON.parse(raw);
+            if (message.error) reject(new Error(message.error.message)); else resolve(message.result);
+          } } as unknown as WebSocketRoute;
+          target.receive(sink, { id: `files-${this.count++}`, method, params });
+        });
+        const version = (dataBase64: string) => createHash("sha256").update(Buffer.from(dataBase64, "base64")).digest("hex");
+        try {
+          if (request.method() === "GET") {
+            const result = await native("fs/readFile", { path: url.searchParams.get("path") });
+            return respond({ ...result, version: version(result.dataBase64) });
+          }
+          const form = await new Request(request.url(), { method: "POST", headers: request.headers(), body: request.postDataBuffer()! }).formData();
+          const path = String(form.get("path"));
+          const original = await native("fs/readFile", { path });
+          if (version(original.dataBase64) !== form.get("expectedVersion")) return respond({ code: "FILE_CONFLICT", error: "文件已被其他程序修改；你的草稿已保留，请先比较或重新载入。" }, 409);
+          const file = form.get("file") as File;
+          const dataBase64 = Buffer.from(await file.arrayBuffer()).toString("base64");
+          await native("fs/writeFile", { path, dataBase64 });
+          return respond({ version: version(dataBase64) });
+        } catch (cause: any) { return respond({ error: cause.message }, 502); }
+      }
       if (url.pathname.startsWith("/api/navigation/")) {
         const hostId = decodeURIComponent(
           url.pathname.slice("/api/navigation/".length),

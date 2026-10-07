@@ -7,12 +7,15 @@ export type ConversationSnapshot = {
   turns: any[];
   tokenUsage: any;
   cursor: string | null;
+  /** A bounded painting snapshot; its cursor must be re-established by native history. */
+  historyTruncated?: boolean;
 };
 type CacheRecord = ConversationSnapshot & { key: string; scope: string; savedAt: number; bytes: number };
 export type ConversationPersistence = {
   read(key: string): Promise<CacheRecord | undefined>;
   write(record: CacheRecord, maxEntries: number, maxBytes: number, oldest: number): Promise<void>;
   remove(key: string): Promise<void>;
+  removeMany?(keys: string[]): Promise<void>;
   removeHost(scope: string, hostId: string): Promise<void>;
   clear(): Promise<void>;
 };
@@ -62,6 +65,7 @@ export function indexedConversationPersistence(): ConversationPersistence | unde
       };
     }),
     remove: key => transaction<void>('readwrite', store => { store.delete(key); }),
+    removeMany: keys => transaction<void>('readwrite', store => { for (const key of keys) store.delete(key); }),
     removeHost: (scope, hostId) => transaction<void>('readwrite', store => {
       const request = store.getAll();
       request.onsuccess = () => {
@@ -80,16 +84,104 @@ export async function conversationSessionScope(credential: string): Promise<stri
   return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+const snapshotBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+/** Keep recent content when large tool output or a long conversation exceeds the disk budget. */
+export function boundedConversationSnapshot(snapshot: ConversationSnapshot): ConversationSnapshot {
+  const copy: ConversationSnapshot = JSON.parse(JSON.stringify(snapshot));
+  if (snapshotBytes(copy) <= maxEntryBytes) return copy;
+  copy.historyTruncated = true;
+  // Native cursors are opaque. The old cursor would skip any history we remove here.
+  copy.cursor = null;
+  const trimStrings = (value: any): any => {
+    if (typeof value === 'string') return value.length > 64 * 1024 ? `${value.slice(0, 64 * 1024)}\n…` : value;
+    if (Array.isArray(value)) return value.map(trimStrings);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, trimStrings(child)]));
+    return value;
+  };
+  copy.thread = trimStrings(copy.thread);
+  copy.items = copy.items.map(item => {
+    const trimmed = trimStrings(item);
+    return JSON.stringify(item) === JSON.stringify(trimmed) ? trimmed : { ...trimmed, cacheTruncated: true };
+  });
+  copy.turns = copy.turns.map(turn => ({ ...trimStrings(turn), items: [] }));
+  // Binary search a suffix instead of repeatedly serializing every shrinking prefix.
+  let low = 0, high = copy.items.length;
+  const originalItems = copy.items;
+  const originalTurns = copy.turns;
+  const suffix = (start: number) => {
+    const items = originalItems.slice(start);
+    const retained = new Set(items.map(item => item.turnId).filter(Boolean));
+    const turns = retained.size ? originalTurns.filter(turn => retained.has(turn.id)) : originalTurns.slice(-1);
+    return { ...copy, items, turns };
+  };
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (snapshotBytes(suffix(middle)) <= maxEntryBytes) high = middle;
+    else low = middle + 1;
+  }
+  return suffix(low);
+}
+
+export type MemoryConversationHistory = { turns: any[]; cursor: string | null; engineId: string | null; eventGapRevision?: number; historyTruncated?: boolean };
+type MemoryRecord = { items: any[]; history?: MemoryConversationHistory; bytes: number };
+
+/** Bounded LRU for live arrays. Current and running conversations retain their in-flight events. */
+export class ConversationMemoryCache {
+  private records = new Map<string, MemoryRecord>();
+  constructor(private protectedIds: () => Iterable<string> = () => [], private limit = 24, private byteLimit = 12 * 1024 * 1024) {}
+  get size() { return this.records.size; }
+  get(id: string): any[] | undefined {
+    const record = this.records.get(id);
+    if (!record) return;
+    this.records.delete(id); this.records.set(id, record);
+    return record.items;
+  }
+  history(id: string) { return this.records.get(id)?.history; }
+  set(id: string, items: any[]) {
+    const previous = this.records.get(id);
+    this.records.delete(id);
+    this.records.set(id, { items, history: previous?.history, bytes: snapshotBytes(items) });
+    this.prune();
+    return this;
+  }
+  rememberHistory(id: string, history: MemoryConversationHistory) {
+    const record = this.records.get(id);
+    if (!record) return;
+    record.history = { ...history, turns: history.turns.map(turn => ({ ...turn, items: [] })) };
+    this.prune();
+  }
+  refresh(id: string) {
+    const record = this.records.get(id);
+    if (record) record.bytes = snapshotBytes(record.items);
+    this.prune();
+  }
+  delete(id: string) { return this.records.delete(id); }
+  clear() { this.records.clear(); }
+  private prune() {
+    const protectedIds = new Set(this.protectedIds());
+    let bytes = [...this.records.values()].reduce((sum, record) => sum + record.bytes, 0);
+    for (const [id, record] of this.records) {
+      if (this.records.size <= this.limit && bytes <= this.byteLimit) break;
+      if (protectedIds.has(id)) continue;
+      this.records.delete(id); bytes -= record.bytes;
+    }
+  }
+}
+
 export class ConversationCache {
   private records = new Map<string, CacheRecord>();
   private scope = '';
   private generation = 0;
   private revisions = new Map<string, number>();
   private writes: Promise<void> = Promise.resolve();
+  private removals = new Set<string>();
+  private removalTimer?: ReturnType<typeof setTimeout>;
   constructor(private persistence = indexedConversationPersistence(), private now = () => Date.now()) {}
   activate(scope: string | null) {
     if (this.scope === (scope || '')) return;
     this.generation++;
+    clearTimeout(this.removalTimer); this.removalTimer = undefined; this.removals.clear();
     this.scope = scope || '';
     this.records.clear();
     this.revisions.clear();
@@ -113,6 +205,7 @@ export class ConversationCache {
     this.revisions.set(key, revision);
     try {
       // A preceding remove/write must commit before a new disk read starts.
+      this.flushRemovals();
       await this.writes;
       if (generation !== this.generation || (this.revisions.get(key) || 0) !== revision) return null;
       const record = await this.persistence.read(key);
@@ -126,10 +219,11 @@ export class ConversationCache {
   }
   write(snapshot: ConversationSnapshot) {
     try {
-      const copy = this.copy(snapshot);
+      const copy = boundedConversationSnapshot(snapshot);
       const bytes = new TextEncoder().encode(JSON.stringify(copy)).byteLength;
-      if (bytes > maxEntryBytes) { this.remove(snapshot.hostId, snapshot.threadId); return; }
+      if (bytes > maxEntryBytes) return;
       const record: CacheRecord = { ...copy, key: identity(this.scope, snapshot.hostId, snapshot.threadId), scope: this.scope, savedAt: this.now(), bytes };
+      this.removals.delete(record.key);
       this.revisions.set(record.key, (this.revisions.get(record.key) || 0) + 1);
       this.remember(record);
       if (!this.scope || !this.persistence) return;
@@ -142,15 +236,15 @@ export class ConversationCache {
   remove(hostId: string, threadId: string) {
     const key = identity(this.scope, hostId, threadId);
     this.records.delete(key);
+    if (this.removals.has(key)) return;
     this.revisions.set(key, (this.revisions.get(key) || 0) + 1);
-    const generation = this.generation;
-    this.writes = this.writes.then(async () => {
-      if (generation === this.generation) await this.persistence?.remove(key);
-    }).catch(() => {});
+    this.removals.add(key);
+    if (!this.removalTimer) this.removalTimer = setTimeout(() => this.flushRemovals(), 100);
   }
   removeHost(hostId: string) {
     for (const [key, record] of this.records) if (record.hostId === hostId) this.records.delete(key);
     for (const [key, revision] of this.revisions) if (JSON.parse(key)[1] === hostId) this.revisions.set(key, revision + 1);
+    for (const key of this.removals) if (JSON.parse(key)[1] === hostId) this.removals.delete(key);
     const generation = this.generation;
     const scope = this.scope;
     this.writes = this.writes.then(async () => {
@@ -159,13 +253,25 @@ export class ConversationCache {
   }
   clear() {
     this.generation++;
+    clearTimeout(this.removalTimer); this.removalTimer = undefined; this.removals.clear();
     this.scope = '';
     this.records.clear();
     this.revisions.clear();
     this.writes = this.writes.then(() => this.persistence?.clear()).catch(() => {});
     return this.writes;
   }
-  flush() { return this.writes; }
+  flush() { this.flushRemovals(); return this.writes; }
+  private flushRemovals() {
+    clearTimeout(this.removalTimer); this.removalTimer = undefined;
+    if (!this.removals.size) return;
+    const keys = [...this.removals]; this.removals.clear();
+    const generation = this.generation;
+    this.writes = this.writes.then(async () => {
+      if (generation !== this.generation || !this.persistence) return;
+      if (this.persistence.removeMany) await this.persistence.removeMany(keys);
+      else await Promise.all(keys.map(key => this.persistence!.remove(key)));
+    }).catch(() => {});
+  }
   private remember(record: CacheRecord) {
     this.records.delete(record.key);
     this.records.set(record.key, record);

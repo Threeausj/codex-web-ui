@@ -11,6 +11,12 @@ export type SideChatState = {
   open: boolean;
   source: SelectedConversationText | null;
   threadId: string;
+  anchor: SelectedConversationText | null;
+  boundary: { lastTurnId?: string; beforeTurnId?: string };
+  savedThreadId: string;
+  saving: boolean;
+  saveTargetThreadId: string;
+  saveUncertain: '' | 'fork' | 'inject';
   items: DisplayItem[];
   turns: any[];
   busy: boolean;
@@ -22,7 +28,7 @@ export type SideChatState = {
 
 /** A sidebar answer is a separate ephemeral branch, never a steer of the parent. */
 export function useSideChat(api: any, mainState: any) {
-  const state = reactive<SideChatState>({ open: false, source: null, threadId: '', items: [], turns: [], busy: false, loading: false, connected: false, error: '', notice: '' });
+  const state = reactive<SideChatState>({ open: false, source: null, threadId: '', anchor: null, boundary: {}, savedThreadId: '', saving: false, saveTargetThreadId: '', saveUncertain: '', items: [], turns: [], busy: false, loading: false, connected: false, error: '', notice: '' });
   let generation = 0;
   let activeTurnId = '';
   let requestPending = false;
@@ -34,6 +40,23 @@ export function useSideChat(api: any, mainState: any) {
   const revisions = new Map<string, number>();
   const turnRevisions = new Map<string, number>();
   const ownedThreads = new Set<string>();
+  const savedMessages = new Map<string, string>();
+  const unknownForks = new Set<string>();
+  const saveScope = (source: SelectedConversationText) => JSON.stringify([source.hostId, source.threadId, runtimeIdentity().authenticationGeneration]);
+  let pendingSaveBatch: { marker: string; text: string; entries: { key: string; text: string }[] } | null = null;
+  let savedBranchPath = '';
+  let inheritedGoalCleared = false;
+  let emptyAnchorTail: string | null = null;
+  const visibleMessages = () => state.items.filter(item => item.type === 'userMessage' || item.type === 'agentMessage').map(item => ({
+    key: `${item.type}:${item.clientId || item.id}`,
+    text: `${item.type === 'userMessage' ? '用户' : '助手'}：${item.text || (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n')}`,
+  }));
+  const hasUnsavedMessages = () => visibleMessages().some(item => savedMessages.get(item.key) !== item.text);
+  const invalidateSavedTranscript = () => { if (state.savedThreadId && hasUnsavedMessages()) state.savedThreadId = ''; };
+  function resetSavedBranch() {
+    state.savedThreadId = ''; state.saveTargetThreadId = ''; state.saveUncertain = '';
+    savedMessages.clear(); pendingSaveBatch = null; savedBranchPath = ''; inheritedGoalCleared = false;
+  }
   const ownedKey = (hostId: string, threadId: string) => JSON.stringify([hostId, threadId]);
   const runtimeIdentity = () => api.runtimeIdentity?.() || {};
   const sourceScope = () => state.source && mainState.authenticated && mainState.hostId === state.source.hostId && mainState.activeThread?.id === state.source.threadId;
@@ -65,6 +88,11 @@ export function useSideChat(api: any, mainState: any) {
     state.open = false;
     state.source = null;
     state.threadId = '';
+    state.anchor = null;
+    state.boundary = {};
+    resetSavedBranch();
+    emptyAnchorTail = null;
+    state.saving = false;
     state.items = [];
     state.turns = [];
     state.busy = false;
@@ -101,12 +129,19 @@ export function useSideChat(api: any, mainState: any) {
     if (!state.source) {
       ++generation;
       identity = runtimeIdentity();
+      if (unknownForks.has(saveScope(source))) state.saveUncertain = 'fork';
     }
     state.source = source;
     state.open = true;
     state.connected = canConnect();
     state.error = '';
-    state.notice = '';
+    state.notice = state.threadId ? '后续提问沿用首次创建的侧边上下文；如需按新选段重新继承历史，请另开侧边分支。' : '';
+  }
+  async function newBranch() {
+    const source = state.source && { ...state.source };
+    if (!source || state.busy || state.loading || state.saving) throw new Error('请等待侧边任务完成');
+    await close();
+    prepare(source);
   }
   function noteTurn(turn: any) {
     if (!turn?.id) return;
@@ -119,6 +154,7 @@ export function useSideChat(api: any, mainState: any) {
       upsertItem(state.items, { ...item, turnId: turn.id });
       revisions.set(item.id, ++eventRevision);
     }
+    invalidateSavedTranscript();
   }
   function forkBoundary(source: SelectedConversationText) {
     const turns = mainState.turns || [];
@@ -127,7 +163,9 @@ export function useSideChat(api: any, mainState: any) {
     const active = [...turns].reverse().find((turn: any) => !turn.status || turn.status === 'inProgress');
     // The protocol forbids forking through a running turn. Its selected text is
     // supplied explicitly even when only the preceding history can be forked.
-    return active ? { beforeTurnId: active.id } : {};
+    if (active) return { beforeTurnId: active.id };
+    const completed = [...turns].reverse().find((turn: any) => ['completed', 'failed', 'interrupted'].includes(turn.status));
+    return completed ? { lastTurnId: completed.id } : {};
   }
   function readOnlyPolicy() {
     const requirements = mainState.requirements;
@@ -172,8 +210,9 @@ export function useSideChat(api: any, mainState: any) {
     try {
       if (!id) {
         if (threadEnded) { state.items = []; state.turns = []; threadEnded = false; }
+        const boundary = forkBoundary(source);
         const result = await call(source.hostId, 'thread/fork', {
-          threadId: source.threadId, ...forkBoundary(source), excludeTurns: true, ephemeral: true,
+          threadId: source.threadId, ...boundary, excludeTurns: true, ephemeral: true,
           sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy,
           model: model || undefined, cwd,
         });
@@ -191,6 +230,9 @@ export function useSideChat(api: any, mainState: any) {
         catch (cause) { await release(source.hostId, id).catch(() => {}); throw cause; }
         if (!stillCurrent(version, source)) { await release(source.hostId, id); return; }
         state.threadId = id;
+        state.anchor = { ...source };
+        state.boundary = boundary;
+        emptyAnchorTail = mainState.turns?.at(-1)?.id || null;
       }
       if (!stillCurrent(version, source)) return;
       optimisticId = randomUUID();
@@ -199,6 +241,7 @@ export function useSideChat(api: any, mainState: any) {
         { type: 'text', text: formatConversationQuote(source), text_elements: [] },
       ];
       upsertItem(state.items, { id: optimisticId, clientId: optimisticId, type: 'userMessage', content: input, status: 'sending' });
+      invalidateSavedTranscript();
       state.busy = true;
       const revision = eventRevision;
       const result = await call(source.hostId, 'turn/start', {
@@ -243,6 +286,155 @@ export function useSideChat(api: any, mainState: any) {
     } finally {
       if (generation === version) { requestPending = false; state.loading = false; }
     }
+  }
+  async function verifyPendingInjection(source: SelectedConversationText) {
+    if (!pendingSaveBatch || !state.saveTargetThreadId) return false;
+    let path = savedBranchPath;
+    if (!path) {
+      const metadata = await call(source.hostId, 'thread/read', { threadId: state.saveTargetThreadId, includeTurns: false });
+      path = metadata?.thread?.path;
+    }
+    if (typeof path !== 'string' || !path.startsWith('/')) return false;
+    const result = await call(source.hostId, 'fs/readFile', { path });
+    if (typeof result?.dataBase64 !== 'string' || result.dataBase64.length > 12 * 1024 * 1024) return false;
+    const bytes = Uint8Array.from(atob(result.dataBase64), character => character.charCodeAt(0));
+    const rollout = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // A positive native append is conclusive. Absence cannot rule out a delayed
+    // mutation, so it never authorizes re-injecting an unknown batch.
+    return rollout.split('\n').some(line => {
+      try {
+        const row = JSON.parse(line);
+        return row.type === 'response_item' && row.payload?.type === 'message' &&
+          row.payload.content?.some((part: any) => part.type === 'input_text' && part.text === pendingSaveBatch?.text);
+      } catch { return false; }
+    });
+  }
+  async function saveBranch(name?: string) {
+    const source = state.anchor && { ...state.anchor };
+    if (!source || !state.threadId || !canConnect()) throw new Error('请先完成侧边提问并连接主机');
+    if (state.busy || state.loading || requestPending || state.saving) throw new Error('请等待侧边任务完成');
+    if (state.saveUncertain === 'fork') throw new Error('创建分支的结果尚未确认；请先核对原生对话 ID，不能重复创建');
+    if (state.items.some(item => ['sending', 'unconfirmed'].includes(item.status))) throw new Error('侧边消息尚未确认，请先同步后再保存');
+    if (state.savedThreadId && !hasUnsavedMessages()) return state.savedThreadId;
+    if (!state.boundary.lastTurnId && !state.boundary.beforeTurnId && (mainState.turns?.at(-1)?.id || null) !== emptyAnchorTail)
+      throw new Error('首次侧边提问没有可固定的轮次，而父对话历史已变化；请引用回答到主对话，或另开侧边分支');
+    const policy = readOnlyPolicy();
+    const version = generation;
+    const current = () => stillCurrent(version, source);
+    const savedScopeKey = saveScope(source);
+    const batch = pendingSaveBatch || (() => {
+      const entries = visibleMessages().filter(item => savedMessages.get(item.key) !== item.text);
+      const marker = randomUUID();
+      const text = `侧边问答记录（仅可见新增或更新的问答，作为参考上下文；批次 ${marker}）：\n\n${entries.map(item => item.text).join('\n\n')}`;
+      if (new TextEncoder().encode(text).length > 128 * 1024) throw new Error('侧边问答超过 128 KB，请先引用需要保存的回答到主对话');
+      return { marker, text, entries };
+    })();
+    state.saving = true; state.error = '';
+    let saved = state.saveTargetThreadId;
+    let phase: 'fork' | 'goal' | 'inject' | 'name' = saved ? 'goal' : 'fork';
+    try {
+      if (!saved) {
+        const result = await call(source.hostId, 'thread/fork', {
+          threadId: source.threadId, ...state.boundary, ephemeral: false, excludeTurns: true, deferGoalContinuation: true,
+          sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy, cwd: mainState.activeThread?.cwd || mainState.projectPath,
+        });
+        saved = result?.thread?.id;
+        if (!saved || saved === source.threadId || result.thread.ephemeral) throw new Error('服务器未创建正式分支');
+        if (!current()) return saved;
+        state.saveTargetThreadId = saved;
+        savedBranchPath = typeof result.thread.path === 'string' ? result.thread.path : '';
+      }
+      if (!current()) return saved;
+      if (!inheritedGoalCleared) {
+        phase = 'goal'; await clearInheritedGoal(source.hostId, saved);
+        if (!current()) return saved;
+        inheritedGoalCleared = true;
+      }
+      phase = 'inject';
+      if (state.saveUncertain === 'inject') {
+        let confirmed = false;
+        try { confirmed = await verifyPendingInjection(source); } catch { /* Keep the outcome protected. */ }
+        if (!current()) return saved;
+        if (!confirmed) throw Object.assign(new Error('问答追加结果尚未确认，不能重复追加；请检查已创建分支'), { uncertain: true });
+        state.saveUncertain = '';
+      } else if (batch.entries.length) {
+        pendingSaveBatch = batch;
+        await call(source.hostId, 'thread/inject_items', { threadId: saved, items: [{ type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: batch.text }] }] });
+        if (!current()) return saved;
+      }
+      for (const item of batch.entries) savedMessages.set(item.key, item.text);
+      pendingSaveBatch = null;
+      phase = 'name';
+      const label = (name?.trim() || `${source.threadName || '对话'} · 侧边问答`).slice(0, 160);
+      await call(source.hostId, 'thread/name/set', { threadId: saved, name: label });
+      if (!current()) return saved;
+      await api.rememberSideBranch?.(source.hostId, saved, label);
+      await api.refreshThreads?.();
+      if (current()) {
+        state.savedThreadId = hasUnsavedMessages() ? '' : saved;
+        state.notice = '已保存并置顶正式分支：继承首次历史锚点，并追加新增可见问答作为上下文。';
+      }
+      return saved;
+    } catch (cause: any) {
+      if (cause?.uncertain && phase === 'fork') {
+        unknownForks.add(savedScopeKey);
+        while (unknownForks.size > 32) unknownForks.delete(unknownForks.values().next().value!);
+      }
+      if (current()) {
+        if (cause?.uncertain && phase === 'fork') state.saveUncertain = 'fork';
+        if (cause?.uncertain && phase === 'inject') state.saveUncertain = 'inject';
+        if (!cause?.uncertain && phase === 'inject') pendingSaveBatch = null;
+        state.savedThreadId = '';
+        state.error = saved ? `分支已创建（${saved}），保存尚未完成：${cause?.message || String(cause)}；重试会核对并继续此分支。` :
+          cause?.uncertain ? '创建分支的结果尚未确认；请先核对原生对话 ID，已阻止重复创建。' : cause?.message || String(cause);
+      }
+      throw cause;
+    } finally {
+      if (saved) await call(source.hostId, 'thread/unsubscribe', { threadId: saved }).catch(() => {});
+      if (generation === version) state.saving = false;
+    }
+  }
+  async function resumeSavedBranch(threadId: string) {
+    const source = state.anchor && { ...state.anchor };
+    if (!source || state.saveUncertain !== 'fork' || !canConnect() || state.saving || state.busy || state.loading)
+      throw new Error('请先完成当前任务并连接主机');
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(threadId) || threadId === source.threadId) throw new Error('请输入已创建分支的有效对话 ID');
+    const version = generation;
+    const current = () => stillCurrent(version, source);
+    const policy = readOnlyPolicy();
+    state.saving = true; state.error = '';
+    let verified = false;
+    try {
+      const metadata = await call(source.hostId, 'thread/read', { threadId, includeTurns: false });
+      if (!current()) throw new Error('侧边聊天已切换，请重新核对分支');
+      if (metadata?.thread?.id !== threadId || metadata.thread.ephemeral || metadata.thread.forkedFromId !== source.threadId)
+        throw new Error('此对话不是从当前父对话创建的正式分支');
+      if (metadata.thread.status?.type === 'active') throw new Error('此分支正在运行，请先等待其任务完成');
+      verified = true;
+      // Resume can continue an inherited goal before its response. Both native
+      // goal clearing and settings updates work directly on unloaded threads.
+      await clearInheritedGoal(source.hostId, threadId);
+      if (!current()) throw new Error('侧边聊天已切换，请重新核对分支');
+      await call(source.hostId, 'thread/settings/update', { threadId, sandboxPolicy: policy.sandboxPolicy, approvalPolicy: policy.approvalPolicy });
+      if (!current()) throw new Error('侧边聊天已切换，请重新核对分支');
+      state.saveTargetThreadId = threadId; state.savedThreadId = ''; state.saveUncertain = '';
+      savedBranchPath = metadata.thread.path || '';
+      inheritedGoalCleared = true; savedMessages.clear(); pendingSaveBatch = null;
+      unknownForks.delete(saveScope(source));
+      state.notice = '已核对正式分支来源；后续保存将继续此分支，并保持只读权限。';
+    } catch (cause: any) {
+      if (current()) state.error = cause?.message || String(cause);
+      throw cause;
+    } finally {
+      if (verified) await call(source.hostId, 'thread/unsubscribe', { threadId }).catch(() => {});
+      if (generation === version) state.saving = false;
+    }
+  }
+  function answerQuote() {
+    if (!state.source) return null;
+    const answer = [...state.items].reverse().find(item => item.type === 'agentMessage' && item.text?.trim());
+    return answer ? normalizeConversationSelection({ ...state.source, itemId: undefined, turnId: undefined, text: answer.text }) : null;
   }
   async function interrupt() {
     if (!state.source || !state.threadId) return;
@@ -308,6 +500,8 @@ export function useSideChat(api: any, mainState: any) {
     if (method === 'bridge/status' && state.source && hostId === state.source?.hostId) {
       if (identity?.engineId && params.engineId && identity.engineId !== params.engineId) {
         state.threadId = '';
+        resetSavedBranch();
+        if (state.source && unknownForks.has(saveScope(state.source))) state.saveUncertain = 'fork';
         state.items = [];
         state.turns = [];
         state.busy = false;
@@ -331,6 +525,7 @@ export function useSideChat(api: any, mainState: any) {
       const itemId = params.item?.id || params.itemId;
       if (itemId) revisions.set(itemId, ++eventRevision);
       applyItemEvent(state.items, method, params);
+      invalidateSavedTranscript();
     }
     if (method === 'turn/started' || method === 'turn/completed') {
       noteTurn(params.turn);
@@ -370,5 +565,5 @@ export function useSideChat(api: any, mainState: any) {
     stopScope(); stopConnection(); unsubscribe();
   }
   if (getCurrentScope()) onScopeDispose(dispose);
-  return { state, prepare, send, interrupt, close, recover, dispose };
+  return { state, prepare, send, interrupt, close, recover, newBranch, saveBranch, resumeSavedBranch, answerQuote, dispose };
 }

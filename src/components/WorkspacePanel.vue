@@ -26,6 +26,7 @@ const props = defineProps<{
   state: any;
   initialTab?: string;
   openPath?: string;
+  openLine?: number;
 }>();
 const emit = defineEmits<{ close: []; error: [message: string] }>();
 const tab = ref(props.initialTab || "files");
@@ -46,10 +47,14 @@ const entries = ref<any[]>([]);
 const file = ref<any>(null);
 const content = ref("");
 const originalContent = ref("");
+const fileEditor = ref<HTMLTextAreaElement>();
+const selectedLine = ref<number | null>(null);
 const loading = ref(false);
 const saving = ref(false);
 const error = ref("");
 const downloading = ref("");
+const conflict = ref<any>(null);
+const expandedChanges = ref(new Set<string>());
 let directoryGeneration = 0;
 let fileGeneration = 0;
 let revealGeneration = 0;
@@ -66,12 +71,21 @@ const previewKey = ref(0);
 const previewDocument = ref(false);
 const fileView = ref<"preview" | "source">("preview");
 const dirty = computed(() => content.value !== originalContent.value);
+const changeScope = ref("loaded");
+// Keep every patch in execution order. These are operation counts, not a net
+// repository diff; repeated edits and later undo must not silently disappear.
 const changes = computed(() => {
   const map = new Map<string, any>();
-  for (const item of props.state.items || [])
-    if (item.type === "fileChange")
-      for (const change of item.changes || []) map.set(change.path, change);
-  return [...map.values()];
+  const latestTurnId = props.state.turns?.at(-1)?.id;
+  for (const item of props.state.items || []) {
+    if (item.type !== "fileChange" || (changeScope.value === "latest" && item.turnId !== latestTurnId)) continue;
+    for (const change of item.changes || []) {
+      let entry = map.get(change.path);
+      if (!entry) { entry = { path: change.path, patches: [] }; map.set(change.path, entry); }
+      entry.patches.push({ ...change, itemId: item.id, turnId: item.turnId });
+    }
+  }
+  return [...map.values()].map(change => ({ ...change, diff: change.patches.map((patch: any) => patch.diff || "").join("\n") }));
 });
 const filteredChanges = computed(() => changes.value.filter(change => change.path.toLocaleLowerCase().includes(changeSearch.value.trim().toLocaleLowerCase())));
 const changeTotals = computed(() => changes.value.reduce((sum, change) => { const count = diffStats(change.diff); return { added: sum.added + count.added, removed: sum.removed + count.removed } }, { added: 0, removed: 0 }));
@@ -114,7 +128,7 @@ async function readDirectory(path: string, interruptReveal = true) {
       loading.value = false;
   }
 }
-async function openFile(path: string, destination = "files") {
+async function openFile(path: string, destination = "files", line?: number) {
   if (!path) return;
   if (file.value?.path === path) {
     ++fileGeneration;
@@ -122,6 +136,7 @@ async function openFile(path: string, destination = "files") {
     tab.value = destination;
     previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
+    if (line) await focusLine(line);
     return;
   }
   ++revealGeneration;
@@ -138,6 +153,8 @@ async function openFile(path: string, destination = "files") {
   try {
     const result = await props.api.readFile(path);
     if (generation !== fileGeneration || scope !== fileScope()) return;
+    conflict.value = null;
+    selectedLine.value = null;
     file.value = { ...result, path };
     content.value = result.content || "";
     originalContent.value = content.value;
@@ -145,6 +162,7 @@ async function openFile(path: string, destination = "files") {
     previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
     tab.value = destination;
+    if (line) await focusLine(line);
   } catch (cause: any) {
     if (generation === fileGeneration && scope === fileScope())
       error.value = cause.message || "读取文件失败";
@@ -153,7 +171,19 @@ async function openFile(path: string, destination = "files") {
       loading.value = false;
   }
 }
-async function revealPath(path: string) {
+async function focusLine(line: number) {
+  if (!file.value || file.value.binary || isImage.value) return;
+  selectedLine.value = Math.max(1, Math.min(Math.floor(line), content.value.split("\n").length));
+  fileView.value = "source";
+  await nextTick();
+  const editor = fileEditor.value;
+  if (!editor) return;
+  const lines = content.value.split("\n");
+  const start = lines.slice(0, selectedLine.value - 1).reduce((total, value) => total + value.length + 1, 0);
+  editor.focus(); editor.setSelectionRange(start, start + (lines[selectedLine.value - 1]?.length || 0));
+  editor.scrollTop = Math.max(0, (selectedLine.value - 3) * (parseFloat(getComputedStyle(editor).lineHeight) || 20));
+}
+async function revealPath(path: string, line?: number) {
   const generation = ++revealGeneration;
   const scope = fileScope();
   try {
@@ -170,7 +200,7 @@ async function revealPath(path: string) {
       content.value = originalContent.value = "";
       tab.value = "files";
       await readDirectory(path, false);
-    } else await openFile(path);
+    } else await openFile(path, "files", line);
   } catch (cause: any) {
     if (scope === fileScope() && generation === revealGeneration)
       error.value = cause.message || "无法打开路径";
@@ -219,18 +249,41 @@ async function save() {
   saving.value = true;
   error.value = "";
   try {
-    await props.api.writeFile(path, savedContent);
-    if (current()) originalContent.value = savedContent;
+    const result = await props.api.writeFile(path, savedContent, savedFile.version, props.state.hostId);
+    if (current()) { originalContent.value = savedContent; savedFile.version = result.version; conflict.value = null; }
   } catch (cause: any) {
-    if (current()) error.value = cause.message || "保存文件失败";
+    if (current()) {
+      error.value = cause.message || "保存文件失败";
+      if (cause.status === 409 && cause.code === "FILE_CONFLICT") {
+        try {
+          const disk = await props.api.readFile(path, { silentError: true });
+          if (current()) conflict.value = disk;
+        } catch { if (current()) error.value += " 读取磁盘版本失败，请重试保存以重新检查。"; }
+      }
+    }
   } finally {
     if (current()) saving.value = false;
   }
+}
+function resolveConflict(reload: boolean) {
+  if (!conflict.value || !file.value) return;
+  if (reload && !window.confirm("重新载入会丢弃当前草稿，是否继续？")) return;
+  file.value.version = conflict.value.version;
+  originalContent.value = conflict.value.content;
+  if (reload) content.value = conflict.value.content;
+  conflict.value = null;
+  error.value = "";
+  fileView.value = "source";
+}
+function toggleChange(event: Event, key: string) {
+  if ((event.currentTarget as HTMLDetailsElement).open) expandedChanges.value.add(key);
+  else expandedChanges.value.delete(key);
 }
 function closeFile() {
   if (dirty.value && !window.confirm("当前文件有未保存的修改，仍要返回文件列表吗？")) return;
   ++fileGeneration;
   file.value = null;
+  conflict.value = null;
   content.value = originalContent.value = "";
   saving.value = false;
   previewDocument.value = false;
@@ -331,9 +384,9 @@ watch(
   { immediate: true },
 );
 watch(
-  () => props.openPath,
-  (value) => {
-    if (value) void revealPath(value);
+  () => [props.openPath, props.openLine] as const,
+  ([value, line]) => {
+    if (value) void revealPath(value, line);
   },
   { immediate: true },
 );
@@ -484,6 +537,12 @@ defineExpose({
             <Icon :name="saving ? 'LoaderCircle' : 'Save'" :size="13" />保存
           </button>
         </div>
+        <section v-if="conflict" class="file-save-conflict" role="alert" aria-label="文件保存冲突">
+          <strong>磁盘内容已更新，你的草稿已保留</strong>
+          <div class="file-conflict-comparison"><div><span>磁盘版本</span><pre>{{ conflict.content }}</pre></div><div><span>当前草稿</span><pre>{{ content }}</pre></div></div>
+          <div class="file-conflict-actions"><button class="button button-small button-secondary" @click="resolveConflict(true)">重新载入磁盘版本</button><button class="button button-small" :disabled="conflict.binary" @click="resolveConflict(false)">保留草稿并手动合并</button></div>
+          <small>手动合并后再次保存；保存前仍会检查磁盘是否又有更新。</small>
+        </section>
         <div v-if="isImage" class="file-image">
           <img :src="file.dataUrl" :alt="displayName" />
         </div>
@@ -503,6 +562,7 @@ defineExpose({
         />
         <textarea
           v-else
+          ref="fileEditor"
           v-model="content"
           class="file-editor"
           spellcheck="false"
@@ -510,7 +570,7 @@ defineExpose({
           :aria-label="displayName + ' 文件内容'"
         ></textarea>
         <div class="file-editor-footer">
-          <span>{{ isImage ? '图片预览' : content.split("\n").length + ' 行' }}</span
+          <span>{{ isImage ? '图片预览' : content.split("\n").length + ' 行' }}{{ selectedLine && !isImage ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
           ><span>{{
             state.permission === "read-only"
               ? "只读"
@@ -781,11 +841,13 @@ defineExpose({
     </div>
     <div v-else class="workspace-body changes-view">
       <div class="changes-heading">
-        <span>本次对话 · {{ changes.length }} 个文件</span><span class="diff-stats"><span class="diff-count-add">+{{ changeTotals.added }}</span><span class="diff-count-remove">−{{ changeTotals.removed }}</span></span>
+        <span>{{ changeScope === 'latest' ? '上一轮操作' : '已加载操作记录' }} · {{ changes.length }} 个文件</span><span class="diff-stats"><span class="diff-count-add">+{{ changeTotals.added }}</span><span class="diff-count-remove">−{{ changeTotals.removed }}</span></span>
       </div>
+      <div class="changes-scope"><select v-model="changeScope" aria-label="变更记录范围"><option value="loaded">已加载操作记录</option><option value="latest">上一轮操作</option></select><button class="button button-small button-secondary" @click="tab = 'git'">工作区／暂存差异</button></div>
+      <p class="changes-scope-note">行数为所选记录中累计操作；工作区净变更与暂存内容可在 Git 查看。</p>
       <label class="workspace-file-search"><Icon name="Search" :size="14" /><input v-model="changeSearch" aria-label="搜索变更文件名" placeholder="搜索变更文件名" /><button v-if="changeSearch" class="icon-button" aria-label="清除变更搜索" @click="changeSearch = ''"><Icon name="X" :size="13" /></button></label>
       <p v-if="changes.length && !filteredChanges.length" class="file-search-empty">没有匹配的变更文件</p>
-      <details v-for="change in filteredChanges" :key="`${state.hostId}:${state.activeThread?.id || ''}:${change.path}`" class="change-card">
+      <details v-for="change in filteredChanges" :key="`${state.hostId}:${state.activeThread?.id || ''}:${change.path}`" class="change-card" @toggle="toggleChange($event, change.path)">
         <summary class="file-diff-heading" :title="change.path">
           <Icon name="FileText" :size="15" /><span class="change-path">{{
             change.path.replace(state.projectPath + "/", "")
@@ -793,9 +855,12 @@ defineExpose({
           ><span class="diff-stats"><span class="diff-count-add">+{{ diffStats(change.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(change.diff).removed }}</span></span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="openFile(change.path)"><Icon name="ArrowUpRight" :size="14" /></button
           ><Icon name="ChevronDown" :size="14" />
         </summary>
-        <pre
-          class="diff-code"
-        ><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
+        <div v-if="expandedChanges.has(change.path)" class="change-patches">
+          <section v-for="(patch, patchIndex) in change.patches" :key="`${patch.itemId}:${patchIndex}`">
+            <div v-if="change.patches.length > 1" class="change-patch-label">第 {{ Number(patchIndex) + 1 }} 次修改 <span class="diff-stats"><span class="diff-count-add">+{{ diffStats(patch.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(patch.diff).removed }}</span></span></div>
+            <pre class="diff-code"><span v-for="(line, index) in (patch.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
+          </section>
+        </div>
       </details>
       <div v-if="!changes.length" class="panel-empty">
         <Icon name="GitCompareArrows" :size="32" />
@@ -807,6 +872,15 @@ defineExpose({
 </template>
 
 <style scoped>
+.file-save-conflict { flex: 0 0 auto; padding: 12px; border-bottom: 1px solid var(--border); background: var(--surface); font-size: 12px; max-height: 50%; overflow: auto; }
+.file-conflict-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
+.file-conflict-comparison > div { min-width: 0; }
+.file-conflict-comparison pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font-size: 11px; }
+.file-conflict-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.changes-scope { display: flex; gap: 6px; align-items: center; }
+.changes-scope select { min-width: 0; padding: 4px; font-size: 12px; }
+.changes-scope-note { font-size: 11px; color: var(--muted); margin: 8px 0; }
+.change-patch-label { display: flex; gap: 8px; padding: 6px 10px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); }
 .changes-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .workspace-file-search { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); }
 .workspace-file-search input { min-width: 0; width: 100%; border: 0; background: transparent; font-size: 12px; padding: 4px 0; }
