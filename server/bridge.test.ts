@@ -59,6 +59,60 @@ function reconnectableTransport() {
   return { transport, sent }
 }
 
+test('pausing releases only this client subscription in proxy mode and keeps every browser paused until explicit resume', async () => {
+  const peers: ReturnType<typeof reconnectableTransport>[] = []
+  const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Proxy fixture' }, { mode: 'proxy', transportFactory: () => { const value = reconnectableTransport(); peers.push(value); return value.transport } })
+  try {
+    const first = new Browser(); const second = new Browser()
+    bridge.attach('session:first', first.ws(), 'first'); bridge.attach('session:second', second.ws(), 'second')
+    await bridge.connect()
+    const joining = bridge.request('thread/resume', { threadId: 'web-thread' })
+    await tick()
+    const resumeRequest = peers[0]!.sent.find(message => message.method === 'thread/resume')!
+    peers[0]!.transport.output.emit('data', Buffer.from(`${JSON.stringify({ id: resumeRequest.id, result: { thread: { id: 'web-thread', status: { type: 'active' } } } })}\n`))
+    await joining
+    peers[0]!.transport.output.emit('data', Buffer.from(`${JSON.stringify({ method: 'thread/started', params: { thread: { id: 'unrelated-desktop-thread' } } })}\n`))
+    assert.equal(bridge.runtime.loadedThreadCount, 1); assert.equal(bridge.runtime.activeThreadCount, 1)
+    assert.equal(bridge.runtime.managed, false)
+    const paused = bridge.pause()
+    await tick()
+    const requests = peers[0]!.sent.filter(message => message.method === 'thread/unsubscribe')
+    assert.deepEqual(requests.map(message => message.params), [{ threadId: 'web-thread' }])
+    peers[0]!.transport.output.emit('data', Buffer.from(`${JSON.stringify({ id: requests[0]!.id, result: { status: 'unsubscribed' } })}\n`))
+    await paused
+    for (const browser of [first, second]) {
+      const status = browser.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as { paused: boolean; connected: boolean }
+      assert.equal(status.paused, true); assert.equal(status.connected, false)
+      assert.equal(browser.readyState, 1)
+    }
+    const recovered = new Browser(); bridge.attach('session:recovered', recovered.ws(), 'recovered')
+    recovered.request({ id: 123, method: 'thread/list', params: {} })
+    await tick()
+    assert.equal(peers.length, 1, 'Reconnect and RPC must never rebuild a manually released runtime')
+    assert.equal((recovered.sent.find(message => message.id === 123)?.error?.data as { code?: string })?.code, 'runtime_paused')
+    await bridge.resume()
+    assert.equal(peers.length, 2); assert.equal(bridge.connected, true); assert.equal(bridge.paused, false)
+  } finally { bridge.close() }
+})
+
+test('pausing during host-key resolution prevents a transport start until explicit resume', async () => {
+  let resolvePin: ((value: SSHHostKeyPin) => void) | undefined
+  let count = 0
+  const bridge = new Bridge({ id: 'ssh-test', kind: 'ssh', name: 'Fixture', hostname: 'fixture.test' }, {
+    resolveSshHostKeyPin: () => new Promise(resolve => { resolvePin = resolve }),
+    transportFactory: () => { count++; return reconnectableTransport().transport },
+  })
+  try {
+    const connection = bridge.connect()
+    const rejected = assert.rejects(connection, /Host connection was closed/)
+    await bridge.pause()
+    resolvePin!({ file: '/fixture/key', hostKeyAlias: 'fixture.test' })
+    await rejected
+    assert.equal(count, 0)
+    assert.equal(bridge.paused, true)
+  } finally { bridge.close() }
+})
+
 const sshResolverHost: Host = { id: 'ssh-pinned', kind: 'ssh', name: 'Pinned fixture', hostname: 'host.example.test', username: 'test', port: 2222 }
 
 test('SSH trust is resolved before each fresh transport while tabs and simultaneous connects reuse the running engine', async () => {

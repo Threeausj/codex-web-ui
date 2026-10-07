@@ -5,6 +5,7 @@ import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import { subagentStatus } from "./subagents";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
+import { ConversationCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
 import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
@@ -83,6 +84,8 @@ const state = reactive({
   threads: [] as any[],
   activeThread: null as any,
   selectingThread: false,
+  threadReady: true,
+  runtimePaused: false,
   switchingHost: false,
   runtimePolicy: null as { sandboxPolicy: any; approvalPolicy: any } | null,
   items: [] as DisplayItem[],
@@ -170,6 +173,13 @@ const attachmentOriginals = new WeakMap<object, File>();
 const terminalSessionNames = new Map<string, string>();
 let terminalSelectionGeneration = 0;
 const itemCache = new Map<string, DisplayItem[]>();
+const conversationCache = new ConversationCache();
+const tokenUsages = new Map<string, any>();
+const tokenUsageRevisions = new Map<string, number>();
+const compactionUsageRevisions = new Map<string, number>();
+const pausedHosts = new Set<string>();
+let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+let cacheActivation: Promise<void> = Promise.resolve();
 const activeTurns = new Map<string, string>();
 const turnRevisions = new Map<string, number>();
 const threadBusy = new Map<string, boolean>();
@@ -195,6 +205,103 @@ const legacyRecency = new Map<
 >();
 const recencyKey = (hostId: string, threadId: string) =>
   JSON.stringify([hostId, threadId]);
+function activateConversationCache() {
+  const authentication = authenticationGeneration;
+  const credential = csrfToken;
+  cacheActivation = conversationSessionScope(credential).then(scope => {
+    if (authentication === authenticationGeneration && state.authenticated && csrfToken === credential)
+      conversationCache.activate(scope);
+  }).catch(() => {});
+  return cacheActivation;
+}
+function clearConversationCaches() {
+  clearTimeout(snapshotTimer);
+  itemCache.clear();
+  tokenUsages.clear();
+  tokenUsageRevisions.clear();
+  compactionUsageRevisions.clear();
+  state.items = [];
+  state.turns = [];
+  state.tokenUsage = null;
+  state.activeThread = null;
+  state.threadReady = true;
+  state.threadConflict = null;
+  state.busy = false;
+  state.threads = [];
+  state.navigation = {};
+  state.projects = [];
+  state.pendingRequests = [];
+  state.agentActivity = {};
+  state.diff = '';
+  state.plan = [];
+  activeTurns.clear();
+  threadBusy.clear();
+  turnRevisions.clear();
+  itemRevisions.clear();
+  threadRevisions.clear();
+  removedThreads.clear();
+  threadListScope = '';
+  loadedMorePages = false;
+  loadedGlobalPages = false;
+  threadCursor = null;
+  turnCursor = null;
+  state.moreThreads = false;
+  state.moreTurns = false;
+  state.projectThreadPages = {};
+  ++listGeneration;
+  ++configGeneration;
+  ++integrationGeneration;
+  for (const host of state.hosts) navigationRevisions.set(host.id, (navigationRevisions.get(host.id) || 0) + 1);
+  navigationRequests.clear();
+  void conversationCache.clear();
+}
+function saveConversationSnapshot() {
+  const thread = state.activeThread;
+  if (!state.authenticated || !thread?.id || !state.threadReady || state.threadConflict || revertedTurnCandidates.has(thread.id)) return;
+  conversationCache.write({
+    hostId: state.hostId, threadId: thread.id, thread,
+    items: state.items.filter(item => item.status !== 'sending'),
+    turns: state.turns.map(turn => ({ ...turn, items: [] })),
+    tokenUsage: state.tokenUsage, cursor: turnCursor,
+  });
+}
+function scheduleConversationSnapshot(threadId?: string) {
+  if (!threadId) return;
+  if (threadId !== state.activeThread?.id) {
+    conversationCache.remove(state.hostId, threadId);
+    return;
+  }
+  clearTimeout(snapshotTimer);
+  snapshotTimer = setTimeout(saveConversationSnapshot, 250);
+}
+function flushConversationCache() {
+  clearTimeout(snapshotTimer);
+  saveConversationSnapshot();
+  return conversationCache.flush();
+}
+function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
+  const metadata = state.threads.find(thread => thread.id === id);
+  state.activeThread = { ...snapshot.thread, ...metadata, id };
+  state.items = itemCache.get(id) ?? snapshot.items;
+  state.turns = snapshot.turns;
+  const key = recencyKey(state.hostId, id);
+  if (!tokenUsages.has(key)) tokenUsages.set(key, snapshot.tokenUsage);
+  state.tokenUsage = tokenUsages.get(key) ?? null;
+  turnCursor = snapshot.cursor;
+  state.moreTurns = !!turnCursor;
+}
+function beginCompactionUsage(threadId: string) {
+  const key = recencyKey(state.hostId, threadId);
+  if (!compactionUsageRevisions.has(key)) compactionUsageRevisions.set(key, tokenUsageRevisions.get(key) || 0);
+  tokenUsages.set(key, null);
+  if (state.activeThread?.id === threadId) state.tokenUsage = null;
+}
+// Android may discard the renderer rather than emit a normal unload event.
+// Commit small private snapshots while hidden; the server retains the runtime.
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('pagehide', () => { void flushConversationCache(); });
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') void flushConversationCache();
+});
 function appendTerminal(chunk: string) {
   state.terminalOutput = (state.terminalOutput + chunk).slice(-500000);
   for (const listener of terminalListeners) listener(chunk);
@@ -308,15 +415,19 @@ function validateSession(): Promise<SessionStatus | null> {
       throw new Error("登录状态查询返回无效结果，请联网后重试");
     state.authRequired = session.authRequired ?? state.authRequired;
     if (session.authenticated) {
-      if (csrfToken && session.csrfToken && csrfToken !== session.csrfToken)
+      if (csrfToken && session.csrfToken && csrfToken !== session.csrfToken) {
         authenticationGeneration++;
+        clearConversationCaches();
+      }
       csrfToken = session.csrfToken ?? csrfToken;
       state.authenticated = true;
+      void activateConversationCache();
     } else {
       const wasAuthenticated = state.authenticated;
       authenticationGeneration++;
       csrfToken = "";
       state.authenticated = false;
+      clearConversationCaches();
       closeConnection();
       if (wasAuthenticated) state.error = "登录已过期，请重新登录";
     }
@@ -473,6 +584,7 @@ function mergeNavigation(hostId: string, threads: any[], replace = false) {
   nav.threads = [...records.values()];
 }
 function refreshHostNavigation(hostId: string): Promise<void> {
+  if (pausedHosts.has(hostId)) return Promise.resolve();
   const existing = navigationRequests.get(hostId);
   if (existing) return existing;
   const nav = hostNavigation(hostId);
@@ -625,6 +737,7 @@ function navigationProjectPage(hostId: string, projectPath: string) {
     : state.navigation[hostId]?.projectPages[projectPath];
 }
 function closeConnection() {
+  saveConversationSnapshot();
   localReverts.clear();
   clearTimeout(reconnectTimer);
   clearInterval(refreshTimer);
@@ -642,6 +755,7 @@ function closeConnection() {
   }
   pending.clear();
   state.connected = false;
+  if (state.activeThread) state.threadReady = false;
 }
 function rpc<M extends Method>(
   method: M,
@@ -824,18 +938,38 @@ function receive(message: any) {
     return;
   }
   const { method, params: p = {} } = message;
+  if (p.threadId || method === 'bridge/thread/changed') scheduleConversationSnapshot(p.threadId);
   if (method === 'bridge/thread/changed') { receiveThreadChange(p); return; }
   if (method === "bridge/status") {
     const reconnecting = !state.connected && p.connected;
     if (reconnecting) seenThreadChanges.clear();
     state.connected = p.connected;
+    if (typeof p.paused === 'boolean') {
+      state.runtimePaused = p.paused;
+      if (p.paused) {
+        saveConversationSnapshot();
+        pausedHosts.add(state.hostId);
+        state.connected = false;
+        state.threadReady = false;
+        state.busy = false;
+        state.pendingRequests = [];
+        if (state.threadConflict && state.error === state.threadConflict.message) state.error = '';
+        state.threadConflict = null;
+        state.takingOverThread = false;
+        ++takeoverOperation;
+        state.terminalRunning = false;
+        state.terminalProcesses = [];
+        state.terminalSessionName = '';
+        clearTimeout(reconnectTimer);
+      } else pausedHosts.delete(state.hostId);
+    }
     state.connectionMode = p.mode ?? state.connectionMode;
     if (p.error) state.error = p.error;
-    if (p.connected) {
+    if (p.connected && !state.runtimePaused) {
       state.error = state.threadConflict?.message || "";
       if (p.pendingRequests) state.pendingRequests = p.pendingRequests;
     }
-    if (p.connected && Array.isArray(p.activeProcesses)) {
+    if (p.connected && !state.runtimePaused && Array.isArray(p.activeProcesses)) {
       state.terminalProcesses = p.activeProcesses;
       const process = p.activeProcesses.find(
         (process: any) => process.processId === state.terminalProcessId,
@@ -938,8 +1072,16 @@ function receive(message: any) {
     if (item?.type === 'agentMessage') {
       state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], text: item.text, updatedAt: Date.now() };
     }
+    if (p.item?.type === "contextCompaction" && method === "item/started") beginCompactionUsage(p.threadId);
     if (p.item?.type === "contextCompaction" && method === "item/completed") {
       compactedSinceInput.add(p.threadId);
+      const key = recencyKey(state.hostId, p.threadId);
+      const startRevision = compactionUsageRevisions.get(key);
+      if (startRevision === undefined || (tokenUsageRevisions.get(key) || 0) <= startRevision) {
+        tokenUsages.set(key, null);
+        if (state.activeThread?.id === p.threadId) state.tokenUsage = null;
+      }
+      compactionUsageRevisions.delete(key);
       if (state.activeThread?.id === p.threadId) toast("上下文已压缩");
     }
   }
@@ -977,8 +1119,13 @@ function receive(message: any) {
     }
     void refreshThreads().catch(() => {});
   }
+  if (method === "thread/tokenUsage/updated" && p.threadId) {
+    const key = recencyKey(state.hostId, p.threadId);
+    tokenUsages.set(key, p.tokenUsage);
+    tokenUsageRevisions.set(key, (tokenUsageRevisions.get(key) || 0) + 1);
+    if (p.threadId === state.activeThread?.id) state.tokenUsage = p.tokenUsage;
+  }
   if (p.threadId === state.activeThread?.id) {
-    if (method === "thread/tokenUsage/updated") state.tokenUsage = p.tokenUsage;
     if (method === "turn/diff/updated") state.diff = p.diff;
     if (method === "turn/plan/updated") state.plan = p.plan;
     if (method === "error") state.error = p.error?.message ?? "app-server 错误";
@@ -1028,6 +1175,10 @@ function connect(): Promise<void> {
           clearTimeout(timer);
           resolve();
         }
+        if (message.method === "bridge/status" && message.params?.paused) {
+          clearTimeout(timer);
+          resolve();
+        }
         if (message.method === "bridge/status" && message.params?.error) {
           clearTimeout(timer);
           reject(new Error(message.params.error));
@@ -1048,7 +1199,9 @@ function connect(): Promise<void> {
         return;
       }
       localReverts.clear();
+      saveConversationSnapshot();
       state.connected = false;
+      if (state.activeThread) state.threadReady = false;
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
         entry.reject(
@@ -1085,10 +1238,12 @@ function connect(): Promise<void> {
 }
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
-  if (state.authenticated && state.online)
+  if (state.authenticated && state.online && !state.runtimePaused)
     reconnectTimer = setTimeout(() => { void resumeConnection(); }, 2500);
 }
-function resumeConnection(): Promise<void> {
+function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
+  if (state.runtimePaused && !options.explicit) return Promise.resolve();
+  if (options.explicit) { state.runtimePaused = false; pausedHosts.delete(state.hostId); }
   if (!state.online || !state.authenticated || state.loading || state.switchingHost)
     return Promise.resolve();
   const generation = hostSelectionGeneration;
@@ -1115,12 +1270,13 @@ function resumeConnection(): Promise<void> {
       if (!current()) return;
       await connect();
       if (!current()) return;
+      if (state.runtimePaused || !state.connected) return;
       startNavigationRefresh();
       await sync();
     } catch (error) {
       if (current()) fail(error);
     } finally {
-      if (current() && !state.connected) scheduleReconnect();
+      if (current() && !state.connected && !state.runtimePaused) scheduleReconnect();
     }
   })();
   const promise = recovery.finally(() => {
@@ -1135,6 +1291,8 @@ async function bootstrap() {
   state.hosts = data.hosts;
   state.projects = data.projects;
   state.connectionMode = data.connectionMode;
+  pausedHosts.clear();
+  for (const id of data.runtimePausedHostIds || []) if (typeof id === 'string') pausedHosts.add(id);
   if (data.preferences)
     state.preferences = { ...state.preferences, ...data.preferences };
   else {
@@ -1150,6 +1308,7 @@ async function bootstrap() {
   state.hostId = state.hosts.some((h) => h.id === preferredHost)
     ? preferredHost
     : "local";
+  state.runtimePaused = pausedHosts.has(state.hostId);
   state.terminalProcessId = terminalIds()[state.hostId] || "";
   const preferred = saved<Record<string, string>>("codex.projectPaths", {})[
     state.hostId
@@ -1159,16 +1318,36 @@ async function bootstrap() {
     preferred ??
     selectedHost?.cwd ??
     (selectedHost?.kind === "ssh" ? "/tmp" : localCwd);
-  startNavigationRefresh();
-  for (const host of state.hosts)
-    if (host.id !== state.hostId) void refreshHostNavigation(host.id);
-  await connect();
-  await sync();
   const preferredThread = saved<Record<string, string>>(
     "codex.selectedThreadIds",
     {},
   )[state.hostId];
-  if (preferredThread) await selectThread(preferredThread);
+  // Restore the target before connecting or loading optional host integrations.
+  // A slow/offline SSH host must not turn a saved conversation into a new chat.
+  const generation = selectionGeneration;
+  const hostId = state.hostId;
+  if (preferredThread) {
+    state.activeThread = state.threads.find(thread => thread.id === preferredThread) || { id: preferredThread };
+    state.threadReady = false;
+    state.selectingThread = true;
+    await cacheActivation;
+    const snapshot = await conversationCache.read(hostId, preferredThread);
+    if (snapshot && generation === selectionGeneration && hostId === state.hostId)
+      applyConversationSnapshot(snapshot, preferredThread);
+  }
+  startNavigationRefresh();
+  for (const host of state.hosts)
+    if (host.id !== state.hostId && !pausedHosts.has(host.id)) void refreshHostNavigation(host.id);
+  try {
+    await connect();
+    if (generation !== selectionGeneration || hostId !== state.hostId || state.runtimePaused) return;
+    await Promise.all([
+      sync(false),
+      preferredThread ? selectThread(preferredThread) : Promise.resolve(),
+    ]);
+  } finally {
+    if (generation === selectionGeneration && hostId === state.hostId) state.selectingThread = false;
+  }
 }
 function startNavigationRefresh() {
   clearInterval(refreshTimer);
@@ -1190,6 +1369,7 @@ async function initialize() {
 }
 async function login(password: string) {
   authenticationGeneration++;
+  clearConversationCaches();
   state.selectingThread = false;
   state.threadConflict = null;
   state.takingOverThread = false;
@@ -1213,6 +1393,7 @@ async function login(password: string) {
     authenticationGeneration++;
     csrfToken = session.csrfToken;
     state.authenticated = true;
+    await activateConversationCache();
     await bootstrap();
   } finally {
     state.loading = false;
@@ -1227,6 +1408,7 @@ async function logout() {
   authenticationGeneration++;
   csrfToken = "";
   state.authenticated = false;
+  clearConversationCaches();
   state.selectingThread = false;
   state.threadConflict = null;
   state.takingOverThread = false;
@@ -1262,20 +1444,21 @@ function setOnline(online: boolean) {
   state.online = online;
   if (!online) closeConnection();
 }
-async function sync() {
+async function sync(refreshActive = true) {
+  if (state.runtimePaused || !state.connected) return;
   const hostId = state.hostId;
-  const generation = selectionGeneration;
   const selectedId = state.activeThread?.id;
-  await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills()]);
+  const historyRefresh = refreshActive && selectedId ? selectThread(selectedId) : Promise.resolve();
+  await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills(), historyRefresh]);
   if (
     hostId === state.hostId &&
-    generation === selectionGeneration &&
     selectedId === state.activeThread?.id &&
     selectedId
   )
-    await selectThread(selectedId);
+    void refreshGoal(hostId, selectedId);
 }
 async function refreshThreads() {
+  if (state.runtimePaused) return;
   const generation = ++listGeneration;
   const requestScope = state.hostId;
   const revision = threadEventSequence;
@@ -1448,29 +1631,47 @@ async function selectThread(id: string) {
   state.goalTokenBudget = state.goal?.tokenBudget ?? null;
   const previousProfileId = state.activePermissionProfileId;
   const previousPolicy = state.runtimePolicy;
+  saveConversationSnapshot();
   state.selectingThread = true;
+  state.threadReady = false;
   state.runtimePolicy = null;
   const runtimeRevision = turnRevisions.get(id) ?? 0;
   const itemRevision = itemEventSequence;
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
-  state.activeThread = state.threads.find((t) => t.id === id) ?? { id };
-  state.items = itemCache.get(id) ?? [];
-  state.turns = [];
+  const cached = conversationCache.peek(hostId, id);
+  state.activeThread = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
+  state.items = itemCache.get(id) ?? cached?.items ?? [];
+  state.turns = cached?.turns ?? (previousId === id ? state.turns : []);
   if (previousId !== id) clearAttachments();
-  state.tokenUsage = null;
+  state.tokenUsage = tokenUsages.has(modeKey) ? tokenUsages.get(modeKey) : cached?.tokenUsage ?? null;
+  if (cached && !tokenUsages.has(modeKey)) tokenUsages.set(modeKey, cached.tokenUsage);
   state.diff = "";
   state.plan = [];
   state.busy = activeTurns.has(id);
-  state.moreTurns = false;
+  turnCursor = cached?.cursor ?? null;
+  state.moreTurns = !!turnCursor;
+  rememberThread(id);
+  // IndexedDB is a painting aid only. Its delayed answer cannot overwrite live
+  // events, a different selection, or a successful native resume.
+  if (!cached && !state.items.length) {
+    void conversationCache.read(hostId, id).then(snapshot => {
+      if (snapshot && current() && !state.threadReady && itemEventSequence === itemRevision)
+        applyConversationSnapshot(snapshot, id);
+    });
+  }
+  if (state.runtimePaused) { state.selectingThread = false; return; }
   try {
-    const result = await rpc("thread/resume", {
+    const resumeRequest = rpc("thread/resume", {
       threadId: id,
       excludeTurns: true,
       config: { 'features.default_mode_request_user_input': true },
     }, 45000, { silentError: true });
+    // History reads do not acquire a writer, so they can run beside resume.
+    // Neither cached content nor this read authorizes sending until both finish.
+    const [result, initialPage] = await Promise.all([resumeRequest, history(id, null, hostId)]);
+    let page = initialPage;
     if (!current()) return;
-    let page = await history(id, null, hostId);
-    if (!current()) return;
+    if (!result.thread?.id) throw new Error('无法恢复此对话，请同步后重试。');
     const requestedDepth = Math.min(
       10,
       Math.max(
@@ -1569,14 +1770,16 @@ async function selectThread(id: string) {
     itemCache.set(id, state.items);
     turnCursor = page.nextCursor;
     state.moreTurns = !!turnCursor;
+    state.threadReady = true;
     rememberThread(id);
+    saveConversationSnapshot();
     if (state.projectPath !== previousProject) {
       rememberProject();
       void readConfig();
       state.selectedSkills = [];
       void loadSkills().catch(() => {});
     }
-    await refreshGoal(hostId, id);
+    void refreshGoal(hostId, id);
   } catch (error) {
     if (current()) {
       if (writerConflict(error)) {
@@ -1586,8 +1789,14 @@ async function selectThread(id: string) {
         state.busy = false;
         rememberThread(id);
       } else {
-        newThread();
-        fail(error);
+        if ((error as any)?.data?.code === 'runtime_paused' || (error as any)?.code === 'runtime_paused') {
+          state.runtimePaused = true;
+          pausedHosts.add(hostId);
+          state.error = '此主机的 Web Codex 已释放，请在资源管理中恢复连接。';
+        } else fail(error);
+        // A transient resume/history failure must keep the selected target and
+        // its draft. Returning to welcome previously erased the saved selection.
+        rememberThread(id);
       }
     }
   } finally {
@@ -1653,6 +1862,7 @@ async function loadOlderTurns() {
   state.turns.unshift(...older);
   turnCursor = page.nextCursor;
   state.moreTurns = !!turnCursor;
+  saveConversationSnapshot();
   const depthKey = `codex.historyDepth.${state.hostId}.${id}`;
   sessionStorage.setItem(
     depthKey,
@@ -1667,8 +1877,10 @@ function newThread(remember = true) {
   state.selectingThread = false;
   state.runtimePolicy = null;
   ++selectionGeneration;
+  saveConversationSnapshot();
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   state.activeThread = null;
+  state.threadReady = true;
   state.selectedSkills = [];
   state.goal = null;
   state.goalTokenBudget = null;
@@ -1769,6 +1981,8 @@ function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
 async function send(text: string, editedInput?: any[]) {
+  if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
+  if (state.activeThread && !state.threadReady) throw fail(new Error('正在加载会话，请先同步对话后发送。'));
   if (state.threadConflict) throw fail(new Error('此对话仍被其他 Codex 客户端占用，请先重试或强制进入。'));
   if (!text.trim() && !state.attachments.length && !editedInput?.length && !state.selectedSkills.length) return;
   if (state.editingMessage && !editedInput) throw fail(new Error("正在重新发送编辑后的消息，请稍候"));
@@ -1985,7 +2199,7 @@ async function send(text: string, editedInput?: any[]) {
   }
 }
 function canEditMessage(itemId: string) {
-  const blocked = !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
+  const blocked = !state.threadReady || state.runtimePaused || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
   if (blocked) return false;
   if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
     if (pendingMessageEdit.blocked) return false;
@@ -2000,6 +2214,8 @@ function cancelMessageEdit(itemId: string) {
 function resetEditedHistory(threadId: string, removed: string[] = []) {
   for (const turnId of removed) discardedTurns.add(turnId);
   itemCache.delete(threadId);
+  conversationCache.remove(state.hostId, threadId);
+  tokenUsages.delete(recencyKey(state.hostId, threadId));
   itemRevisions.delete(threadId);
   compactedSinceInput.delete(threadId);
   noteRuntime(threadId, false);
@@ -2120,6 +2336,7 @@ async function interrupt() {
 }
 async function fork(lastTurnId?: string) {
   if (!state.activeThread) return;
+  if (!state.threadReady || state.runtimePaused) throw fail(new Error('请先恢复当前会话连接。'));
   const result = await rpc("thread/fork", {
     threadId: state.activeThread.id,
     lastTurnId,
@@ -2132,13 +2349,23 @@ async function fork(lastTurnId?: string) {
 async function compact() {
   const id = state.activeThread?.id;
   if (!id) return;
+  if (!state.threadReady || state.runtimePaused) throw fail(new Error('请先恢复当前会话连接。'));
   if (state.busy) throw fail(new Error("请等待当前任务完成后压缩上下文"));
   state.busy = true;
+  const key = recencyKey(state.hostId, id);
+  const previousUsage = tokenUsages.get(key);
+  const revision = tokenUsageRevisions.get(key) || 0;
+  beginCompactionUsage(id);
   try {
     await rpc("thread/compact/start", { threadId: id });
     compactedSinceInput.add(id);
   } catch (error) {
     state.busy = false;
+    if (!(error as any)?.uncertain && (tokenUsageRevisions.get(key) || 0) === revision) {
+      tokenUsages.set(key, previousUsage ?? null);
+      if (state.activeThread?.id === id) state.tokenUsage = previousUsage ?? null;
+      compactionUsageRevisions.delete(key);
+    }
     throw error;
   }
 }
@@ -2175,6 +2402,9 @@ function cleanupArchivedThread(id: string) {
   threadRevisions.set(id, ++threadEventSequence);
   state.threads = state.threads.filter((thread) => thread.id !== id);
   if (state.activeThread?.id === id) newThread();
+  itemCache.delete(id);
+  conversationCache.remove(state.hostId, id);
+  tokenUsages.delete(recencyKey(state.hostId, id));
 }
 async function archiveThread(id: string, hostId = state.hostId) {
   await scopedRpc(hostId, "thread/archive", { threadId: id });
@@ -2380,6 +2610,7 @@ async function setHost(id: string) {
   const hostGeneration = ++hostSelectionGeneration;
   state.switchingHost = true;
   const previous = hostNavigation(state.hostId);
+  saveConversationSnapshot();
   previous.threads = [...state.threads];
   previous.cursor = threadCursor;
   previous.loadedMore = loadedMorePages;
@@ -2412,6 +2643,7 @@ async function setHost(id: string) {
   state.projectThreadPages = {};
   state.pendingRequests = [];
   state.hostId = id;
+  state.runtimePaused = pausedHosts.has(id);
   state.agentActivity = {};
   state.model = "";
   state.models = [];
@@ -2443,6 +2675,7 @@ async function setHost(id: string) {
     await connect();
     if (id !== state.hostId || hostGeneration !== hostSelectionGeneration)
       return;
+    if (state.runtimePaused) return;
     await sync();
   } finally {
     if (hostGeneration === hostSelectionGeneration) state.switchingHost = false;
@@ -2492,6 +2725,9 @@ async function updateHost(id: string, host: any) {
     result.hosts ??
     state.hosts.map((item) => (item.id === id ? result.host : item));
   if (result.connectionReset) {
+    conversationCache.removeHost(id);
+    for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
+    if (state.hostId === id) { state.threadReady = false; itemCache.clear(); }
     navigationRevisions.set(id, (navigationRevisions.get(id) ?? 0) + 1);
     navigationRequests.delete(id);
     delete state.navigation[id];
@@ -2515,6 +2751,8 @@ async function removeHost(id: string) {
   delete state.navigation[id];
   state.projects = state.projects.filter((project) => project.hostId !== id);
   if (state.hostId === id) await setHost("local");
+  conversationCache.removeHost(id);
+  for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
 }
 async function uploadFiles(files: FileList | File[], reportError = true) {
   const generation = selectionGeneration;
@@ -3019,6 +3257,7 @@ async function mutateGoal(hostId: string, threadId: string, patch: { objective?:
   return goals.get(key) || null;
 }
 async function modeAction(action: (hostId: string, threadId: string | undefined, selected: () => boolean) => Promise<void>) {
+  if (state.runtimePaused || (state.activeThread && !state.threadReady)) throw new Error('请先恢复当前会话连接。');
   if (state.modeBusy || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext)
     throw new Error('正在提交或加载会话，请稍候');
   if (!state.connected || !state.online) throw new Error('请先连接工作站');
@@ -3367,6 +3606,7 @@ export function useCodex() {
     state,
     initialize,
     resumeConnection,
+    flushConversationCache,
     login,
     logout,
     setOnline,

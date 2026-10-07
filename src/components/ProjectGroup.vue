@@ -34,6 +34,7 @@ const menuReady = ref(false);
 const menuPosition = ref({ left: 0, top: 0 });
 const menuId = `project-menu-${useId()}`;
 let opener: HTMLElement | null = null;
+let openerPosition: { left: number; top: number } | null = null;
 const openEvent = "codex-project-menu-open";
 const hostId = computed(() => props.project.hostId || "local");
 const host = computed(() =>
@@ -109,6 +110,8 @@ async function openMenu(event: MouseEvent | KeyboardEvent) {
   opener = target?.matches("button")
     ? target
     : target?.querySelector<HTMLElement>(".project-row") || null;
+  const openerBounds = opener?.getBoundingClientRect();
+  openerPosition = openerBounds ? { left: openerBounds.left, top: openerBounds.top } : null;
   const anchor = target?.getBoundingClientRect();
   const pointer = event instanceof MouseEvent && event.type === "contextmenu";
   const x = pointer ? event.clientX : anchor?.left || 0;
@@ -152,7 +155,17 @@ function outside(event: PointerEvent) {
 function dismissOnScroll(event: Event) {
   if (event.target instanceof Node && menuElement.value?.contains(event.target))
     return;
-  closeMenu();
+  // Only movement of the anchor changes the fixed menu position. Streaming
+  // replies and cached-history restoration scroll the separate conversation
+  // pane and must not dismiss a project menu the user has just opened.
+  if (event.target !== window &&
+      !(opener && event.target instanceof Node && event.target.contains(opener))) return;
+  const position = opener?.getBoundingClientRect();
+  // A scrollIntoView from the preceding pointer action can deliver its scroll
+  // event after contextmenu. The anchor was already in its final position when
+  // the menu opened, so dismiss only when it has actually moved since then.
+  if (!position || !openerPosition || Math.abs(position.left - openerPosition.left) > .5 ||
+      Math.abs(position.top - openerPosition.top) > .5) closeMenu();
 }
 function menuKey(event: KeyboardEvent) {
   if (event.key === "Escape") {

@@ -106,7 +106,7 @@ test("pin, search and archive target the row's host without replacing the active
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
 });
 
-test("an unavailable remote stays labelled while local chat and mobile typography remain usable", async ({
+test("host status strip is removed while remote projects, local chat and mobile typography remain usable", async ({
   page,
   mock,
 }) => {
@@ -117,9 +117,8 @@ test("an unavailable remote stays labelled while local chat and mobile typograph
   await page.setViewportSize({ width: 390, height: 844 });
   await login(page);
   await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "刷新主机 开发服务器", exact: true }),
-  ).toContainText("未连接");
+  await expect(page.getByRole('navigation', { name: '会话导航' }).getByLabel('主机状态')).toHaveCount(0);
+  await expect(page.locator('.nav-project-group[data-host-id="ssh-test"] .host-badge')).toHaveText('开发服务器');
   await expect(page.locator(".error-banner")).toHaveCount(0);
   await recent(page).locator('[data-host-id="local"] .thread-row').click();
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");

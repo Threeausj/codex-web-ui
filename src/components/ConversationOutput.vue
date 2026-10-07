@@ -180,19 +180,12 @@ function activityLabel(block: any) {
         {{ block.turn.error.message }}
       </p>
       <ChatItem
-        v-for="item in block.answers"
+        v-for="item in block.outputs"
         :key="item.id"
         :item="item"
         :busy="running(block)"
-        :can-fork="!busy && !editing && !!item.turnId"
+        :can-fork="item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
         @fork="emit('fork', $event)"
-        @open-file="emit('openFile', $event)"
-        @error="emit('error', $event)"
-      />
-      <ChatItem
-        v-for="item in block.dividers"
-        :key="item.id"
-        :item="item"
         @open-file="emit('openFile', $event)"
         @error="emit('error', $event)"
       />

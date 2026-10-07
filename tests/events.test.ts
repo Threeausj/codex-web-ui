@@ -859,6 +859,46 @@ test("browser state handles out-of-order RPCs and live events without reviving t
         handle = defaults;
       },
     );
+    await t.test('releasing a Web runtime clears stale approval, choice, conflict and terminal state before the disconnect finishes', async () => {
+      handle = request => {
+        if (request.method === 'thread/resume') {
+          ws.deliver({ id: request.id, error: { code: -32000, message: `thread ${request.params.threadId} already has an active writer` } });
+          return undefined;
+        }
+        return defaults(request);
+      };
+      await api.selectThread('a');
+      assert.ok(api.state.threadConflict);
+      const approvals = [
+        { id: 7001, method: 'item/commandExecution/requestApproval', params: { threadId: 'a' } },
+        { id: 7002, method: 'item/tool/requestUserInput', params: { threadId: 'a', questions: [] } },
+      ];
+      for (const request of approvals) ws.deliver(request);
+      assert.equal(api.state.pendingRequests.length, 2);
+      api.state.terminalProcessId = 'web-pty-release-fixture';
+      const inventory = [{ processId: api.state.terminalProcessId, tty: true, lastOutput: '' }];
+      ws.deliver({ method: 'bridge/status', params: { connected: true, paused: false, activeProcesses: inventory, pendingRequests: approvals } });
+      assert.equal(api.state.terminalRunning, true);
+      const before = ws.requests.length;
+      // The first pause status is sent before the subprocess is reaped. Its old
+      // inventory must not re-add controls for requests that are being cancelled.
+      ws.deliver({ method: 'bridge/status', params: { connected: true, paused: true, pendingRequests: approvals, activeProcesses: inventory } });
+      assert.equal(api.state.connected, false);
+      assert.equal(api.state.runtimePaused, true);
+      assert.equal(api.state.threadReady, false);
+      assert.equal(api.state.activeThread.id, 'a');
+      assert.equal(api.state.pendingRequests.length, 0);
+      assert.equal(api.state.threadConflict, null);
+      assert.equal(api.state.terminalRunning, false);
+      assert.equal(api.state.terminalProcesses.length, 0);
+      await api.resumeConnection();
+      await assert.rejects(api.send('暂停后不能提交'), /已释放/);
+      assert.equal(ws.requests.length, before);
+      handle = defaults;
+      ws.deliver({ method: 'bridge/status', params: { connected: true, paused: false, pendingRequests: [], activeProcesses: [] } });
+      await api.selectThread('a');
+      assert.equal(api.state.threadReady, true);
+    });
     await t.test('private GETs use distinct cache keys and preserve existing query parameters', async () => {
       const before = fetchCalls.length;
       await api.http('/preferences?source=history');
