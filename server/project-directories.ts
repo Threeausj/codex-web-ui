@@ -23,7 +23,13 @@ const absolutePath = z
       path.posix.isAbsolute(value) && !/[\x00-\x1f\x7f-\x9f]/.test(value),
     "请提供绝对目录路径，且不能包含控制字符。",
   );
-const query = z.object({ path: absolutePath.optional() }).strict();
+const query = z
+  .object({
+    path: absolutePath.optional(),
+    // The shared browser HTTP client adds this nonce to private GET requests.
+    _request: z.string().uuid().optional(),
+  })
+  .strict();
 const collator = new Intl.Collator("zh-CN", {
   numeric: true,
   sensitivity: "base",
