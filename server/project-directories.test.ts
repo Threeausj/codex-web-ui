@@ -10,6 +10,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "../src/lib/uuid.js";
 import express from "express";
 import { Auth } from "./auth.js";
 import { Bridge, type Transport } from "./bridge.js";
@@ -177,6 +178,26 @@ test("directory defaults use configured host cwd, local server cwd or remote roo
   assert.equal(endpoint.selectedHosts.length, before);
 });
 
+test("browser cache nonces allow default and explicit directory requests without reaching filesystem RPCs", async (t) => {
+  const endpoint = await fixture();
+  t.after(endpoint.close);
+  for (const [hostId, requested, expected] of [
+    ["local", undefined, "/local/default"],
+    ["remote-root", undefined, "/"],
+    ["remote", "/项目", "/项目"],
+  ] as const) {
+    const params = new URLSearchParams({ _request: randomUUID() });
+    if (requested) params.set("path", requested);
+    const response = await endpoint.get(hostId, `?${params}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { path: expected, entries: [] });
+    assert.deepEqual(endpoint.calls.slice(-2), [
+      { hostId, method: "fs/getMetadata", params: { path: expected } },
+      { hostId, method: "fs/readDirectory", params: { path: expected } },
+    ]);
+  }
+});
+
 test("strict directory queries reject relative, control-character, repeated and extra parameters before connecting", async (t) => {
   const endpoint = await fixture();
   t.after(endpoint.close);
@@ -191,6 +212,11 @@ test("strict directory queries reject relative, control-character, repeated and 
     "?path=%2Fa&path=%2Fb",
     "?path=%2Fa&hostId=local",
     "?path%5Bname%5D=%2Fa",
+    "?_request=",
+    "?_request=not-a-uuid",
+    "?_request%5Bname%5D=invalid",
+    `?_request=${randomUUID()}&_request=${randomUUID()}`,
+    `?path=%2Fa&hostId=local&_request=${randomUUID()}`,
     `?path=${encodeURIComponent("/" + "a".repeat(4096))}`,
   ];
   for (const query of invalid) {
