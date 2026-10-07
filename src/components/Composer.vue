@@ -2,6 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
+import { clipboardFiles } from "../lib/clipboard";
+import { contextUsage } from "../lib/context-usage";
 import {
   availablePermissionProfiles,
   permissionProfileProblems,
@@ -20,7 +22,8 @@ const pickerElement = ref<HTMLElement>();
 const pickerMaxHeight = ref(400);
 const fileInput = ref<HTMLInputElement>();
 const dropping = ref(false);
-const uploading = ref(false);
+const uploadCount = ref(0);
+const uploading = computed(() => uploadCount.value > 0);
 const submitting = ref(false);
 let pendingDraftSubmission: {
   key: string; hostId: string; projectPath: string; threadId?: string; targetKey?: string;
@@ -217,9 +220,24 @@ const permissionLabel = computed(
     )[props.state.permission] ||
     "默认权限",
 );
+const context = computed(() => contextUsage(props.state.tokenUsage));
+const contextLabel = computed(() => context.value
+  ? `上下文 ${context.value.percent}%`
+  : props.state.activeThread ? "上下文 —" : "上下文 0%");
+const contextTitle = computed(() => {
+  const details = context.value
+    ? `${context.value.used.toLocaleString()} / ${context.value.limit.toLocaleString()} tokens（当前上下文）`
+    : props.state.activeThread ? "Codex 尚未报告当前上下文用量" : "新对话尚未使用上下文";
+  return `${details}\n${props.state.busy ? "任务结束后可压缩上下文" : "点击压缩上下文"}`;
+});
+const compactDisabled = computed(() => !props.state.activeThread || !props.state.connected ||
+  props.state.busy || props.state.threadConflict || props.state.threadReady === false ||
+  props.state.runtimePaused || contextDisabled.value);
 const canSend = computed(
   () =>
     !props.state.threadConflict &&
+    (!props.state.activeThread || props.state.threadReady !== false) &&
+    !props.state.runtimePaused &&
     props.state.connected &&
     !props.state.selectingThread &&
     !props.state.switchingHost &&
@@ -409,22 +427,31 @@ async function send() {
 }
 async function upload(list: FileList | File[] | null) {
   if (!list?.length || props.contextBusy || props.state.switchingHost || props.state.selectingThread) return;
-  uploading.value = true;
+  // Copy browser-owned lists before any asynchronous work. Parallel pastes keep
+  // sending disabled until every upload completes.
+  const files = Array.from(list);
+  const key = draftKey.value;
+  uploadCount.value++;
   try {
-    await props.api.uploadFiles(list);
+    await props.api.uploadFiles(files, false);
   } catch (cause: any) {
-    emit("error", cause.message || "上传失败");
+    if (key === draftKey.value) emit("error", cause.message || "上传失败");
   } finally {
-    uploading.value = false;
+    uploadCount.value--;
     if (fileInput.value) fileInput.value.value = "";
   }
 }
 function paste(event: ClipboardEvent) {
-  const items = event.clipboardData?.files;
-  if (items?.length) {
-    event.preventDefault();
-    void upload(items);
+  const files = clipboardFiles(event.clipboardData);
+  if (!files.length) return;
+  if (props.contextBusy || props.state.switchingHost || props.state.selectingThread) {
+    emit("error", "会话切换中，请稍后粘贴文件或图片。");
+    return;
   }
+  // Leave the browser's normal text insertion intact for mixed text/image
+  // clipboards. Image-only pastes should not insert a browser-specific filename.
+  if (!event.clipboardData?.getData("text/plain")) event.preventDefault();
+  void upload(files);
 }
 function drop(event: DragEvent) {
   dropping.value = false;
@@ -776,6 +803,17 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           /></label>
         </div>
         <div class="composer-submit">
+          <button
+            class="context-usage"
+            :class="{ 'context-high': context && context.percent >= 80 }"
+            :title="contextTitle"
+            :aria-label="contextLabel"
+            :disabled="compactDisabled"
+            @click="emit('command', 'compact')"
+          >
+            <span class="context-ring" :style="{ '--context-percent': `${context?.percent || 0}%` }" aria-hidden="true"></span>
+            <span>{{ contextLabel }}</span>
+          </button>
           <label
             class="composer-select permission-select"
             :class="{
@@ -923,6 +961,11 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .composer .composer-tools { min-width: 0; }
 .composer .model-select { min-width: 0; }
 .composer .model-select select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.context-usage { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; min-height: 28px; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.context-usage:hover:not(:disabled) { color: var(--text); background: var(--soft); }
+.context-usage:disabled { opacity: 1; cursor: default; }
+.context-usage.context-high { color: var(--warning); }
+.context-ring { display: inline-block; width: 13px; height: 13px; flex: 0 0 auto; border-radius: 50%; background: conic-gradient(currentColor var(--context-percent), var(--border) 0); mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0); }
 @media (max-width: 600px) {
   .composer-area { border-radius: 15px; }
   .composer { padding: 12px 12px 10px; }
@@ -945,7 +988,8 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   .composer .model-select select { flex: 1 1 0; max-width: none; min-height: 36px; font-size: 12px; }
   .composer .effort-select { flex: 0 0 auto; margin: 0 0 0 4px; gap: 3px; }
   .composer .effort-select select { width: 36px; max-width: 36px; min-height: 36px; padding-inline: 0; font-size: 12px; }
-  .composer .composer-submit { min-width: 0; width: 100%; justify-content: flex-end; gap: 9px; }
+  .composer .composer-submit { min-width: 0; width: 100%; justify-content: flex-end; gap: 7px; }
+  .context-usage { margin-right: auto; min-height: 36px; font-size: 11px; gap: 4px; padding-inline: 0; }
   .composer .permission-select { min-width: 0; max-width: calc(100% - 50px); }
   .composer .permission-select select { width: auto; max-width: min(170px, 100%); text-overflow: ellipsis; min-height: 36px; font-size: 12px; }
   .composer .send-button { width: 36px; height: 36px; }

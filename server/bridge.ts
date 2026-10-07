@@ -10,7 +10,7 @@ import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
 
-export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
+export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Pending = { originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
@@ -51,12 +51,15 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   child.on('close', (code, signal) => events.emit('transportClose', new Error(host.kind === 'ssh' && code === 127 ? '远端未找到 Codex，请确认登录 shell 的 PATH，或在主机设置中指定 Codex 路径' : `Codex app-server exited (${signal || code})`)))
   let forceClose: ReturnType<typeof setTimeout> | undefined
   child.once('close', () => { clearTimeout(forceClose) })
-  const transport = { input: child.stdin, output: child.stdout, events, dispose: () => {
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
+  const transport = { input: child.stdin, output: child.stdout, events, pid: child.pid, startedAt: Date.now(), closed, dispose: () => {
     child.stdin.end()
     child.kill('SIGTERM')
     if (!forceClose && child.exitCode === null && child.signalCode === null) { forceClose = setTimeout(() => child.kill('SIGKILL'), 1000); forceClose.unref() }
   } }
-  return options.mode === 'proxy' ? webSocketProxyTransport(transport) : transport
+  // The proxy learns its frame limit during the asynchronous upgrade. Preserve
+  // that object's identity so later advertised limits reach Bridge.send().
+  return options.mode === 'proxy' ? Object.assign(webSocketProxyTransport(transport), { pid: transport.pid, startedAt: transport.startedAt, closed }) : transport
 }
 
 /** One app-server per host. Request IDs are rewritten; responses never fan out to other tabs. */
@@ -70,6 +73,10 @@ export class Bridge {
   private counter = 0
   private generation = 0
   private disposed = false
+  private pausing?: Promise<void>
+  private subscribedThreads = new Set<string>()
+  private activeThreads = new Set<string>()
+  paused = false
   connected = false
   userAgent?: string
   codexHome?: string
@@ -79,8 +86,17 @@ export class Bridge {
     this.clientName = normalizeCodexClientName(options.clientName)
   }
   get mode() { return this.host.kind === 'ssh' ? 'ssh' : this.options.mode || 'spawn' }
+  get runtime() {
+    return { connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
+      ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
+      loadedThreadCount: this.subscribedThreads.size, activeThreadCount: this.activeThreads.size,
+      activeProcesses: [...this.processes.values()].map(({ processId, tty, cwd, startedAt }) => ({ processId, tty, cwd, startedAt })),
+      processes: this.transport?.pid ? [{ pid: this.transport.pid, role: this.host.kind === 'ssh' || this.options.mode === 'proxy' ? 'transport' : 'app-server', local: true }] : [],
+    }
+  }
 
   async connect(): Promise<void> {
+    if (this.paused) throw Object.assign(new Error('此主机的 Web Codex 已释放，点击“连接 Web Codex”后恢复'), { status: 409, code: 'runtime_paused' })
     if (this.connected) return
     if (this.connecting) return this.connecting
     if (this.disposed) throw new Error('Host connection was closed')
@@ -95,7 +111,7 @@ export class Bridge {
     try {
       const knownHostsFile = this.host.kind === 'ssh' && this.options.resolveSshHostKeyPin
         ? await this.options.resolveSshHostKeyPin(this.host) : this.options.sshHostKeyPin
-      if (generation !== this.generation || this.disposed) throw new Error('Host connection was closed')
+      if (generation !== this.generation || this.disposed || this.paused) throw new Error('Host connection was closed')
       transport = this.options.transportFactory ? this.options.transportFactory(this.host)
         : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile })
     } catch (error) {
@@ -122,7 +138,7 @@ export class Bridge {
     transport.events.on('transportClose', error => { if (generation === this.generation) this.disconnect(error) })
     try {
       const result = await this.rawRequest('initialize', { clientInfo: { name: this.clientName, title: 'Codex Web', version: '0.1.0' }, capabilities: { experimentalApi: true } }, undefined, undefined, 30000) as { userAgent?: string; codexHome?: string }
-      if (generation !== this.generation) throw new Error('App-server connection changed')
+      if (generation !== this.generation || this.paused) throw new Error('App-server connection changed')
       this.send({ method: 'initialized' })
       this.userAgent = result.userAgent
       this.codexHome = result.codexHome
@@ -189,7 +205,7 @@ export class Bridge {
   }
 
   private status(key: string, clientId?: string) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, hostId: this.host.id, mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
+    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, hostId: this.host.id, mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
   }
 
   private finishProcess(requestId: string, result?: unknown, error?: RpcMessage['error']) {
@@ -287,7 +303,7 @@ export class Bridge {
       const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient)
       reply({ id: message.id, result })
     } catch (error) {
-      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean }).uncertain ? { data: { uncertain: true } } : {}) } })
+      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : (error as { code?: string }).code === 'runtime_paused' ? { data: { code: 'runtime_paused' } } : {}) } })
     }
   }
 
@@ -302,6 +318,13 @@ export class Bridge {
       if (pending.method === 'command/exec') this.finishProcess(String(message.id), message.result, message.error)
       if (message.error) pending.reject(new RpcFailure(message.error))
       else {
+        const params = pending.params as { threadId?: string } | undefined
+        const result = message.result as { thread?: { id?: string; status?: { type?: string } } } | undefined
+        if (['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
+          this.subscribedThreads.add(result.thread.id)
+          if (result.thread.status?.type === 'active') this.activeThreads.add(result.thread.id)
+        }
+        if (pending.method === 'thread/unsubscribe' && params?.threadId) { this.subscribedThreads.delete(params.threadId); this.activeThreads.delete(params.threadId) }
         this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
@@ -315,6 +338,16 @@ export class Bridge {
       return
     }
     if (message.method) {
+      const event = message.params as { threadId?: string; turn?: { status?: string }; status?: { type?: string } } | undefined
+      if (event?.threadId && this.subscribedThreads.has(event.threadId)) {
+        if (message.method === 'turn/started' && event.turn?.status === 'inProgress') this.activeThreads.add(event.threadId)
+        if (message.method === 'turn/completed') this.activeThreads.delete(event.threadId)
+        if (message.method === 'thread/status/changed') {
+          if (event.status?.type === 'active') this.activeThreads.add(event.threadId)
+          else this.activeThreads.delete(event.threadId)
+        }
+        if (message.method === 'thread/closed') { this.subscribedThreads.delete(event.threadId); this.activeThreads.delete(event.threadId) }
+      }
       if (message.method === 'command/exec/outputDelta') {
         const params = message.params as { processId?: string; stream?: string; deltaBase64?: string } | undefined
         const process = params?.processId ? this.processes.get(params.processId) : undefined
@@ -344,7 +377,36 @@ export class Bridge {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error) }
     this.pending.clear()
     this.approvals.clear()
+    this.subscribedThreads.clear()
+    this.activeThreads.clear()
     for (const key of this.clients.keys()) this.status(key)
+  }
+
+  /** Release only this bridge's subscriptions and child transport. Keep sockets
+   * attached so an automatic browser reconnect cannot reclaim desktop locks. */
+  pause(): Promise<void> {
+    this.paused = true
+    if (this.pausing) return this.pausing
+    for (const key of this.clients.keys()) this.status(key)
+    const transport = this.transport
+    this.pausing = (async () => {
+      if (this.connected) await Promise.allSettled([...this.subscribedThreads].map(threadId => this.rawRequest('thread/unsubscribe', { threadId }, undefined, undefined, 2000)))
+      this.disconnect(new Error('Web Codex 已释放，可切换到桌面端或 CLI'))
+      if (transport?.closed) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try { await Promise.race([transport.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); timer.unref?.() })]) }
+        finally { clearTimeout(timer) }
+      }
+    })().finally(() => { this.pausing = undefined })
+    return this.pausing
+  }
+
+  async resume(): Promise<void> {
+    await this.pausing
+    await this.connecting?.catch(() => {})
+    if (this.disposed) throw new Error('Host connection was closed')
+    this.paused = false
+    await this.connect()
   }
 
   close(reason = 'Server stopping', code = 1001) {

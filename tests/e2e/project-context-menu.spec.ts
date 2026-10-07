@@ -90,6 +90,36 @@ test("mobile project menu stays inside screen edges and closes on tab or resize"
   await expect(menu).toHaveCount(0);
 });
 
+test("conversation scrolling preserves a project menu while scrolling its sidebar anchor closes it", async ({ page, mock }) => {
+  mock.turns.get("thread-existing")![0].items.at(-1).text = Array.from({ length: 100 }, (_, index) => `较长的历史回复 ${index}`).join("\n\n");
+  const original = mock.threads[0];
+  mock.threads.push(...Array.from({ length: 20 }, (_, index) => ({ ...original, id: `scroll-menu-${index}`, name: `侧栏对话 ${index}` })));
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').filter({ hasText: "已有测试历史" }).click();
+  await expect(page.getByRole("button", { name: "编辑消息", exact: true })).toBeVisible();
+  const row = localRow(page);
+  await row.scrollIntoViewIfNeeded();
+  await page.getByRole("button", { name: "Demo Project 项目操作", exact: true }).click();
+  const menu = projectMenu(page);
+  await expect(menu).toBeVisible();
+  const sidebar = page.locator(".sidebar-scroll");
+  // Browser scroll notifications are queued. A notification from the
+  // pointer's preceding scrollIntoView must not dismiss the newly opened menu
+  // when the anchor has already reached its final position.
+  await sidebar.dispatchEvent("scroll");
+  await expect(menu).toBeVisible();
+  const conversation = page.locator(".conversation-scroll");
+  const previousConversation = await conversation.evaluate((element) => element.scrollTop);
+  await conversation.evaluate((element) => { element.scrollTop = element.scrollTop > 20 ? 10 : 40; });
+  await expect.poll(() => conversation.evaluate((element) => element.scrollTop)).not.toBe(previousConversation);
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "归档聊天", exact: true })).toBeVisible();
+  const previousSidebar = await sidebar.evaluate((element) => element.scrollTop);
+  await sidebar.evaluate((element) => { element.scrollTop += 50; });
+  await expect.poll(() => sidebar.evaluate((element) => element.scrollTop)).not.toBe(previousSidebar);
+  await expect(menu).toHaveCount(0);
+});
+
 test("showing a remote project opens its host's workspace files without resuming local history", async ({
   page,
   mock,

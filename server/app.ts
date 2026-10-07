@@ -20,6 +20,7 @@ import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerHostConnection } from './host-connection.js'
+import { readRuntimePausedHosts, registerHostResources } from './host-resources.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
 import { registerProjectDirectories } from './project-directories.js'
@@ -43,6 +44,7 @@ export async function createApp(options: AppOptions = {}) {
   const clientName = normalizeCodexClientName(options.bridgeOptions?.clientName ?? process.env.CODEX_CLIENT_NAME)
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
+  const runtimePausedHosts = await readRuntimePausedHosts(dataDir)
   const sshHostKeys = new SSHHostKeyService({ ...options.sshHostKeyOptions, dataDir })
   const configuredOrigins = options.origins || (process.env.PUBLIC_ORIGIN || '').split(',').filter(Boolean)
   const origins = trustedOrigins(configuredOrigins, options.port || Number(process.env.PORT) || 8787)
@@ -71,7 +73,7 @@ export async function createApp(options: AppOptions = {}) {
     const host = storage.host(hostId)
     if (!host) throw Object.assign(new Error('Host not found'), { status: 404 })
     let bridge = bridges.get(hostId)
-    if (!bridge) { bridge = new Bridge(host, bridgeOptions); bridges.set(hostId, bridge) }
+    if (!bridge) { bridge = new Bridge(host, bridgeOptions); bridges.set(hostId, bridge); if (runtimePausedHosts.has(hostId)) void bridge.pause() }
     return bridge
   }
   const app = express()
@@ -96,9 +98,10 @@ export async function createApp(options: AppOptions = {}) {
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
+  registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, bridgeOptions })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
-    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get() })
+    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), runtimePausedHostIds: [...runtimePausedHosts] })
   }))
   app.get('/api/hosts', (_req, res) => res.json({ hosts: storage.hosts }))
   registerHostConnection(app, bridgeOptions)

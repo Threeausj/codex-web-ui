@@ -10,11 +10,19 @@ export function conversationBlocks(
   turns: any[],
 ): ConversationBlock[] {
   const metadata = new Map(turns.map((turn) => [turn.id, turn]));
+  const order = new Map(turns.map((turn, index) => [turn.id, index]));
   const groups = new Map<
     string,
     Extract<ConversationBlock, { kind: "turn" }>
   >();
   const blocks: ConversationBlock[] = [];
+  const insertTurn = (block: Extract<ConversationBlock, { kind: "turn" }>) => {
+    const position = order.get(block.id);
+    const following = position == null ? -1 : blocks.findIndex((entry) =>
+      entry.kind === "turn" && (order.get(entry.id) ?? -1) > position);
+    if (following < 0) blocks.push(block);
+    else blocks.splice(following, 0, block);
+  };
   for (const item of items) {
     if (
       !item.turnId &&
@@ -28,32 +36,25 @@ export function conversationBlocks(
     if (!block) {
       block = { kind: "turn", id, items: [], turn: metadata.get(id) };
       groups.set(id, block);
-      blocks.push(block);
+      insertTurn(block);
     }
     block.items.push(item);
   }
   // Failed or interrupted work may end before its first item is persisted.
   // Keep its status and error visible in chronological turn order.
-  const order = new Map(turns.map((turn, index) => [turn.id, index]));
   for (const turn of turns) {
     if (
       groups.has(turn.id) ||
       !["failed", "interrupted", "inProgress"].includes(turn.status)
     )
       continue;
-    const block: ConversationBlock = {
+    const block: Extract<ConversationBlock, { kind: "turn" }> = {
       kind: "turn",
       id: turn.id,
       items: [],
       turn,
     };
-    const following = blocks.findIndex(
-      (entry) =>
-        entry.kind === "turn" &&
-        (order.get(entry.id) ?? -1) > order.get(turn.id)!,
-    );
-    if (following < 0) blocks.push(block);
-    else blocks.splice(following, 0, block);
+    insertTurn(block);
   }
   return blocks;
 }
@@ -70,10 +71,14 @@ export function turnPresentation(items: DisplayItem[]) {
   );
   const visible = new Set([...users, ...answers].map((item) => item.id));
   const dividers = items.filter((item) => item.type === "contextCompaction");
+  const answerIds = new Set(answers.map((item) => item.id));
+  // Compaction can happen before a reply in the same turn. Preserve that
+  // position instead of moving every divider behind the final answer.
+  const outputs = items.filter((item) => answerIds.has(item.id) || item.type === "contextCompaction");
   const activity = items.filter(
     (item) => !visible.has(item.id) && item.type !== "contextCompaction",
   );
-  return { users, answers, activity, dividers };
+  return { users, answers, activity, dividers, outputs };
 }
 
 export function elapsedLabel(turn: any) {

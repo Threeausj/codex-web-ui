@@ -123,3 +123,23 @@ test("failed turns without items retain their error and chronological position",
     "账户不可用",
   );
 });
+
+test("compaction stays in its recorded position before later final answers, including the same turn", () => {
+  const items = [
+    { id: "first-final", type: "agentMessage", phase: "final_answer", text: "first" },
+    { id: "compact", type: "contextCompaction" },
+    { id: "second-final", type: "agentMessage", phase: "final_answer", text: "after compaction" },
+    { id: "commentary", type: "agentMessage", phase: "commentary", text: "activity" },
+  ];
+  assert.deepEqual(turnPresentation(items).outputs.map((item) => item.id), ["first-final", "compact", "second-final"]);
+});
+
+test("late compaction items follow canonical turn chronology instead of becoming a permanent history footer", () => {
+  const blocks = conversationBlocks([
+    { id: "first", type: "agentMessage", turnId: "one", text: "first answer" },
+    { id: "next-user", type: "userMessage", turnId: "two" },
+    { id: "next", type: "agentMessage", turnId: "two", text: "next answer" },
+    { id: "compact", type: "contextCompaction", turnId: "compaction" },
+  ], [{ id: "one", status: "completed" }, { id: "compaction", status: "completed" }, { id: "two", status: "completed" }]);
+  assert.deepEqual(blocks.map((block) => block.id), ["one", "compaction", "two"]);
+});

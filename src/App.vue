@@ -16,6 +16,7 @@ import Composer from "./components/Composer.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
 import ResizableWorkspace from "./components/ResizableWorkspace.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
 import ProjectDialog from "./components/ProjectDialog.vue";
 import { isPinned } from "./lib/navigation";
@@ -38,6 +39,7 @@ const composer = ref<InstanceType<typeof Composer>>();
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
 const settingsOpen = ref(false);
+const resourcesOpen = ref(false);
 const settingsTab = ref("general");
 const paletteOpen = ref(false);
 const paletteQuery = ref("");
@@ -131,20 +133,18 @@ watch(() => [state.authenticated, choiceRequests.value.length, threadTitle.value
 const welcome = computed(() => !state.activeThread && !state.items.length);
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.loading || !state.online ||
-  state.selectingThread || state.switchingHost || state.changingContext,
+  state.selectingThread || state.switchingHost || state.changingContext ||
+  state.runtimePaused || (state.activeThread && !state.threadReady),
+);
+const threadActionsDisabled = computed(() =>
+  !state.activeThread || state.busy || !state.connected || !state.online ||
+  !state.threadReady || state.runtimePaused || state.selectingThread,
 );
 const editableItemId = computed(() => {
   if (editDisabled.value) return undefined;
   const item = state.items.filter((item) => item.type === 'userMessage').at(-1);
   return item && api.canEditMessage(item.id) ? item.id : undefined;
 });
-const contextUsed = computed(() => state.tokenUsage?.last?.totalTokens ?? 0);
-const contextLimit = computed(() => state.tokenUsage?.modelContextWindow || 0);
-const contextPercent = computed(() =>
-  contextLimit.value
-    ? Math.min(100, Math.round((contextUsed.value / contextLimit.value) * 100))
-    : 0,
-);
 const paletteActions = [
   {
     id: "new",
@@ -238,6 +238,9 @@ async function action(fn: () => any) {
   }
 }
 function saveScroll() {
+  // Cached history paints before native hydration finishes. Its initial layout
+  // must not replace the reading position saved by the previous app window.
+  if (state.loading || state.selectingThread || (state.activeThread && !state.threadReady)) return;
   if (scroll.value && state.activeThread?.id)
     sessionStorage.setItem(
       `codex.scroll.${state.hostId}.${state.activeThread.id}`,
@@ -388,10 +391,17 @@ async function projectAction({
   }
 }
 function openSettings(tab = "general") {
+  resourcesOpen.value = false;
   settingsTab.value = tab;
   settingsOpen.value = true;
   threadMenu.value = false;
   sidebarOpen.value = false;
+}
+function openResources() {
+  resourcesOpen.value = true;
+  settingsOpen.value = false;
+  sidebarOpen.value = false;
+  threadMenu.value = false;
 }
 function openPalette() {
   paletteQuery.value = "";
@@ -589,6 +599,7 @@ function onKeydown(event: KeyboardEvent) {
   } else if (event.key === "Escape") {
     paletteOpen.value = false;
     settingsOpen.value = false;
+    resourcesOpen.value = false;
     renameOpen.value = false;
     sidebarOpen.value = false;
     threadMenu.value = false;
@@ -622,9 +633,10 @@ watch(
     state.busy,
   ],
   async () => {
-    if (!showScrollBottom.value) {
+    if (!showScrollBottom.value && !state.loading && !state.selectingThread && state.threadReady) {
       await nextTick();
-      scrollBottom();
+      if (!showScrollBottom.value && !state.loading && !state.selectingThread && state.threadReady)
+        scrollBottom();
     }
   },
 );
@@ -795,6 +807,9 @@ watch(() => [state.authenticated, state.loading], () => {
           ></span
           ><Icon name="ChevronDown" :size="12" />
         </div>
+        <button class="sidebar-action resources-button" @click="openResources">
+          <Icon name="Server" :size="17" /><span>资源管理</span><Icon name="ChevronRight" :size="14" />
+        </button>
         <button class="sidebar-action settings-button" @click="openSettings()">
           <Icon name="Settings2" :size="17" /><span>设置</span
           ><span class="sidebar-account">{{
@@ -870,12 +885,12 @@ watch(() => [state.authenticated, state.loading], () => {
             </button>
             <div v-if="threadMenu" class="thread-menu">
               <button
-                :disabled="!state.activeThread || state.busy"
+                :disabled="threadActionsDisabled"
                 @click="execute('fork')"
               >
                 <Icon name="GitBranch" :size="16" />创建分支</button
               ><button
-                :disabled="!state.activeThread || state.busy"
+                :disabled="threadActionsDisabled"
                 @click="execute('compact')"
               >
                 <Icon name="RefreshCw" :size="16" />压缩上下文</button
@@ -924,7 +939,11 @@ watch(() => [state.authenticated, state.loading], () => {
           </div>
         </div>
       </header>
-      <div v-if="state.error || state.threadConflict" class="global-error" :class="{ 'thread-conflict': state.threadConflict }" role="alert">
+      <div v-if="state.runtimePaused" class="connection-banner" role="status">
+        <Icon name="Server" :size="15" />Web Codex 已释放，可切换桌面端。
+        <button class="button button-small button-secondary" @click="openResources">资源管理中恢复连接</button>
+      </div>
+      <div v-else-if="state.error || state.threadConflict" class="global-error" :class="{ 'thread-conflict': state.threadConflict }" role="alert">
         <Icon name="AlertCircle" :size="16" /><span>{{ state.error || state.threadConflict?.message }}</span
         ><button
           v-if="state.threadConflict"
@@ -953,7 +972,7 @@ watch(() => [state.authenticated, state.loading], () => {
       <div v-if="!state.online" class="connection-banner" role="status">
         <Icon name="WifiOff" :size="15" />目前离线，联网后将重新连接。操作不会自动提交。
       </div>
-      <div v-else-if="!state.connected && !state.error" class="connection-banner">
+      <div v-else-if="!state.connected && !state.error && !state.runtimePaused" class="connection-banner">
         <Icon
           :name="state.loading ? 'LoaderCircle' : 'WifiOff'"
           :size="15"
@@ -1115,22 +1134,6 @@ watch(() => [state.authenticated, state.loading], () => {
               </div>
             </details>
           </div>
-          <div v-if="state.tokenUsage" class="context-status">
-            <button
-              @click="execute('compact')"
-              :disabled="state.busy"
-              :title="`已使用 ${contextUsed.toLocaleString()} / ${contextLimit.toLocaleString()} tokens，点击压缩上下文`"
-            >
-              <span
-                class="context-ring"
-                :style="{ '--context-used': contextPercent + '%' }"
-              ></span
-              ><span>上下文 {{ contextPercent }}%</span
-              ><span v-if="state.autoCompact" class="context-auto"
-                >自动压缩</span
-              >
-            </button>
-          </div>
           <Composer
             ref="composer"
             :api="api"
@@ -1164,6 +1167,12 @@ watch(() => [state.authenticated, state.loading], () => {
       :api="api"
       :state="state"
       @close="editingProject = null"
+    />
+    <ResourcePanel
+      v-if="resourcesOpen"
+      :api="api"
+      :state="state"
+      @close="resourcesOpen = false"
     />
     <SettingsPanel
       v-if="settingsOpen"

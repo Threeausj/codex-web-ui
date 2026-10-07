@@ -194,42 +194,6 @@ onBeforeUnmount(() => {
         />
       </button>
     </div>
-    <div class="nav-hosts" aria-label="主机状态">
-      <button
-        v-for="host in state.hosts"
-        :key="host.id"
-        class="nav-host-label"
-        :title="
-          host.id === state.hostId
-            ? state.connected
-              ? '已连接'
-              : '连接中或未连接，点击重试'
-            : state.navigation[host.id]?.error || '点击刷新主机对话'
-        "
-        :aria-label="`刷新主机 ${host.name}`"
-        @click="api.retryNavigationHost(host.id)"
-      >
-        <Icon
-          :name="host.kind === 'ssh' ? 'Server' : 'Monitor'"
-          :size="12"
-        /><span>{{ host.name }}</span>
-        <Icon
-          v-if="state.navigation[host.id]?.loading && host.id !== state.hostId"
-          name="LoaderCircle"
-          :size="11"
-          class="spin"
-        />
-        <span
-          v-else-if="
-            host.id === state.hostId
-              ? !state.connected
-              : state.navigation[host.id]?.error
-          "
-          class="host-status"
-          >未连接</span
-        >
-      </button>
-    </div>
     <div v-if="searchMode" class="nav-search-results">
       <div class="sidebar-section-heading">
         <strong>{{ archived ? "已归档" : "搜索结果" }}</strong
