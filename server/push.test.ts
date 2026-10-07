@@ -121,7 +121,7 @@ test('the default production sender generates encrypted VAPID requests and handl
   try {
     const device = subscription('default-sender-device')
     await push.subscribe('test-session', device)
-    assert.deepEqual(await push.test('test-session', device.endpoint), { ok: true })
+    assert.deepEqual(await push.test('test-session', device.endpoint), { ok: true, queued: true }); await push.flush()
     assert.equal(requests.length, 1)
     const sent = requests[0]!
     assert.equal(sent.options.hostname, 'fcm.googleapis.com')
@@ -136,12 +136,7 @@ test('the default production sender generates encrypted VAPID requests and handl
     const ciphertext = Buffer.concat(sent.chunks)
     assert.ok(ciphertext.length > 100 && !ciphertext.includes(Buffer.from('后台通知已开启')))
     statusCode = 410
-    await assert.rejects(push.test('test-session', device.endpoint), error => {
-      const failure = error as Error & { status?: number }
-      assert.equal(failure.status, 410)
-      assert.ok(!failure.message.includes('default-sender-device') && !failure.message.includes('Private provider response'))
-      return true
-    })
+    assert.deepEqual(await push.test('test-session', device.endpoint), { ok: true, queued: true }); await push.flush()
     assert.equal(requests.length, 2)
     assert.equal(push.hasActiveSubscriptions, false)
   } finally { await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
@@ -173,7 +168,7 @@ test('push HTTP routes require authentication, CSRF and valid device keys withou
     const stranger = await app.login()
     assert.equal((await fetch(app.base + '/api/push/test', { method: 'POST', headers: stranger.headers, body: JSON.stringify({ endpoint: device.endpoint }) })).status, 403)
     const test = await fetch(app.base + '/api/push/test', { method: 'POST', headers: session.headers, body: JSON.stringify({ endpoint: device.endpoint }) })
-    assert.equal(test.status, 200)
+    assert.equal(test.status, 202); await app.push.flush()
     assert.equal(app.sent.length, 1)
     assert.equal(app.sent[0]!.options.TTL, 3600)
     assert.equal(app.sent[0]!.options.contentEncoding, 'aes128gcm')
@@ -193,8 +188,8 @@ test('repeated tests have independent notification tags and push topics, includi
   try {
     const device = subscription('repeated-test')
     await app.push.subscribe('session', device)
-    await app.push.test('session', device.endpoint)
-    await app.push.test('session', device.endpoint)
+    await app.push.test('session', device.endpoint); await app.push.flush()
+    await app.push.test('session', device.endpoint); await app.push.flush()
     assert.equal(app.sent.length, 2)
     assert.notEqual(app.sent[0]!.payload.tag, app.sent[1]!.payload.tag)
     assert.notEqual(app.sent[0]!.options.topic, app.sent[1]!.options.topic)
@@ -533,7 +528,7 @@ test('expired upstream subscriptions are removed and provider errors never expos
     const session = await app.login(); const device = subscription('private-token-upstream')
     await fetch(app.base + '/api/push/subscription', { method: 'POST', headers: session.headers, body: JSON.stringify({ subscription: device, preferences }) })
     const response = await fetch(app.base + '/api/push/test', { method: 'POST', headers: session.headers, body: JSON.stringify({ endpoint: device.endpoint }) })
-    assert.equal(response.status, 410)
+    assert.equal(response.status, 202); await app.push.flush()
     const body = await response.text()
     assert.ok(!body.includes('private-token') && !body.includes('secret-body') && !body.includes('fcm.googleapis.com'))
     assert.equal(app.push.hasActiveSubscriptions, false)
@@ -627,16 +622,16 @@ test('logout, durable revocation and grant expiry purge pending retries before s
   let service = await PushService.create(directory, new Set([origin]), options)
   try {
     await service.subscribe('session', device)
-    const result = await service.test('session', device.endpoint)
+    const result = await service.test('session', device.endpoint); await service.flush()
     assert.equal(result.queued, true); assert.equal(calls, 1)
     await service.revokeSession('session'); clock += 5000; await service.flush()
     assert.equal(calls, 1); assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8')).outbox.length, 0)
-    await service.subscribe('session', device); await service.test('session', device.endpoint); await service.close()
+    await service.subscribe('session', device); await service.test('session', device.endpoint); await service.flush(); await service.close()
     revoked = true; clock += 5000; service = await PushService.create(directory, new Set([origin]), options); await service.flush()
     assert.equal(calls, 2); assert.equal(service.hasActiveSubscriptions, false)
     await assert.rejects(service.subscribe('session', device), /Sign in again/)
     revoked = false
-    await service.subscribe('session', { ...device, expirationTime: clock + 2000 }); await service.test('session', device.endpoint)
+    await service.subscribe('session', { ...device, expirationTime: clock + 2000 }); await service.test('session', device.endpoint); await service.flush()
     clock += 5000; await service.flush(); assert.equal(calls, 3); assert.equal(service.hasActiveSubscriptions, false)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
@@ -649,7 +644,7 @@ test('test notification failure returns a persisted 202 retry with sanitized own
     const response = await fetch(app.base + '/api/push/test', { method: 'POST', headers: session.headers, body: JSON.stringify({ endpoint: device.endpoint }) })
     assert.equal(response.status, 202)
     const result = await response.json() as { ok: boolean; queued: boolean; retryAt: number }
-    assert.ok(result.ok && result.queued && result.retryAt >= Date.now() + 29000)
+    assert.ok(result.ok && result.queued); await app.push.flush()
     const statusResponse = await fetch(app.base + '/api/push/status', { headers: { cookie: session.cookie } })
     assert.equal(statusResponse.status, 200); assert.equal(statusResponse.headers.get('cache-control'), 'no-store')
     const status = await statusResponse.json() as Record<string, unknown>
@@ -679,7 +674,7 @@ test('outbox TTL expires notifications rather than retrying indefinitely', async
   let clock = Date.now(); let sent = 0
   const service = await PushService.create(directory, new Set([origin]), { now: () => clock, deliveryTtlMs: 1000, sendNotification: async () => { sent++; throw Object.assign(new Error('503'), { statusCode: 503 }) } })
   try {
-    const device = subscription('expire-event'); await service.subscribe('session', device); await service.test('session', device.endpoint)
+    const device = subscription('expire-event'); await service.subscribe('session', device); await service.test('session', device.endpoint); await service.flush()
     clock += 1001; await service.flush()
     assert.equal(sent, 1); assert.equal(service.status('session').queued, 0); assert.equal(service.status('session').expired, 1)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
@@ -690,7 +685,7 @@ test('retry attempts remain bounded even when the provider is continuously unava
   let clock = Date.now(); let sent = 0
   const service = await PushService.create(directory, new Set([origin]), { now: () => clock, retryBaseMs: 1, sendNotification: async () => { sent++; throw Object.assign(new Error('503'), { statusCode: 503 }) } })
   try {
-    const device = subscription('bounded-attempts'); await service.subscribe('session', device); await service.test('session', device.endpoint)
+    const device = subscription('bounded-attempts'); await service.subscribe('session', device); await service.test('session', device.endpoint); await service.flush()
     for (let attempt = 1; attempt < 10; attempt++) { clock += 1000; await service.flush() }
     assert.equal(sent, 8); assert.equal(service.status('session').queued, 0); assert.equal(service.status('session').failed, 1)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
@@ -701,7 +696,7 @@ test('subscription replacement and preference changes cancel old queued deliveri
   let clock = Date.now(); let sent = 0
   const service = await PushService.create(directory, new Set([origin]), { now: () => clock, sendNotification: async () => { sent++; throw Object.assign(new Error('503'), { statusCode: 503 }) } })
   try {
-    const device = subscription('replace-grant'); await service.subscribe('old-session', device); await service.test('old-session', device.endpoint)
+    const device = subscription('replace-grant'); await service.subscribe('old-session', device); await service.test('old-session', device.endpoint); await service.flush()
     await service.subscribe('new-session', device); clock += 5000; await service.flush()
     assert.equal(sent, 1); assert.equal(service.status('old-session').devices, 0); assert.equal(service.status('new-session').queued, 0)
     service.observe(host, { method: 'thread/started', params: { thread: { id: 'preference-thread', source: 'cli' } } })
@@ -712,7 +707,7 @@ test('subscription replacement and preference changes cancel old queued deliveri
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
 
-test('full outbox is bounded without deduping an event that was never persisted', async () => {
+test('a durable bounded backlog retains one-time events and drains without requiring protocol replay', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-outbox-bound-'))
   let clock = Date.now(); let failing = true; let sent = 0
   const service = await PushService.create(directory, new Set([origin]), { now: () => clock, maxQueuedDeliveries: 2, sendNotification: async () => { sent++; if (failing) throw Object.assign(new Error('503'), { statusCode: 503 }) } })
@@ -723,12 +718,58 @@ test('full outbox is bounded without deduping an event that was never persisted'
     for (const turn of ['one', 'two', 'overflow']) service.observe(host, event(turn))
     await service.flush()
     const stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
-    assert.equal(stored.outbox.length, 2); assert.equal(stored.events.length, 2); assert.equal(sent, 2)
+    assert.equal(stored.outbox.length, 3); assert.equal(stored.events.length, 3); assert.equal(sent, 3); assert.equal(service.status('session').backlog, 1)
     failing = false; clock += 5000; await service.flush()
     service.observe(host, event('overflow')); await service.flush()
-    assert.equal(sent, 5); assert.equal(service.status('session').queued, 0)
+    assert.equal(sent, 6); assert.equal(service.status('session').queued, 0)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
+
+test('test notification receipt returns after durable enqueue while all delivery workers are occupied', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-accepted-'));
+  let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; }); let started = 0;
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async () => { started++; await held; } });
+  try {
+    for (let i = 0; i < 5; i++) await service.subscribe('session', subscription(`test-accepted-${i}`));
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'busy', source: 'cli' } } });
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'busy', turn: { id: 't', status: 'completed' } } });
+    while (started < 4) await tick();
+    const result = await service.test('session', subscription('test-accepted-4').endpoint);
+    assert.deepEqual(result, { ok: true, queued: true }); assert.equal(started, 4);
+    const stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'));
+    assert.equal(stored.outbox.length, 6); assert.equal(service.status('session').queued, 6);
+  } finally { release(); await service.close(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('long provider Retry-After survives restart and does not retry at the shorter local backoff', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-long-retry-'));
+  let clock = Date.now(), sent = 0;
+  const options = { now: () => clock, sendNotification: async () => { sent++; throw Object.assign(new Error('429'), { statusCode: 429, headers: { 'retry-after': '1800' } }); } };
+  let service = await PushService.create(directory, new Set([origin]), options);
+  try {
+    const device = subscription('long-retry'); await service.subscribe('session', device); await service.test('session', device.endpoint); await service.flush();
+    assert.equal(service.status('session').nextRetryAt, clock + 1800000);
+    await service.close(); service = await PushService.create(directory, new Set([origin]), options);
+    clock += 600000; await service.flush(); assert.equal(sent, 1);
+    clock += 1200000; await service.flush(); assert.equal(sent, 2);
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('durable backlog overflow is counted per device and accepted events survive a cold restart', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-overflow-'));
+  let clock = Date.now(), failing = true, sent = 0;
+  const options = { now: () => clock, maxQueuedDeliveries: 1, resolveThread: async (_host: any, id: string) => ({ id, source: 'cli' }), sendNotification: async () => { sent++; if (failing) throw Object.assign(new Error('503'), { statusCode: 503 }); } };
+  let service = await PushService.create(directory, new Set([origin]), options);
+  try {
+    await service.subscribe('session', subscription('overflow'));
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'main', source: 'cli' } } });
+    for (let i = 0; i < 6; i++) service.observe(host, { method: 'turn/completed', params: { threadId: 'main', turn: { id: `t-${i}`, status: 'completed' } } });
+    await service.flush(); assert.equal(service.status('session').queued, 5); assert.equal(service.status('session').overflow, 1);
+    await service.close(); failing = false; clock += 5000; service = await PushService.create(directory, new Set([origin]), options); await service.flush();
+    assert.equal(sent, 10); assert.equal(service.status('session').queued, 0); assert.equal(service.status('session').overflow, 1);
+    assert.equal(service.status('session').failed, 1);
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }); }
+});
 
 test('failed atomic outbox persistence never dispatches or dedupes an uncommitted event', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-outbox-atomic-'))
@@ -766,7 +807,7 @@ test('hard delivery timeout schedules a durable retry instead of hanging or disc
     t.mock.timers.enable({ apis: ['setTimeout'] })
     const response = service.test('session', device.endpoint)
     await started; clock += 12000; t.mock.timers.tick(12000)
-    assert.equal((await response).queued, true); assert.equal(service.status('session').lastFailure, 'timeout')
+    assert.equal((await response).queued, true); await service.flush(); assert.equal(service.status('session').lastFailure, 'timeout')
     clock += 5000; await service.flush()
     assert.equal(calls, 2); assert.equal(service.status('session').queued, 0); assert.equal(service.status('session').delivered, 1)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }

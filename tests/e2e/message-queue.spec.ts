@@ -11,8 +11,8 @@ async function install(page: Page, mock: MockCodex, supported = true, shared?: {
     reorder: ['threadId', 'queuedSubmissionIds'], start: ['threadId', 'queuedSubmissionId'],
   };
   await page.route('**/api/hosts/*/native-capabilities*', route => route.fulfill({ json: {
-    status: 'known', checkedAt: Date.now(), methods: Object.fromEntries(Object.entries(fields).map(([name, params]) =>
-      [`thread/queue/${name}`, { available: supported, params, required: ['threadId'] }])),
+    status: 'known', checkedAt: Date.now(), methods: { ...Object.fromEntries(Object.entries(fields).map(([name, params]) =>
+      [`thread/queue/${name}`, { available: supported, params, required: ['threadId'] }])), 'thread/settings/update': { available: supported, params: ['threadId','cwd','model','effort','sandboxPolicy','approvalPolicy','collaborationMode'], required: ['threadId'] } },
   } }));
   if (!(mock.turns.get(threadId) || []).some(turn => turn.id === running.id))
     mock.turns.set(threadId, [...(mock.turns.get(threadId) || []), running]);

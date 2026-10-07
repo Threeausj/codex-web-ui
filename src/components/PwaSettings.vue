@@ -17,7 +17,7 @@ const props = defineProps<{ api: any; state: any }>();
 const notice = ref('');
 const localError = ref('');
 const testing = ref<'push' | 'system' | ''>('');
-type DeliveryStatus = { devices: number; queued: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastFailureAt: number | null; lastFailure: string | null };
+type DeliveryStatus = { devices: number; queued: number; overflow?: number; backlog?: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastFailureAt: number | null; lastFailure: string | null };
 const deliveryStatus = ref<DeliveryStatus | null>(null);
 const deliveryError = ref('');
 let statusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -141,6 +141,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
       <div v-if="deliveryStatus && pwaState.pushSubscribed" class="pwa-delivery-status" aria-live="polite" aria-label="推送投递状态">
         <span>推送服务已接收 {{ deliveryStatus.delivered }} 条</span>
         <span v-if="deliveryStatus.queued">待发送 {{ deliveryStatus.queued }} 条<span v-if="deliveryStatus.retrying"> · 自动重试 {{ deliveryStatus.retrying }} 条</span><span v-if="retryTime"> · 下次 {{ retryTime }}</span></span>
+        <span v-if="deliveryStatus.overflow">积压已达上限，{{ deliveryStatus.overflow }} 条未能入队</span>
         <span v-if="deliveryStatus.failed || deliveryStatus.expired">发送失败 {{ deliveryStatus.failed }} 条 · 已过期 {{ deliveryStatus.expired }} 条</span>
         <span v-if="deliveryStatus.lastFailure && (deliveryStatus.lastFailure !== 'metadata_pending' || deliveryStatus.queued) && (deliveryStatus.queued || (deliveryStatus.lastFailureAt || 0) > (deliveryStatus.lastDeliveredAt || 0))">{{ failures[deliveryStatus.lastFailure] || '发送暂时受阻' }}</span>
       </div>

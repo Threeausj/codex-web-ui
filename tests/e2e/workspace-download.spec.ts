@@ -73,7 +73,7 @@ test("binary download preserves every byte and is not exposed as an editable tex
   await expect(
     page.getByText("此文件可下载后查看", { exact: true }),
   ).toBeVisible();
-  await expect(page.locator(".file-editor")).toHaveCount(0);
+  await expect(page.locator(".code-editor")).toHaveCount(0);
   const pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
   const downloaded = await pending;
@@ -132,14 +132,14 @@ test("a late file response from an old project cannot replace the new workspace 
     "/workspace/other",
   );
   release!();
-  await expect(page.locator(".file-editor")).toHaveCount(0);
+  await expect(page.locator(".code-editor")).toHaveCount(0);
   await page
     .locator(".file-tree-row")
     .filter({ hasText: "index.html" })
     .click();
   await expect(
     page.getByRole("textbox", { name: "index.html 文件内容" }),
-  ).toHaveValue("<h1>Demo preview</h1>");
+  ).toHaveText("<h1>Demo preview</h1>");
 });
 
 test("a late path lookup cannot overwrite a more recently revealed file in the same project", async ({
@@ -192,10 +192,10 @@ test("a late path lookup cannot overwrite a more recently revealed file in the s
   await page.getByRole("link", { name: "second", exact: true }).click();
   await expect(
     page.getByRole("textbox", { name: "second.txt 文件内容" }),
-  ).toHaveValue("/workspace/demo/second.txt");
+  ).toHaveText("/workspace/demo/second.txt");
   release!();
   await page.waitForTimeout(100);
   await expect(
     page.getByRole("textbox", { name: "second.txt 文件内容" }),
-  ).toHaveValue("/workspace/demo/second.txt");
+  ).toHaveText("/workspace/demo/second.txt");
 });

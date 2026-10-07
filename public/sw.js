@@ -3,7 +3,7 @@ const BUILD = "__CODEX_BUILD__";
 const PRECACHE = __CODEX_PRECACHE__;
 const CACHE_PREFIX = "codex-app-shell-";
 const CACHE_NAME = CACHE_PREFIX + BUILD;
-const PUBLIC_PATHS = new Set(PRECACHE);
+const PUBLIC_PATHS = new Set(__CODEX_PUBLIC_ASSETS__);
 
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
@@ -56,8 +56,19 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   if (url.search || (!PUBLIC_PATHS.has(url.pathname) && !url.pathname.startsWith("/assets/"))) return;
-  // Only responses installed from the build manifest are ever written to a cache.
-  event.respondWith((async () => (await caches.match(request)) || fetch(request))());
+  // Large editors, PDF workers and language grammars load on demand. Keep
+  // strict build-manifest validation and never send credentials into this cache.
+  event.respondWith((async () => {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    if (!PUBLIC_PATHS.has(url.pathname)) return fetch(request);
+    const cacheKey = new Request(url, { credentials: "omit" });
+    const response = await fetch(cacheKey);
+    if (response.ok && response.type === "basic") {
+      const cache = await caches.open(CACHE_NAME); await cache.put(cacheKey, response.clone());
+    }
+    return response;
+  })());
 });
 
 function navigationData(value) {

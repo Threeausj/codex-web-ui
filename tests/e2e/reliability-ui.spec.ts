@@ -21,7 +21,7 @@ test('external changes preserve the browser draft and require an explicit confli
   const conflict = page.getByRole('alert', { name: '文件保存冲突' });
   await expect(conflict).toContainText('# Codex changed this');
   await expect(conflict).toContainText('# My draft');
-  await expect(editor).toHaveValue('# My draft'); expect(writes).toBe(0);
+  await expect(editor).toHaveText('# My draft'); expect(writes).toBe(0);
   await conflict.getByRole('button', { name: '保留草稿并手动合并' }).click();
   await editor.fill('# Codex changed this\n# My merged draft');
   await page.getByRole('button', { name: '保存', exact: true }).click();
@@ -100,6 +100,31 @@ test('native model service tiers and live account windows use host data and keep
   await expect.poll(() => mock.request('turn/start')?.params.serviceTier).toBe('fast');
 });
 
+test('quota events invalidate an older pending read and trigger one follow-up without stale display', async ({ page, mock }) => {
+  const receive = (mock as any).receive.bind(mock); let reads = 0; let finish: (() => void) | undefined;
+  const result = (usedPercent: number) => ({ rateLimits: { primary: { usedPercent, windowDurationMins: 300, resetsAt: 1900000000 } }, ordinaryUsageAllowed: true });
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method !== 'account/rateLimits/read') return receive(socket, request);
+    reads++;
+    if (reads === 1) { finish = () => socket.send(JSON.stringify({ id: request.id, result: result(55) })); return; }
+    return socket.send(JSON.stringify({ id: request.id, result: result(95) }));
+  };
+  await login(page); await expect.poll(() => !!finish).toBe(true);
+  mock.emit('account/rateLimits/updated', result(95)); finish!();
+  await expect.poll(() => reads).toBe(2);
+  await page.getByLabel('查看账户使用额度', { exact: true }).click();
+  await expect(page.locator('.account-usage-popover')).toContainText('已用 95%');
+  await expect(page.locator('.account-usage-popover')).not.toContainText('已用 55%');
+});
+
+test('an account restriction stays visible even with no quota windows or model service tiers', async ({ page, mock }) => {
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: any, request: any) => request.method === 'account/rateLimits/read'
+    ? socket.send(JSON.stringify({ id: request.id, result: { ordinaryUsageAllowed: false, rateLimits: { primary: null, secondary: null } } })) : receive(socket, request);
+  await login(page); await expect(page.getByRole('status').filter({ hasText: '常规额度已受限' })).toBeVisible();
+  await expect(page.getByLabel('查看账户使用额度', { exact: true })).toHaveCount(0);
+});
+
 test('late saves of a different file cannot replace the editor or unlock another pending save', async ({ page, mock }) => {
   const receive = (mock as any).receive.bind(mock);
   const pending = new Map<string, () => void>();
@@ -122,13 +147,13 @@ test('late saves of a different file cannot replace the editor or unlock another
   page.once('dialog', dialog => dialog.accept());
   await page.getByRole('link', { name: '打开另一个文件', exact: true }).click();
   const second = page.getByRole('textbox', { name: 'index.html 文件内容' });
-  await expect(second).toHaveValue('<h1>Demo preview</h1>');
+  await expect(second).toHaveText('<h1>Demo preview</h1>');
   await second.fill('<h1>Second save</h1>');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => pending.has('/workspace/demo/index.html')).toBe(true);
   const firstFinished = page.waitForResponse(response => response.url().includes('/files') && response.request().method() === 'POST' && !!response.request().postData()?.includes('/workspace/demo/README.md'));
   pending.get('/workspace/demo/README.md')!(); await firstFinished;
-  await expect(second).toHaveValue('<h1>Second save</h1>');
+  await expect(second).toHaveText('<h1>Second save</h1>');
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
   pending.get('/workspace/demo/index.html')!();
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeDisabled();

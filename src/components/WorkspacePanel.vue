@@ -10,7 +10,11 @@ import {
 import Icon from "./Icon.vue";
 import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
+import { privateState } from "../lib/private-state";
+import type { ConversationSelectionSource } from "../lib/conversation-selection";
 import { isImagePath, isMarkdownPath } from "../lib/file-preview";
+const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
+const PdfPreview = defineAsyncComponent(() => import("./PdfPreview.vue"));
 const InteractiveTerminal = defineAsyncComponent(
   () => import("./InteractiveTerminal.vue"),
 );
@@ -28,7 +32,7 @@ const props = defineProps<{
   openPath?: string;
   openLine?: number;
 }>();
-const emit = defineEmits<{ close: []; error: [message: string] }>();
+const emit = defineEmits<{ close: []; error: [message: string]; add: [source: ConversationSelectionSource]; ask: [source: ConversationSelectionSource] }>();
 const tab = ref(props.initialTab || "files");
 const tabs = [
   { id: "files", name: "文件", icon: "Folder" },
@@ -44,20 +48,25 @@ const changeSearch = ref("");
 const directory = ref("");
 const directoryInput = ref("");
 const entries = ref<any[]>([]);
-const file = ref<any>(null);
-const content = ref("");
-const originalContent = ref("");
-const fileEditor = ref<HTMLTextAreaElement>();
-const selectedLine = ref<number | null>(null);
+type EditorTab = { file: any; content: string; original: string; view: "preview" | "source"; conflict: any; saving: boolean; line?: number | null };
+const editorTabs = ref<EditorTab[]>([]);
+const activePath = ref("");
+const activeEditor = computed(() => editorTabs.value.find(entry => entry.file.path === activePath.value));
+const file = computed(() => activeEditor.value?.file || null);
+const content = computed({ get: () => activeEditor.value?.content || "", set: value => { if (activeEditor.value) activeEditor.value.content = value; } });
+const originalContent = computed({ get: () => activeEditor.value?.original || "", set: value => { if (activeEditor.value) activeEditor.value.original = value; } });
+const fileEditor = ref<InstanceType<typeof CodeEditor>>();
+const selectedLine = computed({ get: () => activeEditor.value?.line || null, set: value => { if (activeEditor.value) activeEditor.value.line = value; } });
 const loading = ref(false);
-const saving = ref(false);
+const saving = computed({ get: () => !!activeEditor.value?.saving, set: value => { if (activeEditor.value) activeEditor.value.saving = value; } });
 const error = ref("");
 const downloading = ref("");
-const conflict = ref<any>(null);
+const conflict = computed({ get: () => activeEditor.value?.conflict || null, set: value => { if (activeEditor.value) activeEditor.value.conflict = value; } });
 const expandedChanges = ref(new Set<string>());
 let directoryGeneration = 0;
 let fileGeneration = 0;
 let revealGeneration = 0;
+let workspaceGeneration = 0;
 const fileScope = () => `${props.state.hostId}\0${props.state.projectPath}`;
 const terminalCommand = ref("");
 const terminalMode = ref("shell");
@@ -69,7 +78,18 @@ const previewUrl = ref("");
 const previewMode = ref("desktop");
 const previewKey = ref(0);
 const previewDocument = ref(false);
-const fileView = ref<"preview" | "source">("preview");
+const fileView = computed({ get: () => activeEditor.value?.view || "preview", set: value => { if (activeEditor.value) activeEditor.value.view = value; } });
+const draftWarning = ref("");
+let activeScope = "", draftTimer: ReturnType<typeof setTimeout> | undefined, workspaceReady: Promise<void> = Promise.resolve();
+function persistDrafts() {
+  clearTimeout(draftTimer);
+  if (!activeScope || !props.state.authenticated) return;
+  const scope = activeScope;
+  const tabs = editorTabs.value.map(entry => ({ ...entry, saving: false, file: { ...entry.file, dataUrl: undefined, dataBase64: undefined } }));
+  void privateState.write("file-workspace", scope, { tabs, activePath: activePath.value }).then(() => { if (scope === activeScope) draftWarning.value = ""; }).catch(cause => { if (scope === activeScope) draftWarning.value = `草稿保留在当前页面，持久化失败：${cause.message}`; });
+}
+function scheduleDrafts() { clearTimeout(draftTimer); draftTimer = setTimeout(persistDrafts, 180); }
+watch([editorTabs, activePath], scheduleDrafts, { deep: true });
 const dirty = computed(() => content.value !== originalContent.value);
 const changeScope = ref("loaded");
 // Keep every patch in execution order. These are operation counts, not a net
@@ -130,7 +150,7 @@ async function readDirectory(path: string, interruptReveal = true) {
 }
 async function openFile(path: string, destination = "files", line?: number) {
   if (!path) return;
-  if (file.value?.path === path) {
+  if (file.value?.path === path && (!file.value.binary && !/^image\//.test(file.value.mime) || file.value.dataUrl || file.value.dataBase64)) {
     ++fileGeneration;
     loading.value = false;
     tab.value = destination;
@@ -140,25 +160,23 @@ async function openFile(path: string, destination = "files", line?: number) {
     return;
   }
   ++revealGeneration;
-  if (
-    dirty.value &&
-    !window.confirm("当前文件有未保存的修改，仍要打开其他文件吗？")
-  )
-    return;
+  const existing = editorTabs.value.find(entry => entry.file.path === path);
+  if (existing) {
+    activePath.value = path; tab.value = destination; previewDocument.value = destination === "preview";
+    if (!existing.file.binary && !/^image\//.test(existing.file.mime)) { if (line) await focusLine(line); return; }
+    if (existing.file.dataUrl || existing.file.dataBase64) return;
+  }
+  if (!existing && editorTabs.value.length >= 16) { error.value = "最多打开 16 个文件，请先关闭一个标签"; return; }
   loading.value = true;
   const generation = ++fileGeneration;
-  saving.value = false;
   const scope = fileScope();
   error.value = "";
   try {
     const result = await props.api.readFile(path);
     if (generation !== fileGeneration || scope !== fileScope()) return;
-    conflict.value = null;
-    selectedLine.value = null;
-    file.value = { ...result, path };
-    content.value = result.content || "";
-    originalContent.value = content.value;
-    fileView.value = "preview";
+    const entry: EditorTab = { file: { ...result, path }, content: result.content || "", original: result.content || "", view: "preview", conflict: null, saving: false, line: null };
+    if (existing) Object.assign(existing, entry); else editorTabs.value.push(entry);
+    activePath.value = path;
     previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
     tab.value = destination;
@@ -178,10 +196,7 @@ async function focusLine(line: number) {
   await nextTick();
   const editor = fileEditor.value;
   if (!editor) return;
-  const lines = content.value.split("\n");
-  const start = lines.slice(0, selectedLine.value - 1).reduce((total, value) => total + value.length + 1, 0);
-  editor.focus(); editor.setSelectionRange(start, start + (lines[selectedLine.value - 1]?.length || 0));
-  editor.scrollTop = Math.max(0, (selectedLine.value - 3) * (parseFloat(getComputedStyle(editor).lineHeight) || 20));
+  editor.focusLine(selectedLine.value);
 }
 async function revealPath(path: string, line?: number) {
   const generation = ++revealGeneration;
@@ -190,14 +205,8 @@ async function revealPath(path: string, line?: number) {
     const metadata = await props.api.rpc("fs/getMetadata", { path });
     if (scope !== fileScope() || generation !== revealGeneration) return;
     if (metadata.isDirectory) {
-      if (
-        dirty.value &&
-        !window.confirm("当前文件有未保存的修改，仍要显示项目目录吗？")
-      )
-        return;
       ++fileGeneration;
-      file.value = null;
-      content.value = originalContent.value = "";
+      activePath.value = "";
       tab.value = "files";
       await readDirectory(path, false);
     } else await openFile(path, "files", line);
@@ -242,27 +251,28 @@ function up() {
 async function save() {
   if (!file.value || saving.value || props.state.permission === "read-only") return;
   const path = file.value.path;
-  const savedFile = file.value;
+  const savedEditor = activeEditor.value!;
+  const savedFile = savedEditor.file;
   const savedContent = content.value;
   const scope = fileScope();
-  const current = () => file.value === savedFile && scope === fileScope();
+  const current = () => scope === fileScope() && editorTabs.value.includes(savedEditor);
   saving.value = true;
   error.value = "";
   try {
     const result = await props.api.writeFile(path, savedContent, savedFile.version, props.state.hostId);
-    if (current()) { originalContent.value = savedContent; savedFile.version = result.version; conflict.value = null; }
+    if (current()) { savedEditor.original = savedContent; savedFile.version = result.version; savedEditor.conflict = null; persistDrafts(); }
   } catch (cause: any) {
     if (current()) {
       error.value = cause.message || "保存文件失败";
       if (cause.status === 409 && cause.code === "FILE_CONFLICT") {
         try {
           const disk = await props.api.readFile(path, { silentError: true });
-          if (current()) conflict.value = disk;
+          if (current()) savedEditor.conflict = disk;
         } catch { if (current()) error.value += " 读取磁盘版本失败，请重试保存以重新检查。"; }
       }
     }
   } finally {
-    if (current()) saving.value = false;
+    if (current()) savedEditor.saving = false;
   }
 }
 function resolveConflict(reload: boolean) {
@@ -280,14 +290,20 @@ function toggleChange(event: Event, key: string) {
   else expandedChanges.value.delete(key);
 }
 function closeFile() {
-  if (dirty.value && !window.confirm("当前文件有未保存的修改，仍要返回文件列表吗？")) return;
-  ++fileGeneration;
-  file.value = null;
-  conflict.value = null;
-  content.value = originalContent.value = "";
-  saving.value = false;
-  previewDocument.value = false;
-  tab.value = "files";
+  ++fileGeneration; activePath.value = ""; previewDocument.value = false; tab.value = "files";
+}
+function closeEditor(path: string) {
+  const entry = editorTabs.value.find(entry => entry.file.path === path);
+  if (!entry || entry.saving) return;
+  if (entry.content !== entry.original && !window.confirm("关闭标签会丢弃此文件的未保存草稿，是否继续？")) return;
+  editorTabs.value = editorTabs.value.filter(candidate => candidate !== entry);
+  if (activePath.value === path) activePath.value = editorTabs.value.at(-1)?.file.path || "";
+  persistDrafts();
+}
+function codeSelection(value: { text: string; startLine: number; endLine: number }, action: 'add' | 'ask') {
+  if (!file.value || !props.state.activeThread?.id) return;
+  const source: ConversationSelectionSource = { hostId: props.state.hostId, threadId: props.state.activeThread.id, threadName: props.state.activeThread.name, path: file.value.path, startLine: value.startLine, endLine: value.endLine, text: value.text };
+  if (action === 'add') emit('add', source); else emit('ask', source);
 }
 async function preview(path?: string) {
   previewSource.value = "file";
@@ -306,7 +322,7 @@ async function preview(path?: string) {
     const filePath = input.startsWith("/")
       ? input
       : join(props.state.projectPath, input);
-    if (isMarkdownPath(filePath) || isImagePath(filePath)) {
+    if (isMarkdownPath(filePath) || isImagePath(filePath) || /\.pdf$/i.test(filePath)) {
       previewInput.value = filePath;
       await openFile(filePath, "preview");
       return;
@@ -367,33 +383,43 @@ watch(
   },
 );
 watch(
-  () => [props.state.projectPath, props.state.hostId, props.state.connected],
+  () => [props.state.projectPath, props.state.hostId, props.state.authenticated],
   () => {
-    ++directoryGeneration;
-    ++fileGeneration;
-    ++revealGeneration;
-    downloading.value = "";
-    saving.value = false;
-    previewDocument.value = false;
-    if (props.state.connected && props.state.projectPath) {
-      file.value = null;
-      content.value = originalContent.value = "";
-      void readDirectory(props.state.projectPath, false);
-    }
-  },
-  { immediate: true },
+    persistDrafts();
+    ++directoryGeneration; ++fileGeneration; ++revealGeneration;
+    const version = ++workspaceGeneration;
+    const scope = fileScope(); activeScope = "";
+    const current = () => version === workspaceGeneration && scope === fileScope() && props.state.authenticated;
+    editorTabs.value = []; activePath.value = ""; downloading.value = ""; previewDocument.value = false;
+    workspaceReady = (async () => {
+      await props.api.privateSessionReady?.();
+      if (!current()) return;
+      activeScope = scope;
+      try {
+        const restored = await privateState.read<{ tabs: EditorTab[]; activePath: string }>("file-workspace", scope);
+        if (!current()) return;
+        if (restored && Array.isArray(restored.tabs)) { editorTabs.value = restored.tabs.slice(0, 16).filter(entry => typeof entry.file?.path === "string" && typeof entry.content === "string" && typeof entry.original === "string"); activePath.value = restored.activePath; }
+      } catch { if (current()) draftWarning.value = "无法读取持久化草稿，请检查网站存储权限"; }
+      if (props.state.connected && props.state.projectPath) await readDirectory(props.state.projectPath, false);
+      if (!current()) return;
+      if (props.openPath) await revealPath(props.openPath, props.openLine);
+      else if (file.value?.binary || /^image\//.test(file.value?.mime || "")) await openFile(activePath.value);
+    })();
+  }, { immediate: true },
 );
-watch(
-  () => [props.openPath, props.openLine] as const,
-  ([value, line]) => {
-    if (value) void revealPath(value, line);
-  },
-  { immediate: true },
-);
+watch(() => props.state.connected, connected => {
+  if (connected && props.state.projectPath) void workspaceReady.then(() => readDirectory(directory.value || props.state.projectPath, false));
+});
+watch(() => [props.openPath, props.openLine] as const, ([value, line]) => {
+  if (value) void workspaceReady.then(() => revealPath(value, line));
+});
+if (typeof window !== "undefined") window.addEventListener("pagehide", persistDrafts);
 onBeforeUnmount(() => {
+  persistDrafts(); window.removeEventListener("pagehide", persistDrafts); clearTimeout(draftTimer);
   ++directoryGeneration;
   ++fileGeneration;
   ++revealGeneration;
+  ++workspaceGeneration;
 });
 watch(
   () => props.state.terminalOutput,
@@ -494,6 +520,13 @@ defineExpose({
           />
         </button>
       </form>
+      <p v-if="draftWarning" class="panel-error" role="status">{{ draftWarning }}</p>
+      <nav v-if="editorTabs.length" class="file-tab-bar" aria-label="已打开文件">
+        <div v-for="entry in editorTabs" :key="entry.file.path" :class="{ active: activePath === entry.file.path }">
+          <button :title="entry.file.path" :aria-pressed="activePath === entry.file.path" @click="openFile(entry.file.path, tab)">{{ entry.file.path.split('/').pop() }}<i v-if="entry.content !== entry.original" class="dirty-dot"></i></button>
+          <button class="icon-button" :disabled="entry.saving" :aria-label="'关闭文件 ' + entry.file.path.split('/').pop()" @click="closeEditor(entry.file.path)"><Icon name="X" :size="12" /></button>
+        </div>
+      </nav>
       <template v-if="file">
         <div class="file-editor-heading">
           <button
@@ -546,6 +579,7 @@ defineExpose({
         <div v-if="isImage" class="file-image">
           <img :src="file.dataUrl" :alt="displayName" />
         </div>
+        <PdfPreview v-else-if="file.mime === 'application/pdf' && file.dataBase64" :key="file.path" :data-base64="file.dataBase64" :name="displayName" />
         <div v-else-if="file.binary" class="panel-empty">
           <Icon name="File" :size="32" />
           <p>此文件可下载后查看</p>
@@ -560,15 +594,11 @@ defineExpose({
           :api="api"
           @open-file="openFile($event, tab)"
         />
-        <textarea
-          v-else
-          ref="fileEditor"
-          v-model="content"
-          class="file-editor"
-          spellcheck="false"
-          :readonly="state.permission === 'read-only'"
-          :aria-label="displayName + ' 文件内容'"
-        ></textarea>
+        <CodeEditor
+          v-else :key="file.path" ref="fileEditor" v-model="content" :path="file.path"
+          :line="selectedLine || undefined" :readonly="state.permission === 'read-only'" :allow-question="!!state.activeThread?.id"
+          @save="save" @selection="codeSelection"
+        />
         <div class="file-editor-footer">
           <span>{{ isImage ? '图片预览' : content.split("\n").length + ' 行' }}{{ selectedLine && !isImage ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
           ><span>{{

@@ -1,3 +1,4 @@
+import { privateState } from './private-state';
 import { computed, getCurrentScope, onScopeDispose, reactive, watch } from 'vue';
 import type { QueuedSubmission } from '../../shared/protocol/v2/QueuedSubmission';
 import type { UserInput } from '../../shared/protocol/v2/UserInput';
@@ -10,6 +11,7 @@ const queueFields: Record<string, string[]> = {
   'thread/queue/delete': ['threadId', 'queuedSubmissionId'],
   'thread/queue/reorder': ['threadId', 'queuedSubmissionIds'],
   'thread/queue/start': ['threadId', 'queuedSubmissionId'],
+  'thread/settings/update': ['threadId', 'cwd', 'model', 'effort', 'sandboxPolicy', 'approvalPolicy'],
 };
 type Scope = { key: string; hostId: string; threadId: string; authenticationGeneration?: number; engineId?: string | null };
 type UnknownOutcome = { operation: string; clientId?: string; input?: UserInput[] };
@@ -31,7 +33,7 @@ export function useMessageQueue(api: any, main: any) {
     status: 'unknown' as 'unknown' | 'supported' | 'unsupported',
     reason: '正在检查当前 Codex 的原生消息队列能力…',
     items: [] as QueuedSubmission[], loading: false, mutating: false,
-    error: '', notice: '', uncertain: null as UnknownOutcome | null,
+    error: '', notice: '', restoring: false, uncertain: null as UnknownOutcome | null,
   });
   let disposed = false;
   let generation = 0;
@@ -44,6 +46,9 @@ export function useMessageQueue(api: any, main: any) {
   let capabilityRetry: ReturnType<typeof setTimeout> | undefined;
   let retryCount = 0;
   let verifiedRead = false;
+  const journal = api.operationJournal || privateState;
+  let restoring: Promise<void> | null = null;
+  const receiptKey = (saved: Scope) => JSON.stringify([saved.hostId, saved.threadId]);
   const unknownOutcomes = new Map<string, UnknownOutcome>();
   const scope = (): Scope | null => {
     const identity = api.runtimeIdentity?.() || {};
@@ -65,6 +70,7 @@ export function useMessageQueue(api: any, main: any) {
     if (main.permission === 'read-only') return '只读权限下不能修改消息队列';
     if (main.compacting || main.changingContext || main.editingMessage || main.modeBusy) return '当前对话正在变更，请稍候';
     if (state.status !== 'supported') return state.reason;
+    if (state.restoring) return '正在恢复队列操作回执';
     if (state.uncertain) return '上一项队列操作的结果尚未确认，请先核对队列和对话';
     if (state.mutating) return '队列操作正在提交';
     return '';
@@ -83,7 +89,25 @@ export function useMessageQueue(api: any, main: any) {
     ++generation; ++listRevision;
     listRequest = null; capabilityRequest = null; verifiedRead = false; state.items = []; state.loading = false; state.mutating = false;
     state.error = ''; state.notice = '';
+    restoring = null; state.restoring = !!scope();
     state.uncertain = scope() ? unknownOutcomes.get(scope()!.key) || null : null;
+  }
+  async function restoreReceipt() {
+    const saved = scope(); if (!saved || !state.restoring) return;
+    if (restoring) return restoring;
+    const version = generation;
+    const operation = (async () => {
+      try {
+        await api.privateSessionReady?.();
+        const outcome = await journal.read('queue-outcome', receiptKey(saved));
+        if (!current(saved, version)) return;
+        if (outcome) { unknownOutcomes.set(saved.key, outcome); state.uncertain = outcome; }
+        state.restoring = false;
+      } catch (cause: any) {
+        if (current(saved, version)) { state.error = `恢复队列回执失败：${cause.message}`; state.restoring = true; }
+      }
+    })();
+    restoring = operation; await operation; if (restoring === operation) restoring = null;
   }
   function scheduleRefresh() {
     ++listRevision;
@@ -95,6 +119,7 @@ export function useMessageQueue(api: any, main: any) {
     if (!saved || !main.connected || main.runtimePaused) return;
     const identity = JSON.stringify([saved.hostId, saved.engineId, saved.authenticationGeneration]);
     if (!force && identity === capabilityIdentity && state.status !== 'unknown') return;
+    if (state.restoring) await restoreReceipt();
     if (capabilityRequest) return capabilityRequest;
     const version = generation;
     capabilityIdentity = identity;
@@ -144,6 +169,7 @@ export function useMessageQueue(api: any, main: any) {
   async function refresh() {
     const saved = scope();
     if (!saved || !readable() || state.status !== 'supported') return;
+    if (state.restoring) await restoreReceipt();
     if (listRequest) return listRequest;
     const version = generation;
     const revision = listRevision;
@@ -193,16 +219,27 @@ export function useMessageQueue(api: any, main: any) {
     return request;
   }
   async function mutate(method: string, params: any, outcome?: UnknownOutcome) {
+    if (state.restoring) await restoreReceipt();
     if (blockedReason.value) throw new Error(blockedReason.value);
     const saved = scope()!;
     if (!methodAccepts(capabilities, method, Object.keys({ threadId: saved.threadId, ...params })))
       throw new Error('当前 Codex 的消息队列参数不兼容，请更新后重新连接');
     const version = generation;
     state.mutating = true; state.error = ''; state.notice = '';
-    let accepted = false;
+    let accepted = false, dispatched = false;
+    const receipt: UnknownOutcome = outcome || { operation: method, input: params.input };
     try {
+      await api.privateSessionReady?.();
+      await journal.write('queue-outcome', receiptKey(saved), receipt, true);
+      if (!current(saved, version)) throw new Error('对话或连接已变化，操作未发送');
+      if (['thread/queue/add', 'thread/queue/start'].includes(method)) await api.prepareQueuedSettings?.(saved.hostId, saved.threadId, capabilities);
+      if (!current(saved, version)) throw new Error('对话或连接已变化，操作未发送');
+      dispatched = true;
       const result = await call(saved, method, { threadId: saved.threadId, ...params });
       accepted = true;
+      await journal.remove('queue-outcome', receiptKey(saved)).catch(() => {
+        unknownOutcomes.set(saved.key, receipt); if (current(saved, version)) { state.uncertain = receipt; state.notice = '原生操作已接收，本机回执待清理，请先核对'; }
+      });
       if (current(saved, version)) {
         ++listRevision;
         if (['thread/queue/add', 'thread/queue/update'].includes(method) && result?.queuedSubmission) {
@@ -219,12 +256,12 @@ export function useMessageQueue(api: any, main: any) {
       }
       return result;
     } catch (cause: any) {
-      if (cause?.uncertain) {
+      if (dispatched && cause?.uncertain) {
         const unknown = outcome || { operation: method };
         unknownOutcomes.set(saved.key, unknown);
-        while (unknownOutcomes.size > 32) unknownOutcomes.delete(unknownOutcomes.keys().next().value!);
         if (current(saved, version)) state.uncertain = unknown;
       }
+      if (!dispatched || !cause?.uncertain) await journal.remove('queue-outcome', receiptKey(saved)).catch(() => {});
       if (current(saved, version)) state.error = cause?.uncertain
         ? '连接中断，队列操作可能已生效。已保留草稿，不会自动重复提交。'
         : cause?.message || String(cause);
@@ -242,6 +279,7 @@ export function useMessageQueue(api: any, main: any) {
     try { return await mutate('thread/queue/add', { input, clientUserMessageId: clientId }, { operation: 'add', input, clientId }); }
     catch (cause: any) {
       if (cause?.uncertain && saved && scope()?.key === saved.key && confirmedClient(clientId)) {
+        await journal.remove('queue-outcome', receiptKey(saved));
         unknownOutcomes.delete(saved.key); state.uncertain = null; state.error = '';
         return {};
       }
@@ -274,10 +312,10 @@ export function useMessageQueue(api: any, main: any) {
       api.acceptQueuedTurn?.(saved.threadId, result.turn, { input: item.input, clientUserMessageId: item.clientUserMessageId });
     return result;
   }
-  function acknowledgeUncertain() {
+  async function acknowledgeUncertain() {
     if (!readable() || !verifiedRead || state.loading || state.mutating) throw new Error('请先连接并刷新队列');
     const saved = scope();
-    if (saved) unknownOutcomes.delete(saved.key);
+    if (saved) { await journal.remove('queue-outcome', receiptKey(saved)); unknownOutcomes.delete(saved.key); }
     state.uncertain = null; state.error = '';
     state.notice = '已解除保护；再次发送前请确认对话和队列中没有同一条消息';
   }
@@ -310,5 +348,5 @@ export function useMessageQueue(api: any, main: any) {
   });
   function dispose() { disposed = true; ++generation; clearTimers(); stop(); unsubscribe?.(); }
   if (getCurrentScope()) onScopeDispose(dispose);
-  return { state, canMutate, blockedReason, checkCapabilities, refresh, add, update, remove, move, start, acknowledgeUncertain, dispose };
+  return { settingsLocked: computed(() => state.restoring || state.loading || state.mutating || !!state.uncertain || state.items.length > 0), state, canMutate, blockedReason, checkCapabilities, refresh, add, update, remove, move, start, acknowledgeUncertain, dispose };
 }

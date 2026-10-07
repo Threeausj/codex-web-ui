@@ -135,6 +135,27 @@ test('a native queue-start accepted turn shares otherwise-unbroadcast input with
   } finally { value.bridge.close(); }
 });
 
+test('accepted next-turn settings sync to other browsers without broadcasting private config or rejected settings', async () => {
+  const value = fixture(); const origin = new Browser(), other = new Browser();
+  value.bridge.attach('session:origin', origin.ws(), 'origin'); value.bridge.attach('session:other', other.ws(), 'other');
+  try {
+    await value.bridge.connect();
+    const settings = { threadId: 't', cwd: '/project', model: 'new-model', effort: 'high', sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'never', config: { private: 'secret' } };
+    origin.request({ id: 'settings', method: 'thread/settings/update', params: settings }); await tick();
+    assert.equal(other.sent.some(message => message.method === 'bridge/thread/changed'), false);
+    value.receive({ id: value.sent.find(message => message.method === 'thread/settings/update')!.id, result: {} }); await tick();
+    const change = other.sent.find(message => message.method === 'bridge/thread/changed')!.params as any;
+    assert.equal(change.method, 'thread/settings/update');
+    assert.equal(change.threadId, 't');
+    assert.deepEqual(change.request, { cwd: '/project', model: 'new-model', effort: 'high', sandboxPolicy: { type: 'readOnly' }, approvalPolicy: 'never' });
+    assert.doesNotMatch(JSON.stringify(change), /secret|private/);
+    assert.equal(origin.sent.some(message => message.method === 'bridge/thread/changed'), false);
+    origin.request({ id: 'rejected', method: 'thread/settings/update', params: { threadId: 't', model: 'bad' } }); await tick();
+    value.receive({ id: value.sent.filter(message => message.method === 'thread/settings/update').at(-1)!.id, error: { code: -32000, message: 'Denied' } }); await tick();
+    assert.equal(other.sent.filter(message => message.method === 'bridge/thread/changed').length, 1);
+  } finally { value.bridge.close(); }
+});
+
 test('a second compaction rejection cannot clear running progress; a timed out request cannot leave sticky progress', async () => {
   const value = fixture()
   try {

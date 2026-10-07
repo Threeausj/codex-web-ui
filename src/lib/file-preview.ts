@@ -22,3 +22,13 @@ export function previewFilePath(reference: string, filePath: string, root: strin
 
 export function isMarkdownPath(path: string) { return /\.(?:md|markdown|mdown)$/i.test(path); }
 export function isImagePath(path: string) { return /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(path); }
+
+/** Absolute Markdown file links may carry a one-based line and column. */
+export function fileLinkLocation(reference: string): { path: string; line?: number; column?: number } | null {
+  let value: string; try { value = decodeURIComponent(reference); } catch { return null; }
+  if (!value.startsWith('/') || value.startsWith('//') || /[\x00-\x1f\x7f]/.test(value)) return null;
+  const match = /^(.*?):(\d+)(?::(\d+))?$/.exec(value);
+  if (!match) return { path: value };
+  const line = Number(match[2]), column = match[3] ? Number(match[3]) : undefined;
+  return Number.isSafeInteger(line) && line > 0 && (column === undefined || Number.isSafeInteger(column) && column > 0) ? { path: match[1]!, line, column } : null;
+}

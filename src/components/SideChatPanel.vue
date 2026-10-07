@@ -105,7 +105,7 @@ function quoteAnswer() {
   <section class="side-chat-panel workspace-panel" aria-label="侧边聊天" :aria-busy="state.loading">
     <header class="side-chat-heading">
       <div><Icon name="PanelRight" :size="16" /><strong>侧边聊天</strong></div>
-      <div class="side-chat-heading-actions"><button v-if="state.threadId" type="button" class="icon-button" aria-label="同步侧边聊天" title="同步侧边聊天" :disabled="closing || synchronizing || !state.connected || state.loading" @click="synchronize"><Icon :name="synchronizing ? 'LoaderCircle' : 'RefreshCw'" :size="15" :class="{ spin: synchronizing }" /></button><button type="button" class="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" :disabled="closing" @click="close"><Icon :name="closing ? 'LoaderCircle' : 'X'" :size="17" :class="{ spin: closing }" /></button></div>
+      <div class="side-chat-heading-actions"><button v-if="state.threadId" type="button" class="icon-button" aria-label="同步侧边聊天" title="同步侧边聊天" :disabled="closing || synchronizing || !state.connected || state.loading" @click="synchronize"><Icon :name="synchronizing ? 'LoaderCircle' : 'RefreshCw'" :size="15" :class="{ spin: synchronizing }" /></button><button type="button" class="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" :disabled="closing || state.saving" @click="close"><Icon :name="closing ? 'LoaderCircle' : 'X'" :size="17" :class="{ spin: closing }" /></button></div>
     </header>
     <p class="side-chat-note">{{ state.anchor ? `历史锚点：${state.boundary.lastTurnId ? '截至首次所选轮次' : state.boundary.beforeTurnId ? '首次所选运行轮次之前' : '首次提问时的对话历史'}。后续问题继续此分支。` : '首次提问继承所选位置的对话历史。' }}</p>
     <div v-if="state.threadId" class="side-chat-branch-actions">

@@ -719,6 +719,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
       <div v-if="quotedContexts.length" class="composer-quotes" aria-label="引用到对话的内容">
         <div v-for="(source, index) in quotedContexts" :key="conversationSelectionKey(source)" class="composer-quote">
           <Icon name="Quote" :size="14" />
+          <small v-if="source.path" class="composer-quote-source" :title="source.path">{{ source.path.split('/').pop() }}{{ source.startLine ? ':' + source.startLine + (source.endLine && source.endLine !== source.startLine ? '–' + source.endLine : '') : '' }}</small>
           <span :title="source.text">{{ source.text }}</span>
           <button class="icon-button" :disabled="submitting" :aria-label="`移除引用 ${index + 1}`" @click="removeContext(index)"><Icon name="X" :size="13" /></button>
         </div>
@@ -827,7 +828,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               v-model="state.model"
               aria-label="选择模型"
               :disabled="
-                state.busy ||
+                state.busy || queue?.settingsLocked.value ||
                 state.modeBusy ||
                 state.selectingThread ||
                 state.switchingHost ||
@@ -856,7 +857,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               v-model="state.effort"
               aria-label="推理强度"
               :disabled="
-                state.busy || state.modeBusy || state.selectingThread || state.switchingHost || contextBusy
+                state.busy || queue?.settingsLocked.value || state.modeBusy || state.selectingThread || state.switchingHost || contextBusy
               "
             >
               <option
@@ -870,7 +871,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               </option></select
             ><Icon name="ChevronDown" :size="12"
           /></label>
-          <ModelServiceOptions :api="api" :state="state" :disabled="contextDisabled || state.busy || state.modeBusy" />
+          <ModelServiceOptions :api="api" :state="state" :disabled="contextDisabled || state.busy || state.modeBusy || queue?.settingsLocked.value" />
         </div>
         <div class="composer-submit">
           <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : '立即补充到当前任务'">
@@ -907,9 +908,9 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               :size="13" /><select
               :value="selectedPermission"
               @change="choosePermission"
-              aria-label="选择权限"
+              aria-label="选择权限" :data-queue-locked="queue?.settingsLocked.value"
               :disabled="
-                state.busy || state.modeBusy || state.selectingThread || state.switchingHost || contextBusy
+                state.busy || queue?.settingsLocked.value || state.modeBusy || state.selectingThread || state.switchingHost || contextBusy
               "
             >
               <option
@@ -1018,6 +1019,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .composer-quotes { display: grid; gap: 5px; margin-bottom: 9px; max-height: 125px; overflow-y: auto; }
 .composer-quote { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 5px 7px; border-left: 2px solid var(--muted); border-radius: 5px; background: var(--soft); color: var(--muted); font-size: 12px; }
 .composer-quote > svg { flex: 0 0 auto; }
+.composer-quote-source { flex: 0 0 auto; max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .composer-quote > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-quote .icon-button { flex: 0 0 auto; width: 24px; height: 24px; }
 .composer-tokens { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-bottom: 9px; }

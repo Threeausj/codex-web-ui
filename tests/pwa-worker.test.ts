@@ -5,7 +5,8 @@ import vm from 'node:vm';
 
 const source = (await readFile(new URL('../public/sw.js', import.meta.url), 'utf8'))
   .replace('__CODEX_BUILD__', 'test-revision')
-  .replace('__CODEX_PRECACHE__', JSON.stringify(['/index.html', '/offline.html', '/assets/public.js']));
+  .replace('__CODEX_PRECACHE__', JSON.stringify(['/index.html', '/offline.html', '/assets/public.js']))
+  .replace('__CODEX_PUBLIC_ASSETS__', JSON.stringify(['/index.html', '/offline.html', '/assets/public.js', '/assets/pdf-worker.js']));
 
 function worker() {
   const listeners = new Map<string, (event: any) => void>();
@@ -150,4 +151,18 @@ test('worker serves cached public chunks and falls back to public shell only on 
   target.listeners.get('fetch')!({ request: { method: 'GET', mode: 'navigate', url: 'https://codex.example/?thread=thread-1' }, respondWith(value: Promise<Response>) { response = value; } });
   assert.equal(await (await response!).text(), 'public application shell');
   assert.equal(target.cached.size, 2, 'Navigation must not cache a personalized response or query URL');
+});
+
+test('lazy public assets are cached on first use without delaying installation or sending login cookies', async () => {
+  const target = worker(); await target.fire('install', {});
+  assert.equal(target.networkRequests.length, 3);
+  let response: Promise<Response> | undefined;
+  target.listeners.get('fetch')!({ request: new Request('https://codex.example/assets/pdf-worker.js', { credentials: 'include' }), respondWith(value: Promise<Response>) { response = value; } });
+  assert.equal(await (await response!).text(), 'network');
+  assert.equal(target.networkRequests.length, 4);
+  assert.equal(target.networkRequests.at(-1).credentials, 'omit');
+  assert.ok(target.cached.has('https://codex.example/assets/pdf-worker.js'));
+  target.setOffline(true);
+  target.listeners.get('fetch')!({ request: new Request('https://codex.example/assets/pdf-worker.js'), respondWith(value: Promise<Response>) { response = value; } });
+  assert.equal(await (await response!).text(), 'network'); assert.equal(target.networkRequests.length, 4);
 });

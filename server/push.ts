@@ -14,8 +14,8 @@ const MAX_THREAD_TITLES = 2000
 const DELIVERY_TTL = 60 * 60 * 1000
 const MAX_OUTBOX = 1024
 const MAX_ATTEMPTS = 8
-type DeliveryFailure = 'provider_unavailable' | 'rate_limited' | 'timeout' | 'rejected' | 'metadata_pending' | 'expired'
-type DeliveryHealth = { delivered: number; failed: number; expired: number; lastDeliveredAt?: number; lastFailureAt?: number; lastFailure?: DeliveryFailure }
+type DeliveryFailure = 'provider_unavailable' | 'rate_limited' | 'timeout' | 'rejected' | 'metadata_pending' | 'expired' | 'queue_full'
+type DeliveryHealth = { delivered: number; failed: number; expired: number; overflow?: number; lastDeliveredAt?: number; lastFailureAt?: number; lastFailure?: DeliveryFailure }
 const preferencesSchema = z.object({ completed: z.boolean(), approval: z.boolean(), errors: z.boolean() }).strict()
 export type PushPreferences = z.infer<typeof preferencesSchema>
 const defaultPreferences: PushPreferences = { completed: true, approval: true, errors: true }
@@ -81,8 +81,8 @@ function titleText(value: unknown) {
   return value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') || undefined
 }
 type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; ephemeral?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
-const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired'])
-const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
+const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired', 'queue_full'])
+const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), overflow: z.number().int().nonnegative().optional(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
 const noticeSchema = z.object({ title: z.string().max(100), body: z.string().max(100), tag: z.string().max(100), data: z.object({ hostId: z.string().max(256).optional(), threadId: z.string().max(256).optional(), url: z.string().max(4096), kind: z.enum(['completed', 'approval', 'errors', 'test']) }).strict() }).strict()
 const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional() }).strict()
 function emptyHealth(): DeliveryHealth { return { delivered: 0, failed: 0, expired: 0 } }
@@ -188,7 +188,7 @@ export class PushService {
         const event = record(raw)
         if (event && typeof event.key === 'string' && event.key.length <= 1200 && typeof event.expiresAt === 'number' && event.expiresAt > this.now()) this.events.set(event.key, event.expiresAt)
       }
-      if (saved.version === 3 && Array.isArray(saved.outbox)) for (const raw of saved.outbox.slice(0, this.maxOutbox)) {
+      if (saved.version === 3 && Array.isArray(saved.outbox)) for (const raw of saved.outbox.slice(0, this.maxOutbox * 5)) {
         const parsed = outboxSchema.safeParse(raw)
         if (!parsed.success) continue
         const job = parsed.data
@@ -290,13 +290,10 @@ export class PushService {
     const job = this.newDelivery(device, { title: 'Codex', body: '后台通知已开启。', tag: `codex-push-test-${randomUUID()}`, data: { url: '/', kind: 'test' } })
     this.outbox.set(job.id, job)
     this.uncommitted.add(job.id)
-    const firstAttempt = new Promise<DeliveryOutcome>(resolve => this.outcomes.set(job.id, resolve))
     try { await this.save() } catch (error) { this.outbox.delete(job.id); this.outcomes.delete(job.id); throw error }
     finally { this.uncommitted.delete(job.id) }
     this.runDeliveries()
-    const result = await firstAttempt
-    if ('error' in result) throw result.error
-    return result
+    return { ok: true as const, queued: true as const }
   }
 
   /** Own-device aggregate health only: no endpoint, keys, conversation text or credential hashes. */
@@ -306,6 +303,7 @@ export class PushService {
     const queued = [...this.outbox.values()].filter(job => grants.has(job.grantId) && job.expiresAt > this.now() && this.liveDevice(job))
     const recent = own.map(device => device.delivery).sort((a, b) => (b.lastFailureAt || 0) - (a.lastFailureAt || 0))
     return { devices: own.length, queued: queued.length, retrying: queued.filter(job => job.attempts > 0 || job.failure).length,
+      overflow: own.reduce((sum, device) => sum + (device.delivery.overflow || 0), 0), backlog: Math.max(0, queued.length - this.maxOutbox),
       delivered: own.reduce((sum, device) => sum + device.delivery.delivered, 0), failed: own.reduce((sum, device) => sum + device.delivery.failed, 0), expired: own.reduce((sum, device) => sum + device.delivery.expired, 0),
       nextRetryAt: queued.length ? Math.min(...queued.map(job => job.nextAttemptAt)) : null,
       lastDeliveredAt: Math.max(0, ...own.map(device => device.delivery.lastDeliveredAt || 0)) || null,
@@ -442,14 +440,21 @@ export class PushService {
     const auxiliary = () => { const metadata = this.threadTitles.get(JSON.stringify([host.id, threadId])); return metadata?.subagent || metadata?.ephemeral }
     this.prune()
     const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => this.newDelivery(device, notice, host))
-    // Persist all eligible devices together with dedupe. Never record an event that
-    // cannot fit; a later protocol replay may enqueue it once pressure subsides.
-    if (this.outbox.size + jobs.length > this.maxOutbox) return
-    for (const job of jobs) { this.outbox.set(job.id, job); this.uncommitted.add(job.id) }
+    // The first 1,024 jobs are the delivery queue; up to four more queue-sized
+    // batches form a durable backlog. Provider recovery drains the same journal.
+    const accepted: OutboxDelivery[] = [];
+    for (const job of jobs) {
+      if (this.outbox.size < this.maxOutbox * 5) {
+        accepted.push(job); this.outbox.set(job.id, job); this.uncommitted.add(job.id);
+      } else {
+        const device = this.liveDevice(job);
+        if (device) { device.delivery.failed++; device.delivery.overflow = (device.delivery.overflow || 0) + 1; device.delivery.lastFailure = 'queue_full'; device.delivery.lastFailureAt = this.now(); }
+      }
+    }
     this.events.set(key, this.now() + EVENT_TTL)
     while (this.events.size > MAX_EVENTS) this.events.delete(this.events.keys().next().value!)
-    try { await this.save() } catch (error) { this.events.delete(key); for (const job of jobs) this.outbox.delete(job.id); throw error }
-    finally { for (const job of jobs) this.uncommitted.delete(job.id) }
+    try { await this.save() } catch (error) { this.events.delete(key); for (const job of accepted) this.outbox.delete(job.id); throw error }
+    finally { for (const job of accepted) this.uncommitted.delete(job.id) }
     this.runDeliveries()
   }
 
@@ -476,7 +481,7 @@ export class PushService {
   private async retry(job: OutboxDelivery, device: Device, failure: DeliveryFailure, retryAfter?: number) {
     job.failure = failure
     device.delivery.lastFailureAt = this.now(); device.delivery.lastFailure = failure
-    const delay = Math.min(10 * 60 * 1000, Math.max(retryAfter || 0, (this.options.retryBaseMs || 5000) * 2 ** Math.max(0, job.attempts - 1)))
+    const delay = Math.max(retryAfter || 0, Math.min(10 * 60 * 1000, (this.options.retryBaseMs || 5000) * 2 ** Math.max(0, job.attempts - 1)))
     job.nextAttemptAt = Math.min(job.expiresAt, this.now() + delay)
     if (job.attempts >= MAX_ATTEMPTS || job.expiresAt <= this.now()) {
       this.outbox.delete(job.id); device.delivery.failed++

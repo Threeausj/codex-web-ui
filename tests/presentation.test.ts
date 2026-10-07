@@ -143,3 +143,12 @@ test("late compaction items follow canonical turn chronology instead of becoming
   ], [{ id: "one", status: "completed" }, { id: "compaction", status: "completed" }, { id: "two", status: "completed" }]);
   assert.deepEqual(blocks.map((block) => block.id), ["one", "compaction", "two"]);
 });
+
+test('large shuffled canonical histories group once and preserve optimistic standalone anchors', () => {
+  const turns = Array.from({ length: 10000 }, (_, index) => ({ id: `t${index}`, status: 'completed' }));
+  const items = turns.slice().reverse().flatMap(turn => [{ id: `${turn.id}-user`, type: 'userMessage', turnId: turn.id }, { id: `${turn.id}-answer`, type: 'agentMessage', turnId: turn.id, text: 'answer' }]);
+  items.splice(100, 0, { id: 'optimistic', type: 'userMessage', turnId: undefined } as any);
+  const blocks = conversationBlocks(items, turns);
+  assert.equal(blocks.length, 10001); assert.equal(blocks[50]!.id, 'optimistic');
+  assert.deepEqual(blocks.filter(block => block.kind === 'turn').map(block => block.id), turns.map(turn => turn.id));
+});

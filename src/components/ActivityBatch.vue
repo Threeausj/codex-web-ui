@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { historyDisclosures } from "../lib/history-disclosures";
+import { computed, ref, watch } from 'vue';
 import ChatItem from './ChatItem.vue';
 import Icon from './Icon.vue';
 import { activityBatchSummary } from '../lib/activity-presentation';
@@ -7,12 +8,15 @@ import type { DisplayItem } from '../lib/events';
 
 const props = defineProps<{ items: DisplayItem[]; hostId?: string; cwd?: string; busy?: boolean }>();
 const emit = defineEmits<{ openFile: [path: string, line?: number]; error: [message: string] }>();
-const expanded = ref(false);
+const disclosures = historyDisclosures();
+const identity = props.items[0]?.id || '';
+const expanded = ref(disclosures?.batches.has(identity) || false);
+watch(expanded, value => { if (value) disclosures?.batches.add(identity); else disclosures?.batches.delete(identity); });
 const summary = computed(() => activityBatchSummary(props.items));
 </script>
 
 <template>
-  <details class="activity-batch" :open="false" @toggle="expanded = ($event.currentTarget as HTMLDetailsElement).open" :class="{ 'activity-batch-failed': summary.failed }">
+  <details class="activity-batch" :open="expanded" @toggle="expanded = ($event.currentTarget as HTMLDetailsElement).open" :class="{ 'activity-batch-failed': summary.failed }">
     <summary>
       <Icon :name="summary.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: summary.running }" />
       <span class="activity-batch-label">{{ summary.label }}</span>
