@@ -12,7 +12,7 @@ export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
-type Pending = { originalId?: RpcId; clientKey?: string; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
@@ -141,7 +141,7 @@ export class Bridge {
     this.transport.input.write(frame)
   }
 
-  private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000) {
+  private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket) {
     const id = `web:${++this.counter}`
     const command = params as { processId?: string; tty?: boolean; cwd?: string } | undefined
     const processId = method === 'command/exec' && typeof command?.processId === 'string' ? command.processId : undefined
@@ -157,7 +157,7 @@ export class Bridge {
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
-      this.pending.set(id, { method, params, clientKey, originalId, resolve, reject, timer })
+      this.pending.set(id, { method, params, clientKey, clientSocket, originalId, resolve, reject, timer })
       try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
@@ -202,6 +202,62 @@ export class Bridge {
     }
   }
 
+  /** Mutation responses can contain items which Codex never emits as events.
+   * Share only accepted conversation data; RPC responses and configuration
+   * reads remain private to the requesting socket. */
+  private broadcastThreadChange(pending: Pending, result: unknown, changeId: string) {
+    const params = pending.params as Record<string, unknown> | undefined
+    const response = result as { thread?: { id?: unknown }; turn?: unknown; turnId?: unknown } | null
+    let threadId = params?.threadId
+    let changed: Record<string, unknown>
+    const request: Record<string, unknown> = {}
+    switch (pending.method) {
+      case 'thread/start':
+      case 'thread/fork':
+        threadId = response?.thread?.id
+        if (!response?.thread) return
+        changed = { thread: response.thread }
+        break
+      case 'thread/revert':
+      case 'thread/rollback':
+      case 'thread/unarchive':
+        if (!response?.thread) return
+        changed = { thread: response.thread }
+        if (typeof params?.beforeTurnId === 'string') request.beforeTurnId = params.beforeTurnId
+        break
+      case 'turn/start':
+        if (!response?.turn) return
+        changed = { turn: response.turn }
+        break
+      case 'turn/steer':
+        if (typeof response?.turnId !== 'string') return
+        changed = { turnId: response.turnId }
+        break
+      case 'thread/name/set':
+        if (typeof params?.name !== 'string') return
+        request.name = params.name
+        changed = {}
+        break
+      case 'thread/archive':
+      case 'turn/interrupt':
+        changed = {}
+        break
+      default: return
+    }
+    if (typeof threadId !== 'string' || !threadId) return
+    if (['turn/start', 'turn/steer'].includes(pending.method)) {
+      if (Array.isArray(params?.input)) request.input = params.input
+      if (typeof params?.clientUserMessageId === 'string') request.clientUserMessageId = params.clientUserMessageId
+    }
+    const originClientId = pending.clientKey?.slice(pending.clientKey.indexOf(':') + 1)
+    const message = { method: 'bridge/thread/changed', params: {
+      threadId, method: pending.method, result: changed, request, changeId,
+      ...(originClientId ? { originClientId } : {}),
+    } }
+    for (const [key, socket] of this.clients)
+      if (key !== pending.clientKey || socket !== pending.clientSocket) this.clientSend(key, message)
+  }
+
   private async fromClient(key: string, message: RpcMessage) {
     const recipient = this.clients.get(key)
     const reply = (response: RpcMessage) => { if (recipient && this.clients.get(key) === recipient) this.clientSend(key, response) }
@@ -226,7 +282,9 @@ export class Bridge {
         if (params?.disableTimeout === true) timeout = 2 * 60 * 60 * 1000
         else if (typeof params?.timeoutMs === 'number') timeout = Math.min(2 * 60 * 60 * 1000, Math.max(timeout, params.timeoutMs + 30000))
       }
-      const result = await this.rawRequest(message.method, message.params, key, message.id, timeout)
+      // Keep the socket which submitted the request, even if it reconnects
+      // while initialization is pending. Its replacement needs the broadcast.
+      const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient)
       reply({ id: message.id, result })
     } catch (error) {
       reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean }).uncertain ? { data: { uncertain: true } } : {}) } })
@@ -244,6 +302,7 @@ export class Bridge {
       if (pending.method === 'command/exec') this.finishProcess(String(message.id), message.result, message.error)
       if (message.error) pending.reject(new RpcFailure(message.error))
       else {
+        this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
       return

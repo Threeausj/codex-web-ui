@@ -294,6 +294,11 @@ async function newThread() {
   await nextTick();
   composer.value?.focus();
 }
+async function forceEnterThread() {
+  await api.takeoverThread(owner => window.confirm(
+    `强制进入会终止当前占用此对话的 Codex 进程（PID ${owner.pid}），该进程占用的 ${owner.affectedThreadCount} 个会话都会结束，正在运行的任务将被中断。\n\n确认终止并进入此对话？`,
+  ));
+}
 async function selectProject(project: any) {
   if (state.editingMessage) return;
   const generation = ++navigationSelection;
@@ -919,14 +924,25 @@ watch(() => [state.authenticated, state.loading], () => {
           </div>
         </div>
       </header>
-      <div v-if="state.error" class="global-error" role="alert">
-        <Icon name="AlertCircle" :size="16" /><span>{{ state.error }}</span
+      <div v-if="state.error || state.threadConflict" class="global-error" :class="{ 'thread-conflict': state.threadConflict }" role="alert">
+        <Icon name="AlertCircle" :size="16" /><span>{{ state.error || state.threadConflict?.message }}</span
+        ><button
+          v-if="state.threadConflict"
+          :disabled="state.takingOverThread || state.selectingThread || !state.online"
+          @click="api.selectThread(state.threadConflict.threadId)"
+        >重试进入</button
+        ><button
+          v-if="state.threadConflict"
+          :disabled="state.takingOverThread || state.selectingThread || !state.online"
+          @click="forceEnterThread"
+        >{{ state.takingOverThread ? '正在确认占用…' : '强制进入' }}</button
         ><button
           v-if="!state.connected"
           @click="action(() => api.initialize())"
         >
           重新连接</button
         ><button
+          v-if="!state.threadConflict"
           class="icon-button"
           @click="state.error = ''"
           aria-label="关闭错误"
@@ -1249,3 +1265,9 @@ watch(() => [state.authenticated, state.loading], () => {
     >
   </div>
 </template>
+
+<style scoped>
+.global-error.thread-conflict { flex-wrap: wrap; }
+.global-error.thread-conflict > span { flex: 1 1 240px; }
+.global-error.thread-conflict > button { white-space: nowrap; }
+</style>

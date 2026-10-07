@@ -4,6 +4,7 @@ import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMent
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import { subagentStatus } from "./subagents";
 import { editableMessage, editedMessageInput } from "./message-edit";
+import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
 import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
@@ -56,6 +57,8 @@ const state = reactive({
   authRequired: true,
   loading: true,
   error: "",
+  threadConflict: null as { hostId: string; threadId: string; generation: number; message: string } | null,
+  takingOverThread: false,
   connected: false,
   connectionMode: "spawn",
   hosts: [] as any[],
@@ -177,6 +180,10 @@ const compactedSinceInput = new Set<string>();
 const permissionSelections = new Map<string, { mode: string; profileId: string }>();
 const localReverts = new Set<string>();
 const discardedTurns = new Set<string>();
+const completedTurns = new Set<string>();
+const seenThreadChanges = new Set<string>();
+const revertedTurnCandidates = new Map<string, { ids: Set<string>; awaitingAcknowledgement: boolean }>();
+let takeoverOperation = 0;
 let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
 const terminalListeners = new Set<(chunk: string) => void>();
 const terminalDecoders = new Map<string, TextDecoder>();
@@ -730,11 +737,7 @@ function updateTurn(threadId: string, turn: any) {
   if (state.activeThread?.id !== threadId || !turn?.id) return;
   const index = state.turns.findIndex((item) => item.id === turn.id);
   const previous = index >= 0 ? state.turns[index] : null;
-  const next = {
-    ...previous,
-    ...turn,
-    items: turn.items?.length ? turn.items : (previous?.items ?? []),
-  };
+  const next = mergeTurnSnapshot(previous, turn);
   if (index >= 0) state.turns[index] = next;
   else state.turns.push(next);
 }
@@ -748,6 +751,57 @@ function noteContentActivity(threadId: string, turn: any) {
       recencyAt: Math.max(threadActivityAt(thread), timestamp),
     });
 }
+function hydrateTurnItems(threadId: string, turn: any, accepted?: any, preserveLive = true) {
+  if (!turn?.id || discardedTurns.has(turn.id)) return;
+  for (const itemId of mergeAcceptedTurnItems(currentItems(threadId), turn, accepted, preserveLive))
+    noteItem(threadId, itemId);
+}
+function receiveThreadChange(change: any) {
+  const { threadId, method, result = {}, request = {}, changeId } = change;
+  if (!threadId || typeof method !== 'string') return;
+  if (typeof changeId === 'string') {
+    if (seenThreadChanges.has(changeId)) return;
+    seenThreadChanges.add(changeId);
+    if (seenThreadChanges.size > 512) seenThreadChanges.delete(seenThreadChanges.values().next().value!);
+  }
+  if (method === 'thread/start' || method === 'thread/fork' || method === 'thread/unarchive') {
+    updateThread(result.thread);
+    return;
+  }
+  if (method === 'thread/archive') { cleanupArchivedThread(threadId); return; }
+  if (method === 'thread/name/set') {
+    const thread = state.threads.find(thread => thread.id === threadId) || (state.activeThread?.id === threadId ? state.activeThread : null);
+    if (thread && typeof request.name === 'string') updateThread({ ...thread, name: request.name });
+    return;
+  }
+  if (method === 'thread/revert' || method === 'thread/rollback') {
+    if (pendingMessageEdit && pendingMessageEdit.threadId === threadId) pendingMessageEdit.blocked = true;
+    rememberRevertedHistory(threadId, false);
+    const before = state.activeThread?.id === threadId
+      ? state.turns.findIndex(turn => turn.id === request.beforeTurnId) : -1;
+    const removed = state.activeThread?.id === threadId
+      ? (before >= 0 ? state.turns.slice(before) : []).map(turn => turn.id) : [];
+    resetEditedHistory(threadId, removed);
+    updateThread(result.thread);
+    if (state.activeThread?.id === threadId) void selectThread(threadId);
+    return;
+  }
+  if (method === 'turn/start') {
+    const turn = result.turn;
+    if (!turn?.id || discardedTurns.has(turn.id)) return;
+    hydrateTurnItems(threadId, turn, { ...request, placement: 'start' });
+    updateTurn(threadId, turn);
+    noteContentActivity(threadId, turn);
+    if (!completedTurns.has(turn.id) && (!turn.status || turn.status === 'inProgress')) {
+      if (!activeTurns.has(threadId) || activeTurns.get(threadId) === turn.id)
+        noteRuntime(threadId, true, turn.id);
+    }
+    return;
+  }
+  if (method === 'turn/steer' && typeof result.turnId === 'string') {
+    hydrateTurnItems(threadId, { id: result.turnId }, request);
+  }
+}
 function receive(message: any) {
   if (message.id !== undefined && !message.method) {
     const entry = pending.get(message.id);
@@ -758,6 +812,7 @@ function receive(message: any) {
       const error = Object.assign(new Error(message.error.message), {
         uncertain: !!message.error.data?.uncertain,
         code: message.error.code,
+        data: message.error.data,
       });
       entry.reject(entry.silentError ? error : fail(error));
     } else entry.resolve(message.result);
@@ -769,13 +824,15 @@ function receive(message: any) {
     return;
   }
   const { method, params: p = {} } = message;
+  if (method === 'bridge/thread/changed') { receiveThreadChange(p); return; }
   if (method === "bridge/status") {
     const reconnecting = !state.connected && p.connected;
+    if (reconnecting) seenThreadChanges.clear();
     state.connected = p.connected;
     state.connectionMode = p.mode ?? state.connectionMode;
     if (p.error) state.error = p.error;
     if (p.connected) {
-      state.error = "";
+      state.error = state.threadConflict?.message || "";
       if (p.pendingRequests) state.pendingRequests = p.pendingRequests;
     }
     if (p.connected && Array.isArray(p.activeProcesses)) {
@@ -832,6 +889,7 @@ function receive(message: any) {
     const key = recencyKey(state.hostId, p.threadId);
     if (localReverts.delete(key)) return;
     if (pendingMessageEdit && pendingMessageEdit.threadId === p.threadId) pendingMessageEdit.blocked = true;
+    rememberRevertedHistory(p.threadId, true);
     resetEditedHistory(p.threadId);
     if (state.activeThread?.id === p.threadId) void selectThread(p.threadId);
     return;
@@ -886,6 +944,8 @@ function receive(message: any) {
     }
   }
   if (method === "turn/started") {
+    hydrateTurnItems(p.threadId, p.turn);
+    if (completedTurns.has(p.turn.id)) return;
     state.agentActivity[p.threadId] = { status: 'running', startedAt: Date.now(), updatedAt: Date.now() };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
@@ -897,6 +957,8 @@ function receive(message: any) {
     }
   }
   if (method === "turn/completed") {
+    completedTurns.add(p.turn.id);
+    hydrateTurnItems(p.threadId, p.turn, undefined, false);
     state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], status: p.turn.status === 'failed' ? 'errored' : p.turn.status, updatedAt: Date.now() };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
@@ -947,6 +1009,7 @@ function connect(): Promise<void> {
   if (connecting) return connecting;
   clearTimeout(reconnectTimer);
   const host = state.hostId;
+  seenThreadChanges.clear();
   const attempt = new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/rpc?host=${encodeURIComponent(host)}&clientId=${clientId}`,
@@ -1127,11 +1190,18 @@ async function initialize() {
 }
 async function login(password: string) {
   authenticationGeneration++;
+  state.selectingThread = false;
+  state.threadConflict = null;
+  state.takingOverThread = false;
+  ++takeoverOperation;
   closeConnection();
   resetModeContext(true);
   permissionSelections.clear();
   localReverts.clear();
   discardedTurns.clear();
+  completedTurns.clear();
+  seenThreadChanges.clear();
+  revertedTurnCandidates.clear();
   pendingMessageEdit = null;
   state.loading = true;
   state.error = "";
@@ -1157,11 +1227,18 @@ async function logout() {
   authenticationGeneration++;
   csrfToken = "";
   state.authenticated = false;
+  state.selectingThread = false;
+  state.threadConflict = null;
+  state.takingOverThread = false;
+  ++takeoverOperation;
   closeConnection();
   resetModeContext(true);
   permissionSelections.clear();
   localReverts.clear();
   discardedTurns.clear();
+  completedTurns.clear();
+  seenThreadChanges.clear();
+  revertedTurnCandidates.clear();
   pendingMessageEdit = null;
   clearAttachments();
   state.items = [];
@@ -1348,6 +1425,13 @@ function rememberThread(id: string) {
 async function selectThread(id: string) {
   const generation = ++selectionGeneration;
   const hostId = state.hostId;
+  const authentication = authenticationGeneration;
+  const current = () => generation === selectionGeneration && hostId === state.hostId
+    && authentication === authenticationGeneration;
+  if (state.threadConflict) state.error = '';
+  state.threadConflict = null;
+  state.takingOverThread = false;
+  ++takeoverOperation;
   const previousId = state.activeThread?.id;
   if (previousId !== id) {
     pendingMessageEdit = null;
@@ -1383,9 +1467,10 @@ async function selectThread(id: string) {
       threadId: id,
       excludeTurns: true,
       config: { 'features.default_mode_request_user_input': true },
-    });
-    if (generation !== selectionGeneration || hostId !== state.hostId) return;
+    }, 45000, { silentError: true });
+    if (!current()) return;
     let page = await history(id, null, hostId);
+    if (!current()) return;
     const requestedDepth = Math.min(
       10,
       Math.max(
@@ -1397,13 +1482,23 @@ async function selectThread(id: string) {
     );
     for (let depth = 1; depth < requestedDepth && page.nextCursor; depth++) {
       const olderPage = await history(id, page.nextCursor, hostId);
+      if (!current()) return;
       page = {
         data: [...page.data, ...olderPage.data],
         nextCursor: olderPage.nextCursor,
       };
-      if (generation !== selectionGeneration) return;
+      if (!current()) return;
     }
-    if (generation !== selectionGeneration) return;
+    if (!current()) return;
+    // Native revert notifications precede their acknowledgement on some Codex
+    // versions. The acknowledgement's thread.turns is always empty; confirm the
+    // retained prefix from a fresh history read, keeping removed IDs blocked.
+    const candidates = revertedTurnCandidates.get(id);
+    if (candidates) {
+      const retained = new Set(page.data.map((turn: any) => turn.id));
+      for (const turnId of candidates.ids) if (retained.has(turnId)) discardedTurns.delete(turnId);
+      if (!candidates.awaitingAcknowledgement) revertedTurnCandidates.delete(id);
+    }
     const runtimeChanged = (turnRevisions.get(id) ?? 0) !== runtimeRevision;
     const latestStatus = state.activeThread?.status;
     const previousProject = state.projectPath;
@@ -1483,12 +1578,55 @@ async function selectThread(id: string) {
     }
     await refreshGoal(hostId, id);
   } catch (error) {
-    if (generation === selectionGeneration) {
-      newThread();
-      fail(error);
+    if (current()) {
+      if (writerConflict(error)) {
+        const message = '此对话正被其他 Codex 客户端占用。可以重试，或确认后强制进入。';
+        state.threadConflict = { hostId, threadId: id, generation, message };
+        state.error = message;
+        state.busy = false;
+        rememberThread(id);
+      } else {
+        newThread();
+        fail(error);
+      }
     }
   } finally {
-    if (generation === selectionGeneration) state.selectingThread = false;
+    if (current()) state.selectingThread = false;
+  }
+}
+async function takeoverThread(confirmOwner: (owner: { pid: number; affectedThreadCount: number }) => boolean | Promise<boolean>) {
+  const target = state.threadConflict;
+  if (!target || state.takingOverThread || !state.online) return;
+  const authentication = authenticationGeneration;
+  const operation = ++takeoverOperation;
+  const current = () => authentication === authenticationGeneration &&
+    target.hostId === state.hostId && target.threadId === state.activeThread?.id &&
+    target.generation === selectionGeneration && state.threadConflict?.generation === target.generation;
+  state.takingOverThread = true;
+  const endpoint = `/threads/${encodeURIComponent(target.hostId)}/${encodeURIComponent(target.threadId)}/takeover`;
+  try {
+    const inspection = await http(endpoint + '/inspect', { method: 'POST', body: '{}' }, false);
+    if (!current()) return;
+    if (inspection.locked) {
+      const owner = inspection.owner;
+      if (!owner || !Number.isInteger(owner.pid) || !Number.isInteger(owner.affectedThreadCount)
+          || owner.affectedThreadCount < 1 || typeof inspection.challenge !== 'string')
+        throw new Error('无法确认占用进程及受影响会话，请重试。');
+      if (!await confirmOwner(owner) || !current()) return;
+      const result = await http(endpoint, {
+        method: 'POST', body: JSON.stringify({ confirmed: true, challenge: inspection.challenge }),
+      }, false);
+      if (!current()) return;
+      if (result.ok !== true || result.released !== true)
+        throw new Error('未确认占用已释放，请检查后重试。');
+    } else if (inspection.locked !== false) {
+      throw new Error('未确认占用状态，请重试。');
+    }
+    if (current()) await selectThread(target.threadId);
+  } catch (error) {
+    if (current()) fail(error);
+  } finally {
+    if (operation === takeoverOperation) state.takingOverThread = false;
   }
 }
 async function loadOlderTurns() {
@@ -1522,6 +1660,9 @@ async function loadOlderTurns() {
   );
 }
 function newThread(remember = true) {
+  state.threadConflict = null;
+  state.takingOverThread = false;
+  ++takeoverOperation;
   if (remember) rememberThread("");
   state.selectingThread = false;
   state.runtimePolicy = null;
@@ -1628,6 +1769,7 @@ function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
 async function send(text: string, editedInput?: any[]) {
+  if (state.threadConflict) throw fail(new Error('此对话仍被其他 Codex 客户端占用，请先重试或强制进入。'));
   if (!text.trim() && !state.attachments.length && !editedInput?.length && !state.selectedSkills.length) return;
   if (state.editingMessage && !editedInput) throw fail(new Error("正在重新发送编辑后的消息，请稍候"));
   if (state.selectingThread || state.switchingHost || state.changingContext)
@@ -1843,7 +1985,7 @@ async function send(text: string, editedInput?: any[]) {
   }
 }
 function canEditMessage(itemId: string) {
-  const blocked = !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
+  const blocked = !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
   if (blocked) return false;
   if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
     if (pendingMessageEdit.blocked) return false;
@@ -1871,6 +2013,21 @@ function resetEditedHistory(threadId: string, removed: string[] = []) {
     state.moreTurns = false;
     turnCursor = null;
   }
+}
+function rememberRevertedHistory(threadId: string, native: boolean) {
+  const previous = revertedTurnCandidates.get(threadId);
+  if (previous && !native) {
+    previous.awaitingAcknowledgement = false;
+    return;
+  }
+  const candidates = previous?.ids || new Set<string>();
+  if (state.activeThread?.id === threadId)
+    for (const turn of state.turns) if (turn.id) candidates.add(turn.id);
+  for (const item of currentItems(threadId)) if (item.turnId) candidates.add(item.turnId);
+  revertedTurnCandidates.set(threadId, { ids: candidates, awaitingAcknowledgement: native });
+  // Block old events while the retained prefix is being read. This also works
+  // for inactive conversations, whose old turns exist only in the item cache.
+  for (const turnId of candidates) discardedTurns.add(turnId);
 }
 async function resendEditedMessage(itemId: string, text: string) {
   if (!canEditMessage(itemId)) throw fail(new Error("当前消息不能编辑，请等待任务结束并确认会话状态"));
@@ -2231,6 +2388,9 @@ async function setHost(id: string) {
   closeConnection();
   itemCache.clear();
   discardedTurns.clear();
+  completedTurns.clear();
+  seenThreadChanges.clear();
+  revertedTurnCandidates.clear();
   localReverts.clear();
   pendingMessageEdit = null;
   activeTurns.clear();
@@ -3217,6 +3377,7 @@ export function useCodex() {
     loadMoreThreads,
     loadProjectThreads,
     selectThread,
+    takeoverThread,
     loadOlderTurns,
     newThread,
     send,

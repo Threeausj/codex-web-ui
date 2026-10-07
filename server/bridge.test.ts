@@ -181,6 +181,131 @@ test('bridge initializes once and routes same browser IDs to their own tab', asy
   } finally { f.bridge.close() }
 })
 
+test('accepted conversation responses sync across browser sessions while response IDs stay private', async () => {
+  const f = fixture()
+  try {
+    const desktop = new Browser(); const phone = new Browser()
+    f.bridge.attach('desktop-session:desktop', desktop.ws(), 'desktop')
+    f.bridge.attach('phone-session:phone', phone.ws(), 'phone')
+    await tick()
+    const input = [{ type: 'text', text: '另一个页面发送的消息', text_elements: [] }]
+    desktop.request({ id: 1, method: 'turn/start', params: {
+      threadId: 'shared-thread', input, clientUserMessageId: 'client-message',
+      config: { private_setting: 'must-not-broadcast' },
+    } })
+    await tick()
+    const accepted = f.sent.find(message => message.method === 'turn/start')!
+    const turn = { id: 'shared-turn', status: 'inProgress', items: [
+      { id: 'canonical-message', type: 'userMessage', clientId: 'client-message', content: input },
+    ] }
+    f.receive({ id: accepted.id, result: { turn } })
+    await tick()
+    assert.deepEqual(desktop.sent.filter(message => message.id === 1), [{ id: 1, result: { turn } }])
+    assert.equal(phone.sent.some(message => message.id === 1), false)
+    assert.equal(desktop.sent.some(message => message.method === 'bridge/thread/changed'), false)
+    assert.deepEqual(phone.sent.filter(message => message.method === 'bridge/thread/changed'), [{
+      method: 'bridge/thread/changed', params: {
+        threadId: 'shared-thread', method: 'turn/start', result: { turn },
+        request: { input, clientUserMessageId: 'client-message' },
+        changeId: accepted.id, originClientId: 'desktop',
+      },
+    }])
+    assert.doesNotMatch(JSON.stringify(phone.sent), /desktop-session|private_setting|must-not-broadcast/)
+    f.receive({ method: 'item/agentMessage/delta', params: { threadId: 'shared-thread', itemId: 'answer', turnId: turn.id, delta: '实时输出' } })
+    assert.ok(desktop.sent.some(message => message.method === 'item/agentMessage/delta'))
+    assert.ok(phone.sent.some(message => message.method === 'item/agentMessage/delta'))
+  } finally { f.bridge.close() }
+})
+
+test('steering, rename and revert sync only after success, and private reads never broadcast', async () => {
+  const f = fixture()
+  try {
+    const a = new Browser(); const b = new Browser()
+    f.bridge.attach('session:a', a.ws(), 'a')
+    f.bridge.attach('session:b', b.ws(), 'b')
+    await tick()
+    const input = [{ type: 'text', text: '追加消息' }]
+    const mutations = [
+      { method: 'turn/steer', params: { threadId: 'same', input, clientUserMessageId: 'steered' }, result: { turnId: 'running' } },
+      { method: 'thread/name/set', params: { threadId: 'same', name: '同步标题' }, result: {} },
+      { method: 'thread/revert', params: { threadId: 'same', beforeTurnId: 'running' }, result: { thread: { id: 'same', turns: [] } } },
+    ]
+    for (const [index, mutation] of mutations.entries()) {
+      a.request({ id: index, method: mutation.method, params: mutation.params })
+      await tick()
+      const request = f.sent.findLast(message => message.method === mutation.method)!
+      const before = b.sent.filter(message => message.method === 'bridge/thread/changed').length
+      assert.equal(before, index)
+      f.receive({ id: request.id, result: mutation.result })
+      await tick()
+      const change = b.sent.filter(message => message.method === 'bridge/thread/changed').at(-1)!
+      assert.equal((change.params as any).method, mutation.method)
+      assert.equal((change.params as any).threadId, 'same')
+    }
+    const before = b.sent.length
+    a.request({ id: 'failure', method: 'turn/start', params: { threadId: 'same', input } })
+    a.request({ id: 'private', method: 'config/read', params: {} })
+    await tick()
+    const failed = f.sent.findLast(message => message.method === 'turn/start')!
+    const read = f.sent.findLast(message => message.method === 'config/read')!
+    f.receive({ id: failed.id, error: { code: -32600, message: 'another writer rejected input' } })
+    f.receive({ id: read.id, result: { config: { secret: 'not-conversation-data' } } })
+    await tick()
+    assert.equal(b.sent.length, before)
+    assert.ok(a.sent.some(message => message.id === 'failure' && message.error))
+    assert.ok(a.sent.some(message => message.id === 'private' && message.result))
+  } finally { f.bridge.close() }
+})
+
+test('accepted input reaches other web clients when its initiating socket disconnects', async () => {
+  const f = fixture()
+  try {
+    const writer = new Browser(); const observer = new Browser()
+    f.bridge.attach('session:writer', writer.ws(), 'writer')
+    f.bridge.attach('session:observer', observer.ws(), 'observer')
+    await tick()
+    writer.request({ id: 7, method: 'turn/steer', params: {
+      threadId: 'shared', input: [{ type: 'text', text: '已接受的补充' }], clientUserMessageId: 'client-id',
+    } })
+    await tick()
+    writer.close()
+    const recovered = new Browser()
+    f.bridge.attach('session:writer', recovered.ws(), 'writer')
+    const request = f.sent.find(message => message.method === 'turn/steer')!
+    f.receive({ id: request.id, result: { turnId: 'turn' } })
+    await tick()
+    assert.equal(observer.sent.filter(message => message.method === 'bridge/thread/changed').length, 1)
+    assert.equal(recovered.sent.filter(message => message.method === 'bridge/thread/changed').length, 1)
+    assert.equal(recovered.sent.some(message => message.id === 7), false)
+    assert.equal(observer.sent.some(message => message.id === 7), false)
+  } finally { f.bridge.close() }
+})
+
+test('accepted input reaches a replacement socket when the sender reconnects during engine initialization', async () => {
+  const f = fixture()
+  try {
+    const writer = new Browser()
+    f.bridge.attach('session:writer', writer.ws(), 'writer')
+    writer.request({ id: 7, method: 'turn/steer', params: {
+      threadId: 'thread-shared', expectedTurnId: 'turn-shared',
+      input: [{ type: 'text', text: 'Accepted during initialization' }], clientUserMessageId: 'input-shared',
+    } })
+    assert.equal(f.sent.some(message => message.method === 'turn/steer'), false)
+    writer.close()
+    const recovered = new Browser()
+    f.bridge.attach('session:writer', recovered.ws(), 'writer')
+    await tick()
+    const accepted = f.sent.find(message => message.method === 'turn/steer')!
+    assert.ok(accepted)
+    f.receive({ id: accepted.id, result: { turnId: 'turn-shared' } })
+    await tick()
+    const changes = recovered.sent.filter(message => message.method === 'bridge/thread/changed')
+    assert.equal(changes.length, 1)
+    assert.equal((changes[0].params as any).request.clientUserMessageId, 'input-shared')
+    assert.equal(recovered.sent.some(message => message.id === 7), false)
+  } finally { f.bridge.close() }
+})
+
 test('a configured client name initializes local and SSH engines without rewriting new or resumed thread requests', async t => {
   const hosts: Host[] = [
     { id: 'local', kind: 'local', name: 'Local' },
