@@ -202,6 +202,11 @@ test("a connected remote cannot send with the previous host's permissions before
   await page.getByRole('combobox', { name: '选择权限', exact: true }).selectOption('danger-full-access');
   await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
   await expect.poll(() => remote.request('config/read')?.method).toBe('config/read');
+  await expect(page.getByRole('heading', { name: '远程项目历史', exact: true })).toBeVisible();
+  await expect(page.locator('.welcome')).toHaveCount(0);
+  await expect(page.locator('.empty-conversation')).toHaveCount(0);
+  await expect(page.locator('.agent-message')).toContainText('远程会话内容');
+  expect(remote.request('thread/resume')).toBeUndefined();
   const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
   await expect(input).toBeEnabled();
   await input.fill('等远程配置完成后发送');
@@ -213,4 +218,88 @@ test("a connected remote cannot send with the previous host's permissions before
   await input.fill('远程权限已经加载');
   await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
   await expect(page.getByRole('combobox', { name: '选择权限', exact: true })).not.toHaveValue('danger-full-access');
+});
+
+test('remote cached history paints before the replacement transport connects, without showing welcome or another host history', async ({ page, mock }) => {
+  remoteFixture(mock);
+  await login(page);
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect(page.locator('.agent-message')).toContainText('远程会话内容');
+  await recent(page).locator('[data-host-id="local"] .thread-row').click();
+  await expect(page.locator('.agent-message')).toContainText('历史保持可读');
+  await page.routeWebSocket(/\/api\/rpc\?host=ssh-test(?:&|$)/, socket => {
+    socket.onMessage(() => {});
+  });
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect(page.getByRole('heading', { name: '远程项目历史', exact: true })).toBeVisible();
+  await expect(page.locator('.welcome')).toHaveCount(0);
+  await expect(page.locator('.agent-message')).toContainText('远程会话内容');
+  await expect(page.locator('.agent-message')).not.toContainText('历史保持可读');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled();
+});
+
+test('slow account, quota and model metadata do not delay a remote writer or sending', async ({ page, mock }) => {
+  const remote = remoteFixture(mock);
+  const receive = (remote as any).receive.bind(remote);
+  (remote as any).receive = (socket: any, request: any) => {
+    if (['account/read', 'account/rateLimits/read', 'model/list', 'permissionProfile/list', 'skills/list'].includes(request.method))
+      remote.requests.push(request);
+    else receive(socket, request);
+  };
+  await login(page);
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect(page.locator('.agent-message')).toContainText('远程会话内容');
+  await expect(page.locator('.welcome')).toHaveCount(0);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('辅助查询仍在等待，正常发送');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
+  expect(remote.request('thread/resume')?.params.threadId).toBe('thread-existing');
+  expect(remote.request('account/read')).toBeDefined();
+});
+
+test('a failed remote permission check keeps the selected conversation readable and never grants a writer', async ({ page, mock }) => {
+  const remote = remoteFixture(mock);
+  const receive = (remote as any).receive.bind(remote);
+  (remote as any).receive = (socket: any, request: any) => {
+    if (request.method === 'configRequirements/read') {
+      remote.requests.push(request);
+      socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: 'Managed permissions unavailable' } }));
+    } else receive(socket, request);
+  };
+  await login(page);
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect(page.getByRole('heading', { name: '远程项目历史', exact: true })).toBeVisible();
+  await expect(page.locator('.welcome')).toHaveCount(0);
+  await expect(page.locator('.global-error')).toContainText('Managed permissions unavailable');
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('检查失败时保留草稿');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled();
+  expect(remote.request('thread/resume')).toBeUndefined();
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect.poll(() => remote.requests.filter(request => request.method === 'configRequirements/read').length).toBe(2);
+  expect(remote.request('thread/resume')).toBeUndefined();
+});
+
+test('a cold thread with slow native history shows its own loading view immediately', async ({ page, mock }) => {
+  const remote = remoteFixture(mock);
+  const receive = (remote as any).receive.bind(remote);
+  const held: { socket: any; request: any }[] = [];
+  let holding = true;
+  await login(page);
+  await expect(recent(page).locator('[data-host-id="ssh-test"] .thread-row')).toBeVisible();
+  (remote as any).receive = (socket: any, request: any) => {
+    if (holding && ['thread/resume', 'thread/turns/list'].includes(request.method)) {
+      remote.requests.push(request);
+      held.push({ socket, request });
+    } else receive(socket, request);
+  };
+  await recent(page).locator('[data-host-id="local"] .thread-row').click();
+  await expect(page.locator('.agent-message')).toContainText('历史保持可读');
+  await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
+  await expect(page.getByRole('heading', { name: '远程项目历史', exact: true })).toBeVisible();
+  await expect(page.locator('.conversation-loading')).toHaveText('正在加载会话…');
+  await expect(page.locator('.welcome')).toHaveCount(0);
+  await expect(page.locator('.agent-message')).toHaveCount(0);
+  holding = false;
+  for (const entry of held) receive(entry.socket, entry.request);
+  await expect(page.locator('.agent-message')).toContainText('远程会话内容');
+  await expect(page.locator('.conversation-loading')).toHaveCount(0);
 });

@@ -76,7 +76,8 @@ test('a fresh installed-app window restores private cached history and draft bef
   await expect(reopened.locator('.welcome-content')).toHaveCount(0);
   await expect(reopened.getByRole('textbox', { name: '消息输入框' })).toHaveValue('关闭应用后继续的草稿');
   await expect(reopened.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled();
-  await expect.poll(() => delayed.held.filter(entry => entry.request.method === 'thread/resume').length).toBe(1);
+  // Cached content is visible, but a writer must wait for managed permissions.
+  expect(delayed.held.filter(entry => entry.request.method === 'thread/resume')).toHaveLength(0);
   delayed.release();
   await expect(reopened.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
   expect(mock.request('turn/start')).toBeUndefined();
