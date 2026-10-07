@@ -183,3 +183,5 @@ npm run doctor:preview
 本阶段工作流及环境验收边界见 [工作流完整度](docs/roadmap.md)。插件市场不在当前范围内。
 
 可启用的 [GitHub Actions 示例](deploy/github-actions/README.md) 覆盖应用与容器集成验证；复制到 `.github/workflows/ci.yml` 即可启用。通过 gh 上传工作流需要 GitHub 登录具有 `workflow` 权限，普通源码上传不需要该附加权限。
+
+登录持久化、通知补投、历史增量缓存及桌面工作流的使用与边界见 [可靠性与工作流](docs/reliability-and-workflows.md)。

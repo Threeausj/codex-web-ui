@@ -65,7 +65,7 @@ onBeforeUnmount(() => window.clearInterval(ticker))
       <div class="subagent-dialogue" aria-label="子智能体对话内容">
         <button v-if="detailCursor" class="button button-small button-secondary subagents-more" :disabled="detailLoading || !connected" @click="read(selectedId, true)">加载更早的消息</button>
         <div v-for="turn in detailTurns" :key="turn.id" class="subagent-turn" :data-agent-turn-id="turn.id">
-          <ChatItem v-for="item in turn.items || []" :key="item.id" :item="{ ...item, turnId: turn.id }" :host-id="state.hostId" @error="localDetailError = $event" />
+          <ChatItem v-for="item in turn.items || []" :key="item.id" :item="{ ...item, turnId: turn.id }" :host-id="state.hostId" :cwd="detailThread?.cwd || state.projectPath" @error="localDetailError = $event" />
         </div>
         <p v-if="detailLoading && !detailTurns.length" class="subagents-note" role="status">正在读取对话…</p>
         <div v-else-if="!detailTurns.length && !detailError" class="panel-empty"><Icon name="Bot" :size="30" /><p>暂无可读取的对话</p><span>临时子智能体的活动会显示在列表中。</span></div>

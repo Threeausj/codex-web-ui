@@ -4,6 +4,39 @@ import { nextTick, reactive } from 'vue';
 import { useSideChat } from '../src/lib/side-chat';
 
 const selected = { hostId: 'local', threadId: 'parent', turnId: 'parent-turn', itemId: 'parent-answer', text: 'NAS Git 读取不再依赖 bwrap；$dangerous', threadName: '部署项目' };
+
+test('sidebar retains its first history anchor, can explicitly restart, and saves visible answers in a separate persistent branch', async () => {
+  const value = fixture();
+  try {
+    const original = JSON.stringify(value.main);
+    value.controller.prepare(selected);
+    await value.controller.send('解释');
+    value.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', text: '可见回答' }] } });
+    value.controller.prepare({ ...selected, turnId: 'new-selected-turn', text: '另一个选段' });
+    assert.equal(value.controller.state.anchor?.turnId, 'parent-turn');
+    assert.match(value.controller.state.notice, /沿用首次/);
+    value.overrides.set('thread/fork', input => ({ thread: { id: input.ephemeral ? 'another-side' : 'saved-sidebar', ephemeral: input.ephemeral, forkedFromId: 'parent' } }));
+    const saved = await value.controller.saveBranch('保存的问答');
+    assert.equal(saved, 'saved-sidebar');
+    const fork = value.calls.filter(call => call.method === 'thread/fork').at(-1)!.params;
+    assert.equal(fork.threadId, 'parent');
+    assert.equal(fork.lastTurnId, 'parent-turn');
+    assert.equal(fork.ephemeral, false);
+    assert.equal(fork.deferGoalContinuation, true);
+    const injected = value.calls.find(call => call.method === 'thread/inject_items')!;
+    assert.equal(injected.params.threadId, 'saved-sidebar');
+    assert.match(injected.params.items[0].content[0].text, /可见回答/);
+    assert.equal(value.calls.filter(call => call.method === 'turn/start').length, 1, 'Saving must never start an inference or steer the parent');
+    assert.equal(JSON.stringify(value.main), original);
+    assert.equal(value.controller.answerQuote()?.text, '可见回答');
+    assert.equal(value.controller.answerQuote()?.threadId, 'parent');
+    assert.equal(await value.controller.saveBranch(), 'saved-sidebar', 'Repeated save reuses the accepted result');
+    await value.controller.newBranch();
+    assert.equal(value.controller.state.threadId, '');
+    assert.equal(value.controller.state.source?.turnId, 'new-selected-turn');
+    assert.equal(value.controller.state.items.length, 0);
+  } finally { value.controller.dispose(); }
+});
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(value => { resolve = value; });
@@ -252,5 +285,156 @@ test('another client ephemeral fork remains outside this sidebar event ownership
     held.resolve({ thread: { id: 'side', ephemeral: true, forkedFromId: 'parent' } });
     await sending;
     assert.equal(value.controller.state.items.some(item => item.id === 'other-answer'), false);
+  } finally { value.controller.dispose(); }
+});
+
+function savedSidebarFixture() {
+  const value = fixture();
+  let turnCount = 0;
+  value.overrides.set('thread/fork', input => ({ thread: { id: input.ephemeral ? 'side' : 'saved-sidebar',
+    ephemeral: input.ephemeral, forkedFromId: 'parent', path: input.ephemeral ? null : '/test/saved.jsonl' } }));
+  value.overrides.set('turn/start', input => ({ turn: { id: `side-${++turnCount}`, status: 'completed', items: [
+    { id: `user-${turnCount}`, clientId: input.clientUserMessageId, type: 'userMessage', content: input.input },
+    { id: `answer-${turnCount}`, type: 'agentMessage', text: `回答${turnCount}` },
+  ] } }));
+  return value;
+}
+
+test('a failed native injection retains its target branch, stays incomplete and retries without creating a second fork', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.controller.prepare(selected); await value.controller.send('首次问题');
+    let reject = true;
+    value.overrides.set('thread/inject_items', () => { if (reject) { reject = false; throw Object.assign(new Error('Method not found'), { code: -32601 }); } return {}; });
+    await assert.rejects(value.controller.saveBranch(), /Method not found/);
+    assert.equal(value.controller.state.saveTargetThreadId, 'saved-sidebar');
+    assert.equal(value.controller.state.savedThreadId, '', 'A partially created branch is not a completed save');
+    assert.match(value.controller.state.error, /保存尚未完成/);
+    assert.equal(await value.controller.saveBranch(), 'saved-sidebar');
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 2);
+    assert.equal(value.controller.state.savedThreadId, 'saved-sidebar');
+  } finally { value.controller.dispose(); }
+});
+
+test('subsequent sidebar questions append only unsaved visible context to the same formal branch and invalidate the completed marker', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.controller.prepare(selected); await value.controller.send('第一问'); await value.controller.saveBranch();
+    const initial = value.calls.find(call => call.method === 'thread/inject_items')!.params.items[0].content[0].text;
+    assert.match(initial, /第一问/); assert.match(initial, /回答1/);
+    await value.controller.send('第二问');
+    assert.equal(value.controller.state.savedThreadId, '');
+    await value.controller.saveBranch();
+    const injection = value.calls.filter(call => call.method === 'thread/inject_items').at(-1)!.params;
+    assert.equal(injection.threadId, 'saved-sidebar');
+    assert.match(injection.items[0].content[0].text, /第二问/); assert.match(injection.items[0].content[0].text, /回答2/);
+    assert.doesNotMatch(injection.items[0].content[0].text, /第一问|回答1/);
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+    await value.controller.saveBranch();
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 2);
+    assert.equal(value.calls.filter(call => call.method === 'turn/start').length, 2, 'Saving never creates an inference');
+  } finally { value.controller.dispose(); }
+});
+
+test('an idle selection without a turn id freezes the latest completed parent turn for initial and saved forks', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.main.busy = false;
+    value.controller.prepare({ ...selected, turnId: undefined }); await value.controller.send('引用回答');
+    assert.deepEqual(value.controller.state.boundary, { lastTurnId: 'parent-turn' });
+    value.main.turns.push({ id: 'new-parent-turn', status: 'completed', items: [] });
+    await value.controller.saveBranch();
+    assert.deepEqual(value.calls.filter(call => call.method === 'thread/fork').map(call => call.params.lastTurnId), ['parent-turn', 'parent-turn']);
+  } finally { value.controller.dispose(); }
+});
+
+test('an unknown native fork outcome is protected across close/reopen and can recover only a verified readonly child branch', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.controller.prepare(selected); await value.controller.send('必须保留的问答');
+    value.overrides.set('thread/fork', input => {
+      if (!input.ephemeral) throw Object.assign(new Error('Lost fork acknowledgement'), { uncertain: true });
+      return { thread: { id: 'side', ephemeral: true } };
+    });
+    await assert.rejects(value.controller.saveBranch(), /Lost fork/);
+    await assert.rejects(value.controller.saveBranch(), /不能重复创建/);
+    await value.controller.close(); value.controller.prepare(selected); await value.controller.send('新的可见问答');
+    await assert.rejects(value.controller.saveBranch(), /不能重复创建/);
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+    value.overrides.set('thread/read', () => ({ thread: { id: 'wrong', forkedFromId: 'unrelated', ephemeral: false } }));
+    await assert.rejects(value.controller.resumeSavedBranch('wrong'), /不是从当前父对话/);
+    assert.equal(value.calls.some(call => call.method === 'thread/resume'), false);
+    value.overrides.set('thread/read', () => ({ thread: { id: 'recovered', forkedFromId: 'parent', ephemeral: false, path: '/test/recovered.jsonl' } }));
+    await value.controller.resumeSavedBranch('recovered');
+    assert.equal(value.calls.some(call => call.method === 'thread/resume'), false, 'Recovery must not automatically continue an inherited goal');
+    assert.deepEqual(value.calls.find(call => call.method === 'thread/settings/update')!.params,
+      { threadId: 'recovered', sandboxPolicy: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'never' });
+    const clearIndex = value.calls.findIndex(call => call.method === 'thread/goal/clear' && call.params.threadId === 'recovered');
+    assert.ok(clearIndex >= 0 && clearIndex < value.calls.findIndex(call => call.method === 'thread/settings/update'));
+    assert.equal(value.calls.filter(call => call.method === 'turn/start').length, 2, 'Recovery starts no inference');
+    await value.controller.saveBranch();
+    assert.equal(value.controller.state.savedThreadId, 'recovered');
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+  } finally { value.controller.dispose(); }
+});
+
+test('unknown injected context must be positively present in native rollout before continuation, and is never appended twice', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.controller.prepare(selected); await value.controller.send('未知追加');
+    let rollout = '';
+    value.overrides.set('thread/inject_items', () => { throw Object.assign(new Error('Lost append acknowledgement'), { uncertain: true }); });
+    value.overrides.set('fs/readFile', () => ({ dataBase64: Buffer.from(rollout).toString('base64') }));
+    await assert.rejects(value.controller.saveBranch(), /Lost append/);
+    assert.equal(value.controller.state.saveUncertain, 'inject');
+    await assert.rejects(value.controller.saveBranch(), /追加结果尚未确认/);
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 1);
+    const appended = value.calls.find(call => call.method === 'thread/inject_items')!.params.items[0];
+    rollout = JSON.stringify({ type: 'response_item', payload: appended }) + '\n';
+    await value.controller.saveBranch();
+    assert.equal(value.controller.state.saveUncertain, '');
+    assert.equal(value.controller.state.savedThreadId, 'saved-sidebar');
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 1);
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+  } finally { value.controller.dispose(); }
+});
+
+test('name update failures resume the same saved branch without appending an acknowledged transcript again', async () => {
+  const value = savedSidebarFixture();
+  try {
+    value.controller.prepare(selected); await value.controller.send('已追加的问答');
+    let reject = true;
+    value.overrides.set('thread/name/set', () => { if (reject) { reject = false; throw new Error('Name projection unavailable'); } return {}; });
+    await assert.rejects(value.controller.saveBranch(), /Name projection/);
+    assert.equal(value.controller.state.savedThreadId, '');
+    await value.controller.saveBranch();
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 1);
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+  } finally { value.controller.dispose(); }
+});
+
+test('a failed durable pin remains an incomplete save and retries the same native branch without another injection', async () => {
+  const value = savedSidebarFixture();
+  const remembered: any[] = [];
+  let fail = true;
+  Object.assign(value.api, { rememberSideBranch: async (...args: any[]) => {
+    remembered.push(args);
+    if (fail) { fail = false; throw new Error('Preferences unavailable'); }
+  } });
+  try {
+    value.controller.prepare(selected); await value.controller.send('需要持久保存的问答');
+    await assert.rejects(value.controller.saveBranch(), /Preferences unavailable/);
+    assert.equal(value.controller.state.savedThreadId, '');
+    assert.equal(value.controller.state.saveTargetThreadId, 'saved-sidebar');
+    await value.controller.saveBranch();
+    assert.equal(value.controller.state.savedThreadId, 'saved-sidebar');
+    assert.deepEqual(remembered, [
+      ['local', 'saved-sidebar', '部署项目 · 侧边问答'],
+      ['local', 'saved-sidebar', '部署项目 · 侧边问答'],
+    ]);
+    assert.equal(value.calls.filter(call => call.method === 'thread/inject_items').length, 1);
+    assert.equal(value.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+    assert.equal(value.calls.filter(call => call.method === 'turn/start').length, 1);
   } finally { value.controller.dispose(); }
 });

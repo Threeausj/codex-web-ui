@@ -49,7 +49,7 @@ async function installPushFixture(page: Page, initial: { active?: boolean; key?:
     const read = () => JSON.parse(localStorage.getItem(storageKey)!);
     const write = (value: any) => localStorage.setItem(storageKey, JSON.stringify(value));
     if (!localStorage.getItem(storageKey)) write({ active, key, permission, generation: 0, endpoint: "https://fcm.googleapis.com/fcm/send/fixture-device-0" });
-    const state = { permissionRequests: 0, gestures: [] as boolean[], subscriptions: [] as any[], unsubscriptions: 0 };
+    const state = { permissionRequests: 0, gestures: [] as boolean[], subscriptions: [] as any[], unsubscriptions: 0, unsubscribeFailure: '' };
     (window as any).pushFixture = state;
     const subscriptionFor = (value: any) => ({
       endpoint: value.endpoint,
@@ -57,6 +57,8 @@ async function installPushFixture(page: Page, initial: { active?: boolean; key?:
       toJSON: () => ({ endpoint: value.endpoint, expirationTime: null, keys: { p256dh: "fixture-public-key", auth: "fixture-auth" } }),
       unsubscribe: async () => {
         state.unsubscriptions++;
+        if (state.unsubscribeFailure === 'reject') throw new Error('Browser subscription cleanup failed');
+        if (state.unsubscribeFailure === 'false') return false;
         const current = read();
         if (current.endpoint === value.endpoint) write({ ...current, active: false });
         return true;
@@ -90,12 +92,15 @@ async function capturePushApi(page: Page, calls: PushCall[], options: { tab?: st
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
     if (pathname.endsWith("/config")) return route.fulfill({ json: { enabled: true, publicKey: options.key ?? publicKey } });
+    if (pathname.endsWith('/status')) return route.fulfill({ json: { devices: 1, queued: 0, retrying: 0, delivered: 0, failed: 0, expired: 0, nextRetryAt: null, lastDeliveredAt: null, lastFailureAt: null, lastFailure: null } });
     calls.push({ method: request.method(), pathname, body: request.postDataJSON(), csrf: request.headers()["x-csrf-token"], tab: options.tab });
     if (pathname.endsWith("/test") && options.testStatus) return route.fulfill({ status: options.testStatus, json: { error: "Notification subscription has expired" } });
     return route.fulfill({ json: { ok: true, expiresAt: Date.now() + 2_592_000_000 } });
   });
 }
 async function openPushSettings(page: Page) {
+  const existing = page.getByRole("button", { name: "应用与通知", exact: true });
+  if (await existing.isVisible()) { await existing.click(); return; }
   const sidebar = page.getByRole("button", { name: "打开侧边栏", exact: true });
   if (await sidebar.isVisible()) await sidebar.click();
   await page.locator(".settings-button").click();
@@ -169,9 +174,36 @@ test("notification consent is requested only on click; device preferences, test,
   await expect(page.getByRole("button", { name: "进入工作区", exact: true })).toBeVisible();
   expect(mock.authenticated).toBe(false);
   expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(2);
-  expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(2);
+  // The authenticated logout endpoint revokes every grant for this login;
+  // browser cleanup does not issue a separate request after signing out.
+  expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
   expect(calls.every((call) => call.csrf === "mock-csrf")).toBe(true);
 });
+
+for (const failure of ['false', 'reject']) {
+  test(`browser unsubscribe ${failure} cannot block server logout or restore the retired device`, async ({ page, mock }) => {
+    const calls: PushCall[] = [];
+    await installPushFixture(page, { active: true, permission: 'granted' });
+    await capturePushApi(page, calls);
+    await loginBuilt(page);
+    await expect.poll(() => calls.filter(call => call.method === 'POST' && call.pathname.endsWith('/subscription')).length).toBe(1);
+    await openPushSettings(page);
+    await page.evaluate(value => { (window as any).pushFixture.unsubscribeFailure = value; }, failure);
+    await page.getByRole('button', { name: '账户', exact: true }).click();
+    await page.getByRole('button', { name: '退出网页', exact: true }).click();
+    await expect(page.getByRole('button', { name: '进入工作区', exact: true })).toBeVisible();
+    expect(mock.authenticated).toBe(false);
+    await expect.poll(() => page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(1);
+    expect(calls.filter(call => call.method === 'DELETE')).toHaveLength(0);
+    const restoredBefore = calls.filter(call => call.method === 'POST' && call.pathname.endsWith('/subscription')).length;
+    await page.getByRole('textbox', { name: '访问密码' }).fill('test-password-123');
+    await page.getByRole('button', { name: '进入工作区', exact: true }).click();
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+    await openPushSettings(page);
+    await expect(page.getByRole('button', { name: '启用通知', exact: true })).toBeVisible();
+    expect(calls.filter(call => call.method === 'POST' && call.pathname.endsWith('/subscription')).length).toBe(restoredBefore);
+  });
+}
 
 test('push tests show pending, acceptance and failure; a separate local test checks display without sending push', async ({ page }) => {
   const calls: PushCall[] = [];
@@ -429,4 +461,86 @@ test("slow subscription restoration cannot overwrite a preference change or re-r
   await expect(page.getByRole("button", { name: "启用通知", exact: true })).toBeEnabled();
   const expired = calls.findIndex((call) => call.pathname.endsWith("/test"));
   expect(calls.slice(expired + 1).filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription"))).toHaveLength(0);
+});
+
+test('a late push test from a signed-out login cannot change a fresh login or its current notification operation', async ({ page, mock }) => {
+  const calls: PushCall[] = [];
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, calls);
+  const pending: import('@playwright/test').Route[] = [];
+  await page.route('**/api/push/test', route => { pending.push(route); });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => pending.length).toBe(1);
+  await page.getByRole('button', { name: '账户', exact: true }).click();
+  await page.getByRole('button', { name: '退出网页', exact: true }).click();
+  await expect(page.getByRole('button', { name: '进入工作区', exact: true })).toBeVisible();
+  expect(mock.authenticated).toBe(false);
+  await expect.poll(() => page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(1);
+  await page.getByRole('textbox', { name: '访问密码' }).fill('test-password-123');
+  await page.getByRole('button', { name: '进入工作区', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '启用通知', exact: true }).click();
+  await expect(page.getByText('本机已启用', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => pending.length).toBe(2);
+  await pending[0]!.fulfill({ status: 410, json: { error: 'Old device endpoint expired' } });
+  await expect(page.getByRole('button', { name: '正在发送…', exact: true })).toBeDisabled();
+  expect(mock.authenticated).toBe(true);
+  expect(await page.evaluate(() => (window as any).pushFixture.unsubscriptions)).toBe(1);
+  await pending[1]!.fulfill({ json: { ok: true } });
+  await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+  await expect(page.getByText('本机已启用', { exact: true })).toBeVisible();
+  await expect(page.getByText('Old device endpoint expired', { exact: true })).toHaveCount(0);
+});
+
+test('queued test notifications show retry acceptance instead of claiming provider delivery and recover the status', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  const calls: PushCall[] = [];
+  await capturePushApi(page, calls);
+  let queued = false;
+  await page.route('**/api/push/status*', route => route.fulfill({ json: {
+    devices: 1, queued: queued ? 1 : 0, retrying: queued ? 1 : 0, delivered: queued ? 0 : 1, failed: 0, expired: 0,
+    nextRetryAt: queued ? Date.now() + 30000 : null, lastDeliveredAt: queued ? null : Date.now(),
+    lastFailureAt: queued ? Date.now() : null, lastFailure: queued ? 'rate_limited' : null,
+  } }));
+  await page.route('**/api/push/test', route => {
+    queued = true;
+    return route.fulfill({ status: 202, json: { ok: true, queued: true, retryAt: Date.now() + 30000 } });
+  });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('测试通知已保存，服务器会自动重试');
+  await expect(page.getByRole('status')).not.toContainText('推送服务已接收测试通知');
+  const health = page.getByLabel('推送投递状态');
+  await expect(health).toContainText('待发送 1 条');
+  await expect(health).toContainText('自动重试 1 条');
+  await expect(health).toContainText('推送服务限流');
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+  queued = false;
+  await page.getByRole('button', { name: '刷新通知状态', exact: true }).click();
+  await expect(health).toContainText('推送服务已接收 1 条');
+  await expect(health).not.toContainText('待发送');
+  await expect(health).not.toContainText('推送服务限流');
+});
+
+test('notification diagnostics show bounded failure and expiration without exposing provider credentials', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  await page.route('**/api/push/status*', route => route.fulfill({ json: {
+    devices: 1, queued: 0, retrying: 0, delivered: 2, failed: 1, expired: 3, nextRetryAt: null,
+    lastDeliveredAt: Date.now() - 2000, lastFailureAt: Date.now(), lastFailure: 'expired',
+  } }));
+  await loginBuilt(page);
+  await openPushSettings(page);
+  const health = page.getByLabel('推送投递状态');
+  await expect(health).toContainText('推送服务已接收 2 条');
+  await expect(health).toContainText('发送失败 1 条 · 已过期 3 条');
+  await expect(health).toContainText('通知已超过有效期');
+  await expect(health).not.toContainText('fcm.googleapis.com');
+  await expect(health).not.toContainText('fixture-auth');
+  await expect(page.getByText('网络或推送服务暂时出错时，服务器会保存通知并自动重试；最多尝试 8 次，有效期 1 小时。服务接收成功不代表手机已显示通知。', { exact: true })).toBeVisible();
 });

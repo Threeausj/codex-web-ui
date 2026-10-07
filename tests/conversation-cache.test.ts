@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ConversationCache, conversationSessionScope, type ConversationSnapshot, type ConversationPersistence } from '../src/lib/conversation-cache';
+import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot, type ConversationPersistence } from '../src/lib/conversation-cache';
 
 function persistence() {
   const rows = new Map<string, any>();
@@ -86,13 +86,83 @@ test('device caches have a bounded history, expire, and gracefully fall back whe
   const huge = snapshot('huge');
   huge.items[0].text = 'x'.repeat(800 * 1024);
   cache.write(huge);
-  assert.equal(cache.peek('local', 'huge'), null);
+  const reduced = cache.peek('local', 'huge');
+  assert.ok(reduced?.items[0].text.length);
+  assert.ok(reduced.items[0].text.length < 800 * 1024);
+  assert.equal(reduced.historyTruncated, true);
+  assert.equal(reduced.cursor, null);
+  assert.equal(reduced.items[0].cacheTruncated, true);
+  await cache.flush();
+  const fresh = new ConversationCache(store, () => time);
+  fresh.activate('session');
+  assert.equal((await fresh.read('local', 'huge'))?.items[0].text, reduced.items[0].text);
   const broken = new ConversationCache({ ...store, write: async () => { throw new Error('Quota exceeded'); }, read: async () => { throw new Error('Disabled IndexedDB'); } });
   broken.activate('session');
   broken.write(snapshot());
   await broken.flush();
   assert.ok(broken.peek('local', 'thread-a'));
   assert.equal(await broken.read('local', 'missing'), null);
+});
+
+test('bounded snapshots retain recent turns and never keep an older cursor that skips trimmed history', async () => {
+  const { store } = persistence();
+  const cache = new ConversationCache(store);
+  cache.activate('session');
+  const long = snapshot('long');
+  long.turns = Array.from({ length: 360 }, (_, index) => ({ id: `turn-${index}`, items: [], status: 'completed' }));
+  long.items = long.turns.map(turn => ({ id: `answer-${turn.id}`, turnId: turn.id, type: 'agentMessage', text: 'x'.repeat(3000) }));
+  cache.write(long);
+  const reduced = cache.peek('local', 'long')!;
+  assert.ok(reduced.items.length > 200 && reduced.items.length < 360);
+  assert.equal(reduced.items.at(-1).id, 'answer-turn-359');
+  assert.equal(reduced.turns.at(-1).id, 'turn-359');
+  assert.equal(reduced.items.length, reduced.turns.length);
+  assert.equal(reduced.cursor, null);
+  assert.equal(reduced.historyTruncated, true);
+  assert.ok(new TextEncoder().encode(JSON.stringify(reduced)).byteLength <= 768 * 1024);
+});
+
+test('inactive delta invalidations are coalesced, while invalidation immediately rejects stale memory and pending reads', async () => {
+  const { store, rows } = persistence();
+  const batches: string[][] = [];
+  store.removeMany = async keys => { batches.push(keys); for (const key of keys) rows.delete(key); };
+  const cache = new ConversationCache(store);
+  cache.activate('session');
+  cache.write(snapshot('a')); cache.write(snapshot('b'));
+  await cache.flush();
+  for (let index = 0; index < 1000; index++) { cache.remove('local', 'a'); cache.remove('local', 'b'); }
+  assert.equal(cache.peek('local', 'a'), null);
+  assert.equal(cache.peek('local', 'b'), null);
+  await cache.flush();
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].length, 2);
+  assert.equal(rows.size, 0);
+  cache.remove('local', 'a');
+  cache.write(snapshot('a'));
+  await cache.flush();
+  assert.ok(await cache.read('local', 'a'));
+  assert.equal(batches.length, 1);
+});
+
+test('memory LRU bounds idle conversations while preserving the selected and running arrays and their history', () => {
+  const protectedIds = new Set(['active', 'running']);
+  const cache = new ConversationMemoryCache(() => protectedIds, 3, 100000);
+  const active = [{ id: 'active-answer', text: 'Selected' }];
+  const running = [{ id: 'running-answer', text: 'Streaming' }];
+  cache.set('active', active); cache.set('running', running);
+  cache.rememberHistory('active', { turns: [{ id: 'active-turn', items: active }], cursor: 'older', engineId: 'engine' });
+  for (let index = 0; index < 20; index++) cache.set(`idle-${index}`, [{ id: `${index}` }]);
+  assert.equal(cache.size, 3);
+  assert.equal(cache.get('active'), active);
+  assert.equal(cache.get('running'), running);
+  assert.equal(cache.history('active')?.cursor, 'older');
+  assert.equal(cache.history('active')?.turns[0].items.length, 0);
+  assert.equal(cache.get('idle-0'), undefined);
+  cache.get('idle-19');
+  protectedIds.delete('running');
+  cache.set('newest', [{ id: 'newest' }]);
+  assert.equal(cache.get('running'), undefined);
+  assert.equal(cache.get('active'), active);
 });
 
 test('persisted scope uses a one-way digest rather than the session credential', async () => {

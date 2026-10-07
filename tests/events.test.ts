@@ -129,6 +129,22 @@ test("authoritative user messages clear temporary sending status", () => {
   assert.equal(items[0].status, undefined);
 });
 
+test('large snapshot merges index IDs and client aliases once rather than rescanning history for every live item', () => {
+  let reads = 0;
+  const snapshot: DisplayItem[] = Array.from({ length: 10000 }, (_, index) => ({
+    get id() { reads++; return `item-${index}`; }, type: 'agentMessage', text: 'Cached',
+  }));
+  const live = Array.from({ length: 10000 }, (_, index) => ({ id: `item-${index}`, type: 'agentMessage', text: 'Live' }));
+  snapshot.push({ id: 'optimistic-user', clientId: 'same-client', type: 'userMessage', status: 'unconfirmed' });
+  live.push({ id: 'native-user', clientId: 'same-client', type: 'userMessage', content: [] } as any);
+  const merged = mergeSnapshotItems(snapshot, live, new Set(live.map(item => item.id)));
+  assert.equal(merged.length, 10001);
+  assert.equal(merged[9999].text, 'Live');
+  assert.equal(merged[10000].id, 'native-user');
+  assert.equal(merged[10000].status, undefined);
+  assert.ok(reads < 40000, `Snapshot IDs read ${reads} times`);
+});
+
 test("browser state handles out-of-order RPCs and live events without reviving turns or changing selected chats", async (t) => {
   const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
   const install = (key: string, value: unknown) => {

@@ -19,7 +19,7 @@ type Call = {
   env: Record<string, string | null>;
 };
 
-async function fixture(useAppServer = false, options: { directRead?: boolean; unavailableSandbox?: boolean } = {}) {
+async function fixture(useAppServer = false, options: { directRead?: boolean; unavailableSandbox?: boolean; busyWorktree?: boolean } = {}) {
   const directory = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), "codex-git-workflow-")),
   );
@@ -46,6 +46,7 @@ async function fixture(useAppServer = false, options: { directRead?: boolean; un
   const app = express();
   app.use(express.json());
   registerGit(app, {
+    busyWorktreeThreads: async () => options.busyWorktree ? ['running-web-thread'] : [],
     ...(options.directRead ? { getHost: (id: string) => id === "local" ? { id, name: "Test", kind: "local" as const } : undefined } : {}),
     getBridge: async () =>
       bridge ||
@@ -441,3 +442,84 @@ test(
     }
   },
 );
+
+test('review options read branch and commit labels without writing or requiring a sandbox namespace', async () => {
+  const f = await fixture(false, { directRead: true, unavailableSandbox: true });
+  try {
+    await f.run('branch', 'feature/review-base');
+    const result = await f.get('review-options');
+    assert.equal(result.code, 200);
+    assert.ok(result.body.branches.includes('main'));
+    assert.ok(result.body.branches.includes('feature/review-base'));
+    assert.equal(result.body.commits[0].title, 'Initial');
+    assert.match(result.body.commits[0].sha, /^[a-f0-9]{40}$/);
+    assert.equal(f.calls.length, 0);
+  } finally { await f.close(); }
+});
+
+test('new isolated worktrees can select a starting branch without copying current uncommitted changes', async () => {
+  const f = await fixture();
+  try {
+    await f.run('switch', '-c', 'feature/base');
+    await fs.writeFile(path.join(f.root, 'base-only.txt'), 'selected base\n');
+    await f.run('add', '--', 'base-only.txt');
+    await f.run('commit', '-m', 'Selected base');
+    await f.run('switch', 'main');
+    await fs.writeFile(path.join(f.root, 'one.txt'), 'main uncommitted\n');
+    const destination = path.join(f.directory, 'selected-base-worktree');
+    const result = await f.post('worktree', { path: destination, branch: 'feature/task', startPoint: 'feature/base' });
+    assert.equal(result.code, 201);
+    assert.equal(await fs.readFile(path.join(destination, 'base-only.txt'), 'utf8'), 'selected base\n');
+    assert.equal(await fs.readFile(path.join(destination, 'one.txt'), 'utf8'), 'original one\n');
+    assert.equal(await fs.readFile(path.join(f.root, 'one.txt'), 'utf8'), 'main uncommitted\n');
+    const add = f.calls.findLast(call => call.command.includes('worktree') && call.command.includes('add'))!;
+    assert.equal(add.command.at(-1), 'feature/base');
+    assert.equal((await f.post('worktree', { path: path.join(f.directory, 'invalid-start'), branch: 'feature/bad', startPoint: '--force' })).code, 400);
+  } finally { await f.close(); }
+});
+
+test('safe worktree cleanup preserves branches and rejects dirty, ignored, locked, current and primary directories', async () => {
+  const f = await fixture();
+  try {
+    await fs.writeFile(path.join(f.root, '.gitignore'), 'private.key\n');
+    await f.run('add', '--', '.gitignore'); await f.run('commit', '-m', 'Ignore private key');
+    const destination = path.join(f.directory, 'cleanup-worktree');
+    assert.equal((await f.post('worktree', { path: destination, branch: 'feature/cleanup' })).code, 201);
+    assert.equal((await f.post('worktree/remove', { path: destination, permission: 'read-only' })).code, 403);
+    await fs.writeFile(path.join(destination, 'one.txt'), 'unsaved model edits\n');
+    assert.equal((await f.post('worktree/remove', { path: destination })).code, 409);
+    await fs.writeFile(path.join(destination, 'one.txt'), 'original one\n');
+    await fs.writeFile(path.join(destination, 'new-file.txt'), 'untracked\n');
+    assert.equal((await f.post('worktree/remove', { path: destination })).code, 409);
+    await fs.rm(path.join(destination, 'new-file.txt'));
+    await fs.writeFile(path.join(destination, 'private.key'), 'ignored private data\n');
+    assert.equal((await f.post('worktree/remove', { path: destination })).code, 409);
+    assert.equal(await fs.readFile(path.join(destination, 'private.key'), 'utf8'), 'ignored private data\n');
+    await fs.rm(path.join(destination, 'private.key'));
+    await f.run('worktree', 'lock', destination);
+    assert.equal((await f.post('worktree/remove', { path: destination })).code, 409);
+    await f.run('worktree', 'unlock', destination);
+    assert.equal((await f.post('worktree/remove', { path: f.root })).code, 409);
+    assert.equal((await f.post('worktree/remove', { cwd: destination, path: destination })).code, 409);
+    const removed = await f.post('worktree/remove', { path: destination });
+    assert.equal(removed.code, 200);
+    assert.equal(removed.body.removedPath, destination);
+    assert.ok(!removed.body.worktrees.some((tree: any) => tree.path === destination));
+    await assert.rejects(fs.stat(destination), { code: 'ENOENT' });
+    assert.equal((await f.run('branch', '--list', 'feature/cleanup')).trim(), 'feature/cleanup');
+    assert.ok(!f.calls.findLast(call => call.command.includes('remove'))!.command.includes('--force'));
+  } finally { await f.close(); }
+});
+
+test('safe worktree cleanup refuses a Web thread currently running in that directory', async () => {
+  const f = await fixture(false, { busyWorktree: true });
+  try {
+    const destination = path.join(f.directory, 'running-worktree');
+    assert.equal((await f.post('worktree', { path: destination, branch: 'feature/running' })).code, 201);
+    const result = await f.post('worktree/remove', { path: destination });
+    assert.equal(result.code, 409);
+    assert.match(result.body.error, /正在运行的 Web 会话/);
+    assert.ok((await fs.stat(destination)).isDirectory());
+    assert.ok(!f.calls.some(call => call.command.includes('remove')));
+  } finally { await f.close(); }
+});

@@ -21,6 +21,8 @@ import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerConversationImages } from './conversation-images.js'
+import { registerFiles } from './files.js'
+import { registerDiagnostics } from './diagnostics.js'
 import { registerThreadContext } from './thread-context.js'
 import { registerHostConnection } from './host-connection.js'
 import { readRuntimePausedHosts, readRuntimeReleasedThreads, registerHostResources } from './host-resources.js'
@@ -62,7 +64,7 @@ export async function createApp(options: AppOptions = {}) {
   const httpsOnly = configuredOrigins.length > 0 && configuredOrigins.every(origin => origin.trim().startsWith('https:'))
   const auth = await Auth.create(dataDir, options.password || process.env.CODEX_WEB_PASSWORD, origins, options.secureCookie ?? httpsOnly)
   const push = await PushService.create(dataDir, origins, {
-    ...options.pushOptions, credentialVersion: auth.pushCredentialVersion,
+    ...options.pushOptions, credentialVersion: auth.pushCredentialVersion, isSessionRevoked: hash => auth.isPushSessionRevokedHash(hash),
     resolveThread: options.pushOptions?.resolveThread ?? (async (host, threadId) => {
       const bridge = await getBridge(host.id)
       const result = await bridge.request('thread/read', { threadId, includeTurns: false }, 2500) as { thread?: unknown }
@@ -110,12 +112,26 @@ export async function createApp(options: AppOptions = {}) {
   registerPush(app, push)
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
-  registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
+  registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions,
+    busyWorktreeThreads: async (hostId, directory) => {
+      const bridge = await getBridge(hostId)
+      const active = bridge.runtime.threads.filter(thread => thread.active)
+      const matched: string[] = []
+      for (const entry of active) {
+        const result = await bridge.request('thread/read', { threadId: entry.id, includeTurns: false }) as { thread?: { cwd?: string } }
+        if (!result.thread?.cwd) throw Object.assign(new Error('无法确认运行中会话的工作目录，请稍后重试'), { status: 409 })
+        if (result.thread.cwd === directory || result.thread.cwd.startsWith(directory + '/')) matched.push(entry.id)
+      }
+      return matched
+    },
+  })
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
   registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)
+  registerFiles(app, getBridge)
+  registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
@@ -271,7 +287,7 @@ export async function createServer(options: AppOptions = {}) {
       if (!sockets) { sockets = new Set(); sessionSockets.set(session.id, sockets) }
       sockets.add(ws)
       const key = `${session.id}:${clientId}`
-      void context.getBridge(hostId).then(bridge => bridge.attach(key, ws, clientId, () => context.auth.isSessionActive(session.id))).catch(() => ws.close(1011, 'Cannot connect to host'))
+      void context.getBridge(hostId).then(bridge => bridge.attach(key, ws, clientId, () => context.auth.isSessionActive(session.id), { engineId: url.searchParams.get('engineId') || '', afterSequence: Number(url.searchParams.get('afterSequence') ?? -1) })).catch(() => ws.close(1011, 'Cannot connect to host'))
       const validateSession = setInterval(() => { if (!context.auth.getSession(req.headers.cookie)) ws.close(4003, 'Session expired') }, 15000)
       validateSession.unref()
       ws.on('close', () => { clearInterval(validateSession); sockets!.delete(ws); if (!sockets!.size) sessionSockets.delete(session.id) })

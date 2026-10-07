@@ -14,7 +14,7 @@ export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
-type Pending = { originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
 export type ReleasedThread = { name: string; restoreThreadIds: string[] }
@@ -77,6 +77,12 @@ export class Bridge {
   private generation = 0
   private engineId?: string
   private eventSequence = 0
+  private replayEvents: { event: RpcMessage; bytes: number; at: number }[] = []
+  private replayBytes = 0
+  private connectionAttempts = 0
+  private lastConnectedAt?: number
+  private lastDisconnectedAt?: number
+  private lastProtocolError?: { at: number; code: number; method: string; category: string }
   private contexts = new Map<string, { tokenUsage: ThreadTokenUsage | null; compacting: boolean }>()
   private compactions = new Map<string, { requests: Set<string>; items: Map<string, string | undefined> }>()
   private disposed = false
@@ -182,8 +188,11 @@ export class Bridge {
       throw error
     }
     this.transport = transport
+    ++this.connectionAttempts
     this.engineId = randomUUID()
     this.eventSequence = 0
+    this.replayEvents = []
+    this.replayBytes = 0
     const decoder = new StringDecoder('utf8')
     let buffer = ''
     transport.output.on('data', (chunk: Buffer) => {
@@ -208,6 +217,7 @@ export class Bridge {
       this.userAgent = result.userAgent
       this.codexHome = result.codexHome
       this.connected = true
+      this.lastConnectedAt = Date.now()
       for (const key of this.clients.keys()) this.status(key)
     } catch (error) {
       if (generation === this.generation) this.disconnect(error as Error)
@@ -222,7 +232,7 @@ export class Bridge {
     this.transport.input.write(frame)
   }
 
-  private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket) {
+  private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket, respond?: (message: RpcMessage) => void) {
     const id = `web:${++this.counter}`
     const compactThread = method === 'thread/compact/start' ? (params as { threadId?: string })?.threadId : undefined
     if (typeof compactThread === 'string') { this.compaction(compactThread).requests.add(id); this.updateCompaction(compactThread) }
@@ -241,7 +251,7 @@ export class Bridge {
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
-      this.pending.set(id, { method, params, clientKey, clientSocket, originalId, resolve, reject, timer })
+      this.pending.set(id, { method, params, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
       try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { this.removeCompactionRequest(compactThread, id); clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
@@ -256,11 +266,24 @@ export class Bridge {
   }
   async request(method: string, params?: unknown, timeout = 120000): Promise<unknown> { await this.connect(); this.checkThreadRequest(method, params); return this.rawRequest(method, params, undefined, undefined, timeout) }
 
-  attach(key: string, socket: WebSocket, clientId: string, isAuthenticated = () => true) {
+  attach(key: string, socket: WebSocket, clientId: string, isAuthenticated = () => true, cursor?: { engineId: string; afterSequence: number }) {
     const previous = this.clients.get(key)
     if (previous && previous !== socket) previous.close(4001, 'Client reconnected')
     this.clients.set(key, socket)
-    this.status(key, clientId)
+    let replayComplete = false
+    if (cursor && cursor.engineId === this.engineId && Number.isSafeInteger(cursor.afterSequence) && cursor.afterSequence >= 0 && cursor.afterSequence <= this.eventSequence) {
+      this.pruneReplay()
+      const next = this.replayEvents.find(entry => Number(entry.event.bridgeEventSequence) > cursor.afterSequence)
+      replayComplete = cursor.afterSequence === this.eventSequence || Number(next?.event.bridgeEventSequence) === cursor.afterSequence + 1
+      if (replayComplete) for (const entry of this.replayEvents) {
+        if (Number(entry.event.bridgeEventSequence) > cursor.afterSequence) {
+          const approval = entry.event.id !== undefined && entry.event.method ? this.approvals.get(JSON.stringify(entry.event.id)) : undefined
+          const staleRequest = entry.event.id !== undefined && entry.event.method && (!approval || approval.message.params !== entry.event.params)
+          this.clientSend(key, staleRequest ? { method: 'bridge/event/ack', bridgeEventSequence: entry.event.bridgeEventSequence } : entry.event)
+        }
+      }
+    }
+    this.status(key, clientId, replayComplete)
     for (const approval of this.approvals.values()) this.clientSend(key, approval.message)
     socket.on('message', data => {
       if (this.clients.get(key) !== socket) return
@@ -280,14 +303,36 @@ export class Bridge {
     if (client?.readyState === 1) client.send(JSON.stringify(message))
   }
 
+  diagnostics() {
+    this.pruneReplay()
+    return { engineId: this.engineId || null, userAgent: this.userAgent || null, connected: this.connected, paused: this.paused,
+      connectionMode: this.mode, reconnectCount: Math.max(0, this.connectionAttempts - 1),
+      lastConnectedAt: this.lastConnectedAt || null, lastDisconnectedAt: this.lastDisconnectedAt || null,
+      lastProtocolError: this.lastProtocolError || null,
+      cachedEvents: { count: this.replayEvents.length, firstSequence: this.replayEvents[0]?.event.bridgeEventSequence || this.eventSequence,
+        lastSequence: this.eventSequence, capacity: 4096, bytes: this.replayBytes, maxBytes: 4 * 1024 * 1024, ttlMs: 5 * 60 * 1000 } }
+  }
+  private pruneReplay() {
+    const oldest = Date.now() - 5 * 60 * 1000
+    while (this.replayEvents.length && (this.replayEvents.length > 4096 || this.replayBytes > 4 * 1024 * 1024 || this.replayEvents[0]!.at < oldest)) {
+      this.replayBytes -= this.replayEvents.shift()!.bytes
+    }
+  }
+  private rememberEvent(event: RpcMessage) {
+    const bytes = Buffer.byteLength(JSON.stringify(event))
+    this.replayEvents.push({ event, bytes, at: Date.now() })
+    this.replayBytes += bytes
+    this.pruneReplay()
+  }
   private broadcast(message: RpcMessage) {
     const event = { ...message, bridgeEventSequence: ++this.eventSequence }
+    this.rememberEvent(event)
     for (const key of this.clients.keys()) this.clientSend(key, event)
     return event
   }
 
-  private status(key: string, clientId?: string) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
+  private status(key: string, clientId?: string, replayComplete?: boolean) {
+    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, ...(replayComplete !== undefined ? { replayComplete } : {}), hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
   }
 
   private finishProcess(requestId: string, result?: unknown, error?: RpcMessage['error']) {
@@ -324,6 +369,7 @@ export class Bridge {
         if (typeof params?.beforeTurnId === 'string') request.beforeTurnId = params.beforeTurnId
         break
       case 'turn/start':
+      case 'thread/queue/start':
         if (!response?.turn) return
         changed = { turn: response.turn }
         break
@@ -349,10 +395,11 @@ export class Bridge {
     }
     const originClientId = pending.clientKey?.slice(pending.clientKey.indexOf(':') + 1)
     const message = { method: 'bridge/thread/changed', params: {
-      threadId, method: pending.method, result: changed, request, changeId,
+      threadId, method: pending.method === 'thread/queue/start' ? 'turn/start' : pending.method, result: changed, request, changeId,
       ...(originClientId ? { originClientId } : {}),
     } }
     const sequence = ++this.eventSequence
+    this.rememberEvent({ ...message, bridgeEventSequence: sequence })
     for (const [key, socket] of this.clients)
       this.clientSend(key, key !== pending.clientKey || socket !== pending.clientSocket
         ? { ...message, bridgeEventSequence: sequence }
@@ -361,7 +408,12 @@ export class Bridge {
 
   private async fromClient(key: string, message: RpcMessage) {
     const recipient = this.clients.get(key)
-    const reply = (response: RpcMessage) => { if (recipient && this.clients.get(key) === recipient) this.clientSend(key, response) }
+    let replied = false
+    const reply = (response: RpcMessage) => {
+      if (replied) return
+      replied = true
+      if (recipient && this.clients.get(key) === recipient) this.clientSend(key, response)
+    }
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('RPC message must be an object')
     const validId = (typeof message.id === 'string' && message.id.length <= 256) || (typeof message.id === 'number' && Number.isSafeInteger(message.id))
     if (!message.method && validId && ('result' in message || 'error' in message)) {
@@ -390,7 +442,7 @@ export class Bridge {
       this.checkThreadRequest(message.method, message.params)
       // Keep the socket which submitted the request, even if it reconnects
       // while initialization is pending. Its replacement needs the broadcast.
-      const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient)
+      const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient, reply)
       reply({ id: message.id, result })
     } catch (error) {
       reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : ['runtime_paused', 'thread_released'].includes((error as { code?: string }).code || '') ? { data: { code: (error as { code?: string }).code } } : {}) } })
@@ -413,6 +465,8 @@ export class Bridge {
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
       if (pending.method === 'command/exec') this.finishProcess(String(message.id), message.result, message.error)
       if (message.error) {
+        this.lastProtocolError = { at: Date.now(), code: message.error.code, method: pending.method,
+          category: message.error.code === -32601 ? 'unsupportedMethod' : message.error.code === -32602 ? 'invalidParameters' : 'runtimeError' }
         const threadId = pending.method === 'thread/compact/start' ? (pending.params as { threadId?: string })?.threadId : undefined
         this.removeCompactionRequest(threadId, String(message.id))
         pending.reject(new RpcFailure(message.error))
@@ -427,6 +481,9 @@ export class Bridge {
           if (result.thread.status?.type === 'active') this.activeThreads.add(result.thread.id)
         }
         if (pending.method === 'thread/unsubscribe' && params?.threadId) { this.subscribedThreads.delete(params.threadId); this.activeThreads.delete(params.threadId) }
+        // Send the origin's accepted result before advancing its event cursor.
+        // Otherwise an ACK followed by a disconnect could hide a lost result.
+        if (pending.originalId !== undefined) pending.respond?.({ id: pending.originalId, result: message.result })
         if (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method)) this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
@@ -472,6 +529,7 @@ export class Bridge {
   }
 
   private disconnect(error: Error) {
+    this.lastDisconnectedAt = Date.now()
     ++this.generation
     this.connected = false
     this.lastError = error.message

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
 import type { AuthenticatedRequest, Session } from './types.js'
+import { MAX_PERSISTED_SESSIONS, readSessions, sessionHash, writeSessions } from './auth-sessions.js'
 
 export const COOKIE_NAME = 'codex_web_session'
 export const SESSION_TTL = 30 * 24 * 60 * 60 * 1000
@@ -57,12 +58,14 @@ export class Auth {
   private salt = randomBytes(32)
   private passwordHash: Buffer
   private sessions = new Map<string, Session>()
+  private revokedPushSessions = new Map<string, number>()
   private attempts = new Map<string, { count: number; startedAt: number }>()
   private revokeListeners = new Set<(sessionId: string) => void>()
   private logoutListeners = new Set<(sessionId: string) => void | Promise<void>>()
   private passwordListeners = new Set<(sessionId: string, credentialVersion: string) => void | Promise<void>>()
   private passwordChanges: Promise<void> = Promise.resolve()
   private passwordFile?: string
+  private sessionFile?: string
   private credentialVersion = randomBytes(16).toString('hex')
   constructor(password: string, readonly allowedOrigins: Set<string>, private readonly secureCookie = false) {
     if (password.length < 12 || password.length > 1024) throw new Error('CODEX_WEB_PASSWORD must contain between 12 and 1024 characters')
@@ -91,6 +94,21 @@ export class Auth {
     auth.passwordHash = Buffer.from(saved.hash, 'base64url')
     auth.credentialVersion = saved.credentialVersion
     auth.passwordFile = file
+    auth.sessionFile = path.join(dataDir, 'web-sessions.json')
+    let sessions: Awaited<ReturnType<typeof readSessions>> = undefined
+    try { sessions = await readSessions(auth.sessionFile, saved.credentialVersion, auth.passwordHash, SESSION_TTL) }
+    catch {
+      // A damaged revocation cache must not resurrect previously logged-out push
+      // grants. Rotate the generation without changing the password, then repair.
+      const recovered = { ...saved, credentialVersion: randomBytes(16).toString('hex') }
+      await savePasswordRecord(file, recovered)
+      auth.credentialVersion = recovered.credentialVersion
+      await auth.persistSessions()
+      console.error('Stored web sessions could not be verified; device logins were reset, sign in again')
+    }
+    // Recover the real bearer ID only from a verified request, never from disk.
+    for (const record of sessions?.sessions || []) auth.sessions.set(record.sessionHash, { id: '', csrfToken: record.csrfToken, expiresAt: record.expiresAt })
+    for (const record of sessions?.revokedSessions || []) auth.revokedPushSessions.set(record.sessionHash, record.expiresAt)
     return auth
   }
 
@@ -116,15 +134,17 @@ export class Auth {
   }
 
   getSession(cookieHeader?: string): Session | undefined {
-    const session = this.sessions.get(parseCookies(cookieHeader)[COOKIE_NAME] || '')
-    if (session && session.expiresAt > Date.now()) return session
-    if (session) this.revoke(session.id)
+    const id = parseCookies(cookieHeader)[COOKIE_NAME] || ''
+    const hash = sessionHash(id)
+    const session = this.sessions.get(hash)
+    if (session && session.expiresAt > Date.now()) { session.id = id; return session }
+    if (session) this.revoke(id)
     return undefined
   }
 
   isSessionActive(sessionId: string) {
-    const session = this.sessions.get(sessionId)
-    if (session && session.expiresAt > Date.now()) return true
+    const session = this.sessions.get(sessionHash(sessionId))
+    if (session && session.expiresAt > Date.now()) { session.id = sessionId; return true }
     if (session) this.revoke(sessionId)
     return false
   }
@@ -146,8 +166,21 @@ export class Auth {
   }
 
   private revoke(sessionId: string) {
-    if (!this.sessions.delete(sessionId)) return
+    if (!this.sessions.delete(sessionHash(sessionId))) return
     for (const listener of this.revokeListeners) listener(sessionId)
+  }
+
+  /** Explicit logout remains authoritative even if the push subscription file could not be saved. */
+  isPushSessionRevokedHash(hash: string) {
+    const expiresAt = this.revokedPushSessions.get(hash)
+    if (expiresAt && expiresAt > Date.now()) return true
+    if (expiresAt) this.revokedPushSessions.delete(hash)
+    return false
+  }
+
+  private persistSessions(sessions = this.sessions, revoked = this.revokedPushSessions) {
+    if (!this.sessionFile) return Promise.resolve()
+    return writeSessions(this.sessionFile, this.credentialVersion, this.passwordHash, sessions, revoked)
   }
 
   isTrustedOrigin(origin?: string) { return Boolean(origin && this.allowedOrigins.has(origin)) }
@@ -191,18 +224,30 @@ export class Auth {
     res.cookie(COOKIE_NAME, session.id, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure || httpsOrigin, maxAge: SESSION_TTL, path: '/' })
   }
 
-  login: RequestHandler = (req: Request, res: Response) => {
+  login: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
     if (req.headers.origin && !this.isTrustedOrigin(req.headers.origin)) { res.status(403).json({ error: 'Untrusted origin' }); return }
-    const now = Date.now()
     if (!this.allowPasswordAttempt(req, res)) return
     const password = req.body?.password
     if (typeof password !== 'string' || password.length > 1024 || !this.matchesPassword(password)) { res.status(401).json({ error: 'Incorrect password' }); return }
-    const old = this.getSession(req.headers.cookie)
-    if (old) this.revoke(old.id)
-    const session: Session = { id: randomBytes(32).toString('base64url'), csrfToken: randomBytes(32).toString('base64url'), expiresAt: now + SESSION_TTL }
-    this.sessions.set(session.id, session)
-    this.sessionCookie(req, res, session)
-    res.set('Cache-Control', 'no-store').json({ authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt })
+    const operation = this.passwordChanges.then(async () => {
+      // A queued password change may have invalidated the earlier verification.
+      if (!this.matchesPassword(password)) { res.status(401).json({ error: 'Incorrect password' }); return }
+      const old = this.getSession(req.headers.cookie)
+      const session: Session = { id: randomBytes(32).toString('base64url'), csrfToken: randomBytes(32).toString('base64url'), expiresAt: Date.now() + SESSION_TTL }
+      const sessions = new Map([...this.sessions].filter(([, existing]) => existing.expiresAt > Date.now()))
+      if (old) sessions.delete(sessionHash(old.id))
+      const revokedCount = [...this.revokedPushSessions.values()].filter(expiry => expiry > Date.now()).length
+      if (sessions.size + revokedCount >= MAX_PERSISTED_SESSIONS) { res.status(503).json({ error: '登录设备过多，请稍后重试。' }); return }
+      sessions.set(sessionHash(session.id), session)
+      try { await this.persistSessions(sessions) }
+      catch { res.status(503).json({ error: '无法保存登录状态，请稍后重试。' }); return }
+      if (old) this.revoke(old.id)
+      this.sessions = sessions
+      this.sessionCookie(req, res, session)
+      res.set('Cache-Control', 'no-store').json({ authenticated: true, csrfToken: session.csrfToken, expiresAt: session.expiresAt })
+    })
+    this.passwordChanges = operation.catch(() => {})
+    void operation.catch(next)
   }
 
   changePassword: RequestHandler = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
@@ -224,7 +269,14 @@ export class Auth {
       this.passwordHash = Buffer.from(saved.hash, 'base64url')
       this.credentialVersion = saved.credentialVersion
       session.expiresAt = Date.now() + SESSION_TTL
-      for (const id of this.sessions.keys()) if (id !== session.id) this.revoke(id)
+      for (const [hash, other] of this.sessions) if (hash !== sessionHash(session.id)) {
+        this.sessions.delete(hash)
+        if (other.id) for (const listener of this.revokeListeners) listener(other.id)
+      }
+      this.revokedPushSessions.clear()
+      try { await this.persistSessions() }
+      // The new persisted password generation already rejects all old grants on restart.
+      catch { console.error('Unable to persist current web login after password change') }
       // The persisted credential generation also invalidates old push grants on restart.
       for (const listener of this.passwordListeners) {
         try { await listener(session.id, saved.credentialVersion) }
@@ -237,12 +289,27 @@ export class Auth {
     void operation.catch(next)
   }
 
-  logout: RequestHandler = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    const session = req.session || this.getSession(req.headers.cookie)
-    if (session) this.revoke(session.id)
-    res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure, path: '/' })
-    try { if (session) await Promise.all([...this.logoutListeners].map(listener => listener(session.id))) }
-    catch (error) { next(error); return }
-    res.json({ authenticated: false })
+  logout: RequestHandler = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    const operation = this.passwordChanges.then(async () => {
+      const session = this.getSession(req.headers.cookie)
+      if (session) {
+        const sessions = new Map(this.sessions)
+        sessions.delete(sessionHash(session.id))
+        const revoked = new Map([...this.revokedPushSessions].filter(([, expiry]) => expiry > Date.now()))
+        revoked.set(sessionHash(session.id), Date.now() + SESSION_TTL)
+        try { await this.persistSessions(sessions, revoked) }
+        catch { res.status(503).json({ error: '无法保存退出状态，请稍后重试。' }); return }
+        this.revoke(session.id)
+        this.sessions = sessions
+        this.revokedPushSessions = revoked
+        const results = await Promise.allSettled([...this.logoutListeners].map(listener => Promise.resolve().then(() => listener(session.id))))
+        if (results.some(result => result.status === 'rejected')) console.error('Unable to persist device cleanup after web logout; authorization remains revoked')
+      }
+      const httpsOrigin = Boolean(req.get('origin')?.startsWith('https:') && this.isTrustedOrigin(req.get('origin')))
+      res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: 'strict', secure: this.secureCookie || req.secure || httpsOrigin, path: '/' })
+      res.set('Cache-Control', 'no-store').json({ authenticated: false })
+    })
+    this.passwordChanges = operation.catch(() => {})
+    void operation.catch(next)
   }
 }

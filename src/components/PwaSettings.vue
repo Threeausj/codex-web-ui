@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import Icon from './Icon.vue';
 import {
   pwaState,
@@ -17,6 +17,27 @@ const props = defineProps<{ api: any; state: any }>();
 const notice = ref('');
 const localError = ref('');
 const testing = ref<'push' | 'system' | ''>('');
+type DeliveryStatus = { devices: number; queued: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastFailureAt: number | null; lastFailure: string | null };
+const deliveryStatus = ref<DeliveryStatus | null>(null);
+const deliveryError = ref('');
+let statusTimer: ReturnType<typeof setTimeout> | undefined;
+let disposed = false;
+let statusReading = false;
+const failures: Record<string, string> = { provider_unavailable: '推送服务暂时不可用', rate_limited: '推送服务限流', timeout: '推送连接超时', rejected: '推送服务拒绝请求', metadata_pending: '正在确认对话类型', expired: '通知已超过有效期' };
+const retryTime = computed(() => deliveryStatus.value?.nextRetryAt ? new Date(deliveryStatus.value.nextRetryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
+async function refreshDeliveryStatus() {
+  clearTimeout(statusTimer);
+  if (disposed || statusReading || pwaState.offline) return;
+  statusReading = true;
+  try {
+    const result = await props.api.requestHttp('/push/status', { signal: AbortSignal.timeout(10000) }, false);
+    if (!disposed) { deliveryStatus.value = result; deliveryError.value = ''; }
+  } catch (cause: any) { if (!disposed) deliveryError.value = cause.message || '无法读取推送状态'; }
+  finally {
+    statusReading = false;
+    if (!disposed && deliveryStatus.value?.queued) statusTimer = setTimeout(() => { void refreshDeliveryStatus(); }, 5000);
+  }
+}
 const android = /Android/i.test(navigator.userAgent);
 const categories: { key: keyof PushPreferences; label: string; description: string }[] = [
   { key: 'completed', label: '回复已完成', description: 'Codex 完成本次任务时提醒' },
@@ -41,15 +62,23 @@ async function operate(action: () => Promise<any>, message: string, progress = '
   localError.value = '';
   try { await action(); notice.value = message; }
   catch (cause: any) { localError.value = cause.message || '操作失败，请重试'; }
+  finally { void refreshDeliveryStatus(); }
 }
 async function sendTest(kind: 'push' | 'system') {
   testing.value = kind;
+  let queued = false;
   try {
     await operate(
-      () => kind === 'push' ? testDevicePush(props.api) : testSystemNotification(),
+      async () => {
+        const result = kind === 'push' ? await testDevicePush(props.api) : await testSystemNotification();
+        // Queue acceptance is different from push-provider acceptance.
+        queued = kind === 'push' && result?.queued === true;
+        return result;
+      },
       kind === 'push' ? '推送服务已接收测试通知，请查看系统通知。' : '系统通知已发出，请查看通知栏。',
       kind === 'push' ? '正在发送测试通知…' : '正在检查系统通知…',
     );
+    if (queued) notice.value = '推送服务暂时不可用，测试通知已保存，服务器会自动重试。';
   } finally { testing.value = ''; }
 }
 async function preferenceChanged(key: keyof PushPreferences, event: Event) {
@@ -58,7 +87,8 @@ async function preferenceChanged(key: keyof PushPreferences, event: Event) {
   await operate(() => saveDevicePushPreferences(props.api, preferences), '通知偏好已保存');
   input.checked = pwaState.pushPreferences[key];
 }
-onMounted(() => { void initializeDevicePush(props.api); });
+onMounted(() => { void initializeDevicePush(props.api); void refreshDeliveryStatus(); });
+onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
 </script>
 
 <template>
@@ -108,7 +138,15 @@ onMounted(() => { void initializeDevicePush(props.api); });
           <input type="checkbox" :aria-label="category.label" :checked="pwaState.pushPreferences[category.key]" :disabled="pwaState.pushBusy || pwaState.offline" @change="preferenceChanged(category.key, $event)" />
         </label>
       </div>
+      <div v-if="deliveryStatus && pwaState.pushSubscribed" class="pwa-delivery-status" aria-live="polite" aria-label="推送投递状态">
+        <span>推送服务已接收 {{ deliveryStatus.delivered }} 条</span>
+        <span v-if="deliveryStatus.queued">待发送 {{ deliveryStatus.queued }} 条<span v-if="deliveryStatus.retrying"> · 自动重试 {{ deliveryStatus.retrying }} 条</span><span v-if="retryTime"> · 下次 {{ retryTime }}</span></span>
+        <span v-if="deliveryStatus.failed || deliveryStatus.expired">发送失败 {{ deliveryStatus.failed }} 条 · 已过期 {{ deliveryStatus.expired }} 条</span>
+        <span v-if="deliveryStatus.lastFailure && (deliveryStatus.lastFailure !== 'metadata_pending' || deliveryStatus.queued) && (deliveryStatus.queued || (deliveryStatus.lastFailureAt || 0) > (deliveryStatus.lastDeliveredAt || 0))">{{ failures[deliveryStatus.lastFailure] || '发送暂时受阻' }}</span>
+      </div>
+      <p v-if="deliveryError" class="pwa-subtle">{{ deliveryError }}</p>
       <p class="pwa-subtle">设置仅作用于这台设备。退出登录会撤销本机通知；移动系统可能因省电或网络状态延迟送达。</p>
+      <p class="pwa-subtle">网络或推送服务暂时出错时，服务器会保存通知并自动重试；最多尝试 8 次，有效期 1 小时。服务接收成功不代表手机已显示通知。</p>
       <p v-if="android" class="pwa-subtle">Android Chrome 的后台通知需要手机能连接 Google 推送服务。若测试已接收却未收到，先点击“检查系统通知”；能收到系统检查通知时，请检查手机的 Google 服务连接和省电设置。</p>
     </section>
     <div v-if="localError || pwaState.pushError" class="pwa-feedback error" role="alert"><Icon name="AlertCircle" :size="16" /><span>{{ localError || pwaState.pushError }}</span></div>
@@ -146,6 +184,7 @@ onMounted(() => { void initializeDevicePush(props.api); });
 .pwa-feedback { display:flex;align-items:flex-start;gap:8px;line-height:1.7;font-size:12px;color:var(--muted); }
 .pwa-feedback > svg { flex-shrink:0;margin-top:2px; }
 .pwa-feedback.error { color:var(--danger, #b94d45); }
+.pwa-delivery-status { display:flex;flex-direction:column;gap:5px;margin-top:14px;color:var(--muted);font-size:11px;line-height:1.7; }
 @media(max-width:760px) {
   .pwa-description, .pwa-section p, .pwa-instructions { font-size:13px; }
   .pwa-title h4, .pwa-preference strong { font-size:14px; }

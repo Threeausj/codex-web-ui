@@ -16,6 +16,7 @@ const props = defineProps<{
   busy: boolean;
   hideFork?: boolean;
   hostId?: string;
+  cwd?: string;
   editableItemId?: string;
   editing?: boolean;
   editDisabled?: boolean;
@@ -24,7 +25,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   fork: [turnId?: string];
-  openFile: [path: string];
+  openFile: [path: string, line?: number];
   error: [message: string];
 }>();
 const editSession = ref<{
@@ -74,6 +75,11 @@ const blocks = computed(() =>
       : { ...block, ...turnPresentation(block.items) },
   ),
 );
+const expandedTurns = reactive(new Set<string>());
+function toggleTurn(event: Event, id: string) {
+  if ((event.currentTarget as HTMLDetailsElement).open) expandedTurns.add(id);
+  else expandedTurns.delete(id);
+}
 const finishedTurns = reactive(new Set<string>());
 const runningTurnId = computed(() => {
   if (!props.busy) return null;
@@ -106,7 +112,7 @@ function activityLabel(block: any) {
   <template v-for="block in blocks" :key="block.id">
     <ChatItem
       v-if="block.kind === 'message'"
-      :host-id="hostId"
+      :host-id="hostId" :cwd="cwd"
       :item="block.item"
       :busy="busy"
       :can-fork="!hideFork && !busy && !editing && !!block.item.turnId"
@@ -118,14 +124,14 @@ function activityLabel(block: any) {
       :cancel-edit="cancelEdit"
       :save-edit="saveEdit"
       @fork="emit('fork', $event)"
-      @open-file="emit('openFile', $event)"
+      @open-file="(path, line) => emit('openFile', path, line)"
       @error="emit('error', $event)"
     />
     <section v-else class="conversation-turn" :data-turn-id="block.id">
       <ChatItem
         v-for="item in block.users"
         :key="item.id"
-        :host-id="hostId"
+        :host-id="hostId" :cwd="cwd"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && !busy && !editing && !!item.turnId"
@@ -137,7 +143,7 @@ function activityLabel(block: any) {
         :cancel-edit="cancelEdit"
         :save-edit="saveEdit"
         @fork="emit('fork', $event)"
-        @open-file="emit('openFile', $event)"
+        @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"
       />
       <details
@@ -149,6 +155,7 @@ function activityLabel(block: any) {
           ['failed', 'interrupted'].includes(block.turn?.status)
         "
         class="turn-activity"
+        @toggle="toggleTurn($event, block.id)"
         :open="running(block)"
       >
         <summary
@@ -162,23 +169,23 @@ function activityLabel(block: any) {
           }}</span>
           <Icon name="ChevronRight" :size="14" />
         </summary>
-        <div v-if="block.activity.length" class="turn-activity-content">
+        <div v-if="block.activity.length && expandedTurns.has(block.id)" class="turn-activity-content">
           <template v-for="entry in block.activityBlocks" :key="entry.id">
             <ActivityBatch
               v-if="entry.kind === 'batch'"
-              :host-id="hostId"
+              :host-id="hostId" :cwd="cwd"
               :items="entry.items"
               :busy="running(block)"
-              @open-file="emit('openFile', $event)"
+              @open-file="(path, line) => emit('openFile', path, line)"
               @error="emit('error', $event)"
             />
             <ChatItem
               v-else
-              :host-id="hostId"
+              :host-id="hostId" :cwd="cwd"
               :item="entry.item"
               :busy="running(block)"
               :can-fork="false"
-              @open-file="emit('openFile', $event)"
+              @open-file="(path, line) => emit('openFile', path, line)"
               @error="emit('error', $event)"
             />
           </template>
@@ -197,12 +204,12 @@ function activityLabel(block: any) {
       <ChatItem
         v-for="item in block.outputs"
         :key="item.id"
-        :host-id="hostId"
+        :host-id="hostId" :cwd="cwd"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
         @fork="emit('fork', $event)"
-        @open-file="emit('openFile', $event)"
+        @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"
       />
     </section>
@@ -211,14 +218,14 @@ function activityLabel(block: any) {
        the editor mounted at the history tail so failures retain the draft. -->
   <ChatItem
     v-if="editSession && editingItem && !items.some((item) => item.id === editSession?.itemId)"
-    :host-id="hostId"
+    :host-id="hostId" :cwd="cwd"
     :item="editingItem"
     :editing="editing"
     :edit-disabled="editDisabled"
     :edit-session="editSession"
     :cancel-edit="cancelEdit"
     :save-edit="saveEdit"
-    @open-file="emit('openFile', $event)"
+    @open-file="(path, line) => emit('openFile', path, line)"
     @error="emit('error', $event)"
   />
   <div

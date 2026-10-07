@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { conversationMarkdown } from '../lib/conversation-markdown'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
+import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
 import { publicReasoningSummary } from '../lib/activity-presentation'
 
 const props = defineProps<{
   item: any
   hostId?: string
+  cwd?: string
   busy?: boolean
   collapseTools?: boolean
   canFork?: boolean
@@ -21,7 +22,7 @@ const props = defineProps<{
   cancelEdit?: () => void
   saveEdit?: () => Promise<void>
 }>()
-const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string]; error: [message: string] }>()
+const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string, line?: number]; error: [message: string] }>()
 const copied = ref(false)
 const editorOpen = computed(() => props.editSession?.itemId === props.item.id)
 const editDraft = computed({
@@ -33,7 +34,24 @@ const editPending = computed(() => props.editSession?.saving || props.editing)
 const hasEditInput = computed(() => !!editDraft.value.trim() ||
   (props.item.content || []).some((input: any) => ['image', 'localImage'].includes(input.type)))
 const text = computed(() => props.item.text || (props.item.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'))
-const html = computed(() => DOMPurify.sanitize(marked.parse(text.value, { async: false }) as string, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'] }))
+const renderedText = ref(text.value)
+let markdownFrame: number | undefined
+watch(text, value => {
+  if (!props.busy || props.item.type !== 'agentMessage') { renderedText.value = value; return }
+  if (markdownFrame != null) return
+  markdownFrame = requestAnimationFrame(() => { markdownFrame = undefined; renderedText.value = text.value })
+})
+watch(() => props.busy, busy => { if (!busy) renderedText.value = text.value })
+onBeforeUnmount(() => { if (markdownFrame != null) cancelAnimationFrame(markdownFrame) })
+const html = computed(() => conversationMarkdown(renderedText.value, props.hostId, props.cwd || props.item.cwd))
+const findings = computed(() => props.item.type === 'exitedReviewMode' ? reviewFindings(props.item.review) : []);
+const toolExpanded = ref(false)
+const expandedFiles = ref(new Set<string>())
+function toggleFile(event: Event, path: string) {
+  if ((event.currentTarget as HTMLDetailsElement).open) expandedFiles.value.add(path)
+  else expandedFiles.value.delete(path)
+}
+
 const userImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')))
 const localImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'localImage' && c.path))
 const reasoningSummary = computed(() => publicReasoningSummary(props.item))
@@ -88,6 +106,8 @@ function onEditKeydown(event: KeyboardEvent) {
   }
 }
 function onLink(event: MouseEvent) {
+  const image = (event.target as Element).closest('img[data-file-path]') as HTMLImageElement | null
+  if (image) { event.preventDefault(); emit('openFile', image.dataset.filePath!); return }
   const anchor = (event.target as Element).closest('a')
   if (!anchor) return
   const href = anchor.getAttribute('href') || ''
@@ -132,21 +152,29 @@ function onLink(event: MouseEvent) {
   </template>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon :name="item.status === 'inProgress' ? 'LoaderCircle' : 'RefreshCw'" :size="13" :class="{ spin: item.status === 'inProgress' }" />{{ item.status === 'inProgress' ? '正在压缩上下文…' : item.status === 'failed' ? '上下文压缩失败' : item.status === 'interrupted' ? '上下文压缩已取消' : '上下文已压缩' }}<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
-  <details v-else class="tool-item" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
+  <details v-else class="tool-item" @toggle="toolExpanded = ($event.currentTarget as HTMLDetailsElement).open" :open="toolOpenByDefault" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
     <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
+    <template v-if="toolExpanded">
     <div v-if="item.type === 'fileChange'" class="file-changes">
-      <details v-for="change in item.changes" :key="change.path" class="file-diff">
+      <details v-for="change in item.changes" :key="change.path" class="file-diff" @toggle="toggleFile($event, change.path)">
         <summary class="file-diff-heading"><Icon name="FileText" :size="15" /><span class="file-diff-path" :title="change.path">{{ change.path }}</span><span class="diff-stats"><span class="diff-count-add">+{{ diffStats(change.diff).added }}</span><span class="diff-count-remove">−{{ diffStats(change.diff).removed }}</span></span><span>{{ typeof change.kind === 'string' ? change.kind : Object.keys(change.kind || {})[0] }}</span><button class="icon-button" :aria-label="`打开文件 ${change.path}`" :title="`打开文件 ${change.path}`" @click.stop.prevent="emit('openFile', change.path)"><Icon name="ArrowUpRight" :size="14" /></button><Icon name="ChevronDown" :size="14" /></summary>
-        <pre class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
+        <pre v-if="expandedFiles.has(change.path)" class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </details>
     </div>
+    <div v-else-if="item.type === 'imageGeneration' && item.savedPath" class="tool-content"><ConversationImage :path="item.savedPath" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
     <div v-else-if="item.type === 'imageView' && item.path" class="tool-content"><ConversationImage :path="item.path" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
+    <div v-else-if="findings.length" class="review-findings"><article v-for="(finding, index) in findings" :key="index" class="review-finding"><strong>{{ finding.title }}</strong><p>{{ finding.body }}</p><button class="button button-small button-secondary" @click="emit('openFile', finding.file, finding.start)">{{ finding.file }}{{ finding.start ? ':' + finding.start : '' }}</button></article></div>
     <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>
+    </template>
   </details>
 </template>
 
 <style scoped>
 .file-diff > summary { list-style: none; cursor: pointer; }
+.review-findings { padding: 10px 0; }
+.review-finding { border-left: 2px solid var(--border); padding: 8px 12px; font-size: 12px; }
+.review-finding p { white-space: pre-wrap; line-height: 1.7; margin: 6px 0; }
+.review-finding button { max-width: 100%; overflow-wrap: anywhere; }
 .file-diff > summary::-webkit-details-marker { display: none; }
 .file-diff-heading .file-diff-path { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-diff > summary > svg:last-child { transition: transform .15s; }

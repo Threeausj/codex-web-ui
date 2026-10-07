@@ -14,7 +14,10 @@ export function isReadOnlyGitQuery(args: string[]): boolean {
     ['rev-parse', '--absolute-git-dir'], ['rev-parse', '--verify', 'HEAD'],
     ['symbolic-ref', '--quiet', '--short', 'HEAD'],
     ['status', '--porcelain=v1', '-z', '--untracked-files=normal'],
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'],
     ['for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+    ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'],
+    ['log', '-30', '--format=%H%x00%s', '--no-decorate'],
     ['worktree', 'list', '--porcelain', '-z'],
   ].some(expected => same(args, expected))) return true
   if (args.length === 3 && args[0] === 'check-ref-format' && args[1] === '--branch')

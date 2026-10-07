@@ -19,6 +19,7 @@ import SideChatPanel from "./components/SideChatPanel.vue";
 import ApprovalCard from "./components/ApprovalCard.vue";
 import Composer from "./components/Composer.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
+import ReviewPanel from "./components/ReviewPanel.vue";
 import ResizableWorkspace from "./components/ResizableWorkspace.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
@@ -42,12 +43,14 @@ const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
 const workspaceTab = ref("files");
 const workspacePath = ref("");
+const workspaceLine = ref<number>();
 const workspace = ref<InstanceType<typeof WorkspacePanel>>();
 const composer = ref<InstanceType<typeof Composer>>();
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
 const settingsOpen = ref(false);
 const resourcesOpen = ref(false);
+const reviewOpen = ref(false);
 const settingsTab = ref("general");
 const paletteOpen = ref(false);
 const paletteQuery = ref("");
@@ -357,13 +360,14 @@ async function chooseNewContext(hostId: string, path?: string) {
     composer.value?.focus();
   }
 }
-function openWorkspace(tab = "files", path = "") {
+function openWorkspace(tab = "files", path = "", line?: number) {
   sideChat.state.open = false;
   const samePath = workspaceOpen.value && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceOpen.value = true;
   workspacePath.value = path;
-  if (path && samePath) void nextTick(() => workspace.value?.revealPath(path));
+  workspaceLine.value = line;
+  if (path && samePath) void nextTick(() => workspace.value?.revealPath(path, line));
   else if (!path) void nextTick(() => workspace.value?.setTab(tab));
 }
 function toggleWorkspace() {
@@ -469,19 +473,7 @@ async function execute(command: string) {
   else if (command === "settings") openSettings();
   else if (command === "settings-projects") openSettings("projects");
   else if (command === "review") {
-    await action(async () => {
-      if (!state.activeThread) await api.newThread();
-      if (!state.activeThread)
-        await api.send(
-          "请审查当前项目的未提交代码变更，关注错误、回归和缺少的测试。",
-        );
-      else
-        await api.rpc("review/start", {
-          threadId: state.activeThread.id,
-          target: { type: "uncommittedChanges" },
-          delivery: "inline",
-        });
-    });
+    reviewOpen.value = true;
   }
 }
 async function fork(turnId?: string) {
@@ -633,6 +625,7 @@ function onKeydown(event: KeyboardEvent) {
     paletteOpen.value = false;
     settingsOpen.value = false;
     resourcesOpen.value = false;
+    reviewOpen.value = false;
     renameOpen.value = false;
     sidebarOpen.value = false;
     threadMenu.value = false;
@@ -1101,6 +1094,7 @@ watch(() => [state.authenticated, state.loading], () => {
             <ConversationOutput
               :key="`${state.hostId}:${state.activeThread?.id || 'new'}`"
               :host-id="state.hostId"
+              :cwd="state.activeThread?.cwd || state.projectPath"
               :items="state.items"
               :turns="state.turns"
               :busy="state.busy"
@@ -1110,7 +1104,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :edit-message="api.resendEditedMessage"
               :cancel-message-edit="api.cancelMessageEdit"
               @fork="fork"
-              @open-file="openWorkspace('files', $event)"
+              @open-file="(path, line) => openWorkspace('files', path, line)"
               @error="showError"
             />
             <ApprovalCard
@@ -1196,12 +1190,13 @@ watch(() => [state.authenticated, state.loading], () => {
         :state="state"
         :initial-tab="workspaceTab"
         :open-path="workspacePath"
+        :open-line="workspaceLine"
         @close="workspaceOpen = false"
         @error="showError"
       />
     </ResizableWorkspace>
     <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" panel-id="side-chat-panel">
-      <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @open-file="openWorkspace('files', $event)" />
+      <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @quote="addToConversation" @open-file="(path, line) => openWorkspace('files', path, line)" />
     </ResizableWorkspace>
     <ProjectDialog
       v-if="editingProject"
@@ -1216,6 +1211,13 @@ watch(() => [state.authenticated, state.loading], () => {
       :api="api"
       :state="state"
       @close="resourcesOpen = false"
+    />
+    <ReviewPanel
+      v-if="reviewOpen"
+      :api="api"
+      :state="state"
+      @close="reviewOpen = false"
+      @file="reviewOpen = false; openWorkspace('files', $event.path, $event.line)"
     />
     <SettingsPanel
       v-if="settingsOpen"

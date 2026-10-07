@@ -28,6 +28,7 @@ async function authentication(directory?: string, explicit: string | null = pass
   app.get('/session', auth.session)
   app.post('/login', auth.login)
   app.post('/password', auth.requireAuth, auth.requireCsrf, auth.changePassword)
+  app.post('/logout', auth.requireAuth, auth.requireCsrf, auth.logout)
   const server = http.createServer(app)
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
@@ -137,7 +138,7 @@ test('the private password hash survives restarts and overrides environment and 
       assert.equal((await restarted.post('/login', { password })).status, 401)
       assert.equal((await restarted.post('/login', { password: 'stale-environment-password-123' })).status, 401)
       assert.equal((await restarted.post('/login', { password: nextPassword })).status, 200)
-      assert.equal(restarted.auth.getSession(session.cookie), undefined)
+      assert.equal(restarted.auth.getSession(session.cookie)!.csrfToken, session.csrfToken)
     } finally { await restarted.close() }
   } finally { if (app) await app.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
@@ -271,6 +272,7 @@ test('password rotation revokes other RPC sockets, preview tickets and push devi
     assert.equal((await fetch(base + '/api/push/config', { headers: { cookie: other.cookie } })).status, 401)
     assert.equal((await fetch(base + tickets[0])).status, 200)
     assert.equal((await fetch(base + tickets[1])).status, 403)
+    application.push.observe({ id: 'local', name: 'Local', kind: 'local' }, { method: 'thread/started', params: { thread: { id: 'thread-1', source: 'cli' } } })
     application.push.observe({ id: 'local', name: 'Local', kind: 'local' }, { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'after-password-change', status: 'completed' } } })
     await application.push.flush()
     assert.deepEqual(sent, [currentDevice.endpoint])
@@ -346,7 +348,7 @@ test('unbound legacy devices are rejected and only matching credential generatio
     } finally { await upgraded.close() }
     assert.deepEqual(sent, [])
     const saved = JSON.parse(await fs.readFile(file, 'utf8'))
-    assert.equal(saved.version, 2)
+    assert.equal(saved.version, 3)
     assert.equal(saved.subscriptions[0].credentialVersion, initialAuth.pushCredentialVersion)
     const unchangedAuth = await Auth.create(directory, nextPassword, new Set([origin]))
     assert.equal(unchangedAuth.pushCredentialVersion, initialAuth.pushCredentialVersion)
@@ -370,4 +372,162 @@ test('unbound legacy devices are rejected and only matching credential generatio
     finally { await restoredLegacyPush.close() }
     assert.deepEqual(sent, [device.endpoint])
   } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('private hashed login records preserve the bearer ID, CSRF and expiry across a service restart', async () => {
+  const app = await authentication(undefined, password, true)
+  try {
+    const current = await app.login(); const other = await app.login()
+    const original = app.auth.getSession(current.cookie)!
+    const content = await fs.readFile(path.join(app.dataDir, 'web-sessions.json'), 'utf8')
+    const saved = JSON.parse(content)
+    assert.equal(saved.sessions.length, 2)
+    assert.ok(!content.includes(original.id) && !content.includes(password))
+    assert.equal(saved.sessions[0].sessionHash.length, 43)
+    assert.equal((await fs.stat(path.join(app.dataDir, 'web-sessions.json'))).mode & 0o777, 0o600)
+    assert.ok(!(await fs.readdir(app.dataDir)).some(file => file.endsWith('.tmp')))
+    await app.close()
+    const restarted = await authentication(app.dataDir, 'stale-environment-password-123', true)
+    try {
+      assert.equal(restarted.auth.isSessionActive(original.id), true)
+      const restored = restarted.auth.getSession(current.cookie)!
+      assert.deepEqual(restored, original)
+      assert.equal(restarted.auth.getSession(other.cookie)!.csrfToken, other.csrfToken)
+      const status = await fetch(restarted.base + '/session', { headers: { cookie: current.cookie } })
+      assert.equal(status.headers.get('cache-control'), 'no-store')
+      assert.deepEqual(await status.json(), { authenticated: true, authRequired: true, csrfToken: current.csrfToken, expiresAt: current.expiresAt })
+      assert.equal((await restarted.post('/logout', {}, { cookie: current.cookie, 'x-csrf-token': 'stale-csrf' })).status, 403)
+      assert.equal((await restarted.post('/logout', {}, { ...current.headers, origin: 'https://attacker.invalid' })).status, 403)
+      assert.ok(restarted.auth.getSession(current.cookie))
+    } finally { await restarted.close() }
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
+})
+
+test('durable logout revokes only its session and device hash despite failed browser-independent device cleanup', async t => {
+  const app = await authentication()
+  try {
+    const current = await app.login(); const other = await app.login()
+    const currentId = app.auth.getSession(current.cookie)!.id
+    const { sessionHash } = await import('./auth-sessions.js')
+    const revoked: string[] = []
+    const logs: string[] = []
+    app.auth.onSessionRevoked(id => revoked.push(id))
+    app.auth.onLogout(async () => { throw new Error('private-push-file-failure') })
+    t.mock.method(console, 'error', (message: string) => logs.push(message))
+    const result = await app.post('/logout', {}, current.headers)
+    assert.equal(result.status, 200)
+    assert.equal(result.headers.get('cache-control'), 'no-store')
+    assert.match(result.headers.get('set-cookie')!, /Expires=Thu, 01 Jan 1970/i)
+    assert.deepEqual(await result.json(), { authenticated: false })
+    assert.deepEqual(revoked, [currentId])
+    assert.equal(app.auth.getSession(current.cookie), undefined)
+    assert.equal(app.auth.isPushSessionRevokedHash(sessionHash(currentId)), true)
+    assert.ok(app.auth.getSession(other.cookie))
+    assert.equal(logs.length, 1)
+    assert.ok(!logs[0]!.includes('private-push-file-failure'))
+    await app.close()
+    const restarted = await authentication(app.dataDir)
+    try {
+      assert.equal(restarted.auth.getSession(current.cookie), undefined)
+      assert.equal(restarted.auth.isPushSessionRevokedHash(sessionHash(currentId)), true)
+      assert.equal(restarted.auth.getSession(other.cookie)!.csrfToken, other.csrfToken)
+    } finally { await restarted.close() }
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
+})
+
+test('password rotation retains the current durable login but permanently rejects the old generation and other cookies', async () => {
+  const app = await authentication()
+  try {
+    const current = await app.login(); const other = await app.login()
+    const oldRecord = await fs.readFile(path.join(app.dataDir, 'web-sessions.json'), 'utf8')
+    assert.equal((await app.post('/password', { currentPassword: password, newPassword: nextPassword }, current.headers)).status, 200)
+    await app.close()
+    const restarted = await authentication(app.dataDir)
+    try {
+      assert.equal(restarted.auth.getSession(current.cookie)!.csrfToken, current.csrfToken)
+      assert.equal(restarted.auth.getSession(other.cookie), undefined)
+      assert.equal((await restarted.post('/login', { password })).status, 401)
+      assert.equal((await restarted.post('/login', { password: nextPassword })).status, 200)
+    } finally { await restarted.close() }
+    // Restoring a stale session backup must not restore authorizations after rotation.
+    await fs.writeFile(path.join(app.dataDir, 'web-sessions.json'), oldRecord)
+    const reset = await Auth.create(app.dataDir, password, new Set([origin]))
+    assert.equal(reset.getSession(current.cookie), undefined)
+    assert.equal(reset.getSession(other.cookie), undefined)
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
+})
+
+test('expired durable sessions and revocations are not restored', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const app = await authentication()
+  try {
+    const current = await app.login(); const signedOut = await app.login()
+    const { sessionHash } = await import('./auth-sessions.js')
+    const signedOutHash = sessionHash(app.auth.getSession(signedOut.cookie)!.id)
+    assert.equal((await app.post('/logout', {}, signedOut.headers)).status, 200)
+    await app.close()
+    now += SESSION_TTL
+    const restarted = await Auth.create(app.dataDir, password, new Set([origin]))
+    assert.equal(restarted.getSession(current.cookie), undefined)
+    assert.equal(restarted.isPushSessionRevokedHash(signedOutHash), false)
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
+})
+
+test('corrupt, modified and linked session records fail closed without preventing a fresh password login', async t => {
+  const app = await authentication()
+  t.mock.method(console, 'error', () => {})
+  try {
+    const current = await app.login()
+    const file = path.join(app.dataDir, 'web-sessions.json')
+    const initial = await fs.readFile(file, 'utf8')
+    const saved = JSON.parse(initial)
+    const changedExpiry = structuredClone(saved)
+    changedExpiry.sessions[0].expiresAt += 1
+    for (const content of ['not-json', JSON.stringify({ ...saved, version: 2 }), JSON.stringify({ ...saved, credentialVersion: '0'.repeat(32) }), JSON.stringify({ ...saved, signature: 'a'.repeat(43) }), JSON.stringify({ ...saved, sessionId: current.cookie }), JSON.stringify(changedExpiry), 'x'.repeat(2 * 1024 * 1024 + 1)]) {
+      await fs.writeFile(file, content)
+      const restarted = await Auth.create(app.dataDir, password, new Set([origin]))
+      assert.equal(restarted.getSession(current.cookie), undefined)
+    }
+    const target = path.join(app.dataDir, 'untrusted-sessions.json')
+    await fs.writeFile(target, initial)
+    await fs.rm(file)
+    await fs.symlink(target, file)
+    const restarted = await authentication(app.dataDir)
+    try {
+      assert.equal(restarted.auth.getSession(current.cookie), undefined)
+      const fresh = await restarted.login()
+      assert.ok(restarted.auth.getSession(fresh.cookie))
+      assert.equal((await fs.lstat(file)).isSymbolicLink(), false)
+      assert.equal(await fs.readFile(target, 'utf8'), initial)
+    } finally { await restarted.close() }
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
+})
+
+test('failed durable login and logout writes never claim success or silently revive a completed logout', async t => {
+  const app = await authentication()
+  try {
+    const current = await app.login()
+    const file = path.join(app.dataDir, 'web-sessions.json')
+    const before = await fs.readFile(file, 'utf8')
+    const rename = fs.rename.bind(fs)
+    t.mock.method(fs, 'rename', async (from, to) => { if (to === file) throw new Error('private-session-write-failure'); return rename(from, to) })
+    const failedLogin = await app.post('/login', { password }, { cookie: current.cookie })
+    assert.equal(failedLogin.status, 503)
+    assert.equal(failedLogin.headers.get('set-cookie'), null)
+    assert.ok(!(await failedLogin.text()).includes('private-session-write-failure'))
+    const failedLogout = await app.post('/logout', {}, current.headers)
+    assert.equal(failedLogout.status, 503)
+    assert.equal(failedLogout.headers.get('set-cookie'), null)
+    assert.ok(!(await failedLogout.text()).includes('private-session-write-failure'))
+    assert.ok(app.auth.getSession(current.cookie))
+    assert.equal(await fs.readFile(file, 'utf8'), before)
+    assert.ok(!(await fs.readdir(app.dataDir)).some(name => name.endsWith('.tmp')))
+    const stillValid = await Auth.create(app.dataDir, password, new Set([origin]))
+    assert.ok(stillValid.getSession(current.cookie))
+    t.mock.restoreAll()
+    assert.equal((await app.post('/logout', {}, current.headers)).status, 200)
+    const revoked = await Auth.create(app.dataDir, password, new Set([origin]))
+    assert.equal(revoked.getSession(current.cookie), undefined)
+  } finally { await app.close(); await fs.rm(app.dataDir, { recursive: true, force: true }) }
 })

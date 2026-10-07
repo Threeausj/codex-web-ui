@@ -239,3 +239,55 @@ test('eight bounded quotations deduplicate and prevent further additions without
   await expect(page.locator('.composer-quote')).toHaveCount(8);
   expect(mock.request('turn/start')).toBeUndefined();
 });
+
+test('sidebar can quote its answer, save visible context without another model call, and explicitly reset its history anchor', async ({ page, mock }) => {
+  const wire = selectionWire(mock);
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method === 'thread/inject_items') { mock.requests.push(request); return socket.send(JSON.stringify({ id: request.id, result: {} })); }
+    return receive(socket, request);
+  };
+  await selectHistory(page);
+  const main = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await main.fill('主对话草稿');
+  await selectMessage(page);
+  await page.getByRole('button', { name: '在侧边聊天中提问', exact: true }).click();
+  const panel = page.getByRole('region', { name: '侧边聊天', exact: true });
+  await page.getByRole('textbox', { name: '围绕引用内容提问', exact: true }).fill('解释一下');
+  await page.getByRole('button', { name: '发送侧边问题', exact: true }).click();
+  await expect(panel.getByRole('button', { name: '引用回答到主对话' })).toBeEnabled();
+  await panel.getByRole('button', { name: '引用回答到主对话' }).click();
+  await expect(page.locator('.composer-quote')).toContainText('流式回复完成 ✅');
+  await expect(main).toHaveValue('主对话草稿');
+  const inferenceCount = mock.requests.filter(request => request.method === 'turn/start').length;
+  await panel.getByRole('button', { name: '保存并置顶正式分支' }).click();
+  await expect(panel.getByRole('button', { name: '分支已保存' })).toBeDisabled();
+  const fork = mock.requests.filter(request => request.method === 'thread/fork' && request.params.ephemeral === false).at(-1)!;
+  expect(fork.params).toMatchObject({ threadId: 'thread-existing', lastTurnId: 'turn-history', ephemeral: false, deferGoalContinuation: true });
+  expect(mock.request('thread/inject_items')!.params.items[0].content[0].text).toContain('流式回复完成 ✅');
+  const savedId = mock.request('thread/inject_items')!.params.threadId;
+  expect(mock.preferences.pins).toContainEqual({ kind: 'thread', hostId: 'local', id: savedId, label: '已有测试历史 · 侧边问答' });
+  expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(inferenceCount);
+  page.once('dialog', dialog => dialog.accept());
+  await panel.getByRole('button', { name: '另开侧边分支' }).click();
+  await expect(panel.getByRole('button', { name: '保存并置顶正式分支' })).toHaveCount(0);
+  await expect(panel.getByText('想了解这段内容的哪一部分？')).toBeVisible();
+  expect(wire.releases).toContain(wire.sideThreadId);
+  await expect(main).toHaveValue('主对话草稿');
+  // Native unstarted forks may be absent from thread/list. Reload must hydrate
+  // the explicitly pinned branch by ID without creating a model turn.
+  const savedThread = structuredClone(mock.threads.find(thread => thread.id === savedId)!);
+  mock.threads = mock.threads.filter(thread => thread.id !== savedId);
+  const receiveSaved = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method === 'thread/read' && request.params?.threadId === savedId) {
+      mock.requests.push(request);
+      return socket.send(JSON.stringify({ id: request.id, result: { thread: savedThread } }));
+    }
+    return receiveSaved(socket, request);
+  };
+  await page.reload();
+  await expect(page.locator('[data-section="pinned"] .thread-row').filter({ hasText: '已有测试历史 · 侧边问答' })).toBeVisible();
+  await expect(main).toHaveValue('主对话草稿');
+  expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(inferenceCount);
+});

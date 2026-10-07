@@ -6,7 +6,7 @@ import ConversationOutput from './ConversationOutput.vue';
 import { conversationSelectionKey } from '../lib/conversation-selection';
 
 const props = defineProps<{ controller: any; api: any; mainState: any }>();
-const emit = defineEmits<{ openFile: [path: string] }>();
+const emit = defineEmits<{ openFile: [path: string, line?: number]; quote: [value: any] }>();
 const state = computed(() => props.controller.state);
 const question = ref('');
 const questionField = ref<HTMLTextAreaElement>();
@@ -14,6 +14,7 @@ const transcript = ref<HTMLElement>();
 const localError = ref('');
 const closing = ref(false);
 const synchronizing = ref(false);
+const recoveryId = ref('');
 const followTail = ref(true);
 const sourceKey = computed(() => conversationSelectionKey(state.value.source));
 const requests = computed(() => state.value.threadId && state.value.source?.hostId === props.mainState.hostId
@@ -79,6 +80,25 @@ async function close() {
   catch (cause: any) { localError.value = cause?.message || '关闭失败，请重试。'; }
   finally { closing.value = false; }
 }
+async function newBranch() {
+  if (!window.confirm("另开侧边分支会关闭当前临时问答，并按当前选段重新继承历史，是否继续？")) return;
+  try { await props.controller.newBranch(); }
+  catch (cause: any) { localError.value = cause.message; }
+}
+async function saveBranch() {
+  localError.value = '';
+  try { await props.controller.saveBranch(); }
+  catch (cause: any) { localError.value = cause.message; }
+}
+async function recoverSavedBranch() {
+  localError.value = '';
+  try { await props.controller.resumeSavedBranch(recoveryId.value.trim()); recoveryId.value = ''; }
+  catch (cause: any) { localError.value = cause.message; }
+}
+function quoteAnswer() {
+  const value = props.controller.answerQuote();
+  if (value) emit('quote', value);
+}
 </script>
 
 <template>
@@ -87,13 +107,22 @@ async function close() {
       <div><Icon name="PanelRight" :size="16" /><strong>侧边聊天</strong></div>
       <div class="side-chat-heading-actions"><button v-if="state.threadId" type="button" class="icon-button" aria-label="同步侧边聊天" title="同步侧边聊天" :disabled="closing || synchronizing || !state.connected || state.loading" @click="synchronize"><Icon :name="synchronizing ? 'LoaderCircle' : 'RefreshCw'" :size="15" :class="{ spin: synchronizing }" /></button><button type="button" class="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" :disabled="closing" @click="close"><Icon :name="closing ? 'LoaderCircle' : 'X'" :size="17" :class="{ spin: closing }" /></button></div>
     </header>
-    <p class="side-chat-note">围绕所选内容提问，原对话保持不变。</p>
+    <p class="side-chat-note">{{ state.anchor ? `历史锚点：${state.boundary.lastTurnId ? '截至首次所选轮次' : state.boundary.beforeTurnId ? '首次所选运行轮次之前' : '首次提问时的对话历史'}。后续问题继续此分支。` : '首次提问继承所选位置的对话历史。' }}</p>
+    <div v-if="state.threadId" class="side-chat-branch-actions">
+      <button type="button" class="button button-small button-secondary" :disabled="state.busy || state.loading || state.saving || !state.connected" @click="newBranch">另开侧边分支</button>
+      <button type="button" class="button button-small button-secondary" :disabled="state.busy || state.loading || state.saving || !!state.savedThreadId || state.saveUncertain === 'fork' || !state.connected" @click="saveBranch">{{ state.savedThreadId ? '分支已保存' : state.saving ? '正在保存…' : state.saveUncertain === 'fork' ? '创建结果待确认' : state.saveUncertain === 'inject' ? '核对并继续保存' : state.saveTargetThreadId ? '保存新增问答到分支' : '保存并置顶正式分支' }}</button>
+      <button type="button" class="button button-small button-secondary" :disabled="state.busy || !controller.answerQuote()" @click="quoteAnswer">引用回答到主对话</button>
+    </div>
+    <form v-if="state.saveUncertain === 'fork'" class="side-chat-save-recovery" @submit.prevent="recoverSavedBranch">
+      <label>创建结果待确认：请先核对已创建的原生对话，再填写其对话 ID。<input v-model="recoveryId" maxlength="128" aria-label="已创建正式分支的对话 ID" placeholder="正式分支的对话 ID" :disabled="state.saving" /></label>
+      <button type="submit" class="button button-small button-secondary" :disabled="!recoveryId.trim() || state.saving || state.busy || !state.connected">指定已创建分支继续保存</button>
+    </form>
     <details v-if="state.source" class="side-chat-quote" open>
       <summary><Icon name="CornerDownLeft" :size="14" /><span>引用 {{ state.source.threadName || '原对话' }}</span><Icon name="ChevronDown" :size="13" /></summary>
       <blockquote>{{ state.source.text }}</blockquote>
     </details>
     <div ref="transcript" class="side-chat-transcript" aria-label="侧边聊天消息" @scroll.passive="onScroll">
-      <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :hide-fork="true" @open-file="emit('openFile', $event)" @error="localError = $event" />
+      <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :cwd="mainState.projectPath" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
       <ApprovalCard v-for="request in requests" :key="request.id" :request="request" :api="api" />
       <p v-if="state.loading" class="side-chat-status" role="status"><Icon name="LoaderCircle" :size="15" class="spin" />正在准备侧边对话…</p>
       <div v-if="!state.items?.length && !state.loading && !state.busy" class="side-chat-empty"><Icon name="CircleHelp" :size="24" /><p>想了解这段内容的哪一部分？</p></div>
@@ -115,6 +144,7 @@ async function close() {
 .side-chat-heading > div { display: flex; align-items: center; gap: 8px; }
 .side-chat-heading-actions { margin-left: auto; }
 .side-chat-heading strong { font-size: 13px; font-weight: 600; }
+.side-chat-branch-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px 0; flex-shrink: 0; }
 .side-chat-note { font-size: 11px; color: var(--muted); padding: 10px 16px 0; margin: 0; line-height: 1.7; }
 .side-chat-quote { margin: 10px 14px 0; padding: 9px 10px; border-left: 2px solid var(--green); background: var(--soft); border-radius: 6px; flex-shrink: 0; font-size: 12px; min-width: 0; }
 .side-chat-quote summary { display: flex; align-items: center; gap: 6px; list-style: none; color: var(--muted); cursor: pointer; }
@@ -130,6 +160,8 @@ async function close() {
 .side-chat-empty { color: var(--muted); text-align: center; padding: 30px 8px; font-size: 12px; }
 .side-chat-error { color: var(--red); font-size: 12px; line-height: 1.7; padding: 8px 16px; margin: 0; overflow-wrap: anywhere; flex-shrink: 0; }
 .side-chat-status { display: flex; align-items: center; gap: 6px; padding: 8px 16px; margin: 0; color: var(--muted); font-size: 12px; flex-shrink: 0; line-height: 1.7; }
+.side-chat-save-recovery { margin: 4px 12px; display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; color: var(--muted); }
+.side-chat-save-recovery input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; padding: 6px; }
 .side-chat-composer { margin: 8px 12px 12px; padding: 10px 12px 8px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); min-width: 0; }
 .side-chat-composer:focus-within { border-color: var(--muted); }
 .side-chat-label { position: absolute; clip: rect(0, 0, 0, 0); width: 1px; height: 1px; overflow: hidden; }
