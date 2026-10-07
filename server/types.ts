@@ -16,7 +16,7 @@ export type Project = { id: string; name: string; path: string; rootPaths?: stri
 export type Session = { id: string; csrfToken: string; expiresAt: number }
 export interface AuthenticatedRequest extends Request { session?: Session }
 export type RpcId = string | number
-export type RpcMessage = { id?: RpcId; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } }
+export type RpcMessage = { id?: RpcId; method?: string; params?: unknown; result?: unknown; bridgeEventSequence?: number; error?: { code: number; message: string; data?: unknown } }
 
 export function rpcError(id: RpcId, message: string, code = -32000): RpcMessage {
   return { id, error: { code, message } }

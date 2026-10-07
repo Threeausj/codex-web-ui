@@ -2,134 +2,48 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import ChatItem from './ChatItem.vue'
-import { mergeSubagents, subagentStatusLabel, subagentTime, type SubagentGroup } from '../lib/subagents'
+import { subagentStatusLabel, subagentTime, type SubagentGroup } from '../lib/subagents'
+import { getSubagentPrefetch } from '../lib/subagent-prefetch'
 
 const props = defineProps<{ api: any; state: any }>()
-const threads = ref<any[]>([])
-const nextCursor = ref<string | null>(null)
-const loading = ref(false)
-const error = ref('')
+const { rootId, connected, agents, nextCursor, loading, error, contents, load, read: fetchContent, refresh: refreshContent } = getSubagentPrefetch(props.api, props.state)
 const selectedId = ref('')
-const detailThread = ref<any>(null)
-const detailTurns = ref<any[]>([])
-const detailCursor = ref<string | null>(null)
-const detailLoading = ref(false)
-const detailError = ref('')
+const localDetailError = ref('')
 const now = ref(Date.now())
-let listGeneration = 0
-let detailGeneration = 0
-const rootId = computed(() => props.state.activeThread?.id || props.state.threadId || '')
-const scope = () => JSON.stringify([props.state.hostId, rootId.value])
-const connected = computed(() => !!props.state.connected)
-const agents = computed(() => mergeSubagents(rootId.value, threads.value, props.state.items || [], props.state.agentActivity || {}))
 const selected = computed(() => agents.value.find(agent => agent.id === selectedId.value))
+const content = computed(() => contents.value.get(selectedId.value))
+const detailThread = computed(() => content.value?.thread)
+const detailTurns = computed(() => content.value?.turns || [])
+const detailCursor = computed(() => content.value?.cursor)
+const detailLoading = computed(() => !!content.value?.loading)
+const detailError = computed(() => localDetailError.value || content.value?.error || '')
 const definitions: { id: SubagentGroup; label: string }[] = [
   { id: 'active', label: '已开启' }, { id: 'waiting', label: '等待输入' },
   { id: 'completed', label: '完成' }, { id: 'other', label: '其他' },
 ]
 const groups = computed(() => definitions.map(group => ({ ...group, agents: agents.value.filter(agent => agent.group === group.id) })).filter(group => group.agents.length))
 
-async function load(more = false, preserve = false) {
-  if (!rootId.value || !connected.value || loading.value && more) return
-  const requestScope = scope()
-  const generation = ++listGeneration
-  loading.value = true
-  error.value = ''
-  try {
-    const result = await props.api.listSubagents(rootId.value, more ? nextCursor.value : undefined)
-    if (generation !== listGeneration || requestScope !== scope() || !connected.value) return
-    const page = Array.isArray(result?.data) ? result.data : []
-    const combined = new Map<string, any>((more || preserve ? threads.value : []).map(thread => [thread.id, thread]))
-    for (const thread of page) combined.set(thread.id, thread)
-    threads.value = [...combined.values()]
-    if (!preserve) nextCursor.value = result?.nextCursor || null
-  } catch (cause: any) {
-    if (generation === listGeneration && requestScope === scope()) error.value = cause.message || '无法读取子智能体'
-  } finally {
-    if (generation === listGeneration && requestScope === scope()) loading.value = false
-  }
-}
-async function read(id: string, more = false, preserve = false) {
-  if (!connected.value || !id || detailLoading.value && more) return
-  const requestScope = scope()
-  const generation = ++detailGeneration
-  selectedId.value = id
-  detailLoading.value = true
-  detailError.value = ''
-  try {
-    const result = await props.api.readSubagent(id, more ? detailCursor.value : undefined)
-    if (generation !== detailGeneration || requestScope !== scope() || selectedId.value !== id || !connected.value) return
-    const page = Array.isArray(result?.turns) ? result.turns : []
-    const unique = new Map<string, any>()
-    const combined = more ? [...page, ...detailTurns.value] : preserve ? [...detailTurns.value, ...page] : page
-    for (const turn of combined) unique.set(turn.id, turn)
-    detailTurns.value = [...unique.values()]
-    if (!preserve) detailCursor.value = result?.nextCursor || null
-    detailThread.value = result?.thread || detailThread.value
-    if (result?.thread) {
-      const existing = threads.value.findIndex(thread => thread.id === id)
-      const thread = { ...result.thread, turns: detailTurns.value }
-      if (existing >= 0) threads.value[existing] = thread
-      else threads.value.push(thread)
-    }
-  } catch (cause: any) {
-    if (generation === detailGeneration && requestScope === scope() && selectedId.value === id)
-      detailError.value = cause.message || '无法读取子智能体对话'
-  } finally {
-    if (generation === detailGeneration && requestScope === scope() && selectedId.value === id) detailLoading.value = false
-  }
+function read(id: string, more = false) {
+  localDetailError.value = ''
+  return fetchContent(id, true, more)
 }
 function open(id: string) {
-  ++detailGeneration
-  detailTurns.value = []
-  detailThread.value = null
-  detailCursor.value = null
-  detailError.value = ''
+  localDetailError.value = ''
   selectedId.value = id
-  void read(id)
+  // A hydrated child opens immediately. An in-flight prefetch is reused.
+  if (!contents.value.get(id)?.hydrated && !contents.value.get(id)?.error) void fetchContent(id)
 }
 function closeDetail() {
-  ++detailGeneration
   selectedId.value = ''
-  detailLoading.value = false
+  localDetailError.value = ''
 }
 function refresh() {
-  void load()
-  if (selectedId.value) void read(selectedId.value, false, true)
+  localDetailError.value = ''
+  void refreshContent(true)
 }
-watch(() => [props.state.hostId, rootId.value], () => {
-  ++listGeneration
-  ++detailGeneration
-  threads.value = []
-  nextCursor.value = null
-  loading.value = false
-  error.value = ''
-  closeDetail()
-  detailThread.value = null
-  detailTurns.value = []
-  detailCursor.value = null
-  detailError.value = ''
-  void load()
-}, { immediate: true })
-watch(connected, value => {
-  ++listGeneration
-  ++detailGeneration
-  loading.value = detailLoading.value = false
-  if (value) refresh()
-})
+watch(() => [props.state.hostId, rootId.value, props.state.authenticated], closeDetail)
 const ticker = window.setInterval(() => { now.value = Date.now() }, 1000)
-const poller = window.setInterval(() => {
-  if (!connected.value || document.visibilityState !== 'visible') return
-  if (!loading.value) void load(false, true)
-  if (selectedId.value && ['active', 'waiting'].includes(selected.value?.group || '') && !detailLoading.value)
-    void read(selectedId.value, false, true)
-}, 15_000)
-onBeforeUnmount(() => {
-  ++listGeneration
-  ++detailGeneration
-  window.clearInterval(ticker)
-  window.clearInterval(poller)
-})
+onBeforeUnmount(() => window.clearInterval(ticker))
 </script>
 
 <template>
@@ -141,7 +55,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <p v-if="!connected" class="subagents-note" role="status"><Icon name="WifiOff" :size="15" />连接已断开，重新连接后可刷新状态。</p>
-    <p v-if="error" class="subagents-error" role="alert">{{ error }}<button class="button button-small button-secondary" :disabled="!connected || loading" @click="load()">重试</button></p>
+    <p v-if="error" class="subagents-error" role="alert">{{ error }}<button class="button button-small button-secondary" :disabled="!connected || loading" @click="load(false, false, true)">重试</button></p>
     <div v-if="selectedId" class="subagent-detail">
       <div class="subagent-detail-heading">
         <button class="icon-button" aria-label="返回子智能体列表" title="返回子智能体列表" @click="closeDetail"><Icon name="ArrowLeft" :size="16" /></button>
@@ -151,9 +65,9 @@ onBeforeUnmount(() => {
       <div class="subagent-dialogue" aria-label="子智能体对话内容">
         <button v-if="detailCursor" class="button button-small button-secondary subagents-more" :disabled="detailLoading || !connected" @click="read(selectedId, true)">加载更早的消息</button>
         <div v-for="turn in detailTurns" :key="turn.id" class="subagent-turn" :data-agent-turn-id="turn.id">
-          <ChatItem v-for="item in turn.items || []" :key="item.id" :item="{ ...item, turnId: turn.id }" @error="detailError = $event" />
+          <ChatItem v-for="item in turn.items || []" :key="item.id" :item="{ ...item, turnId: turn.id }" :host-id="state.hostId" @error="localDetailError = $event" />
         </div>
-        <p v-if="detailLoading" class="subagents-note" role="status">正在读取对话…</p>
+        <p v-if="detailLoading && !detailTurns.length" class="subagents-note" role="status">正在读取对话…</p>
         <div v-else-if="!detailTurns.length && !detailError" class="panel-empty"><Icon name="Bot" :size="30" /><p>暂无可读取的对话</p><span>临时子智能体的活动会显示在列表中。</span></div>
       </div>
     </div>

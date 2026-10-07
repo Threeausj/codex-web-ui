@@ -221,23 +221,24 @@ const permissionLabel = computed(
     "默认权限",
 );
 const context = computed(() => contextUsage(props.state.tokenUsage));
-const contextLabel = computed(() => context.value
+const contextLabel = computed(() => props.state.compacting ? "正在压缩" : context.value
   ? `上下文 ${context.value.percent}%`
   : props.state.activeThread ? "上下文 —" : "上下文 0%");
 const contextTitle = computed(() => {
   const details = context.value
     ? `${context.value.used.toLocaleString()} / ${context.value.limit.toLocaleString()} tokens（当前上下文）`
     : props.state.activeThread ? "Codex 尚未报告当前上下文用量" : "新对话尚未使用上下文";
-  return `${details}\n${props.state.busy ? "任务结束后可压缩上下文" : "点击压缩上下文"}`;
+  return `${details}\n${props.state.compacting ? "正在压缩上下文，请稍候" : props.state.busy ? "任务结束后可压缩上下文" : "点击压缩上下文"}`;
 });
 const compactDisabled = computed(() => !props.state.activeThread || !props.state.connected ||
-  props.state.busy || props.state.threadConflict || props.state.threadReady === false ||
+  props.state.busy || props.state.compacting || props.state.threadConflict || props.state.threadReady === false ||
   props.state.runtimePaused || contextDisabled.value);
 const canSend = computed(
   () =>
     !props.state.threadConflict &&
     (!props.state.activeThread || props.state.threadReady !== false) &&
     !props.state.runtimePaused &&
+    !props.state.compacting &&
     props.state.connected &&
     !props.state.selectingThread &&
     !props.state.switchingHost &&
@@ -819,7 +820,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
             :class="{
               'full-access': state.permission === 'danger-full-access',
             }"
-            :title="permissionLabel"
+            :title="state.permissionChangePending ? `${permissionLabel}：下一轮生效，当前任务保留启动时权限` : permissionLabel"
             ><Icon
               :name="
                 state.permission === 'danger-full-access'

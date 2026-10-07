@@ -3,6 +3,7 @@ import { randomUUID } from "./uuid";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import { subagentStatus } from "./subagents";
+import { mergeContextUsage } from "./context-usage";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
 import { ConversationCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
@@ -10,6 +11,7 @@ import { revokeDevicePush } from "./pwa";
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
+  resolveWebPermissionSelection,
 } from "./configuration";
 import {
   exportThreadMarkdown,
@@ -28,8 +30,8 @@ import {
   type DisplayItem,
 } from "./events";
 
-type Method = ClientRequest["method"];
-type Params<M extends Method> = Extract<ClientRequest, { method: M }>["params"];
+type Method = ClientRequest["method"] | "bridge/ping";
+type Params<M extends Method> = M extends "bridge/ping" ? Record<string, never> : Extract<ClientRequest, { method: M }>["params"];
 type Pending = {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
@@ -97,10 +99,12 @@ const state = reactive({
   model: "",
   effort: "medium",
   permission: "workspace-write",
+  permissionChangePending: false,
   tokenUsage: null as any,
+  compacting: false,
   busy: false,
   pendingRequests: [] as any[],
-  agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number }>,
+  agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number; turnId?: string; turnStatus?: string }>,
   attachments: [] as any[],
   config: null as any,
   skills: [] as any[],
@@ -148,6 +152,11 @@ let selectionGeneration = 0;
 let hostSelectionGeneration = 0;
 let connecting: Promise<void> | null = null;
 let connectionRecovery: { generation: number; promise: Promise<void> } | null = null;
+let engineId: string | null = null;
+let eventSequence: number | null = null;
+let socketHasEventGap = false;
+let eventGapRevision = 0;
+let writerAttachment: { hostId: string; threadId: string; engineId: string | null } | null = null;
 let listGeneration = 0;
 let configGeneration = 0;
 let integrationGeneration = 0;
@@ -177,7 +186,8 @@ const itemCache = new Map<string, DisplayItem[]>();
 const conversationCache = new ConversationCache();
 const tokenUsages = new Map<string, any>();
 const tokenUsageRevisions = new Map<string, number>();
-const compactionUsageRevisions = new Map<string, number>();
+const compactionRevisions = new Map<string, number>();
+const compactions = new Map<string, { turnId?: string; requested?: boolean }>();
 const pausedHosts = new Set<string>();
 const releasedThreads = new Map<string, Set<string>>();
 function updateReleasedThreads(hostId: string, ids: string[]) {
@@ -185,6 +195,7 @@ function updateReleasedThreads(hostId: string, ids: string[]) {
   if (hostId !== state.hostId) return;
   const released = !!state.activeThread?.id && ids.includes(state.activeThread.id);
   if (released && !state.threadReleased) {
+    if (writerAttachment?.hostId === hostId && writerAttachment.threadId === state.activeThread?.id) writerAttachment = null;
     saveConversationSnapshot(); ++selectionGeneration; state.selectingThread = false;
     state.threadReady = false; state.busy = false; state.threadConflict = null;
     state.pendingRequests = state.pendingRequests.filter(request => request.params?.threadId !== state.activeThread?.id);
@@ -240,10 +251,13 @@ function clearConversationCaches() {
   itemCache.clear();
   tokenUsages.clear();
   tokenUsageRevisions.clear();
-  compactionUsageRevisions.clear();
+  compactionRevisions.clear();
+  compactions.clear();
+  writerAttachment = null;
   state.items = [];
   state.turns = [];
   state.tokenUsage = null;
+  state.compacting = false;
   state.activeThread = null;
   state.threadReady = true;
   state.threadConflict = null;
@@ -313,9 +327,50 @@ function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
 }
 function beginCompactionUsage(threadId: string) {
   const key = recencyKey(state.hostId, threadId);
-  if (!compactionUsageRevisions.has(key)) compactionUsageRevisions.set(key, tokenUsageRevisions.get(key) || 0);
-  tokenUsages.set(key, null);
-  if (state.activeThread?.id === threadId) state.tokenUsage = null;
+  compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
+  if (!compactions.has(key)) compactions.set(key, {});
+  if (state.activeThread?.id === threadId) state.compacting = true;
+}
+function finishCompaction(threadId: string, turnId?: string, completed = true) {
+  const key = recencyKey(state.hostId, threadId);
+  const current = compactions.get(key);
+  if (current?.turnId && turnId && current.turnId !== turnId) return;
+  compactions.delete(key);
+  compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
+  if (current?.requested && !activeTurns.has(threadId)) noteRuntime(threadId, false);
+  if (completed) compactedSinceInput.add(threadId);
+  if (state.activeThread?.id === threadId) state.compacting = false;
+}
+function compactionTurnId(threadId: string, explicit?: string) {
+  return explicit || compactions.get(recencyKey(state.hostId, threadId))?.turnId || activeTurns.get(threadId)
+    || (state.activeThread?.id === threadId ? state.turns.at(-1)?.id : undefined)
+    || [...currentItems(threadId)].reverse().find(item => !!item.turnId)?.turnId;
+}
+function applyTokenUsage(threadId: string, usage: any) {
+  const key = recencyKey(state.hostId, threadId);
+  const merged = mergeContextUsage(tokenUsages.get(key), usage);
+  if (merged == null) return;
+  tokenUsages.set(key, merged);
+  tokenUsageRevisions.set(key, (tokenUsageRevisions.get(key) || 0) + 1);
+  if (state.activeThread?.id === threadId) state.tokenUsage = merged;
+}
+async function refreshContextUsage(hostId: string, threadId: string) {
+  const authentication = authenticationGeneration;
+  const key = recencyKey(hostId, threadId);
+  const revision = tokenUsageRevisions.get(key) || 0;
+  const compaction = compactions.get(key);
+  const compactionRevision = compactionRevisions.get(key) || 0;
+  try {
+    const context = await http(`/hosts/${encodeURIComponent(hostId)}/threads/${encodeURIComponent(threadId)}/context`, {}, false);
+    if (authentication !== authenticationGeneration || hostId !== state.hostId) return;
+    if ((tokenUsageRevisions.get(key) || 0) === revision && context.tokenUsage) applyTokenUsage(threadId, context.tokenUsage);
+    // A slow history/context read cannot clear a compression started meanwhile.
+    if ((compactionRevisions.get(key) || 0) === compactionRevision && compactions.get(key) === compaction && typeof context.compacting === 'boolean') {
+      if (context.compacting) beginCompactionUsage(threadId);
+      else if (compaction && !threadBusy.get(threadId) && !activeTurns.has(threadId)) finishCompaction(threadId, undefined, false);
+    }
+    if (state.activeThread?.id === threadId) scheduleConversationSnapshot(threadId);
+  } catch { /* Older servers and transient reads retain the last measurement. */ }
 }
 // Android may discard the renderer rather than emit a normal unload event.
 // Commit small private snapshots while hidden; the server retains the runtime.
@@ -938,6 +993,10 @@ function receiveThreadChange(change: any) {
   }
 }
 function receive(message: any) {
+  if (typeof message.bridgeEventSequence === 'number') {
+    if (eventSequence !== null && message.bridgeEventSequence > eventSequence + 1) { socketHasEventGap = true; ++eventGapRevision; }
+    eventSequence = Math.max(eventSequence ?? 0, message.bridgeEventSequence);
+  }
   if (message.id !== undefined && !message.method) {
     const entry = pending.get(message.id);
     if (!entry) return;
@@ -962,12 +1021,35 @@ function receive(message: any) {
   if (p.threadId || method === 'bridge/thread/changed') scheduleConversationSnapshot(p.threadId);
   if (method === 'bridge/thread/changed') { receiveThreadChange(p); return; }
   if (method === "bridge/status") {
+    const changedEngine = !!engineId && typeof p.engineId === 'string' && engineId !== p.engineId;
+    if (typeof p.engineId === 'string') {
+      if (engineId !== p.engineId) {
+        if (changedEngine && state.activeThread) {
+          state.threadReady = false;
+          ++selectionGeneration;
+          state.selectingThread = false;
+        }
+        writerAttachment = null;
+        eventSequence = null;
+        socketHasEventGap = true;
+        ++eventGapRevision;
+      }
+      engineId = p.engineId;
+      if (typeof p.eventSequence === 'number') {
+        if (eventSequence !== null && p.eventSequence > eventSequence) { socketHasEventGap = true; ++eventGapRevision; }
+        eventSequence = p.eventSequence;
+      }
+    } else {
+      engineId = null;
+      writerAttachment = null;
+    }
     const reconnecting = !state.connected && p.connected;
     if (reconnecting) seenThreadChanges.clear();
     state.connected = p.connected;
     if (typeof p.paused === 'boolean') {
       state.runtimePaused = p.paused;
       if (p.paused) {
+        writerAttachment = null;
         saveConversationSnapshot();
         pausedHosts.add(state.hostId);
         state.connected = false;
@@ -1001,6 +1083,11 @@ function receive(message: any) {
         terminalDecoders.clear();
         restoreTerminalOutput(process.lastOutput || "");
       }
+    }
+    if (p.connected) clearTimeout(reconnectTimer);
+    if (!state.runtimePaused && state.authenticated) {
+      if (!p.connected) scheduleReconnect();
+      else if (changedEngine && state.activeThread && !state.threadReleased) scheduleReconnect(100);
     }
     return;
   }
@@ -1086,31 +1173,52 @@ function receive(message: any) {
     cleanupArchivedThread(p.threadId);
   }
   if (method?.startsWith("item/") && p.threadId) {
+    if (p.item?.type === 'contextCompaction') {
+      // Legacy runtimes omit turnId on item events. Anchor the divider now;
+      // subsequent replies must never make it a permanent conversation footer.
+      p.turnId = compactionTurnId(p.threadId, p.turnId);
+      const synthetic = currentItems(p.threadId).find(item => item.type === 'contextCompaction' && item.legacyCompaction && item.turnId === p.turnId);
+      if (synthetic && synthetic.id !== p.item.id) {
+        const index = currentItems(p.threadId).indexOf(synthetic);
+        currentItems(p.threadId).splice(index, 1);
+      }
+    }
     const items = currentItems(p.threadId);
     const itemId = p.item?.id ?? p.itemId;
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
     const item = items.find(item => item.id === itemId);
-    if (item?.type === 'agentMessage') {
-      state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], text: item.text, updatedAt: Date.now() };
-    }
-    if (p.item?.type === "contextCompaction" && method === "item/started") beginCompactionUsage(p.threadId);
-    if (p.item?.type === "contextCompaction" && method === "item/completed") {
-      compactedSinceInput.add(p.threadId);
+    state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], updatedAt: Date.now(),
+      ...(item?.type === 'agentMessage' ? { text: item.text } : {}) };
+    if (p.item?.type === "contextCompaction" && method === "item/started") {
+      beginCompactionUsage(p.threadId);
       const key = recencyKey(state.hostId, p.threadId);
-      const startRevision = compactionUsageRevisions.get(key);
-      if (startRevision === undefined || (tokenUsageRevisions.get(key) || 0) <= startRevision) {
-        tokenUsages.set(key, null);
-        if (state.activeThread?.id === p.threadId) state.tokenUsage = null;
-      }
-      compactionUsageRevisions.delete(key);
+      compactions.set(key, { ...compactions.get(key), turnId: p.turnId });
+    }
+    if (p.item?.type === "contextCompaction" && method === "item/completed") {
+      finishCompaction(p.threadId, p.turnId);
       if (state.activeThread?.id === p.threadId) toast("上下文已压缩");
+      void refreshContextUsage(state.hostId, p.threadId);
     }
   }
+  if (method === 'thread/compacted' && p.threadId) {
+    const items = currentItems(p.threadId);
+    const turnId = compactionTurnId(p.threadId, p.turnId);
+    if (!items.some(item => item.type === 'contextCompaction' && item.turnId === turnId)) {
+      const item = { id: `legacy-compaction:${turnId || randomUUID()}`, type: 'contextCompaction', turnId, status: 'completed', legacyCompaction: true };
+      upsertItem(items, item); noteItem(p.threadId, item.id);
+    }
+    finishCompaction(p.threadId, turnId);
+    void refreshContextUsage(state.hostId, p.threadId);
+  }
   if (method === "turn/started") {
+    if (state.activeThread?.id === p.threadId) state.permissionChangePending = false;
+    const compaction = compactions.get(recencyKey(state.hostId, p.threadId));
+    if (compaction?.requested && !compaction.turnId)
+      compactions.set(recencyKey(state.hostId, p.threadId), { ...compaction, turnId: p.turn.id });
     hydrateTurnItems(p.threadId, p.turn);
     if (completedTurns.has(p.turn.id)) return;
-    state.agentActivity[p.threadId] = { status: 'running', startedAt: Date.now(), updatedAt: Date.now() };
+    state.agentActivity[p.threadId] = { status: 'running', startedAt: Date.now(), updatedAt: Date.now(), turnId: p.turn.id, turnStatus: p.turn.status || 'inProgress' };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
     noteRuntime(p.threadId, true, p.turn.id);
@@ -1121,9 +1229,17 @@ function receive(message: any) {
     }
   }
   if (method === "turn/completed") {
+    if (state.activeThread?.id === p.threadId) state.permissionChangePending = false;
+    const compaction = compactions.get(recencyKey(state.hostId, p.threadId));
+    if (compaction && (!compaction.turnId || compaction.turnId === p.turn?.id)) {
+      finishCompaction(p.threadId, p.turn?.id, p.turn?.status === 'completed');
+      if (p.turn?.status !== 'completed') for (const item of currentItems(p.threadId)) {
+        if (item.type === 'contextCompaction' && item.turnId === p.turn?.id && item.status === 'inProgress') item.status = p.turn?.status || 'failed';
+      }
+    }
     completedTurns.add(p.turn.id);
     hydrateTurnItems(p.threadId, p.turn, undefined, false);
-    state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], status: p.turn.status === 'failed' ? 'errored' : p.turn.status, updatedAt: Date.now() };
+    state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], status: p.turn.status === 'failed' ? 'errored' : p.turn.status, updatedAt: Date.now(), turnId: p.turn.id, turnStatus: p.turn.status };
     updateTurn(p.threadId, p.turn);
     noteContentActivity(p.threadId, p.turn);
     if (
@@ -1142,10 +1258,7 @@ function receive(message: any) {
     void refreshThreads().catch(() => {});
   }
   if (method === "thread/tokenUsage/updated" && p.threadId) {
-    const key = recencyKey(state.hostId, p.threadId);
-    tokenUsages.set(key, p.tokenUsage);
-    tokenUsageRevisions.set(key, (tokenUsageRevisions.get(key) || 0) + 1);
-    if (p.threadId === state.activeThread?.id) state.tokenUsage = p.tokenUsage;
+    applyTokenUsage(p.threadId, p.tokenUsage);
   }
   if (p.threadId === state.activeThread?.id) {
     if (method === "turn/diff/updated") state.diff = p.diff;
@@ -1258,10 +1371,29 @@ function connect(): Promise<void> {
   connecting = connection;
   return connection;
 }
-function scheduleReconnect() {
+function scheduleReconnect(delay = 2500) {
   clearTimeout(reconnectTimer);
   if (state.authenticated && state.online && !state.runtimePaused)
-    reconnectTimer = setTimeout(() => { void resumeConnection(); }, 2500);
+    reconnectTimer = setTimeout(() => { void resumeConnection(); }, delay);
+}
+async function probeConnection() {
+  let status: any;
+  try { status = await rpc('bridge/ping', {}, 5000, { silentError: true }); }
+  catch (error) {
+    if ((error as any)?.code !== -32601) throw error;
+  }
+  if (typeof status?.connected !== 'boolean' || typeof status.engineId !== 'string') {
+    // Compatibility with versions predating the lightweight bridge probe.
+    await rpc('thread/loaded/list', { limit: 1 }, 5000, { silentError: true });
+    return;
+  }
+  receive({ method: 'bridge/status', params: status });
+  if (state.activeThread?.id && Array.isArray(status.loadedThreadIds) &&
+      !status.loadedThreadIds.includes(state.activeThread.id)) {
+    writerAttachment = null;
+    state.threadReady = false;
+  }
+  if (!status.connected || status.paused) throw new Error('工作站尚未连接');
 }
 function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   if (state.runtimePaused && !options.explicit) return Promise.resolve();
@@ -1276,25 +1408,50 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   clearTimeout(reconnectTimer);
   const recovery = (async () => {
     try {
-      const session = await validateSession();
-      if (!session?.authenticated || !current()) return;
       const previous = socket;
       if (state.connected && previous?.readyState === WebSocket.OPEN) {
         // Android can resume a socket that still reports OPEN but no longer carries data.
         // Probe with a bounded, read-only request; never replay user commands.
-        try { await rpc("thread/loaded/list", { limit: 1 }, 5000, { silentError: true }); }
+        try { await probeConnection(); }
         catch {
           if (!current() || socket !== previous) return;
           closeConnection();
         }
         if (!current() || (socket && socket !== previous)) return;
+        if (state.connected && socket === previous && !socketHasEventGap && engineId &&
+            (!state.activeThread || (state.threadReady && writerAttachment?.threadId === state.activeThread.id))) {
+          // The native stream is continuous. A foreground/focus event does
+          // not reacquire a writer or reload unchanged history/configuration.
+          return;
+        }
       } else if (!connecting) closeConnection();
       if (!current()) return;
+      // Authenticate when opening a replacement transport. A healthy socket is
+      // already authenticated, so routine foreground probes need no HTTP login.
+      if (!state.connected || (state.activeThread && !state.threadReady)) {
+        const session = await validateSession();
+        if (!session?.authenticated || !current()) return;
+      }
       await connect();
       if (!current()) return;
       if (state.runtimePaused || !state.connected) return;
+      if (previous !== socket && writerAttachment?.engineId === engineId && engineId) {
+        // The engine can retain other threads while this particular writer was
+        // released. Confirm this attachment before keeping send enabled.
+        await probeConnection();
+        if (!current()) return;
+      }
       startNavigationRefresh();
-      await sync();
+      if (state.activeThread?.id && writerAttachment?.hostId === hostId &&
+          writerAttachment.threadId === state.activeThread.id && writerAttachment.engineId &&
+          writerAttachment.engineId === engineId) {
+        await selectThread(state.activeThread.id, { preserveWriter: true });
+      } else if (previous === socket && state.connected && state.threadReady) {
+        // Compatibility with old servers: read missed history without forcing
+        // an unchanged native writer through thread/resume on every focus.
+        if (state.activeThread?.id) await selectThread(state.activeThread.id, { preserveWriter: true });
+        else await refreshThreads();
+      } else await sync();
     } catch (error) {
       if (current()) fail(error);
     } finally {
@@ -1633,12 +1790,18 @@ function rememberThread(id: string) {
   selections[state.hostId] = id;
   localStorage.setItem("codex.selectedThreadIds", JSON.stringify(selections));
 }
-async function selectThread(id: string) {
+async function selectThread(id: string, options: { preserveWriter?: boolean } = {}) {
+  const preserveWriter = options.preserveWriter === true && state.activeThread?.id === id &&
+    !state.threadConflict && !state.threadReleased && !state.runtimePaused &&
+    (state.threadReady || (writerAttachment?.hostId === state.hostId && writerAttachment.threadId === id &&
+      !!engineId && writerAttachment.engineId === engineId));
   const generation = ++selectionGeneration;
   const hostId = state.hostId;
   const authentication = authenticationGeneration;
+  const selectionSocket = socket;
+  const selectionEngine = engineId;
   const current = () => generation === selectionGeneration && hostId === state.hostId
-    && authentication === authenticationGeneration;
+    && authentication === authenticationGeneration && socket === selectionSocket && engineId === selectionEngine;
   if (state.threadConflict) state.error = '';
   state.threadConflict = null;
   state.takingOverThread = false;
@@ -1654,6 +1817,7 @@ async function selectThread(id: string) {
   const modeKey = recencyKey(hostId, id);
   const rememberedMode = conversationModes.get(modeKey) || (previousId === id ? (state.goalMode ? 'goal' : state.collaborationMode) : 'default');
   state.collaborationMode = rememberedMode === 'plan' ? 'plan' : 'default';
+  if (previousId !== id) state.permissionChangePending = false;
   state.goalMode = rememberedMode === 'goal';
   state.goal = goals.get(modeKey) || null;
   state.goalTokenBudget = state.goal?.tokenBudget ?? null;
@@ -1661,10 +1825,11 @@ async function selectThread(id: string) {
   const previousPolicy = state.runtimePolicy;
   saveConversationSnapshot();
   state.selectingThread = true;
-  state.threadReady = false;
-  state.runtimePolicy = null;
+  if (!preserveWriter) state.threadReady = false;
+  if (!preserveWriter) state.runtimePolicy = null;
   const runtimeRevision = turnRevisions.get(id) ?? 0;
   const itemRevision = itemEventSequence;
+  const continuityRevision = eventGapRevision;
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   const cached = conversationCache.peek(hostId, id);
   state.activeThread = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
@@ -1676,6 +1841,7 @@ async function selectThread(id: string) {
   state.diff = "";
   state.plan = [];
   state.busy = activeTurns.has(id);
+  state.compacting = compactions.has(modeKey);
   turnCursor = cached?.cursor ?? null;
   state.moreTurns = !!turnCursor;
   rememberThread(id);
@@ -1702,9 +1868,17 @@ async function selectThread(id: string) {
     return;
   }
   try {
-    const resumeRequest = rpc("thread/resume", {
+    if (!preserveWriter) applyPermissionDefault();
+    const resumeProfile = availablePermissionProfiles(state.preferences.permissionProfiles)
+      .find(profile => profile.id === state.activePermissionProfileId);
+    const webPermission = !preserveWriter ? resolveWebPermissionSelection(state.permission as any, {
+      profile: resumeProfile, cwd: state.activeThread?.cwd || state.projectPath, requirements: state.requirements,
+    }) : null;
+    const resumeRequest = preserveWriter ? rpc('thread/read', { threadId: id, includeTurns: false }, 45000, { silentError: true }) : rpc("thread/resume", {
       threadId: id,
       excludeTurns: true,
+      sandbox: webPermission!.sandbox,
+      approvalPolicy: webPermission!.approvalPolicy,
       config: { 'features.default_mode_request_user_input': true },
     }, 45000, { silentError: true });
     // History reads do not acquire a writer, so they can run beside resume.
@@ -1808,10 +1982,25 @@ async function selectThread(id: string) {
         .map(([itemId]) => itemId),
     );
     state.items = mergeSnapshotItems(loaded, live, changedIds);
+    // Deprecated runtimes may expose compression only as thread/compacted.
+    // Keep that positional marker while its recorded turn remains retained;
+    // canonical ContextCompaction items replace it when they become available.
+    for (const item of live) if (item.legacyCompaction && item.turnId &&
+      state.turns.some(turn => turn.id === item.turnId) &&
+      !state.items.some(entry => entry.type === 'contextCompaction' && entry.turnId === item.turnId)) upsertItem(state.items, item);
     itemCache.set(id, state.items);
     turnCursor = page.nextCursor;
     state.moreTurns = !!turnCursor;
     state.threadReady = true;
+    writerAttachment = { hostId, threadId: id, engineId };
+    if (eventGapRevision === continuityRevision) socketHasEventGap = false;
+    const inProgressCompaction = state.items.find(item => item.type === 'contextCompaction' && item.status === 'inProgress' &&
+      state.turns.some(turn => turn.id === item.turnId && turn.status === 'inProgress'));
+    if (inProgressCompaction) {
+      beginCompactionUsage(id);
+      compactions.set(modeKey, { turnId: inProgressCompaction.turnId });
+    }
+    void refreshContextUsage(hostId, id);
     rememberThread(id);
     saveConversationSnapshot();
     if (state.projectPath !== previousProject) {
@@ -1938,6 +2127,8 @@ function newThread(remember = true) {
   state.busy = false;
   clearAttachments();
   state.tokenUsage = null;
+  state.compacting = false;
+  state.permissionChangePending = false;
   state.diff = "";
   state.plan = [];
   state.error = "";
@@ -2025,6 +2216,7 @@ function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
 async function send(text: string, editedInput?: any[]) {
+  if (state.compacting) throw fail(new Error('正在压缩上下文，请等待压缩完成后发送。'));
   if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
   if (state.activeThread && !state.threadReady) throw fail(new Error('正在加载会话，请先同步对话后发送。'));
   if (state.threadConflict) throw fail(new Error('此对话仍被其他 Codex 客户端占用，请先重试或强制进入。'));
@@ -2078,8 +2270,7 @@ async function send(text: string, editedInput?: any[]) {
     ).sandboxPolicy;
   const approval =
     resolvedProfile?.approvalPolicy ??
-    resumed?.approvalPolicy ??
-    approvalPolicy(permission);
+    resolveWebPermissionSelection(permission as any, { cwd, requirements: state.requirements }).approvalPolicy;
   const workspaceRoots = projectRoots(cwd);
   if (policy.type === "workspaceWrite" && (!resumed || resolvedProfile))
     policy.writableRoots = workspaceRoots;
@@ -2394,21 +2585,19 @@ async function compact() {
   const id = state.activeThread?.id;
   if (!id) return;
   if (!state.threadReady || state.runtimePaused) throw fail(new Error('请先恢复当前会话连接。'));
-  if (state.busy) throw fail(new Error("请等待当前任务完成后压缩上下文"));
-  state.busy = true;
+  if (state.busy || state.compacting) throw fail(new Error("请等待当前任务完成后压缩上下文"));
+  const hostId = state.hostId;
+  noteRuntime(id, true);
   const key = recencyKey(state.hostId, id);
-  const previousUsage = tokenUsages.get(key);
-  const revision = tokenUsageRevisions.get(key) || 0;
   beginCompactionUsage(id);
+  compactions.set(key, { requested: true });
   try {
     await rpc("thread/compact/start", { threadId: id });
-    compactedSinceInput.add(id);
+    // This is an immediate acknowledgement, not the completion event.
   } catch (error) {
-    state.busy = false;
-    if (!(error as any)?.uncertain && (tokenUsageRevisions.get(key) || 0) === revision) {
-      tokenUsages.set(key, previousUsage ?? null);
-      if (state.activeThread?.id === id) state.tokenUsage = previousUsage ?? null;
-      compactionUsageRevisions.delete(key);
+    if (hostId === state.hostId && !(error as any)?.uncertain) {
+      finishCompaction(id, undefined, false);
+      if (!activeTurns.has(id)) noteRuntime(id, false);
     }
     throw error;
   }
@@ -2417,6 +2606,7 @@ async function maybeCompact() {
   if (
     state.autoCompact &&
     !state.busy &&
+    !state.compacting &&
     state.activeThread &&
     !compactedSinceInput.has(state.activeThread.id) &&
     contextPercent(state.tokenUsage) >= state.compactThreshold
@@ -2669,6 +2859,10 @@ async function setHost(id: string) {
   localReverts.clear();
   pendingMessageEdit = null;
   activeTurns.clear();
+  writerAttachment = null;
+  engineId = null;
+  eventSequence = null;
+  socketHasEventGap = false;
   compactedSinceInput.clear();
   turnRevisions.clear();
   threadBusy.clear();
@@ -3098,6 +3292,18 @@ async function readSubagent(threadId: string, cursor: string | null = null) {
   if (hostId !== state.hostId) throw new Error('工作站已切换');
   return { thread: metadata.thread, turns: [...page.data].reverse(), nextCursor: page.nextCursor };
 }
+function getSubagentSnapshot(threadId: string) {
+  if (!state.authenticated) return null;
+  const thread = state.threads.find(thread => thread.id === threadId);
+  const items = state.activeThread?.id === threadId ? state.items : itemCache.get(threadId);
+  if (!thread && !items) return null;
+  const turns = state.activeThread?.id === threadId ? state.turns : [...new Set((items || []).map(item => item.turnId).filter(Boolean))]
+    .map(id => ({ id, items: (items || []).filter(item => item.turnId === id),
+      ...(state.agentActivity[threadId]?.turnId === id && state.agentActivity[threadId]?.turnStatus
+        ? { status: state.agentActivity[threadId].turnStatus }
+        : activeTurns.get(threadId) === id ? { status: 'inProgress' } : {}) }));
+  return { thread, items: items || [], turns };
+}
 function respond(id: string | number, result: any) {
   if (!socket || !state.connected || socket.readyState !== WebSocket.OPEN)
     throw fail(new Error("连接断开，请等待重新连接后审批"));
@@ -3473,6 +3679,7 @@ async function selectPermissionProfile(id: string) {
   state.activePermissionProfileId = id;
   state.runtimePolicy = null;
   if (state.activeThread) permissionSelections.set(recencyKey(state.hostId, state.activeThread.id), { mode: state.permission, profileId: id });
+  notePermissionChange();
   await updatePreferences({ activePermissionProfileId: id });
 }
 function setPermission(mode: string) {
@@ -3494,6 +3701,7 @@ function setPermission(mode: string) {
   state.activePermissionProfileId = "";
   state.runtimePolicy = null;
   if (state.activeThread) permissionSelections.set(recencyKey(state.hostId, state.activeThread.id), { mode, profileId: "" });
+  notePermissionChange();
   if (state.preferences.activePermissionProfileId)
     return updatePreferences({ activePermissionProfileId: "" });
 }
@@ -3503,7 +3711,12 @@ async function selectDefaultPermission(mode: string) {
     await updatePreferences({ defaultPermission: mode, activePermissionProfileId: "" });
     permissionSelections.clear();
     applyPermissionDefault();
+    notePermissionChange();
   } catch (error) { throw fail(error); }
+}
+function notePermissionChange() {
+  state.permissionChangePending = state.busy;
+  if (state.busy) toast('权限将在下一轮任务生效，当前任务保留启动时的权限。');
 }
 async function queryThreads(
   search = "",
@@ -3657,6 +3870,7 @@ export function useCodex() {
     rpc,
     listSubagents,
     readSubagent,
+    getSubagentSnapshot,
     refreshThreads,
     loadMoreThreads,
     loadProjectThreads,

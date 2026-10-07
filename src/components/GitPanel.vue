@@ -49,9 +49,9 @@ const worktreeBranch = ref("");
 const worktreeMode = ref("new");
 let generation = 0;
 let diffGeneration = 0;
-const scope = computed(
-  () => `${props.state.hostId}\0${props.state.projectPath}`,
-);
+const repositoryScope = computed(() => `${props.state.hostId}\0${props.state.projectPath}`);
+const scope = computed(() => `${repositoryScope.value}\0${props.state.permission}`);
+let loadedRepositoryScope = "";
 const readonly = computed(() => props.state.permission === "read-only");
 const canWrite = computed(
   () =>
@@ -269,10 +269,12 @@ async function createWorktree() {
 watch(
   () => [scope.value, props.state.connected],
   () => {
+    const sameRepository = loadedRepositoryScope === repositoryScope.value;
+    loadedRepositoryScope = repositoryScope.value;
     ++generation;
     ++diffGeneration;
     repository.value = null;
-    selected.value = [];
+    if (!sameRepository) selected.value = [];
     diff.value = "";
     diffFile.value = "";
     error.value = "";
@@ -280,7 +282,7 @@ watch(
     loading.value = false;
     busy.value = false;
     diffLoading.value = false;
-    message.value = "";
+    if (!sameRepository) message.value = "";
     if (props.state.connected) void refresh();
   },
   { immediate: true },

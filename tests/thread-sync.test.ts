@@ -82,3 +82,19 @@ test('only native writer conflicts or explicit backend markers enable takeover',
   assert.equal(writerConflict(new Error('Thread not found')), false);
   assert.equal(writerConflict(new Error('Connection refused')), false);
 });
+
+test('a delayed compaction completion follows native item order within its own turn', () => {
+  const items: DisplayItem[] = [
+    { id: 'older', type: 'agentMessage', turnId: 'older' },
+    { id: 'before', type: 'agentMessage', turnId: 'current', text: 'Before' },
+    { id: 'after', type: 'agentMessage', turnId: 'current', text: 'After' },
+    { id: 'compact', type: 'contextCompaction', turnId: 'current' },
+    { id: 'next', type: 'userMessage', turnId: 'next' },
+  ];
+  mergeAcceptedTurnItems(items, { id: 'current', items: [items[1], items[3], items[2]] }, undefined, false);
+  assert.deepEqual(items.map(item => item.id), ['older', 'before', 'compact', 'after', 'next']);
+  applyItemEvent(items, 'item/started', { turnId: 'current', item: { id: 'compact', type: 'contextCompaction' } });
+  assert.equal(items[2].status, 'inProgress');
+  applyItemEvent(items, 'item/completed', { turnId: 'current', item: { id: 'compact', type: 'contextCompaction' } });
+  assert.equal(items[2].status, 'completed');
+});

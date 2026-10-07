@@ -16,6 +16,65 @@ class Browser extends EventEmitter {
   ws() { return this as unknown as WebSocket }
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
+
+test('bridge continuity identifies an engine, sequences notifications and acknowledges a sender without repeating its mutation', async () => {
+  const value = fixture()
+  const first = new Browser(); const second = new Browser()
+  value.bridge.attach('session:first', first.ws(), 'first'); value.bridge.attach('session:second', second.ws(), 'second')
+  try {
+    await value.bridge.connect()
+    const initial = first.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as any
+    assert.equal(typeof initial.engineId, 'string'); assert.equal(initial.eventSequence, 0)
+    value.receive({ method: 'thread/name/updated', params: { threadId: 'thread-a', name: 'Name' } })
+    value.receive({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-a', tokenUsage: { last: { totalTokens: 100 }, modelContextWindow: 1000 } } })
+    assert.deepEqual(first.sent.filter(message => message.bridgeEventSequence).map(message => message.bridgeEventSequence), [1, 2])
+    first.request({ id: 'rename', method: 'thread/name/set', params: { threadId: 'thread-a', name: 'New name' } })
+    await tick()
+    const request = value.sent.find(message => message.method === 'thread/name/set')!
+    value.receive({ id: request.id, result: {} }); await tick()
+    assert.equal(first.sent.find(message => message.method === 'bridge/event/ack')?.bridgeEventSequence, 3)
+    assert.equal(first.sent.some(message => message.method === 'bridge/thread/changed'), false)
+    assert.equal(second.sent.find(message => message.method === 'bridge/thread/changed')?.bridgeEventSequence, 3)
+    first.request({ id: 'ping', method: 'bridge/ping', params: {} }); await tick()
+    const pong = first.sent.find(message => message.id === 'ping')!.result as any
+    assert.equal(pong.engineId, initial.engineId); assert.equal(pong.eventSequence, 3)
+    assert.equal(value.sent.some(message => message.method === 'bridge/ping'), false, 'Liveness checks must stay on the persistent browser bridge')
+    first.close()
+    const resumed = new Browser(); value.bridge.attach('session:first', resumed.ws(), 'first')
+    const recovered = resumed.sent.find(message => message.method === 'bridge/status')!.params as any
+    assert.equal(recovered.engineId, initial.engineId); assert.equal(recovered.eventSequence, 3)
+  } finally { value.bridge.close() }
+})
+
+test('a second compaction rejection cannot clear running progress; a timed out request cannot leave sticky progress', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    const first = value.bridge.request('thread/compact/start', { threadId: 'compacting-thread' })
+    await tick()
+    const accepted = value.sent.filter(message => message.method === 'thread/compact/start').at(-1)!
+    value.receive({ id: accepted.id, result: {} }); await first
+    assert.equal(value.bridge.threadContext('compacting-thread').compacting, true, 'Acknowledgement is not completion')
+    value.receive({ method: 'item/started', params: { threadId: 'compacting-thread', turnId: 'compact-turn', item: { id: 'compact-item', type: 'contextCompaction' } } })
+    const duplicate = value.bridge.request('thread/compact/start', { threadId: 'compacting-thread' })
+    const rejected = assert.rejects(duplicate, /already running/)
+    await tick()
+    const duplicateRequest = value.sent.filter(message => message.method === 'thread/compact/start').at(-1)!
+    value.receive({ id: duplicateRequest.id, error: { code: -32000, message: 'already running' } }); await rejected
+    assert.equal(value.bridge.threadContext('compacting-thread').compacting, true)
+    value.receive({ method: 'turn/completed', params: { threadId: 'compacting-thread', turn: { id: 'unrelated-turn', status: 'completed' } } })
+    assert.equal(value.bridge.threadContext('compacting-thread').compacting, true)
+    value.receive({ method: 'item/completed', params: { threadId: 'compacting-thread', turnId: 'compact-turn', item: { id: 'compact-item', type: 'contextCompaction' } } })
+    assert.equal(value.bridge.threadContext('compacting-thread').compacting, false)
+    const timedOut = value.bridge.request('thread/compact/start', { threadId: 'timeout-thread' }, 10)
+    const timeoutAssertion = assert.rejects(timedOut, /timed out/)
+    await new Promise(resolve => setTimeout(resolve, 20)); await timeoutAssertion
+    assert.equal(value.bridge.threadContext('timeout-thread').compacting, false)
+    const old = value.sent.filter(message => message.method === 'thread/compact/start').at(-1)!
+    value.receive({ id: old.id, error: { code: -32000, message: 'late failure' } })
+    assert.equal(value.bridge.threadContext('timeout-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
 function fixture(options: BridgeOptions = {}, host: Host = { id: 'local', kind: 'local', name: 'Test' }) {
   const input = new PassThrough()
   const output = new PassThrough()
@@ -258,7 +317,7 @@ test('accepted conversation responses sync across browser sessions while respons
     assert.equal(phone.sent.some(message => message.id === 1), false)
     assert.equal(desktop.sent.some(message => message.method === 'bridge/thread/changed'), false)
     assert.deepEqual(phone.sent.filter(message => message.method === 'bridge/thread/changed'), [{
-      method: 'bridge/thread/changed', params: {
+      method: 'bridge/thread/changed', bridgeEventSequence: 1, params: {
         threadId: 'shared-thread', method: 'turn/start', result: { turn },
         request: { input, clientUserMessageId: 'client-message' },
         changeId: accepted.id, originClientId: 'desktop',

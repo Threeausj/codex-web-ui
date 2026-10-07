@@ -123,7 +123,7 @@ test('a stale foreground check cannot replace a host chosen while it was waiting
   await page.locator('[data-section="recent"] [data-host-id="local"] .thread-row').click();
   mock.unresponsiveSockets.add(mock.sockets[0]!);
   await foreground(page);
-  await expect.poll(() => !!mock.request('thread/loaded/list')).toBe(true);
+  await expect.poll(() => !!mock.request('bridge/ping')).toBe(true);
   await page.locator('[data-section="recent"] [data-host-id="ssh-test"] .thread-row').click();
   await expect(page.locator('.agent-message').last()).toHaveText('远程选择保持不变');
   await expect(page.locator('.header-host')).toHaveText('Remote');
