@@ -125,6 +125,7 @@ const state = reactive({
   modeCapabilities: { plan: false, goal: false, loaded: false },
   modeBusy: false,
   modeError: "",
+  goalReadError: "",
   apps: [] as any[],
   mcpServers: [] as any[],
   account: null as any,
@@ -214,6 +215,7 @@ function updateReleasedThreads(hostId: string, ids: string[]) {
   if (hostId !== state.hostId) return;
   const released = !!state.activeThread?.id && ids.includes(state.activeThread.id);
   if (released && !state.threadReleased) {
+    cancelGoalRefresh();
     if (writerAttachment?.hostId === hostId && writerAttachment.threadId === state.activeThread?.id) writerAttachment = null;
     saveConversationSnapshot(); ++selectionGeneration; state.selectingThread = false;
     state.threadReady = false; state.busy = false; state.threadConflict = null;
@@ -863,6 +865,7 @@ function navigationProjectPage(hostId: string, projectPath: string) {
     : state.navigation[hostId]?.projectPages[projectPath];
 }
 function closeConnection() {
+  cancelGoalRefresh();
   notifyProtocol({ method: 'bridge/disconnecting', params: { permanent: state.switchingHost || !state.authenticated } });
   saveConversationSnapshot();
   localReverts.clear();
@@ -1120,6 +1123,7 @@ function receive(message: any) {
     if (typeof p.paused === 'boolean') {
       state.runtimePaused = p.paused;
       if (p.paused) {
+        cancelGoalRefresh();
         writerAttachment = null;
         saveConversationSnapshot();
         pausedHosts.add(state.hostId);
@@ -1144,6 +1148,7 @@ function receive(message: any) {
       state.error = state.threadConflict?.message || "";
       if (p.pendingRequests) state.pendingRequests = p.pendingRequests;
       if (changedEngine) void Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
+      if (state.goalReadError) void refreshCurrentGoal();
     }
     if (p.connected && !state.runtimePaused && Array.isArray(p.activeProcesses)) {
       state.terminalProcesses = p.activeProcesses;
@@ -1496,6 +1501,7 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
             (!state.activeThread || (state.threadReady && writerAttachment?.threadId === state.activeThread.id))) {
           // The native stream is continuous. A foreground/focus event does
           // not reacquire a writer or reload unchanged history/configuration.
+          if (state.goalReadError) void refreshCurrentGoal();
           return;
         }
       } else if (!connecting) closeConnection();
@@ -1866,6 +1872,7 @@ function rememberThread(id: string) {
   localStorage.setItem("codex.selectedThreadIds", JSON.stringify(selections));
 }
 async function selectThread(id: string, options: { preserveWriter?: boolean } = {}) {
+  cancelGoalRefresh();
   const preserveWriter = options.preserveWriter === true && state.activeThread?.id === id &&
     !state.threadConflict && !state.threadReleased && !state.runtimePaused &&
     (state.threadReady || (writerAttachment?.hostId === state.hostId && writerAttachment.threadId === id &&
@@ -1888,6 +1895,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     ++modeOperation;
     state.modeBusy = false;
     state.modeError = "";
+    state.goalReadError = "";
   }
   const modeKey = recencyKey(hostId, id);
   const rememberedMode = conversationModes.get(modeKey) || (previousId === id ? (state.goalMode ? 'goal' : state.collaborationMode) : 'default');
@@ -2237,6 +2245,7 @@ async function loadOlderTurns() {
   );
 }
 function newThread(remember = true) {
+  cancelGoalRefresh();
   state.threadConflict = null;
   state.takingOverThread = false;
   ++takeoverOperation;
@@ -2254,6 +2263,7 @@ function newThread(remember = true) {
   state.goalMode = false;
   state.collaborationMode = 'default';
   state.modeError = "";
+  state.goalReadError = "";
   state.modeBusy = false;
   ++modeOperation;
   state.items = [];
@@ -3761,6 +3771,7 @@ async function saveConfig(edits: any[]) {
   toast("已保存到 Codex 配置");
 }
 function invalidateRuntimeCapabilities() {
+  cancelGoalRefresh();
   clearTimeout(capabilityRetryTimer);
   capabilityRetryTimer = undefined;
   capabilityRetryAttempts = 0;
@@ -3787,6 +3798,7 @@ function scheduleCapabilityRetry() {
   }, Math.min(30000, 2500 * 2 ** capabilityRetryAttempts));
 }
 function resetModeContext(clearGoals = false) {
+  cancelGoalRefresh();
   invalidateRuntimeCapabilities();
   ++modeOperation;
   state.skills = [];
@@ -3796,6 +3808,7 @@ function resetModeContext(clearGoals = false) {
   state.modeCapabilities = { plan: false, goal: false, loaded: false };
   state.modeBusy = false;
   state.modeError = "";
+  state.goalReadError = "";
   state.goal = null;
   state.goalTokenBudget = null;
   state.goalMode = false;
@@ -3859,6 +3872,7 @@ async function loadModeCapabilities() {
       plan: plan.status === 'fulfilled' && plan.value.data?.some((entry: any) => entry.mode === 'plan'),
       goal: goal.status === 'fulfilled' || goalMethodSupported(goal.reason),
     };
+    if (state.modeCapabilities.goal && state.goalReadError) void refreshCurrentGoal();
   })().finally(() => { if (generation === capabilityGeneration) { capabilityRequest = null; scheduleCapabilityRetry(); } });
   capabilityRequest = { hostId, promise };
   return promise;
@@ -3868,6 +3882,8 @@ function applyGoal(hostId: string, threadId: string, goal: ThreadGoal | null) {
   goals.set(key, goal);
   goalRevisions.set(key, (goalRevisions.get(key) || 0) + 1);
   if (hostId !== state.hostId || threadId !== state.activeThread?.id) return;
+  clearTimeout(goalRetryTimer); goalRetryTimer = undefined; goalRetryAttempts = 0;
+  state.goalReadError = '';
   state.goal = goal;
   state.goalTokenBudget = goal?.tokenBudget ?? null;
   if (goal && state.collaborationMode !== 'plan' && (!conversationModes.has(key) || conversationModes.get(key) === 'goal')) state.goalMode = true;
@@ -3877,20 +3893,51 @@ async function goalRpc(hostId: string, method: 'thread/goal/get' | 'thread/goal/
     ? rpc(method, params, 15000, { silentError: true })
     : http(`/goals/${encodeURIComponent(hostId)}`, { method: 'POST', body: JSON.stringify({ method, params }) }, false);
 }
-async function refreshGoal(hostId: string, threadId: string) {
+let goalRefreshGeneration = 0;
+let goalRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let goalRetryAttempts = 0;
+let goalRefreshRequest: { hostId: string; threadId: string; selection: number; promise: Promise<void> } | null = null;
+function cancelGoalRefresh() {
+  ++goalRefreshGeneration;
+  clearTimeout(goalRetryTimer); goalRetryTimer = undefined;
+  goalRetryAttempts = 0; goalRefreshRequest = null;
+}
+function refreshCurrentGoal() {
+  return state.activeThread?.id ? refreshGoal(state.hostId, state.activeThread.id) : Promise.resolve();
+}
+function refreshGoal(hostId: string, threadId: string): Promise<void> {
   const selection = selectionGeneration;
-  if (!state.modeCapabilities.goal || hostId !== state.hostId) return;
+  if (!state.modeCapabilities.goal || hostId !== state.hostId || threadId !== state.activeThread?.id ||
+      !state.connected || !state.online || state.runtimePaused || state.threadReleased) return Promise.resolve();
+  if (goalRefreshRequest?.hostId === hostId && goalRefreshRequest.threadId === threadId && goalRefreshRequest.selection === selection)
+    return goalRefreshRequest.promise;
+  clearTimeout(goalRetryTimer); goalRetryTimer = undefined;
+  const generation = ++goalRefreshGeneration;
   const key = recencyKey(hostId, threadId);
   const revision = goalRevisions.get(key) || 0;
   const auth = authenticationGeneration;
-  try {
+  const requestSocket = socket, requestEngine = engineId;
+  const current = () => generation === goalRefreshGeneration && auth === authenticationGeneration &&
+    selection === selectionGeneration && hostId === state.hostId && threadId === state.activeThread?.id &&
+    socket === requestSocket && engineId === requestEngine && revision === (goalRevisions.get(key) || 0);
+  const promise = (async () => { try {
     const result = await goalRpc(hostId, 'thread/goal/get', { threadId });
-    if (auth !== authenticationGeneration || selection !== selectionGeneration || hostId !== state.hostId || revision !== (goalRevisions.get(key) || 0)) return;
+    if (!current()) return;
     applyGoal(hostId, threadId, result.goal);
   } catch (error) {
-    if (hostId === state.hostId && threadId === state.activeThread?.id && auth === authenticationGeneration)
-      state.modeError = `无法读取目标：${error instanceof Error ? error.message : String(error)}`;
-  }
+    if (!current()) return;
+    state.goalReadError = `无法读取目标：${error instanceof Error ? error.message : String(error)}`;
+    // Retry reads only; never replay goal/set, goal/clear or turn/start.
+    const code = (error as any)?.code;
+    if (((error as any)?.uncertain || !Number.isInteger(code) || code === -32000) && state.connected && state.online && !state.runtimePaused && !state.threadReleased) {
+      goalRetryTimer = setTimeout(() => {
+        goalRetryTimer = undefined;
+        if (current() && !document.hidden) void refreshGoal(hostId, threadId);
+      }, Math.min(30000, 2500 * 2 ** Math.min(goalRetryAttempts++, 4)));
+    }
+  } })().finally(() => { if (goalRefreshRequest?.promise === promise) goalRefreshRequest = null; });
+  goalRefreshRequest = { hostId, threadId, selection, promise };
+  return promise;
 }
 async function mutateGoal(hostId: string, threadId: string, patch: { objective?: string; status?: 'active' | 'paused'; tokenBudget?: number | null }): Promise<ThreadGoal | null> {
   const key = recencyKey(hostId, threadId);
@@ -4392,6 +4439,7 @@ export function useCodex() {
     attachSkill,
     removeSkill,
     setConversationMode,
+    refreshCurrentGoal,
     pauseGoal,
     resumeGoal,
     clearGoal,

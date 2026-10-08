@@ -10,6 +10,7 @@ import {
 import { useCodex } from "./lib/useCodex";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
+import { useMobilePanelBack } from "./lib/mobile-panel-back";
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
@@ -42,6 +43,12 @@ let foregroundTimer: ReturnType<typeof setTimeout> | undefined;
 const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
+useMobilePanelBack(() => state.authenticated, [
+  { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
+  { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
+  // Back hides the side chat so its question and running answer remain intact.
+  { id: 'side-chat', visible: () => sideChat.state.open, close: () => { sideChat.state.open = false; } },
+]);
 const workspaceTab = ref("files");
 const workspacePath = ref("");
 const workspaceLine = ref<number>();
