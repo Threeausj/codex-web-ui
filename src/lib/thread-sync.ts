@@ -72,6 +72,8 @@ export function mergeAcceptedTurnItems(
 export function mergeTurnSnapshot(previous: any, incoming: any): any {
   const completed = ['completed', 'failed', 'interrupted'].includes(previous?.status);
   return { ...previous, ...incoming,
+    ...(incoming.itemsView === 'full' && !(completed && incoming.status === 'inProgress')
+      ? { historySummary: false, historyItemsCursor: null } : {}),
     items: incoming.items?.length ? incoming.items : (previous?.items || []),
     ...(completed && incoming.status === 'inProgress'
       ? { status: previous.status, completedAt: previous.completedAt, error: previous.error,

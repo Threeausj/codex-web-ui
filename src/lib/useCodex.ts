@@ -16,6 +16,7 @@ import { revokeDevicePush } from "./pwa";
 import { useMessageQueue } from "./message-queue";
 import { clearConversationMarkdownCache } from "./conversation-markdown";
 import { privateState } from "./private-state";
+import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './lazy-history';
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -242,6 +243,8 @@ const activeTurns = new Map<string, string>();
 const turnRevisions = new Map<string, number>();
 const threadBusy = new Map<string, boolean>();
 const itemRevisions = new Map<string, Map<string, number>>();
+const historyReader = new LazyHistoryReader();
+const historyDetailRequests = new Map<string, Promise<void>>();
 const threadRevisions = new Map<string, number>();
 const removedThreads = new Set<string>();
 const compactedSinceInput = new Set<string>();
@@ -324,6 +327,8 @@ function clearConversationCaches() {
   threadBusy.clear();
   turnRevisions.clear();
   itemRevisions.clear();
+  historyReader.clear();
+  historyDetailRequests.clear();
   threadRevisions.clear();
   removedThreads.clear();
   threadListScope = '';
@@ -1892,14 +1897,46 @@ async function history(
   threadId: string,
   cursor: string | null = null,
   hostId = state.hostId,
+  full = false,
 ) {
-  return scopedRpc(hostId, "thread/turns/list", {
+  return historyReader.turns(JSON.stringify([authenticationGeneration, hostId, engineId]),
+    (method, params) => scopedRpc(hostId, method, params), {
     threadId,
     cursor,
     limit: 30,
     sortDirection: "desc",
-    itemsView: "full",
-  });
+  }, full);
+}
+
+function loadTurnDetails(turnId: string): Promise<void> {
+  const threadId = state.activeThread?.id;
+  const turn = state.turns.find(entry => entry.id === turnId);
+  if (!threadId || !turn?.historySummary) return Promise.resolve();
+  if (!state.connected || state.runtimePaused) return Promise.reject(new Error('连接恢复后可读取过程记录。'));
+  const hostId = state.hostId, generation = selectionGeneration, authentication = authenticationGeneration;
+  const requestSocket = socket, requestEngine = engineId, revision = itemEventSequence;
+  const scope = JSON.stringify([authentication, hostId, requestEngine]);
+  const key = JSON.stringify([scope, generation, threadId, turnId]);
+  const pending = historyDetailRequests.get(key);
+  if (pending) return pending;
+  const current = () => hostId === state.hostId && generation === selectionGeneration &&
+    authentication === authenticationGeneration && socket === requestSocket && engineId === requestEngine &&
+    threadId === state.activeThread?.id && !discardedTurns.has(turnId);
+  const operation = (async () => {
+    const page = await historyReader.items(scope, (method, params) => rpc(method, params, 45000, { silentError: true }), threadId, turn);
+    if (!current()) return;
+    const index = state.turns.findIndex(entry => entry.id === turnId);
+    if (index < 0 || !state.turns[index].historySummary) return;
+    const changed = new Set([...(itemRevisions.get(threadId)?.entries() || [])]
+      .filter(([, value]) => value > revision).map(([id]) => id));
+    const merged = mergeHistoryDetails(state.items, state.turns, state.turns[index], page, changed);
+    state.items = merged.items;
+    state.turns[index] = merged.turn;
+    itemCache.set(threadId, state.items);
+    saveConversationSnapshot();
+  })().finally(() => { if (historyDetailRequests.get(key) === operation) historyDetailRequests.delete(key); });
+  historyDetailRequests.set(key, operation);
+  return operation;
 }
 function rememberThread(id: string) {
   const selections = saved<Record<string, string>>(
@@ -2106,6 +2143,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     applyPermissionDefault();
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
+    if (reuseHistory) page.data = retainHistoryDetails(page.data, loadedHistory!.turns, live);
     state.turns = [...prefixTurns, ...[...page.data].reverse()];
     for (const turn of liveTurns) updateTurn(id, turn);
     const running = state.turns.find((turn) => turn.status === "inProgress");
@@ -2239,7 +2277,7 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
     if (!current() || generation !== selectionGeneration) return;
     const live = [...state.items];
     const liveTurns = [...state.turns];
-    state.turns = [...turns.values()].reverse();
+    state.turns = retainHistoryDetails([...turns.values()].reverse(), liveTurns, live);
     for (const turn of state.turns) discardedTurns.delete(turn.id);
     for (const turn of liveTurns) updateTurn(id, turn);
     const loaded = state.turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })));
@@ -4341,7 +4379,7 @@ async function exportThread(
   let cursor: string | null = null;
   let count = 0;
   do {
-    const page = await history(id, cursor, hostId);
+    const page = await history(id, cursor, hostId, true);
     count += page.data.length;
     if (count > 5000) throw new Error("对话过长，请通过终端导出原始 rollout");
     pages.unshift([...page.data].reverse());
@@ -4423,6 +4461,7 @@ export function useCodex() {
     updateReleasedThreads,
     takeoverThread,
     loadOlderTurns,
+    loadTurnDetails,
     newThread,
     newThreadInWorktree,
     startReview,

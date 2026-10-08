@@ -24,6 +24,7 @@ const props = defineProps<{
   editDisabled?: boolean;
   editMessage?: (itemId: string, text: string) => Promise<void>;
   cancelMessageEdit?: (itemId: string) => void;
+  loadTurnDetails?: (turnId: string) => Promise<void>;
 }>();
 const emit = defineEmits<{
   fork: [turnId?: string];
@@ -79,8 +80,22 @@ const blocks = computed(() =>
 );
 provideHistoryDisclosures();
 const expandedTurns = reactive(new Set<string>());
+const detailLoads = reactive(new Map<string, { loading: boolean; error: string }>());
+async function loadDetails(id: string) {
+  if (!props.loadTurnDetails || detailLoads.get(id)?.loading) return;
+  const status = reactive({ loading: true, error: '' });
+  detailLoads.set(id, status);
+  try { await props.loadTurnDetails(id); }
+  catch (error: any) { status.error = error?.message || '无法读取过程记录，请重试。'; }
+  finally { status.loading = false; }
+}
+function ensureDetails(id: string) {
+  const turn = props.turns.find(turn => turn.id === id);
+  if (turn?.historySummary && !turn.historyItemsStarted && !detailLoads.get(id)?.error)
+    void loadDetails(id);
+}
 function toggleTurn(event: Event, id: string) {
-  if ((event.currentTarget as HTMLDetailsElement).open) expandedTurns.add(id);
+  if ((event.currentTarget as HTMLDetailsElement).open) { expandedTurns.add(id); ensureDetails(id); }
   else expandedTurns.delete(id);
 }
 const finishedTurns = reactive(new Set<string>());
@@ -105,6 +120,9 @@ watch(runningTurnId, (current, previous) => {
 function running(block: any) {
   return block.id === runningTurnId.value;
 }
+watch(() => props.turns.map(turn => [turn.id, turn.historySummary, turn.historyItemsStarted]), () => {
+  for (const id of expandedTurns) ensureDetails(id);
+}, { flush: 'post' });
 function activityLabel(block: any) {
   const prefix =
     block.turn?.status === "failed"
@@ -157,6 +175,7 @@ function activityLabel(block: any) {
       <details
         v-if="
           block.activity.length ||
+          block.turn?.historySummary ||
           running(block) ||
           block.turn?.durationMs != null ||
           block.turn?.completedAt != null ||
@@ -167,6 +186,7 @@ function activityLabel(block: any) {
         :open="running(block) || expandedTurns.has(block.id)"
       >
         <summary
+          :title="block.turn?.historySummary ? '展开查看完整过程和补充消息' : undefined"
           :aria-label="
             running(block) ? '工作过程（运行中）' : '工作过程与用时'
           "
@@ -177,7 +197,12 @@ function activityLabel(block: any) {
           }}</span>
           <Icon name="ChevronRight" :size="14" />
         </summary>
-        <div v-if="block.activity.length && expandedTurns.has(block.id)" class="turn-activity-content">
+        <div v-if="expandedTurns.has(block.id)" class="turn-activity-content">
+          <p v-if="detailLoads.get(block.id)?.loading" class="activity-loading" role="status"><Icon name="LoaderCircle" :size="14" class="spin" />正在加载过程记录…</p>
+          <div v-if="detailLoads.get(block.id)?.error" class="activity-load-error" role="alert">
+            <span>{{ detailLoads.get(block.id)?.error }}</span>
+            <button class="button button-small button-secondary" @click="loadDetails(block.id)">重试加载过程</button>
+          </div>
           <template v-for="entry in block.activityBlocks" :key="entry.id">
             <ActivityBatch
               v-if="entry.kind === 'batch'"
@@ -197,14 +222,9 @@ function activityLabel(block: any) {
               @error="emit('error', $event)"
             />
           </template>
+          <button v-if="block.turn?.historySummary && props.loadTurnDetails && !detailLoads.get(block.id)?.loading && !detailLoads.get(block.id)?.error" class="button button-small button-secondary activity-load-more" @click="loadDetails(block.id)">{{ block.turn.historyItemsStarted ? '加载更多过程记录' : '加载过程记录' }}</button>
+          <p v-if="!block.activity.length && !block.turn?.historySummary && !detailLoads.get(block.id)?.loading" class="activity-empty">{{ running(block) ? '正在等待新的进展。' : '此轮没有额外的过程记录。' }}</p>
         </div>
-        <p v-else class="activity-empty">
-          {{
-            running(block)
-              ? "正在等待新的进展。"
-              : "此轮没有额外的过程记录。"
-          }}
-        </p>
       </details>
       <p v-if="block.turn?.error?.message" class="turn-error" role="alert">
         {{ block.turn.error.message }}
@@ -250,6 +270,9 @@ function activityLabel(block: any) {
 </template>
 
 <style scoped>
+.activity-loading { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.activity-load-error { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--danger); font-size: 12px; }
+.activity-load-more { margin: 8px 0; }
 .conversation-turn {
   min-width: 0;
 }
