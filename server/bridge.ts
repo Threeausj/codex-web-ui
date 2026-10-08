@@ -8,6 +8,7 @@ import type { WebSocket } from 'ws'
 import type { Host, RpcId, RpcMessage } from './types.js'
 import { rpcError } from './types.js'
 import { webSocketProxyTransport } from './proxy-transport.js'
+import { BrowserChannel } from './browser-channel.js'
 import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
@@ -72,6 +73,8 @@ export class Bridge {
   private pending = new Map<string, Pending>()
   private approvals = new Map<string, Approval>()
   private clients = new Map<string, WebSocket>()
+  private clientChannels = new Map<string, BrowserChannel>()
+  private browserFailures = { send: 0, overflow: 0, timeout: 0 }
   private processes = new Map<string, ActiveProcess>()
   private counter = 0
   private generation = 0
@@ -269,11 +272,19 @@ export class Bridge {
   attach(key: string, socket: WebSocket, clientId: string, isAuthenticated = () => true, cursor?: { engineId: string; afterSequence: number }) {
     const previous = this.clients.get(key)
     if (previous && previous !== socket) previous.close(4001, 'Client reconnected')
+    this.clientChannels.get(key)?.close()
     this.clients.set(key, socket)
+    this.clientChannels.set(key, new BrowserChannel(socket, reason => {
+      ++this.browserFailures[reason]
+      this.dropClient(key, socket)
+    }))
     // A failed browser connection must never tear down the shared app-server.
     socket.on('error', () => this.dropClient(key, socket))
     socket.on('close', () => {
-      if (this.clients.get(key) === socket) this.clients.delete(key)
+      if (this.clients.get(key) === socket) {
+        this.clientChannels.get(key)?.close(); this.clientChannels.delete(key)
+        this.clients.delete(key)
+      }
     })
     let replayComplete = false
     if (cursor && cursor.engineId === this.engineId && Number.isSafeInteger(cursor.afterSequence) && cursor.afterSequence >= 0 && cursor.afterSequence <= this.eventSequence) {
@@ -300,19 +311,17 @@ export class Bridge {
   }
 
   private dropClient(key: string, socket: WebSocket) {
-    if (this.clients.get(key) === socket) this.clients.delete(key)
+    if (this.clients.get(key) === socket) {
+      this.clientChannels.get(key)?.close(); this.clientChannels.delete(key)
+      this.clients.delete(key)
+    }
     socket.terminate()
   }
 
   private clientSend(key: string, message: RpcMessage) {
     const client = this.clients.get(key)
     if (client?.readyState !== 1) return
-    // Check existing backlog, rather than frame size: a large valid history
-    // response may still drain normally. Reconnect uses the existing replay path.
-    if (client.bufferedAmount > 8 * 1024 * 1024) { this.dropClient(key, client); return }
-    try {
-      client.send(JSON.stringify(message), error => { if (error) this.dropClient(key, client) })
-    } catch { this.dropClient(key, client) }
+    this.clientChannels.get(key)?.send(message)
   }
 
   diagnostics() {
@@ -321,6 +330,9 @@ export class Bridge {
       connectionMode: this.mode, reconnectCount: Math.max(0, this.connectionAttempts - 1),
       lastConnectedAt: this.lastConnectedAt || null, lastDisconnectedAt: this.lastDisconnectedAt || null,
       lastProtocolError: this.lastProtocolError || null,
+      browsers: { connected: this.clients.size, failures: { ...this.browserFailures },
+        queuedBytes: [...this.clientChannels.values()].reduce((bytes, channel) => bytes + channel.diagnostics.queuedBytes, 0),
+        sending: [...this.clientChannels.values()].filter(channel => channel.diagnostics.sending).length },
       cachedEvents: { count: this.replayEvents.length, firstSequence: this.replayEvents[0]?.event.bridgeEventSequence || this.eventSequence,
         lastSequence: this.eventSequence, capacity: 4096, bytes: this.replayBytes, maxBytes: 4 * 1024 * 1024, ttlMs: 5 * 60 * 1000 } }
   }
@@ -676,6 +688,8 @@ export class Bridge {
     this.disposed = true
     this.disconnect(new Error('Host connection closed'))
     for (const client of this.clients.values()) client.close(code, reason)
+    for (const channel of this.clientChannels.values()) channel.close()
+    this.clientChannels.clear()
     this.clients.clear()
   }
 }

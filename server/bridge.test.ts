@@ -11,7 +11,7 @@ class Browser extends EventEmitter {
   readyState = 1
   bufferedAmount = 0
   sent: RpcMessage[] = []
-  send(data: string) { this.sent.push(JSON.parse(data)) }
+  send(data: string, callback?: (error?: Error) => void) { this.sent.push(JSON.parse(data)); callback?.() }
   request(message: RpcMessage) { this.emit('message', Buffer.from(JSON.stringify(message))) }
   close() { this.readyState = 3; this.emit('close') }
   terminate() { this.close() }
@@ -19,7 +19,7 @@ class Browser extends EventEmitter {
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
-for (const failure of ['throw', 'callback', 'error', 'backlog'] as const) {
+for (const failure of ['throw', 'callback', 'error'] as const) {
   test(`browser ${failure} failure is isolated from the shared Codex writer and other clients`, async () => {
     const value = fixture()
     const healthy = new Browser()
@@ -31,7 +31,6 @@ for (const failure of ['throw', 'callback', 'error', 'backlog'] as const) {
       if (failure === 'throw') broken.send = () => { throw new Error('Socket failed') }
       if (failure === 'callback') broken.send = ((_data: string, callback: (error: Error) => void) => callback(new Error('Socket failed'))) as typeof broken.send
       if (failure === 'error') broken.emit('error', new Error('Socket failed'))
-      if (failure === 'backlog') broken.bufferedAmount = 8 * 1024 * 1024 + 1
       value.receive({ method: 'item/agentMessage/delta', params: { threadId: 't', itemId: 'answer', delta: 'Still running' } })
       assert.equal(broken.readyState, 3)
       assert.equal(value.bridge.connected, true)
@@ -59,6 +58,32 @@ test('a large valid history response is delivered when the browser has no pendin
     await tick()
     assert.equal(browser.readyState, 1)
     assert.equal((browser.sent.find(message => message.id === 'history')?.result as any).text.length, 8 * 1024 * 1024 + 1)
+  } finally { value.bridge.close() }
+})
+
+test('a history response above 8 MiB followed by live events preserves both browser connections and the shared writer', async () => {
+  const value = fixture(), slow = new Browser(), healthy = new Browser()
+  value.bridge.attach('slow', slow.ws(), 'slow'); value.bridge.attach('healthy', healthy.ws(), 'healthy')
+  try {
+    await value.bridge.connect()
+    const completions: (() => void)[] = [], send = slow.send.bind(slow)
+    slow.send = (data, callback) => {
+      send(data); slow.bufferedAmount = Buffer.byteLength(data)
+      completions.push(() => { slow.bufferedAmount = 0; callback?.() })
+    }
+    slow.request({ id: 'history', method: 'thread/turns/list', params: { threadId: 't', limit: 30 } })
+    await tick()
+    value.receive({ id: value.sent.find(message => message.method === 'thread/turns/list')!.id,
+      result: { data: [{ id: 'turn', items: [{ text: 'x'.repeat(16 * 1024 * 1024) }] }], nextCursor: null } })
+    for (let i = 0; i < 20; i++) value.receive({ method: 'item/agentMessage/delta', params: { threadId: 't', itemId: 'answer', delta: String(i) } })
+    assert.equal(slow.readyState, 1); assert.equal(value.bridge.connected, true)
+    assert.equal(slow.sent.filter(message => message.method === 'item/agentMessage/delta').length, 0)
+    assert.equal(healthy.sent.filter(message => message.method === 'item/agentMessage/delta').length, 20)
+    assert.equal(healthy.sent.some(message => message.id === 'history'), false)
+    while (completions.length) completions.shift()!()
+    await tick()
+    assert.deepEqual(slow.sent.filter(message => message.method === 'item/agentMessage/delta').map(message => (message.params as any).delta), Array.from({ length: 20 }, (_, i) => String(i)))
+    assert.equal(value.bridge.diagnostics().browsers.queuedBytes, 0)
   } finally { value.bridge.close() }
 })
 
