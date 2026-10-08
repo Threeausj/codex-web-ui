@@ -715,7 +715,10 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           <span v-if="goalBudgetInvalid" class="goal-budget-error">请输入正整数或留空</span>
         </div>
       </div>
-      <div v-if="state.modeError" class="composer-mode-error" role="alert">{{ state.modeError }}</div>
+      <div v-if="state.modeError || state.goalReadError" class="composer-mode-error" role="alert">
+        {{ state.modeError || state.goalReadError }}
+        <button v-if="state.goalReadError && !state.modeError" class="text-button" :disabled="!state.connected || !state.online || state.runtimePaused || state.threadReleased" @click="api.refreshCurrentGoal()">重新读取目标</button>
+      </div>
       <div v-if="quotedContexts.length" class="composer-quotes" aria-label="引用到对话的内容">
         <div v-for="(source, index) in quotedContexts" :key="conversationSelectionKey(source)" class="composer-quote">
           <Icon name="Quote" :size="14" />
