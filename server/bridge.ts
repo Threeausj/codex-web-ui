@@ -9,6 +9,7 @@ import type { Host, RpcId, RpcMessage } from './types.js'
 import { rpcError } from './types.js'
 import { webSocketProxyTransport } from './proxy-transport.js'
 import { BrowserChannel } from './browser-channel.js'
+import { JsonLineReader } from './json-lines.js'
 import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
@@ -196,19 +197,15 @@ export class Bridge {
     this.eventSequence = 0
     this.replayEvents = []
     this.replayBytes = 0
-    const decoder = new StringDecoder('utf8')
-    let buffer = ''
+    const reader = new JsonLineReader(line => {
+      if (generation !== this.generation) return false
+      this.receive(JSON.parse(line))
+      return generation === this.generation
+    })
     transport.output.on('data', (chunk: Buffer) => {
       if (generation !== this.generation) return
-      buffer += decoder.write(chunk)
-      if (Buffer.byteLength(buffer) > 64 * 1024 * 1024) { this.disconnect(new Error('App-server frame exceeds the 64 MiB limit')); return }
-      let newline: number
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        if (!line) continue
-        try { this.receive(JSON.parse(line)) } catch { this.disconnect(new Error('Invalid JSON from app-server')); return }
-      }
+      try { reader.write(chunk) }
+      catch (error) { this.disconnect(error instanceof RangeError ? error : new Error('Invalid JSON from app-server')) }
     })
     transport.input.on('error', error => { if (generation === this.generation) this.disconnect(error) })
     transport.events.on('transportError', error => { if (generation === this.generation) this.disconnect(error) })
