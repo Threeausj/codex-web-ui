@@ -874,7 +874,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           <ModelServiceOptions :api="api" :state="state" :disabled="contextDisabled || state.busy || state.modeBusy || queue?.settingsLocked.value" />
         </div>
         <div class="composer-submit">
-          <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : '立即补充到当前任务'">
+          <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : queue?.state.status !== 'supported' ? queue?.state.reason : '立即补充到当前任务'">
             <select v-model="delivery" aria-label="消息发送方式" :disabled="submitting || contextBusy">
               <option value="immediate">立即补充</option>
               <option value="queue" :disabled="!queue?.canMutate.value">下一轮排队</option>

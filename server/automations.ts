@@ -57,6 +57,7 @@ export class AutomationService {
   private ticking = false;
   private closed = false;
   private operations = new Map<string, Promise<void>>();
+  private capacityError = '';
   private readonly file: string;
   private readonly now: () => number;
   error = '';
@@ -84,7 +85,7 @@ export class AutomationService {
     } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('无法读取自动化执行记录，请检查数据目录'); }
     if (start) { this.timer = setInterval(() => { void this.tick().catch(cause => { this.error = (cause as Error).message; }); }, 10000); this.timer.unref(); }
   }
-  list() { return { tasks: structuredClone(this.tasks), runs: structuredClone(this.runs.slice(-300).reverse()), error: this.error }; }
+  list() { return { tasks: structuredClone(this.tasks), runs: structuredClone(this.runs.slice(-300).reverse()), error: this.error || this.capacityError }; }
   private save() {
     const snapshot = JSON.stringify({ version: 1, tasks: this.tasks, runs: this.runs });
     const operation = this.writes.then(async () => {
@@ -124,9 +125,16 @@ export class AutomationService {
     if (this.runs.filter(run => !terminal(run)).length >= 20) throw Object.assign(new Error('自动化等待队列已满'), { status: 409 });
     const { id, createdAt, updatedAt, nextAt, ...spec } = task;
     const run: AutomationRun = { id: randomUUID(), automationId: id, scheduledAt: occurrence, createdAt: this.now(), updatedAt: this.now(), phase: 'queued', attempt: 0, clientId: randomUUID(), spec, logs: [{ at: this.now(), text: '执行已持久化入队' }] };
-    const before = [...this.runs]; this.runs.push(run);
-    while (this.runs.length > 1000) { const index = this.runs.findIndex(entry => terminal(entry) && entry.phase !== 'needs_review'); if (index < 0) throw new Error('执行记录容量不足'); this.runs.splice(index, 1); }
-    try { await this.save(); } catch (cause) { this.runs = before; throw cause; }
+    const before = [...this.runs];
+    try {
+      this.runs.push(run);
+      while (this.runs.length > 1000) {
+        const index = this.runs.findIndex(entry => terminal(entry) && entry.phase !== 'needs_review' && !entry.retryAt);
+        if (index < 0) throw Object.assign(new Error('执行记录容量不足，请先核对未完成的记录'), { status: 409 });
+        this.runs.splice(index, 1);
+      }
+      await this.save();
+    } catch (cause) { this.runs = before; throw cause; }
     return run;
   }
   async runNow(id: string) {
@@ -136,14 +144,23 @@ export class AutomationService {
   async tick() {
     if (this.closed || this.ticking) return; this.ticking = true;
     try {
+      this.capacityError = '';
       for (const task of this.tasks) if (task.enabled && task.nextAt != null && task.nextAt <= this.now()) {
         const occurrence = task.nextAt;
-        if (!this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) await this.enqueue(task, occurrence);
+        if (!this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) {
+          try { await this.enqueue(task, occurrence); }
+          catch (cause: any) {
+            if (cause.status !== 409) throw cause;
+            // Leave the occurrence due, but still dispatch accepted work. A
+            // full waiting queue must not deadlock the dispatcher itself.
+            this.capacityError = cause.message; continue;
+          }
+        }
         task.nextAt = nextAutomationAt(task, this.now()); await this.save();
       }
       for (const run of this.runs) {
         if (this.closed) return;
-        if (run.phase === 'failed' && run.retryAt && run.retryAt <= this.now()) { run.retryAt = undefined; this.note(run, 'queued', '执行前的连接失败，按配置重试'); await this.save(); }
+        if (run.phase === 'failed' && run.retryAt && run.retryAt <= this.now()) { run.retryAt = undefined; delete run.error; this.note(run, 'queued', '执行前的连接失败，按配置重试'); await this.save(); }
         if (run.phase !== 'queued' || this.operations.size >= 2) continue;
         if (this.runs.some(other => other !== run && other.spec.hostId === run.spec.hostId && ['connecting','creating','dispatching','running','waiting'].includes(other.phase))) continue;
         this.note(run, 'connecting', '正在连接主机'); await this.save();

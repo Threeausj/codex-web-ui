@@ -394,12 +394,15 @@ watch(
     workspaceReady = (async () => {
       await props.api.privateSessionReady?.();
       if (!current()) return;
-      activeScope = scope;
       try {
         const restored = await privateState.read<{ tabs: EditorTab[]; activePath: string }>("file-workspace", scope);
         if (!current()) return;
         if (restored && Array.isArray(restored.tabs)) { editorTabs.value = restored.tabs.slice(0, 16).filter(entry => typeof entry.file?.path === "string" && typeof entry.content === "string" && typeof entry.original === "string"); activePath.value = restored.activePath; }
       } catch { if (current()) draftWarning.value = "无法读取持久化草稿，请检查网站存储权限"; }
+      // Do not persist an empty initial workspace while its saved tabs are
+      // still being read. Slow storage must not overwrite the recovery copy.
+      if (!current()) return;
+      activeScope = scope;
       if (props.state.connected && props.state.projectPath) await readDirectory(props.state.projectPath, false);
     })();
     // Restoration must finish independently of metadata/file reads. A held

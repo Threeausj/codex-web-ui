@@ -32,11 +32,40 @@ test('multiple file drafts survive tab switches, bridge reconnection, panel clos
     open.onerror = () => reject(open.error);
     open.onsuccess = () => { const tx = open.result.transaction('records'); const rows = tx.objectStore('records').getAll(); rows.onsuccess = () => { resolve(rows.result.filter(row => JSON.stringify(row.value).includes('Second draft')).length); open.result.close(); }; };
   }))).toBeGreaterThan(0);
+  // Hold just the file-workspace read receipt to simulate slow mobile
+  // storage. The original saved tabs must survive the restoration window.
+  await page.addInitScript(() => {
+    const held: (() => void)[] = [];
+    let holding = true, writes = 0;
+    (window as any).draftReadProbe = { held, get writes() { return writes; }, release() { holding = false; held.splice(0).forEach(done => done()); } };
+    const isWorkspace = (key: unknown) => { try { return JSON.parse(String(key))[1] === 'file-workspace'; } catch { return false; } };
+    const get = IDBObjectStore.prototype.get, put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.get = function(key) {
+      if (this.transaction.db.name === 'codex-private-work' && isWorkspace(key)) (this.transaction as any).holdDraftReceipt = true;
+      return get.call(this, key);
+    };
+    IDBObjectStore.prototype.put = function(value, key) {
+      if (this.transaction.db.name === 'codex-private-work' && isWorkspace(value?.key)) writes++;
+      return key === undefined ? put.call(this, value) : put.call(this, value, key);
+    };
+    const descriptor = Object.getOwnPropertyDescriptor(IDBTransaction.prototype, 'oncomplete')!;
+    Object.defineProperty(IDBTransaction.prototype, 'oncomplete', { ...descriptor, set(handler) {
+      descriptor.set!.call(this, (event: Event) => {
+        if (holding && (this as any).holdDraftReceipt && typeof handler === 'function') held.push(() => handler.call(this, event));
+        else if (typeof handler === 'function') handler.call(this, event);
+      });
+    } });
+  });
   await page.reload();
   const workspace = page.getByRole('button', { name: '切换工作区', exact: true });
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
   if (!await page.locator('.workspace-tabs').isVisible()) await workspace.click();
   await page.locator('.workspace-tabs').getByRole('button', { name: '文件', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).draftReadProbe.held.length)).toBeGreaterThan(0);
+  // Keep restoration pending longer than the editor's persistence debounce.
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => (window as any).draftReadProbe.writes)).toBe(0);
+  await page.evaluate(() => (window as any).draftReadProbe.release());
   await page.getByRole('navigation', { name: '已打开文件' }).getByRole('button', { name: 'index.html', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'index.html 文件内容' })).toHaveText('<h1>Second draft</h1>');
   expect(mock.requests.filter(request => request.method === 'fs/writeFile')).toHaveLength(0);

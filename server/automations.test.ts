@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { AutomationService, nextAutomationAt, type AutomationInput } from './automations.js';
+import { randomUUID } from 'node:crypto';
+import { AutomationService, nextAutomationAt, type AutomationInput, type AutomationRun } from './automations.js';
 const host = { id: 'local', name: 'Fixture', kind: 'local' as const };
 const spec: AutomationInput = { name: 'Review', hostId: 'local', cwd: '/fixture', prompt: 'Review the project', model: 'fixture', effort: 'high', permission: 'read-only', timezone: 'Asia/Shanghai', cadence: { kind: 'interval', minutes: 5 }, enabled: true, maxRetries: 1 };
 async function fixture() {
@@ -68,7 +69,63 @@ test('pre-dispatch connection failures recover using bounded retries; paused sch
   const f = await fixture(); try {
     const task = await f.service.put({ ...spec, enabled: false }); f.advance(30 * 60000); await f.service.tick(); assert.equal(f.calls.length, 0);
     f.setFailure({ connecting: true }); await f.service.runNow(task.id); await f.settle(); assert.equal(f.service.list().runs[0]!.phase, 'failed');
-    f.setFailure(null); f.advance(30000); await f.service.tick(); await f.settle(); assert.equal(f.service.list().runs[0]!.phase, 'running'); assert.equal(f.service.list().runs[0]!.attempt, 2);
+    f.setFailure(null); f.advance(30000); await f.service.tick(); await f.settle(); assert.equal(f.service.list().runs[0]!.phase, 'running'); assert.equal(f.service.list().runs[0]!.attempt, 2); assert.equal(f.service.list().runs[0]!.error, undefined);
+  } finally { await f.close(); }
+});
+
+function journalRun(automationId: string, phase: AutomationRun['phase'], at: number): AutomationRun {
+  return { id: randomUUID(), automationId, scheduledAt: at, createdAt: at, updatedAt: at, phase, attempt: 0, clientId: randomUUID(), spec, logs: [] };
+}
+async function restoreJournal(f: Awaited<ReturnType<typeof fixture>>, runs: AutomationRun[]) {
+  await f.service.close();
+  await fs.writeFile(path.join(f.directory, 'automations.json'), JSON.stringify({ version: 1, tasks: f.service.list().tasks, runs }), { mode: 0o600 });
+  return f.restart();
+}
+test('a full automation queue still dispatches accepted work and admits deferred schedules when capacity returns', async () => {
+  const f = await fixture(); try {
+    const tasks = [];
+    for (let i = 0; i < 20; i++) tasks.push(await f.service.put({ ...spec, name: `Queued ${i}`, enabled: false }));
+    const due = await f.service.put({ ...spec, name: 'Deferred schedule' });
+    const service = await restoreJournal(f, tasks.map(task => journalRun(task.id, 'queued', f.clock())));
+    f.advance(300000); await service.tick(); await f.settle();
+    assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+    assert.equal(service.list().tasks.find(task => task.id === due.id)!.nextAt, due.nextAt);
+    assert.match(service.list().error, /队列已满/);
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+    await service.tick(); await f.settle();
+    assert.ok(service.list().runs.some(run => run.automationId === due.id));
+    assert.equal(service.list().runs.filter(run => ['queued', 'running'].includes(run.phase)).length, 20);
+    assert.ok(service.list().tasks.find(task => task.id === due.id)!.nextAt! > f.clock());
+    assert.equal(service.list().error, '');
+  } finally { await f.close(); }
+});
+test('journal retention preserves pending retries while removing completed history', async () => {
+  const f = await fixture(); try {
+    const first = await f.service.put({ ...spec, enabled: false });
+    const second = await f.service.put({ ...spec, name: 'Another task', enabled: false });
+    f.setFailure({ connecting: true }); await f.service.runNow(first.id); await f.settle();
+    const pendingRetry = f.service.list().runs[0]!;
+    assert.ok(pendingRetry.retryAt);
+    const completed = Array.from({ length: 999 }, () => journalRun(first.id, 'completed', f.clock()));
+    const service = await restoreJournal(f, [pendingRetry, ...completed]);
+    await service.runNow(second.id); await f.settle();
+    const journal = JSON.parse(await fs.readFile(path.join(f.directory, 'automations.json'), 'utf8'));
+    assert.equal(journal.runs.length, 1000);
+    assert.equal(journal.runs.find((run: AutomationRun) => run.id === pendingRetry.id)?.retryAt, pendingRetry.retryAt);
+    assert.equal(journal.runs.some((run: AutomationRun) => run.id === completed[0]!.id), false);
+  } finally { await f.close(); }
+});
+test('a journal full of unresolved records rejects enqueue without leaving an uncommitted native task', async () => {
+  const f = await fixture(); try {
+    const task = await f.service.put({ ...spec, enabled: false });
+    const runs = Array.from({ length: 1000 }, () => journalRun('retired-automation', 'needs_review', f.clock()));
+    const service = await restoreJournal(f, runs);
+    const before = await fs.readFile(path.join(f.directory, 'automations.json'), 'utf8');
+    await assert.rejects(service.runNow(task.id), (cause: any) => cause.status === 409 && /容量不足/.test(cause.message));
+    await service.tick(); await f.settle();
+    assert.equal(f.calls.length, 0);
+    assert.equal((service as any).runs.length, 1000);
+    assert.equal(await fs.readFile(path.join(f.directory, 'automations.json'), 'utf8'), before);
   } finally { await f.close(); }
 });
 test('restarted known native turns require read-only reconciliation instead of reacquiring a writer or repeating inference', async () => {

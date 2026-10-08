@@ -33,3 +33,23 @@ test('automation menu saves a timezone schedule and exposes persisted run logs a
   page.once('dialog', dialog => dialog.accept()); await panel.getByRole('button', { name: '重新执行', exact: true }).click();
   await expect.poll(() => actions).toEqual(['run', 'retry']);
 });
+
+test('automation warnings clear after a successful refresh while failed action feedback remains', async ({ page }) => {
+  let warning = '自动化等待队列已满';
+  await page.route('**/api/automations**', route => route.request().method() === 'POST'
+    ? route.fulfill({ status: 400, json: { error: '测试中的保存失败' } })
+    : route.fulfill({ json: { tasks: [], runs: [], error: warning } }));
+  await login(page); await page.clock.install();
+  await page.getByRole('button', { name: '自动化', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: '自动化', exact: true });
+  await expect(panel.getByRole('alert')).toContainText(warning);
+  warning = ''; await page.clock.fastForward(5000);
+  await expect(panel.getByRole('alert')).toHaveCount(0);
+  await panel.getByRole('button', { name: '新建自动化' }).click();
+  await panel.getByLabel('自动化名称', { exact: true }).fill('失败反馈');
+  await panel.getByLabel('自动化任务', { exact: true }).fill('不提交原生任务');
+  await panel.getByRole('button', { name: '保存自动化' }).click();
+  await expect(panel.getByRole('alert')).toContainText('测试中的保存失败');
+  await page.clock.fastForward(5000);
+  await expect(panel.getByRole('alert')).toContainText('测试中的保存失败');
+});

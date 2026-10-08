@@ -70,6 +70,7 @@ test('a busy composer explicitly chooses native next-turn delivery; accepted inp
   const queue = await install(page, mock); await login(page); await open(page);
   await expect(page.getByRole('combobox', { name: '消息发送方式' })).toHaveValue('immediate');
   await expect.poll(() => mock.requests.some(request => request.method === 'thread/queue/list')).toBe(true);
+  await expect(page.getByRole('region', { name: '原生消息队列' })).toHaveCount(0);
   await page.getByRole('combobox', { name: '消息发送方式' }).selectOption('queue');
   await page.getByRole('textbox', { name: '消息输入框' }).fill('下一轮查看图片');
   await page.locator('input[type="file"]').first().setInputFiles({ name: 'diagram.png', mimeType: 'image/png', buffer: Buffer.from('PNG') });
@@ -110,8 +111,8 @@ test('queue order synchronizes across browsers and preserves each browser compos
 
 test('unsupported native queue advertises the reason and never sends a fake queue probe or starts a turn', async ({ page, mock }) => {
   await install(page, mock, false); await login(page); await open(page);
-  await page.getByRole('button', { name: /运行中 · 下一轮队列 0/ }).click();
-  await expect(page.getByText(/此主机的 Codex 不支持当前原生消息队列协议/)).toBeVisible();
+  await expect(page.locator('.queue-heading')).toHaveCount(0);
+  await expect(page.locator('.queue-delivery')).toHaveAttribute('title', /此主机的 Codex 不支持当前原生消息队列协议/);
   await expect(page.locator('select[aria-label="消息发送方式"] option[value="queue"]')).toHaveJSProperty('disabled', true);
   expect(mock.requests.some(request => request.method.startsWith('thread/queue/'))).toBe(false);
   expect(mock.requests.some(request => request.method === 'turn/start')).toBe(false);
@@ -126,6 +127,7 @@ test('queue failure preserves the draft, and an unknown outcome blocks blind dup
   await page.getByRole('button', { name: '加入下一轮队列', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '消息输入框' })).toHaveValue('必须保留的排队草稿');
   await expect(page.locator('.queue-notice')).toContainText('已保留草稿，不会自动重复提交');
+  await expect(page.locator('.queue-heading')).toHaveCount(0);
   await page.getByRole('combobox', { name: '消息发送方式' }).selectOption('immediate');
   await expect(page.getByRole('button', { name: '追加指令', exact: true })).toHaveCount(0);
   expect(mock.requests.filter(request => request.method === 'thread/queue/add')).toHaveLength(1);
@@ -148,4 +150,5 @@ test('busy tasks cannot be interrupted by queue start; late native start acknowl
   await expect(page.getByText('队列任务已完成', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0);
   expect(queue.items).toHaveLength(0);
+  await expect(page.locator('.queue-heading')).toHaveCount(0);
 });
