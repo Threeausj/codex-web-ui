@@ -17,6 +17,7 @@ import { useMessageQueue } from "./message-queue";
 import { clearConversationMarkdownCache } from "./conversation-markdown";
 import { privateState } from "./private-state";
 import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './lazy-history';
+import { isInteractiveServerRequest } from '../../shared/server-requests';
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -1099,7 +1100,7 @@ function receive(message: any) {
   }
   const consumed = notifyProtocol(message);
   if (message.method && message.id !== undefined) {
-    if (!state.pendingRequests.some((p) => p.id === message.id))
+    if (isInteractiveServerRequest(message) && !state.pendingRequests.some((p) => p.id === message.id))
       state.pendingRequests.push(message);
     return;
   }
@@ -1161,7 +1162,7 @@ function receive(message: any) {
     if (p.error) state.error = p.error;
     if (p.connected && !state.runtimePaused) {
       state.error = state.threadConflict?.message || "";
-      if (p.pendingRequests) state.pendingRequests = p.pendingRequests;
+      if (p.pendingRequests) state.pendingRequests = p.pendingRequests.filter(isInteractiveServerRequest);
       if (changedEngine) void Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
       if (state.goalReadError) void refreshCurrentGoal();
     }

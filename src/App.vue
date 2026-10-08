@@ -144,16 +144,16 @@ const hostProjects = computed(() =>
 const activeRequests = computed(() =>
   state.pendingRequests.filter(
     (request: any) =>
-      !request.params?.threadId ||
-      request.params.threadId === state.activeThread?.id,
+      !(request.params?.threadId || request.params?.conversationId) ||
+      (request.params.threadId || request.params.conversationId) === state.activeThread?.id,
   ),
 );
 const otherRequests = computed(() =>
   state.pendingRequests.filter(
     (request: any) =>
-      request.params?.threadId &&
-      request.params.threadId !== state.activeThread?.id &&
-      request.params.threadId !== sideChat.state.threadId,
+      (request.params?.threadId || request.params?.conversationId) &&
+      (request.params.threadId || request.params.conversationId) !== state.activeThread?.id &&
+      (request.params.threadId || request.params.conversationId) !== sideChat.state.threadId,
   ),
 );
 const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput')));
@@ -1166,6 +1166,7 @@ watch(() => [state.authenticated, state.loading], () => {
               v-for="request in activeRequests"
               :key="String(request.id)"
               :request="request"
+              :items="state.items"
               :api="api"
             />
             <div

@@ -3,7 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import type { ToolRequestUserInputQuestion } from '../../shared/protocol/v2/ToolRequestUserInputQuestion'
 import { userInputAnswer, userInputReady, userInputResponse, type UserInputDrafts } from '../lib/user-input'
 import Icon from './Icon.vue'
-const props = defineProps<{ request: any; api: any }>()
+const props = defineProps<{ request: any; api: any; items?: any[] }>()
 const answers = reactive<UserInputDrafts>(Object.create(null))
 const formAnswers = reactive<Record<string, any>>({})
 const responding = ref(false)
@@ -16,7 +16,19 @@ const isBlocking = computed(() => params.value.isBlocking !== false)
 const answerCount = computed(() => questions.value.filter(question => userInputAnswer(question, answers[question.id]) !== null).length)
 const isPermissions = computed(() => props.request.method?.includes('permissions/requestApproval'))
 const isElicitation = computed(() => props.request.method?.includes('elicitation'))
-const title = computed(() => isQuestion.value ? 'Codex 需要你的选择' : isPermissions.value ? '请求额外权限' : isElicitation.value ? `${params.value.serverName || 'MCP'} 需要你的输入` : props.request.method?.includes('fileChange') ? '批准文件修改' : '批准命令执行')
+const isFileChange = computed(() => ['item/fileChange/requestApproval', 'applyPatchApproval'].includes(props.request.method))
+const network = computed(() => params.value.networkApprovalContext)
+const isStdin = computed(() => params.value.kind === 'writeStdin')
+const title = computed(() => isQuestion.value ? 'Codex 需要你的选择' : isPermissions.value ? '请求额外权限' : isElicitation.value ? `${params.value.serverName || 'MCP'} 需要你的输入` : isFileChange.value ? '批准文件修改' : network.value ? '批准网络访问' : isStdin.value ? '批准终端输入' : '批准命令执行')
+const relatedItem = computed(() => props.items?.find(item => item.id === (params.value.itemId || params.value.callId) &&
+  item.turnId === params.value.turnId && (!item.threadId || item.threadId === (params.value.threadId || params.value.conversationId))))
+const context = computed(() => params.value.bridgeApprovalContext || {})
+const command = computed(() => {
+  const value = params.value.command || context.value.command || relatedItem.value?.command
+  return Array.isArray(value) ? value.map(part => /\s/.test(String(part)) ? JSON.stringify(part) : String(part)).join(' ') : typeof value === 'string' ? value : ''
+})
+const cwd = computed(() => params.value.cwd || context.value.cwd || relatedItem.value?.cwd)
+const filePaths = computed<string[]>(() => context.value.filePaths || relatedItem.value?.changes?.map((change: any) => change.path) || Object.keys(params.value.fileChanges || {}))
 const properties = computed(() => params.value.requestedSchema?.properties || {})
 watch(() => props.request.id, () => {
   for (const key of Object.keys(answers)) delete answers[key]
@@ -41,6 +53,7 @@ async function respond(decision: string) {
     if (isQuestion.value) result = userInputResponse(questions.value, answers)
     else if (isPermissions.value) result = { permissions: decision.startsWith('accept') ? Object.fromEntries(Object.entries(params.value.permissions || {}).filter(([, value]) => value != null)) : {}, scope: decision === 'acceptForSession' ? 'session' : 'turn' }
     else if (isElicitation.value) result = { action: decision === 'accept' ? 'accept' : decision === 'cancel' ? 'cancel' : 'decline', content: decision === 'accept' ? params.value.mode === 'url' ? null : formAnswers : null, _meta: null }
+    else if (['execCommandApproval', 'applyPatchApproval'].includes(props.request.method)) result = { decision: decision === 'accept' ? 'approved' : decision === 'acceptForSession' ? 'approved_for_session' : decision === 'cancel' ? 'abort' : { denied: { rejection: 'Declined by the user' } } }
     await props.api.respond(props.request.id, result)
     submitted.value = true
     if (isQuestion.value) for (const question of questions.value) if (question.isSecret) answers[question.id] = {}
@@ -69,7 +82,16 @@ async function respond(decision: string) {
         <input v-else v-model="formAnswers[name]" class="text-input" :type="(field as any).type === 'number' || (field as any).type === 'integer' ? 'number' : 'text'" />
       </label>
     </template>
-    <template v-else><pre v-if="params.command" class="approval-command">$ {{ params.command }}</pre><p v-if="params.cwd" class="approval-path"><Icon name="Folder" :size="13" />{{ params.cwd }}</p><pre v-if="isPermissions" class="approval-permissions">{{ JSON.stringify(params.permissions, null, 2) }}</pre><p v-if="params.grantRoot" class="approval-path">允许修改：{{ params.grantRoot }}</p></template>
+    <template v-else>
+      <p v-if="network" class="approval-reason">请求连接：{{ network.protocol }} · {{ network.host }}</p>
+      <p v-else-if="isStdin" class="approval-reason">请求向运行中的终端发送输入。</p>
+      <pre v-if="command && !network" class="approval-command">{{ isStdin ? '操作内容：' : '$ ' }}{{ command }}</pre>
+      <p v-if="cwd" class="approval-path"><Icon name="Folder" :size="13" />{{ cwd }}</p>
+      <ul v-if="isFileChange && filePaths.length" class="approval-files"><li v-for="path in filePaths" :key="path">{{ path }}</li></ul>
+      <pre v-if="isPermissions" class="approval-permissions">{{ JSON.stringify(params.permissions, null, 2) }}</pre>
+      <p v-if="params.grantRoot" class="approval-path">允许修改：{{ params.grantRoot }}</p>
+      <p v-if="!isPermissions && !network && !isStdin && !command && !filePaths.length" class="approval-reason">Codex 未提供此操作的详细内容，请先同步对话核对。</p>
+    </template>
     <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
     <div class="approval-actions">
       <span v-if="isQuestion && questions.length" class="question-progress" role="status">{{ submitted ? '回答已发送' : responding ? '正在发送回答…' : `已回答 ${answerCount}/${questions.length}` }}</span>
@@ -82,6 +104,8 @@ async function respond(decision: string) {
 </template>
 
 <style scoped>
+.approval-files { padding-left: 20px; overflow-wrap: anywhere; font-size: 12px; }
+.approval-reason { overflow-wrap: anywhere; }
 .question-card { border-color: var(--border); font-size: 13px; min-width: 0; }
 .question-card .approval-icon { background: var(--soft); color: var(--text); flex-shrink: 0; }
 .question-card .approval-heading strong { font-size: 14px; }

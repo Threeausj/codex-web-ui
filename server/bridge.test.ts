@@ -737,3 +737,64 @@ test('running terminal survives browser disconnect and completion reaches reconn
     assert.ok(!phone.sent.some(message => message.id === 7))
   } finally { f.bridge.close() }
 })
+
+test('current-time callbacks are answered once without a browser, approval or replayed prompt', async () => {
+  const value = fixture();
+  try {
+    await value.bridge.connect();
+    const before = Math.floor(Date.now() / 1000);
+    value.receive({ id: 'clock-request', method: 'currentTime/read', params: { threadId: 't' } });
+    await tick();
+    const answers = value.sent.filter(message => message.id === 'clock-request');
+    assert.equal(answers.length, 1);
+    const time = (answers[0].result as any).currentTimeAt;
+    assert.ok(Number.isInteger(time) && time >= before && time <= Math.floor(Date.now() / 1000));
+    const browser = new Browser(); value.bridge.attach('clock-reader', browser.ws(), 'clock-reader');
+    assert.deepEqual((browser.sent.find(message => message.method === 'bridge/status')!.params as any).pendingRequests, []);
+    assert.equal(browser.sent.some(message => message.method === 'currentTime/read'), false);
+  } finally { value.bridge.close(); }
+});
+
+test('unsupported client tools and service callbacks fail in their native schema without becoming approvals', async () => {
+  const value = fixture(); const browser = new Browser(); value.bridge.attach('reader', browser.ws(), 'reader');
+  try {
+    await value.bridge.connect();
+    value.receive({ id: 321, method: 'item/tool/call', params: { threadId: 't', tool: 'desktop_only_tool', arguments: { token: 'private-argument' } } });
+    value.receive({ id: 'attestation', method: 'attestation/generate', params: {} });
+    value.receive({ id: 'future', method: 'future/clientCallback', params: { threadId: 't' } });
+    await tick();
+    const tool = value.sent.find(message => message.id === 321)!.result as any;
+    assert.equal(tool.success, false); assert.equal(tool.contentItems[0].type, 'inputText');
+    assert.equal(JSON.stringify(tool).includes('private-argument'), false);
+    assert.equal(value.sent.find(message => message.id === 'attestation')!.error?.code, -32601);
+    assert.equal(value.sent.find(message => message.id === 'future')!.error?.code, -32601);
+    assert.equal(browser.sent.some(message => message.id === 321 || message.id === 'attestation' || message.id === 'future'), false);
+    const again = new Browser(); value.bridge.attach('reconnected', again.ws(), 'reconnected');
+    assert.deepEqual((again.sent[0].params as any).pendingRequests, []);
+  } finally { value.bridge.close(); }
+});
+
+test('approval previews survive reconnects, match the exact item scope and never contain outputs or diffs', async () => {
+  const value = fixture(); const browser = new Browser(); value.bridge.attach('reader', browser.ws(), 'reader');
+  try {
+    await value.bridge.connect();
+    value.receive({ method: 'item/started', params: { threadId: 't', turnId: 'turn', item: { id: 'command', type: 'commandExecution', command: 'printf review-me', cwd: '/workspace', aggregatedOutput: 'private-output' } } });
+    value.receive({ id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'turn', itemId: 'command', command: null, reason: null } });
+    value.receive({ id: 'wrong-turn', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'other-turn', itemId: 'command' } });
+    value.receive({ method: 'item/started', params: { threadId: 't', turnId: 'turn', item: { id: 'file', type: 'fileChange', changes: [{ path: 'src/app.ts', diff: 'private-diff' }] } } });
+    value.receive({ id: 'files', method: 'item/fileChange/requestApproval', params: { threadId: 't', turnId: 'turn', itemId: 'file' } });
+    const again = new Browser(); value.bridge.attach('reconnected', again.ws(), 'reconnected');
+    const requests = (again.sent[0].params as any).pendingRequests;
+    assert.deepEqual(requests.find((r: any) => r.id === 'approval').params.bridgeApprovalContext, { command: 'printf review-me', cwd: '/workspace' });
+    assert.equal(requests.find((r: any) => r.id === 'wrong-turn').params.bridgeApprovalContext, undefined);
+    assert.deepEqual(requests.find((r: any) => r.id === 'files').params.bridgeApprovalContext, { filePaths: ['src/app.ts'] });
+    assert.equal(JSON.stringify(requests).includes('private-output'), false);
+    assert.equal(JSON.stringify(requests).includes('private-diff'), false);
+    assert.equal(value.sent.some(message => message.id === 'approval'), false, 'A real approval still requires a decision');
+    value.receive({ method: 'item/completed', params: { threadId: 't', turnId: 'turn', item: { id: 'command', type: 'commandExecution', command: 'x'.repeat(65 * 1024) } } });
+    value.receive({ id: 'oversized', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'turn', itemId: 'command' } });
+    assert.equal((browser.sent.find(message => message.id === 'oversized')!.params as any).bridgeApprovalContext, undefined, 'An omitted oversized preview must not retain an older command');
+    browser.request({ id: 'approval', result: { decision: 'accept' } }); await tick();
+    assert.deepEqual(value.sent.find(message => message.id === 'approval')?.result, { decision: 'accept' });
+  } finally { value.bridge.close(); }
+});

@@ -10,6 +10,7 @@ import { rpcError } from './types.js'
 import { webSocketProxyTransport } from './proxy-transport.js'
 import { BrowserChannel } from './browser-channel.js'
 import { JsonLineReader } from './json-lines.js'
+import { isInteractiveServerRequest } from '../shared/server-requests.js'
 import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
@@ -73,6 +74,8 @@ export class Bridge {
   private connecting?: Promise<void>
   private pending = new Map<string, Pending>()
   private approvals = new Map<string, Approval>()
+  private approvalItems = new Map<string, { context: Record<string, unknown>; bytes: number }>()
+  private approvalItemBytes = 0
   private clients = new Map<string, WebSocket>()
   private clientChannels = new Map<string, BrowserChannel>()
   private browserFailures = { send: 0, overflow: 0, timeout: 0 }
@@ -475,9 +478,35 @@ export class Bridge {
     }
   }
 
+  private rememberApprovalItem(message: RpcMessage) {
+    if (!['item/started', 'item/completed'].includes(message.method || '')) return
+    const p = message.params as any, item = p?.item
+    if (typeof p?.threadId !== 'string' || typeof p.turnId !== 'string' || typeof item?.id !== 'string') return
+    const context: Record<string, unknown> = {}
+    if (item.type === 'commandExecution' && typeof item.command === 'string') context.command = item.command
+    else if (item.type === 'fileChange' && Array.isArray(item.changes))
+      context.filePaths = item.changes.flatMap((change: any) => typeof change?.path === 'string' ? [change.path] : [])
+    else return
+    if (typeof item.cwd === 'string') context.cwd = item.cwd
+    // Retain previews, never command output or diffs. Oversized previews are
+    // omitted rather than showing a truncated command as the entire operation.
+    const bytes = Buffer.byteLength(JSON.stringify(context))
+    const key = JSON.stringify([p.threadId, p.turnId, item.id])
+    this.approvalItemBytes -= this.approvalItems.get(key)?.bytes || 0
+    this.approvalItems.delete(key)
+    if (bytes > 64 * 1024) return
+    this.approvalItems.set(key, { context, bytes }); this.approvalItemBytes += bytes
+    while (this.approvalItems.size > 256 || this.approvalItemBytes > 1024 * 1024) {
+      const first = this.approvalItems.keys().next().value!
+      this.approvalItemBytes -= this.approvalItems.get(first)!.bytes
+      this.approvalItems.delete(first)
+    }
+  }
+
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
     this.observeContext(message)
+    this.rememberApprovalItem(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
       const id = (message.params as { threadId?: string })?.threadId
       if (id && !this.archiveCapture.restoreThreadIds.includes(id)) this.archiveCapture.restoreThreadIds.push(id)
@@ -516,10 +545,27 @@ export class Bridge {
       return
     }
     if (message.id !== undefined && message.method) {
+      // Service callbacks must work even with every browser asleep. They are
+      // not approval prompts, and no shell/tool is executed by accepting them.
+      if (message.method === 'currentTime/read') {
+        this.send({ id: message.id, result: { currentTimeAt: Math.floor(Date.now() / 1000) } })
+        return
+      }
+      if (!isInteractiveServerRequest(message)) {
+        this.lastProtocolError = { at: Date.now(), code: -32601, method: message.method, category: 'unsupportedClientRequest' }
+        if (message.method === 'item/tool/call') {
+          this.send({ id: message.id, result: { success: false, contentItems: [{ type: 'inputText', text: 'This Web client does not implement this client-side tool. Use an available tool or a client that provides it.' }] } })
+        } else this.send(rpcError(message.id, 'This Web client does not implement the requested client capability', -32601))
+        return
+      }
+      const p = message.params as any
+      const details = this.approvalItems.get(JSON.stringify([p?.threadId, p?.turnId, p?.itemId]))
+      const prompt = details && ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(message.method)
+        ? { ...message, params: { ...p, bridgeApprovalContext: details.context } } : message
       // This application has one authenticated user. Their desktop and phone may
       // both review a request; only the first response to a pending server ID wins.
-      this.approvals.set(JSON.stringify(message.id), { message })
-      this.broadcast(message)
+      this.approvals.set(JSON.stringify(message.id), { message: prompt })
+      this.broadcast(prompt)
       return
     }
     if (message.method) {
@@ -566,6 +612,7 @@ export class Bridge {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error) }
     this.pending.clear()
     this.approvals.clear()
+    this.approvalItems.clear(); this.approvalItemBytes = 0
     this.subscribedThreads.clear()
     this.activeThreads.clear()
     this.contexts.clear()
