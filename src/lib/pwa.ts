@@ -1,4 +1,5 @@
 import { reactive } from 'vue';
+import { pushTargetFromUrl } from './push-navigation';
 
 export type PushPreferences = { completed: boolean; approval: boolean; errors: boolean };
 export type PushDestination = { hostId: string; threadId: string };
@@ -72,6 +73,19 @@ function pushHttp(api: HttpApi, path: string, init: RequestInit = {}, reportErro
 function installListeners() {
   if (listenersInstalled) return;
   listenersInstalled = true;
+  // Relaunching the icon focuses the current app without navigating away from
+  // its chat. A notification launch must still select its explicit destination.
+  const launchQueue = (window as Window & { launchQueue?: { setConsumer(callback: (params: { targetURL?: string }) => void): void } }).launchQueue;
+  launchQueue?.setConsumer(({ targetURL }) => {
+    if (!targetURL) return;
+    try {
+      const url = new URL(targetURL);
+      if (url.origin !== location.origin || url.pathname !== '/') return;
+      const target = pushTargetFromUrl(url);
+      if (target) window.dispatchEvent(new CustomEvent('codex:push-navigate', { detail: target }));
+      else window.dispatchEvent(new Event('codex:app-resume'));
+    } catch { /* Ignore malformed or unrelated launches. */ }
+  });
   window.addEventListener('online', () => { pwaState.offline = false; });
   window.addEventListener('offline', () => { pwaState.offline = true; });
   window.addEventListener('storage', (event) => {

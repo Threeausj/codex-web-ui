@@ -11,6 +11,7 @@ import { useCodex } from "./lib/useCodex";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
+import { ReadingPositions, type ReadingPosition } from "./lib/reading-positions";
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
@@ -33,6 +34,18 @@ import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navig
 
 const api = useCodex();
 const state = api.state;
+const readingPositions = new ReadingPositions(() => api.privateSessionReady(), () => api.runtimeIdentity().authenticationGeneration);
+let restoredScrollKey = '';
+function clearWindowReadingPositions() {
+  restoredScrollKey = '';
+  try {
+    for (let i = sessionStorage.length - 1; i >= 0; i--) {
+      const key = sessionStorage.key(i);
+      if (key?.startsWith('codex.scroll.')) sessionStorage.removeItem(key);
+    }
+  } catch { /* Window storage may be disabled. */ }
+}
+watch(() => state.authenticated, authenticated => { if (!authenticated) clearWindowReadingPositions(); });
 const sideChat = useSideChat(api, state);
 const sideChatPanel = ref<InstanceType<typeof SideChatPanel>>();
 useSubagentPrefetch(api, state);
@@ -262,27 +275,30 @@ function saveScroll() {
   // Cached history paints before native hydration finishes. Its initial layout
   // must not replace the reading position saved by the previous app window.
   if (state.loading || state.selectingThread || (state.activeThread && !state.threadReady)) return;
-  if (scroll.value && state.activeThread?.id)
-    sessionStorage.setItem(
-      `codex.scroll.${state.hostId}.${state.activeThread.id}`,
-      JSON.stringify({
-        top: scroll.value.scrollTop,
-        bottom: !showScrollBottom.value,
-      }),
-    );
+  if (!state.authenticated || !scroll.value || !state.activeThread?.id) return;
+  const key = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
+  if (key !== restoredScrollKey) return;
+  const position = { top: scroll.value.scrollTop, bottom: !showScrollBottom.value };
+  try { sessionStorage.setItem(key, JSON.stringify(position)); } catch { /* Durable storage can still retain the position. */ }
+  readingPositions.remember(state.hostId, state.activeThread.id, position);
 }
-function restoreScroll(id: string) {
+async function restoreScroll(id: string, generation = navigationSelection) {
+  const hostId = state.hostId, authentication = api.runtimeIdentity().authenticationGeneration;
+  const key = `codex.scroll.${hostId}.${id}`;
+  const current = () => generation === navigationSelection && hostId === state.hostId &&
+    id === state.activeThread?.id && authentication === api.runtimeIdentity().authenticationGeneration;
+  let position: ReadingPosition | null = null;
   try {
-    const position = JSON.parse(
-      sessionStorage.getItem(`codex.scroll.${state.hostId}.${id}`) || "null",
-    );
-    if (position && !position.bottom && scroll.value) {
-      scroll.value.scrollTop = position.top;
-      onScroll();
-    } else scrollBottom();
-  } catch {
-    scrollBottom();
-  }
+    const saved = JSON.parse(sessionStorage.getItem(key) || "null");
+    if (Number.isFinite(saved?.top) && saved.top >= 0 && typeof saved.bottom === 'boolean') position = saved;
+  } catch { /* A new app window restores from private durable storage. */ }
+  position ??= await readingPositions.read(hostId, id);
+  if (!current()) return;
+  restoredScrollKey = key;
+  if (position && !position.bottom && scroll.value) {
+    scroll.value.scrollTop = position.top;
+    onScroll();
+  } else scrollBottom();
 }
 async function selectThread(
   selection: string | { id: string; hostId: string },
@@ -306,7 +322,7 @@ async function selectThread(
   });
   if (generation !== navigationSelection) return;
   await nextTick();
-  restoreScroll(id);
+  await restoreScroll(id, generation);
 }
 async function newThread() {
   if (state.editingMessage) return;
@@ -568,6 +584,15 @@ function onForeground() {
       await initializeDevicePush(api);
   }, 250);
 }
+function onBackground() {
+  clearTimeout(foregroundTimer);
+  saveScroll();
+  void readingPositions.flush();
+}
+function onVisibilityChange() {
+  if (document.visibilityState === 'hidden') onBackground();
+  else onForeground();
+}
 function onPageShow(event: PageTransitionEvent) {
   if (event.persisted) onForeground();
 }
@@ -686,8 +711,11 @@ onMounted(() => {
   prefersDark.addEventListener("change", applyTheme);
   window.addEventListener("online", onNetworkChange);
   window.addEventListener("offline", onNetworkChange);
-  document.addEventListener("visibilitychange", onForeground);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  document.addEventListener("freeze", onBackground);
   document.addEventListener("resume", onForeground);
+  window.addEventListener("pagehide", onBackground);
+  window.addEventListener("codex:app-resume", onForeground);
   window.addEventListener("pageshow", onPageShow);
   window.addEventListener("focus", onForeground);
   stopPushNavigation = onPushNavigate((value) => {
@@ -696,21 +724,26 @@ onMounted(() => {
     pendingPushTarget = target;
     void openPendingPushTarget();
   });
+  const initialNavigation = navigationSelection;
   void action(() => api.initialize()).then(async () => {
     await nextTick();
-    if (state.activeThread) restoreScroll(state.activeThread.id);
+    if (!state.authenticated) clearWindowReadingPositions();
+    if (state.activeThread) await restoreScroll(state.activeThread.id, initialNavigation);
   });
 });
 onBeforeUnmount(() => {
-  saveScroll();
+  onBackground();
   document.removeEventListener("keydown", onKeydown);
   prefersDark.removeEventListener("change", applyTheme);
   window.visualViewport?.removeEventListener("resize", updateViewport);
   window.removeEventListener("resize", updateViewport);
   window.removeEventListener("online", onNetworkChange);
   window.removeEventListener("offline", onNetworkChange);
-  document.removeEventListener("visibilitychange", onForeground);
+  document.removeEventListener("visibilitychange", onVisibilityChange);
+  document.removeEventListener("freeze", onBackground);
   document.removeEventListener("resume", onForeground);
+  window.removeEventListener("pagehide", onBackground);
+  window.removeEventListener("codex:app-resume", onForeground);
   window.removeEventListener("pageshow", onPageShow);
   window.removeEventListener("focus", onForeground);
   clearTimeout(foregroundTimer);

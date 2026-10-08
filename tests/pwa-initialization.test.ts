@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { transform } from 'esbuild';
+import { build } from 'esbuild';
 
 test('suspended notification initialization times out, aborts HTTP and can retry without signing out', async t => {
   const names = ['window', 'navigator', 'localStorage', 'Notification', 'matchMedia'];
@@ -20,8 +20,8 @@ test('suspended notification initialization times out, aborts HTTP and can retry
   await fs.mkdir(new URL('../node_modules/.cache/', import.meta.url), { recursive: true });
   try {
     const source = await fs.readFile(new URL('../src/lib/pwa.ts', import.meta.url), 'utf8');
-    const compiled = await transform(source, { loader: 'ts', format: 'esm', define: { 'import.meta.env.PROD': 'true', 'import.meta.env.VITE_BUILD_ID': '"test"' } });
-    await fs.writeFile(destination, compiled.code, { mode: 0o600 });
+    const compiled = await build({ stdin: { contents: source, loader: 'ts', resolveDir: new URL('../src/lib/', import.meta.url).pathname }, bundle: true, packages: 'external', write: false, format: 'esm', define: { 'import.meta.env.PROD': 'true', 'import.meta.env.VITE_BUILD_ID': '"test"' } });
+    await fs.writeFile(destination, compiled.outputFiles[0]!.text, { mode: 0o600 });
     const pwa = await import(destination.href);
     let configHung = true; const requests: { path: string; signal?: AbortSignal; reportError?: boolean }[] = [];
     const api = { runtimeIdentity: () => ({ authenticationGeneration: 1 }), requestHttp: async (path: string, init: any, reportError: boolean) => {

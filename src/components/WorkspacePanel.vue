@@ -421,9 +421,16 @@ watch(() => [props.openPath, props.openLine, fileScope()] as const, ([value, lin
     if (version === workspaceGeneration && props.openPath === value && props.openLine === line) void revealPath(value, line);
   });
 }, { immediate: true });
-if (typeof window !== "undefined") window.addEventListener("pagehide", persistDrafts);
+function onWorkspaceHidden() {
+  if (document.visibilityState === 'hidden') persistDrafts();
+}
+window.addEventListener("pagehide", persistDrafts);
+document.addEventListener("visibilitychange", onWorkspaceHidden);
+document.addEventListener("freeze", persistDrafts);
 onBeforeUnmount(() => {
   persistDrafts(); window.removeEventListener("pagehide", persistDrafts); clearTimeout(draftTimer);
+  document.removeEventListener("visibilitychange", onWorkspaceHidden);
+  document.removeEventListener("freeze", persistDrafts);
   ++directoryGeneration;
   ++fileGeneration;
   ++revealGeneration;
