@@ -1157,6 +1157,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :edit-disabled="editDisabled"
               :edit-message="api.resendEditedMessage"
               :cancel-message-edit="api.cancelMessageEdit"
+              :load-turn-details="api.loadTurnDetails"
               @fork="fork"
               @open-file="(path, line) => openWorkspace('files', path, line)"
               @error="showError"

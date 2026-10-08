@@ -260,7 +260,7 @@ export class Bridge {
     if (this.releasing.size && ['thread/archive', 'thread/unarchive'].includes(method))
       throw Object.assign(new Error('会话正在关闭，请稍后再归档或恢复'), { status: 409 })
     const id = (params as { threadId?: string } | undefined)?.threadId
-    if (id && !['thread/read', 'thread/turns/list', 'thread/goal/get'].includes(method) &&
+    if (id && !['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/goal/get'].includes(method) &&
       (this.releasing.has(id) || this.releasedThreads.has(id) || [...this.releasedThreads.values()].some(entry => entry.restoreThreadIds.includes(id))))
       throw Object.assign(new Error('此会话的 Web 连接已关闭，请在资源管理中重新连接会话'), { code: 'thread_released', status: 409 })
   }
@@ -598,7 +598,7 @@ export class Bridge {
       for (const id of ids) this.releasing.add(id)
       // A resume already in flight must settle before shutting down the writer.
       const deadline = Date.now() + 5000
-      while ([...this.pending.values()].some(p => ids.has((p.params as { threadId?: string })?.threadId || '') && !['thread/read', 'thread/turns/list'].includes(p.method))) {
+      while ([...this.pending.values()].some(p => ids.has((p.params as { threadId?: string })?.threadId || '') && !['thread/read', 'thread/turns/list', 'thread/items/list'].includes(p.method))) {
         if (Date.now() > deadline) throw new Error('此会话仍有请求未完成，请稍后重试关闭')
         await new Promise(resolve => setTimeout(resolve, 25))
       }

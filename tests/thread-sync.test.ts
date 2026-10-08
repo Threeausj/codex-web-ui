@@ -75,6 +75,13 @@ test('a late start acknowledgement never changes a completed turn back to runnin
   assert.deepEqual(snapshot.items, completed.items);
 });
 
+test('a late full start acknowledgement cannot mark completed summary history as fully fetched', () => {
+  const completed = { id: 'turn', status: 'completed', historySummary: true, historyItemsCursor: 'more', items: [{ id: 'answer', text: '完整结果' }] };
+  const snapshot = mergeTurnSnapshot(completed, { id: 'turn', status: 'inProgress', itemsView: 'full', items: [{ id: 'answer', text: '完' }] });
+  assert.equal(snapshot.historySummary, true);
+  assert.equal(snapshot.historyItemsCursor, 'more');
+});
+
 test('only native writer conflicts or explicit backend markers enable takeover', () => {
   assert.equal(writerConflict(new Error('thread id already has an active writer')), true);
   assert.equal(writerConflict({ data: { takeoverAvailable: true } }), true);

@@ -43,7 +43,7 @@ export function conversationBlocks(
   for (const turn of turns) {
     if (
       groups.has(turn.id) ||
-      !["failed", "interrupted", "inProgress"].includes(turn.status)
+      (!turn.historySummary && !["failed", "interrupted", "inProgress"].includes(turn.status))
     )
       continue;
     const block: Extract<ConversationBlock, { kind: "turn" }> = {
