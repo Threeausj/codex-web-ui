@@ -18,6 +18,7 @@ test-results
 playwright-report
 coverage
 docs/screenshots
+docs/images
 *.log
 .DS_Store
 **/.codex

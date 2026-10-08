@@ -43,9 +43,14 @@ export async function writePrivateJson(file: string, value: unknown) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
   await fs.chmod(path.dirname(file), 0o700)
   const temporary = `${file}.${randomUUID()}.tmp`
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-  await fs.rename(temporary, file)
-  await fs.chmod(file, 0o600)
+  try {
+    const handle = await fs.open(temporary, 'wx', 0o600)
+    try {
+      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`)
+      await handle.sync()
+    } finally { await handle.close() }
+    await fs.rename(temporary, file)
+  } finally { await fs.rm(temporary, { force: true }) }
 }
 
 async function readJson(file: string): Promise<unknown> {
@@ -58,8 +63,8 @@ async function readJson(file: string): Promise<unknown> {
 export class Storage {
   hosts: Host[] = [{ id: 'local', name: '本机', kind: 'local' }]
   private webProjects: (Project & { hidden?: boolean })[] = []
-  private hostWrites: Promise<unknown> = Promise.resolve()
-  private projectWrites: Promise<unknown> = Promise.resolve()
+  // Host deletion changes both collections, so they must share one write queue.
+  private writes: Promise<unknown> = Promise.resolve()
   constructor(readonly dataDir: string, readonly codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), readonly cwd = process.cwd()) {}
 
   async init() {
@@ -73,14 +78,14 @@ export class Storage {
       }
     }
     const projects = await readJson(path.join(this.dataDir, 'projects.json'))
-    if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string').map(p => ({ ...p, source: 'web' }))
+    if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string' && this.host(p.hostId)).map(p => ({ ...p, source: 'web' }))
   }
 
   host(id: string) { return this.hosts.find(h => h.id === id) }
 
   async addHost(input: unknown) {
     const fields = hostInput.parse(input)
-    return this.mutateHosts(async () => {
+    return this.mutate(async () => {
       const host: Host = { ...fields, id: `ssh-${randomUUID()}`, kind: 'ssh' }
       const hosts = [...this.hosts, host]
       await this.saveHosts(hosts)
@@ -91,7 +96,7 @@ export class Storage {
 
   async updateHost(id: string, input: unknown) {
     const fields = hostUpdateInput.parse(input)
-    return this.mutateHosts(async () => {
+    return this.mutate(async () => {
       const current = this.host(id)
       if (!current) throw Object.assign(new Error('Host not found'), { status: 404 })
       if (current.kind !== 'ssh') throw Object.assign(new Error('Only SSH hosts can be edited'), { status: 400 })
@@ -106,22 +111,25 @@ export class Storage {
   }
 
   async deleteHost(id: string) {
-    return this.mutateHosts(async () => {
+    return this.mutate(async () => {
       if (id === 'local') throw Object.assign(new Error('The local host cannot be removed'), { status: 400 })
       if (!this.host(id)) throw Object.assign(new Error('Host not found'), { status: 404 })
       const hosts = this.hosts.filter(h => h.id !== id)
       const projects = this.webProjects.filter(p => p.hostId !== id)
-      await this.saveHosts(hosts)
       await writePrivateJson(path.join(this.dataDir, 'projects.json'), projects)
+      try { await this.saveHosts(hosts) } catch (error) {
+        await writePrivateJson(path.join(this.dataDir, 'projects.json'), this.webProjects)
+        throw error
+      }
       this.hosts = hosts
       this.webProjects = projects
     })
   }
 
   private saveHosts(hosts = this.hosts) { return writePrivateJson(path.join(this.dataDir, 'hosts.json'), hosts.filter(h => h.kind === 'ssh')) }
-  private mutateHosts<T>(work: () => Promise<T>): Promise<T> {
-    const pending = this.hostWrites.then(work)
-    this.hostWrites = pending.catch(() => {})
+  private mutate<T>(work: () => Promise<T>): Promise<T> {
+    const pending = this.writes.then(work)
+    this.writes = pending.catch(() => {})
     return pending
   }
 
@@ -152,7 +160,8 @@ export class Storage {
   }
 
   async addProject(hostId: string, projectPath: string, name?: string, rootPaths?: string[]) {
-    return this.mutateProjects(async () => {
+    return this.mutate(async () => {
+      if (!this.host(hostId)) throw Object.assign(new Error('Host not found'), { status: 404 })
       const project: Project = { id: `web-${randomUUID()}`, name: name || path.posix.basename(projectPath), path: projectPath, rootPaths: [...new Set([projectPath, ...(rootPaths || [])])], hostId, source: 'web' }
       await this.persistProject(project)
       return project
@@ -160,7 +169,7 @@ export class Storage {
   }
 
   async updateProject(hostId: string, projectPath: string, fields: { name?: string; rootPaths?: string[] }) {
-    return this.mutateProjects(async () => {
+    return this.mutate(async () => {
       const current = (await this.projects()).find(project => project.hostId === hostId && project.path === projectPath)
       if (!current) throw Object.assign(new Error('Project not found'), { status: 404 })
       const project: Project = { ...current, ...fields, rootPaths: [...new Set([projectPath, ...(fields.rootPaths ?? current.rootPaths ?? [])])], source: 'web' }
@@ -170,7 +179,7 @@ export class Storage {
   }
 
   async removeProject(hostId: string, projectPath: string) {
-    return this.mutateProjects(async () => {
+    return this.mutate(async () => {
       const current = (await this.projects()).find(project => project.hostId === hostId && project.path === projectPath)
       if (!current) throw Object.assign(new Error('Project not found'), { status: 404 })
       // A Web-only tombstone also hides imported desktop projects on refresh.
@@ -184,9 +193,4 @@ export class Storage {
     this.webProjects = projects
   }
 
-  private mutateProjects<T>(work: () => Promise<T>): Promise<T> {
-    const pending = this.projectWrites.then(work)
-    this.projectWrites = pending.catch(() => {})
-    return pending
-  }
 }

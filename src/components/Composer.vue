@@ -5,6 +5,7 @@ import NewConversationContext from "./NewConversationContext.vue";
 import MessageQueuePanel from "./MessageQueuePanel.vue";
 import ModelServiceOptions from "./ModelServiceOptions.vue";
 import { clipboardFiles } from "../lib/clipboard";
+import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
 import {
@@ -19,6 +20,7 @@ const emit = defineEmits<{
   host: [hostId: string];
 }>();
 const draft = ref("");
+const draftStorageWarning = ref(false);
 const quotedContexts = ref<ConversationSelectionSource[]>([]);
 const input = ref<HTMLTextAreaElement>();
 const area = ref<HTMLElement>();
@@ -488,14 +490,17 @@ const draftKey = computed(
     `codex.draft.${props.state.hostId}.${props.state.activeThread?.id || props.state.projectPath || "new"}`,
 );
 function saveContexts(key: string, sources: ConversationSelectionSource[]) {
-  try {
-    if (sources.length) localStorage.setItem(`${key}.quotes`, JSON.stringify(sources));
-    else localStorage.removeItem(`${key}.quotes`);
-  } catch { /* The quote remains usable in this window if storage is full. */ }
+  if (sources.length) browserStorage.local.setItem(`${key}.quotes`, JSON.stringify(sources));
+  else browserStorage.local.removeItem(`${key}.quotes`);
+  updateDraftStorageWarning();
+}
+function updateDraftStorageWarning() {
+  draftStorageWarning.value = browserStorage.local.isTemporary(draftKey.value) ||
+    browserStorage.local.isTemporary(`${draftKey.value}.quotes`);
 }
 function readContexts(key: string): ConversationSelectionSource[] {
   try {
-    const saved = JSON.parse(localStorage.getItem(`${key}.quotes`) || '[]');
+    const saved = JSON.parse(browserStorage.local.getItem(`${key}.quotes`) || '[]');
     if (!Array.isArray(saved)) return [];
     const sources: ConversationSelectionSource[] = [];
     let size = 0;
@@ -526,14 +531,15 @@ function addContext(value: ConversationSelectionSource) {
 }
 function removeContext(index: number) { quotedContexts.value.splice(index, 1); }
 function saveDraft(key: string, value: string) {
-  if (value) localStorage.setItem(key, value);
-  else localStorage.removeItem(key);
+  const persisted = value ? browserStorage.local.setItem(key, value) : browserStorage.local.removeItem(key);
   // Migrate drafts from versions that only kept them for the current window.
-  sessionStorage.removeItem(key);
+  if (persisted) browserStorage.session.removeItem(key);
+  updateDraftStorageWarning();
 }
 function clearSubmittedDraft(key: string, submitted: string) {
-  if (localStorage.getItem(key) === submitted) localStorage.removeItem(key);
-  if (sessionStorage.getItem(key) === submitted) sessionStorage.removeItem(key);
+  if (browserStorage.local.getItem(key) === submitted) browserStorage.local.removeItem(key);
+  if (browserStorage.session.getItem(key) === submitted) browserStorage.session.removeItem(key);
+  updateDraftStorageWarning();
 }
 watch(
   draftKey,
@@ -553,7 +559,7 @@ watch(
       saveDraft(previous, draft.value);
       saveContexts(previous, quotedContexts.value);
     }
-    draft.value = localStorage.getItem(key) ?? sessionStorage.getItem(key) ?? "";
+    draft.value = browserStorage.local.getItem(key) ?? browserStorage.session.getItem(key) ?? "";
     quotedContexts.value = readContexts(key).filter(source => source.hostId === props.state.hostId && source.threadId === props.state.activeThread?.id);
     saveDraft(key, draft.value);
     void nextTick(resize);
@@ -719,6 +725,9 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         {{ state.modeError || state.goalReadError }}
         <button v-if="state.goalReadError && !state.modeError" class="text-button" :disabled="!state.connected || !state.online || state.runtimePaused || state.threadReleased" @click="api.refreshCurrentGoal()">重新读取目标</button>
       </div>
+      <div v-if="draftStorageWarning && (draft || quotedContexts.length)" class="composer-mode-error" role="status" aria-label="草稿保存状态">
+        浏览器存储不可用或已满；草稿暂存于此窗口，关闭前请复制保存。
+      </div>
       <div v-if="quotedContexts.length" class="composer-quotes" aria-label="引用到对话的内容">
         <div v-for="(source, index) in quotedContexts" :key="conversationSelectionKey(source)" class="composer-quote">
           <Icon name="Quote" :size="14" />
@@ -839,7 +848,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
                 !state.models?.length
               "
             >
-              <option v-if="!state.models?.length" :value="state.model">
+              <option v-if="!state.models?.some((entry: any) => !entry.hidden && entry.model === state.model)" :value="state.model">
                 {{ state.model || "加载模型…" }}
               </option>
               <option

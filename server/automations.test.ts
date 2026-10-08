@@ -41,6 +41,46 @@ test('calendar recurrence honors timezones, weekdays and a repeated DST hour onl
   assert.equal(new Date(nextAutomationAt({ cadence: { kind: 'weekly', hour: 9, minute: 0, days: [1] }, timezone: 'Asia/Shanghai' }, Date.parse('2026-10-08T00:00:00Z'))).toISOString(), '2026-10-12T01:00:00.000Z');
   assert.equal(new Date(nextAutomationAt({ cadence: { kind: 'daily', hour: 1, minute: 30 }, timezone: 'America/New_York' }, Date.parse('2026-11-01T05:30:00Z'))).toISOString(), '2026-11-02T06:30:00.000Z');
 });
+test('a failed automation save cannot roll back a concurrently accepted task or leak into its journal', async t => {
+  const f = await fixture();
+  const rename = fs.rename.bind(fs); let fail = true;
+  t.mock.method(fs, 'rename', async (source: string, target: string) => {
+    if (target === path.join(f.directory, 'automations.json') && fail) { fail = false; throw new Error('Disk failure'); }
+    return rename(source, target);
+  });
+  try {
+    const failed = assert.rejects(f.service.put({ ...spec, name: 'Failed task' }), /Disk failure/);
+    const accepted = f.service.put({ ...spec, name: 'Accepted task' });
+    await Promise.all([failed, accepted]);
+    assert.deepEqual(f.service.list().tasks.map(task => task.name), ['Accepted task']);
+    const restarted = await f.restart();
+    assert.deepEqual(restarted.list().tasks.map(task => task.name), ['Accepted task']);
+    assert.equal(f.calls.length, 0);
+  } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test('runtime events queued behind configuration writes retain both the new task and completed execution', async t => {
+  const f = await fixture();
+  const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+  const rename = fs.rename.bind(fs);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const pending = new Promise<void>(resolve => { entered = resolve; });
+  let hold = true;
+  t.mock.method(fs, 'rename', async (source: string, target: string) => {
+    if (target === path.join(f.directory, 'automations.json') && hold) { hold = false; entered(); await gate; }
+    return rename(source, target);
+  });
+  try {
+    const addition = f.service.put({ ...spec, name: 'New schedule' }); await pending;
+    assert.equal(f.service.list().tasks.length, 1, 'An uncommitted task must not become visible to the scheduler');
+    f.service.observe(host, { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+    release(); await addition; await f.settle();
+    const journal = JSON.parse(await fs.readFile(path.join(f.directory, 'automations.json'), 'utf8'));
+    assert.deepEqual(journal.tasks.map((value: any) => value.name), ['Review', 'New schedule']);
+    assert.equal(journal.runs[0].phase, 'completed');
+  } finally { release(); t.mock.restoreAll(); await f.close(); }
+});
 test('scheduled execution is durable, independent of browser sockets and does not overlap or replay missed occurrences', async () => {
   const f = await fixture(); try {
     const task = await f.service.put(spec); f.advance(30 * 60000); await f.service.tick(); await f.settle();

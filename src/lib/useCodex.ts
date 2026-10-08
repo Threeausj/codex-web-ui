@@ -2,6 +2,7 @@ import { methodAccepts } from "./integration-capabilities";
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
 import { reactive, toRaw } from "vue";
 import { randomUUID } from "./uuid";
+import { browserStorage } from "./browser-storage";
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
@@ -56,7 +57,7 @@ type HostNavigation = {
 };
 const saved = <T>(key: string, fallback: T): T => {
   try {
-    return JSON.parse(localStorage.getItem(key) ?? "null") ?? fallback;
+    return JSON.parse(browserStorage.local.getItem(key) ?? "null") ?? fallback;
   } catch {
     return fallback;
   }
@@ -191,8 +192,8 @@ let threadEventSequence = 0;
 let itemEventSequence = 0;
 let sendInFlight = false;
 let localCwd = "/tmp";
-let clientId = sessionStorage.getItem("codex.clientId") ?? randomUUID();
-sessionStorage.setItem("codex.clientId", clientId);
+let clientId = browserStorage.session.getItem("codex.clientId") ?? randomUUID();
+browserStorage.session.setItem("codex.clientId", clientId);
 const pending = new Map<string | number, Pending>();
 const attachmentOriginals = new WeakMap<object, File>();
 const terminalSessionNames = new Map<string, string>();
@@ -444,7 +445,7 @@ function subscribeTerminal(listener: (chunk: string) => void) {
 function terminalIds(): Record<string, string> {
   try {
     const value = JSON.parse(
-      sessionStorage.getItem("codex.terminalProcessIds") || "{}",
+      browserStorage.session.getItem("codex.terminalProcessIds") || "{}",
     );
     return value && typeof value === "object" && !Array.isArray(value)
       ? value
@@ -458,7 +459,7 @@ function rememberTerminal(processId: string) {
   state.terminalProcessId = processId;
   const ids = terminalIds();
   ids[state.hostId] = processId;
-  sessionStorage.setItem("codex.terminalProcessIds", JSON.stringify(ids));
+  browserStorage.session.setItem("codex.terminalProcessIds", JSON.stringify(ids));
 }
 function restoreTerminalOutput(output: string) {
   state.terminalOutput = output;
@@ -1188,7 +1189,7 @@ function receive(message: any) {
       completedTerminalProcesses.add(p.processId);
       const ids = terminalIds();
       if (ids[state.hostId] === p.processId) delete ids[state.hostId];
-      sessionStorage.setItem("codex.terminalProcessIds", JSON.stringify(ids));
+      browserStorage.session.setItem("codex.terminalProcessIds", JSON.stringify(ids));
     }
     return;
   }
@@ -1442,7 +1443,7 @@ function connect(): Promise<void> {
       }
       if (event.code === 4001) {
         clientId = randomUUID();
-        sessionStorage.setItem("codex.clientId", clientId);
+        browserStorage.session.setItem("codex.clientId", clientId);
       }
       if (state.authenticated) scheduleReconnect();
     };
@@ -1707,7 +1708,7 @@ async function logout() {
   state.terminalProcessId = "";
   state.terminalOutput = "";
   state.terminalProcesses = [];
-  sessionStorage.setItem("codex.terminalProcessIds", "{}");
+  browserStorage.session.setItem("codex.terminalProcessIds", "{}");
 }
 function setOnline(online: boolean) {
   state.online = online;
@@ -1872,7 +1873,7 @@ function rememberThread(id: string) {
     {},
   );
   selections[state.hostId] = id;
-  localStorage.setItem("codex.selectedThreadIds", JSON.stringify(selections));
+  browserStorage.local.setItem("codex.selectedThreadIds", JSON.stringify(selections));
 }
 async function selectThread(id: string, options: { preserveWriter?: boolean } = {}) {
   cancelGoalRefresh();
@@ -1979,7 +1980,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     const page = initialPage;
     if (!current()) return;
     if (!result.thread?.id) throw new Error('无法恢复此对话，请同步后重试。');
-    const depthValue = Number(sessionStorage.getItem(`codex.historyDepth.${hostId}.${id}`));
+    const depthValue = Number(browserStorage.session.getItem(`codex.historyDepth.${hostId}.${id}`));
     const requestedTurns = Math.max(30, state.turns.length,
       (Number.isFinite(depthValue) ? Math.max(1, Math.min(1000, depthValue)) : 1) * 30);
     // Only reuse a previously validated window on the same continuous engine.
@@ -2242,7 +2243,7 @@ async function loadOlderTurns() {
   state.moreTurns = !!turnCursor;
   saveConversationSnapshot();
   const depthKey = `codex.historyDepth.${state.hostId}.${id}`;
-  sessionStorage.setItem(
+  browserStorage.session.setItem(
     depthKey,
     String(Math.max(1, Math.ceil(state.turns.length / 30))),
   );
@@ -2794,8 +2795,8 @@ async function maybeCompact() {
 function setAutoCompact(enabled: boolean, threshold = 85) {
   state.autoCompact = enabled;
   state.compactThreshold = Math.min(95, Math.max(50, threshold));
-  localStorage.setItem("codex.autoCompact", JSON.stringify(enabled));
-  localStorage.setItem(
+  browserStorage.local.setItem("codex.autoCompact", JSON.stringify(enabled));
+  browserStorage.local.setItem(
     "codex.compactThreshold",
     JSON.stringify(state.compactThreshold),
   );
@@ -2949,7 +2950,7 @@ async function startReview(target: ReviewTarget) {
 function rememberProject() {
   const paths = saved<Record<string, string>>("codex.projectPaths", {});
   paths[state.hostId] = state.projectPath;
-  localStorage.setItem("codex.projectPaths", JSON.stringify(paths));
+  browserStorage.local.setItem("codex.projectPaths", JSON.stringify(paths));
 }
 async function addProject(
   path: string,
@@ -3186,7 +3187,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
   state.terminalSessionName =
     terminalSessionNames.get(`${id}:${state.terminalProcessId}`) || "";
   state.terminalProcesses = [];
-  localStorage.setItem("codex.hostId", JSON.stringify(id));
+  browserStorage.local.setItem("codex.hostId", JSON.stringify(id));
   state.projectPath =
     saved<Record<string, string>>("codex.projectPaths", {})[id] ??
     state.hosts.find((host) => host.id === id)?.cwd ??

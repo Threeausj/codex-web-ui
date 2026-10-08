@@ -53,6 +53,7 @@ export class AutomationService {
   private tasks: Automation[] = [];
   private runs: AutomationRun[] = [];
   private writes: Promise<void> = Promise.resolve();
+  private mutations: Promise<unknown> = Promise.resolve();
   private timer?: ReturnType<typeof setInterval>;
   private ticking = false;
   private closed = false;
@@ -86,33 +87,54 @@ export class AutomationService {
     if (start) { this.timer = setInterval(() => { void this.tick().catch(cause => { this.error = (cause as Error).message; }); }, 10000); this.timer.unref(); }
   }
   list() { return { tasks: structuredClone(this.tasks), runs: structuredClone(this.runs.slice(-300).reverse()), error: this.error || this.capacityError }; }
-  private save() {
-    const snapshot = JSON.stringify({ version: 1, tasks: this.tasks, runs: this.runs });
+  private mutate<T>(work: () => Promise<T>): Promise<T> {
+    const operation = this.mutations.then(() => {
+      if (this.closed) throw Object.assign(new Error('自动化服务正在停止'), { status: 503 });
+      return work();
+    });
+    this.mutations = operation.catch(() => {});
+    return operation;
+  }
+  private save(tasks?: Automation[], commit?: () => void) {
     const operation = this.writes.then(async () => {
+      // Capture at execution time so a queued runtime update cannot overwrite a
+      // configuration that was committed while its disk write was waiting.
+      const snapshot = JSON.stringify({ version: 1, tasks: tasks ?? this.tasks, runs: this.runs });
       await fs.mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const temporary = `${this.file}.${randomUUID()}.tmp`;
-      try { await fs.writeFile(temporary, snapshot, { mode: 0o600, flag: 'wx' }); await fs.rename(temporary, this.file); await fs.chmod(this.file, 0o600); }
+      try {
+        const handle = await fs.open(temporary, 'wx', 0o600);
+        try { await handle.writeFile(snapshot); await handle.sync(); } finally { await handle.close(); }
+        await fs.rename(temporary, this.file);
+        commit?.();
+      }
       finally { await fs.rm(temporary, { force: true }); }
     });
     this.writes = operation.catch(() => {}); return operation;
   }
   async put(input: unknown, id?: string) {
     const spec = automationInput.parse(input);
-    if (!this.dependencies.getHost(spec.hostId)) throw Object.assign(new Error('主机不存在'), { status: 404 });
-    const previous = id ? this.tasks.find(task => task.id === id) : undefined;
-    if (id && !previous) throw Object.assign(new Error('自动化不存在'), { status: 404 });
-    if (!id && this.tasks.length >= 50) throw Object.assign(new Error('最多保存 50 个自动化'), { status: 409 });
-    const task: Automation = { ...spec, id: id || randomUUID(), createdAt: previous?.createdAt || this.now(), updatedAt: this.now(), nextAt: spec.enabled ? nextAutomationAt(spec, this.now()) : null };
-    const before = this.tasks; this.tasks = previous ? this.tasks.map(entry => entry.id === id ? task : entry) : [...this.tasks, task];
-    try { await this.save(); } catch (cause) { this.tasks = before; throw cause; } return structuredClone(task);
+    return this.mutate(async () => {
+      if (!this.dependencies.getHost(spec.hostId)) throw Object.assign(new Error('主机不存在'), { status: 404 });
+      const previous = id ? this.tasks.find(task => task.id === id) : undefined;
+      if (id && !previous) throw Object.assign(new Error('自动化不存在'), { status: 404 });
+      if (!id && this.tasks.length >= 50) throw Object.assign(new Error('最多保存 50 个自动化'), { status: 409 });
+      const task: Automation = { ...spec, id: id || randomUUID(), createdAt: previous?.createdAt || this.now(), updatedAt: this.now(), nextAt: spec.enabled ? nextAutomationAt(spec, this.now()) : null };
+      const tasks = previous ? this.tasks.map(entry => entry.id === id ? task : entry) : [...this.tasks, task];
+      await this.save(tasks, () => { this.tasks = tasks; });
+      return structuredClone(task);
+    });
   }
   async remove(id: string) {
-    if (this.runs.some(run => run.automationId === id && active(run))) throw Object.assign(new Error('请先停止正在执行的自动化'), { status: 409 });
-    if (!this.tasks.some(task => task.id === id)) throw Object.assign(new Error('自动化不存在'), { status: 404 });
-    const retries = this.runs.filter(run => run.automationId === id && run.retryAt).map(run => ({ run, retryAt: run.retryAt }));
-    for (const { run } of retries) run.retryAt = undefined;
-    const before = this.tasks; this.tasks = this.tasks.filter(task => task.id !== id);
-    try { await this.save(); } catch (cause) { this.tasks = before; for (const { run, retryAt } of retries) run.retryAt = retryAt; throw cause; }
+    return this.mutate(async () => {
+      if (this.runs.some(run => run.automationId === id && active(run))) throw Object.assign(new Error('请先停止正在执行的自动化'), { status: 409 });
+      if (!this.tasks.some(task => task.id === id)) throw Object.assign(new Error('自动化不存在'), { status: 404 });
+      const retries = this.runs.filter(run => run.automationId === id && run.retryAt).map(run => ({ run, retryAt: run.retryAt }));
+      for (const { run } of retries) run.retryAt = undefined;
+      const tasks = this.tasks.filter(task => task.id !== id);
+      try { await this.save(tasks, () => { this.tasks = tasks; }); }
+      catch (cause) { for (const { run, retryAt } of retries) run.retryAt = retryAt; throw cause; }
+    });
   }
   private note(run: AutomationRun, phase: Phase, text: string) {
     run.phase = phase; run.updatedAt = this.now(); run.logs.push({ at: this.now(), text: text.slice(0, 1000) });
@@ -138,12 +160,15 @@ export class AutomationService {
     return run;
   }
   async runNow(id: string) {
-    const task = this.tasks.find(task => task.id === id); if (!task) throw Object.assign(new Error('自动化不存在'), { status: 404 });
-    const run = await this.enqueue(task, this.now()); void this.tick().catch(() => {}); return structuredClone(run);
+    const run = await this.mutate(async () => {
+      const task = this.tasks.find(task => task.id === id); if (!task) throw Object.assign(new Error('自动化不存在'), { status: 404 });
+      return this.enqueue(task, this.now());
+    });
+    void this.tick().catch(() => {}); return structuredClone(run);
   }
   async tick() {
     if (this.closed || this.ticking) return; this.ticking = true;
-    try {
+    try { await this.mutate(async () => {
       this.capacityError = '';
       for (const task of this.tasks) if (task.enabled && task.nextAt != null && task.nextAt <= this.now()) {
         const occurrence = task.nextAt;
@@ -168,7 +193,7 @@ export class AutomationService {
         const operation = this.execute(run).catch(cause => { this.error = (cause as Error).message; }).finally(() => this.operations.delete(run.id));
         this.operations.set(run.id, operation);
       }
-    } finally { this.ticking = false; }
+    }); } finally { this.ticking = false; }
   }
   private async execute(run: AutomationRun) {
     let bridge: Bridge | undefined;
@@ -250,6 +275,7 @@ export class AutomationService {
   async close() {
     if (this.closed) { await this.writes; return; }
     this.closed = true; clearInterval(this.timer);
+    await this.mutations;
     for (const run of this.runs.filter(active)) {
       if (['queued', 'connecting'].includes(run.phase)) this.note(run, 'queued', '服务停止；尚未提交的执行将在启动后继续');
       else this.note(run, 'needs_review', '服务停止，保留原生会话 ID 等待核对；不会重复提交');
