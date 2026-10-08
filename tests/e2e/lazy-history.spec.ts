@@ -151,8 +151,8 @@ test('a compaction marker discovered in the second item page keeps its position 
   await group(page).locator('.turn-activity > summary').click();
   await group(page).getByRole('button', { name: '加载更多过程记录', exact: true }).click();
   await expect(group(page).locator('.compaction-divider')).toHaveCount(1);
-  const order = await group(page).evaluate(element => [...element.querySelectorAll('.compaction-divider, .agent-message')].map(item => item.className));
-  expect(order).toEqual(['compaction-divider', 'message agent-message']);
+  const order = await group(page).evaluate(element => [...element.querySelectorAll('.compaction-divider, .agent-message')].map(item => item.classList.contains('compaction-divider') ? 'compaction' : 'answer'));
+  expect(order).toEqual(['compaction', 'answer']);
 });
 
 test('native summary omissions do not discard loaded commentary or steering messages from the detail cache', async ({ page, mock }) => {
