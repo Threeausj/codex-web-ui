@@ -250,9 +250,24 @@ export class AutomationService {
   async reconcile(id: string) {
     const run = this.runs.find(entry => entry.id === id); if (!run || run.phase !== 'needs_review' || !run.threadId) throw Object.assign(new Error('此记录没有可核对的原生会话 ID'), { status: 409 });
     const bridge = await this.dependencies.getBridge(run.spec.hostId);
-    const result = await bridge.request('thread/read', { threadId: run.threadId, includeTurns: true }, 15000) as any;
-    const turn = result.thread?.turns?.find((entry: any) => entry.id === run.turnId || entry.items?.some((item: any) => item.clientUserMessageId === run.clientId || item.id === run.clientId));
+    const result = await bridge.request('thread/read', { threadId: run.threadId, includeTurns: false }, 15000) as any;
+    if (result.thread?.id !== run.threadId) throw Object.assign(new Error('无法确认原生会话 ID'), { status: 409 });
+    const deadline = Date.now() + 45000;
+    const cursors = new Set<string>();
+    let cursor: string | null = null, turn: any;
+    for (let pageIndex = 0; pageIndex < 100 && Date.now() < deadline; pageIndex++) {
+      const page = await bridge.request('thread/turns/list', { threadId: run.threadId, cursor, limit: 30,
+        sortDirection: 'desc', itemsView: 'full' }, Math.max(1, Math.min(15000, deadline - Date.now()))) as any;
+      if (!Array.isArray(page.data)) throw new Error('无法读取原生执行历史');
+      turn = page.data.find((entry: any) => run.turnId ? entry.id === run.turnId : entry.items?.some((item: any) =>
+        item.type === 'userMessage' && (item.clientId === run.clientId || item.clientUserMessageId === run.clientId || item.id === run.clientId)));
+      const nextCursor: unknown = page.nextCursor;
+      if (turn || nextCursor === null || nextCursor === undefined) break;
+      if (typeof nextCursor !== 'string' || !nextCursor || cursors.has(nextCursor)) throw new Error('原生历史分页游标无效或重复，请打开执行会话核对');
+      cursor = nextCursor; cursors.add(nextCursor);
+    }
     if (!turn) throw Object.assign(new Error('仍无法确认原提交；请打开执行会话核对，不会自动重发'), { status: 409 });
+    if (this.closed || run.phase !== 'needs_review') throw Object.assign(new Error('执行记录状态已变更，请刷新后核对'), { status: 409 });
     run.turnId = turn.id;
     if (['completed','failed','interrupted'].includes(turn.status)) this.note(run, turn.status, '已从原生历史确认执行结果');
     else this.note(run, 'needs_review', '原生历史仍显示执行中，请打开会话核对写入者');

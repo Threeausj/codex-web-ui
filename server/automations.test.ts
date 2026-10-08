@@ -14,7 +14,8 @@ async function fixture() {
     calls.push({ method, params });
     if (method === 'thread/start') { if (failure) throw failure; return { thread: { id: `thread-${++count}` } }; }
     if (method === 'turn/start') return { turn: { id: `turn-${count}`, status: 'inProgress' } };
-    if (method === 'thread/read') return { thread: { turns: [{ id: `turn-${count}`, status: 'completed' }] } };
+    if (method === 'thread/read') return { thread: { id: params.threadId, turns: [] } };
+    if (method === 'thread/turns/list') return { data: [{ id: `turn-${count}`, status: 'completed' }], nextCursor: null };
     return {};
   } };
   const dependencies = { getBridge: async () => bridge, getHost: (id: string) => id === 'local' ? host : undefined, now: () => clock };
@@ -175,6 +176,51 @@ test('restarted known native turns require read-only reconciliation instead of r
     await restarted.reconcile(id); assert.equal(restarted.list().runs[0]!.phase, 'completed');
     assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
     assert.equal(f.calls.filter(call => call.method === 'thread/resume').length, 0);
+  } finally { await f.close(); }
+});
+
+test('reconciliation pages native history and recognizes the public clientId alias after a lost turn receipt', async () => {
+  const f = await fixture();
+  try {
+    const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+    const id = f.service.list().runs[0]!.id;
+    const restarted = await f.restart();
+    const run = (restarted as any).runs.find((entry: AutomationRun) => entry.id === id) as AutomationRun;
+    run.turnId = undefined;
+    const calls: any[] = [];
+    f.bridge.request = async (method: string, params: any) => {
+      calls.push({ method, params });
+      assert.ok(['thread/read', 'thread/turns/list'].includes(method));
+      if (method === 'thread/read') { assert.equal(params.includeTurns, false); return { thread: { id: run.threadId, turns: [] } }; }
+      if (!params.cursor) return { data: [{ id: 'unrelated', status: 'completed', items: [] }], nextCursor: 'next' };
+      return { data: [{ id: 'original', status: 'completed', items: [{ type: 'userMessage', id: 'canonical', clientId: run.clientId }] }], nextCursor: null };
+    };
+    await restarted.reconcile(id);
+    assert.equal(restarted.list().runs[0]!.phase, 'completed');
+    assert.equal(restarted.list().runs[0]!.turnId, 'original');
+    assert.equal(calls.filter(call => call.method === 'thread/turns/list').length, 2);
+    assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+  } finally { await f.close(); }
+});
+
+test('a repeated reconciliation cursor or missing native receipt preserves review state and cannot trigger a retry', async () => {
+  const f = await fixture();
+  try {
+    const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+    const id = f.service.list().runs[0]!.id, restarted = await f.restart();
+    let pages = 0;
+    f.bridge.request = async (method: string, params: any) => method === 'thread/read'
+      ? { thread: { id: params.threadId, turns: [] } }
+      : (++pages, { data: [], nextCursor: 'repeat' });
+    await assert.rejects(restarted.reconcile(id), /游标/);
+    assert.equal(pages, 2);
+    assert.equal(restarted.list().runs[0]!.phase, 'needs_review');
+    await assert.rejects(restarted.retry(id), /已确认失败/);
+    f.bridge.request = async (method: string, params: any) => method === 'thread/read'
+      ? { thread: { id: params.threadId, turns: [] } } : { data: [], nextCursor: null };
+    await assert.rejects(restarted.reconcile(id), /无法确认/);
+    assert.equal(restarted.list().runs[0]!.phase, 'needs_review');
+    assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
   } finally { await f.close(); }
 });
 

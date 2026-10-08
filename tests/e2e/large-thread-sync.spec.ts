@@ -106,15 +106,42 @@ test('repeated selection shares one outstanding history read and a dropped old r
 test('a lost mutation response still confirms native history even when missed events were completely replayed', async ({ page, mock }) => {
   await installBridge(page, mock, { replay: true })
   await open(page)
-  const histories = mock.requests.filter(request => request.method === 'thread/turns/list').length
   mock.holdTurnStartResponse = true
   await page.getByRole('textbox', { name: '消息输入框' }).fill('仅提交一次的断线请求')
   await page.getByRole('button', { name: '发送消息', exact: true }).click()
   await expect.poll(() => mock.requests.filter(request => request.method === 'turn/start').length).toBe(1)
+  const historiesBeforeDisconnect = mock.requests.filter(request => request.method === 'thread/turns/list').length
   await mock.sockets[0]!.close({ code: 1006, reason: 'Lost accepted response' })
   await expect.poll(() => mock.sockets.length, { timeout: 12000 }).toBe(2)
-  await expect.poll(() => mock.requests.filter(request => request.method === 'thread/turns/list').length).toBe(histories + 1)
+  await expect.poll(() => mock.requests.filter(request => request.method === 'thread/turns/list').length).toBe(historiesBeforeDisconnect + 1)
   await expect(page.getByText('仅提交一次的断线请求', { exact: true })).toHaveCount(1)
   expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(1)
   expect(mock.request('turn/steer')).toBeUndefined()
+})
+
+test('a revert replayed before connected status waits for fresh history instead of certifying an empty view', async ({ page, mock }) => {
+  const removed = { id: 'replayed-reverted-turn', status: 'completed', items: [
+    { id: 'replayed-reverted-answer', type: 'agentMessage', text: '断线期间应移除的旧回复' },
+  ] }
+  mock.turns.get(threadId)!.push(removed)
+  const bridge = await installBridge(page, mock, { replay: true })
+  await open(page)
+  await expect(page.getByText('断线期间应移除的旧回复', { exact: true })).toBeVisible()
+  const input = page.getByRole('textbox', { name: '消息输入框' })
+  await input.fill('回退同步前不能发送')
+  await mock.sockets[0]!.close({ code: 1006, reason: 'Fixture disconnect before remote revert' })
+  mock.turns.set(threadId, mock.turns.get(threadId)!.filter(turn => turn.id !== removed.id))
+  bridge.control.holdHistory = true
+  bridge.miss({ method: 'thread/reverted', params: { threadId } })
+  bridge.miss({ method: 'bridge/thread/changed', params: { threadId, method: 'thread/revert', changeId: 'remote-revert',
+    result: { thread: { ...mock.threads[0], turns: [] } }, request: { beforeTurnId: removed.id } } })
+  await expect.poll(() => mock.sockets.length, { timeout: 12000 }).toBe(2)
+  await expect.poll(() => bridge.control.held.length).toBe(1)
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled()
+  bridge.control.held[0]!()
+  await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible()
+  await expect(page.getByText('断线期间应移除的旧回复', { exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled()
+  await expect(input).toHaveValue('回退同步前不能发送')
+  expect(mock.request('turn/start')).toBeUndefined()
 })

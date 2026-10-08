@@ -1038,7 +1038,7 @@ function receiveThreadChange(change: any) {
       ? (before >= 0 ? state.turns.slice(before) : []).map(turn => turn.id) : [];
     resetEditedHistory(threadId, removed);
     updateThread(result.thread);
-    if (state.activeThread?.id === threadId) void selectThread(threadId);
+    refreshRevertedThread(threadId);
     return;
   }
   if (method === 'thread/settings/update' && state.activeThread?.id === threadId) {
@@ -1221,7 +1221,7 @@ function receive(message: any) {
     if (pendingMessageEdit && pendingMessageEdit.threadId === p.threadId) pendingMessageEdit.blocked = true;
     rememberRevertedHistory(p.threadId, true);
     resetEditedHistory(p.threadId);
-    if (state.activeThread?.id === p.threadId) void selectThread(p.threadId);
+    refreshRevertedThread(p.threadId);
     return;
   }
   if (discardedTurns.has(p.turnId || p.turn?.id)) return;
@@ -1551,7 +1551,8 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
       if (previous !== socket && replayedConnection?.socket === socket && replayedConnection.engineId === engineId &&
           !socketHasEventGap && !disconnectedWithMutation && retainedWriterConfirmed && state.activeThread?.id &&
           writerAttachment?.hostId === hostId && writerAttachment.threadId === state.activeThread.id &&
-          writerAttachment.engineId === engineId && !state.threadConflict && !state.threadReleased) {
+          writerAttachment.engineId === engineId && !state.threadConflict && !state.threadReleased &&
+          !state.selectingThread && !revertedTurnCandidates.has(state.activeThread.id)) {
         // Only a complete replay plus the bridge's loaded-writer probe can
         // certify the retained view. Disk cache and a bare OPEN socket cannot.
         state.threadReady = true;
@@ -2703,6 +2704,15 @@ function rememberRevertedHistory(threadId: string, native: boolean) {
   // Block old events while the retained prefix is being read. This also works
   // for inactive conversations, whose old turns exist only in the item cache.
   for (const turnId of candidates) discardedTurns.add(turnId);
+}
+function refreshRevertedThread(threadId: string) {
+  if (state.activeThread?.id !== threadId) return;
+  // Replayed notifications precede connected status. Defer their read until
+  // recovery; an old in-flight snapshot must never confirm a reverted head.
+  ++selectionGeneration;
+  state.threadReady = false;
+  state.selectingThread = false;
+  if (state.connected) void selectThread(threadId, { preserveWriter: true });
 }
 async function resendEditedMessage(itemId: string, text: string) {
   if (!canEditMessage(itemId)) throw fail(new Error("当前消息不能编辑，请等待任务结束并确认会话状态"));
