@@ -5,6 +5,7 @@ import type { Express, RequestHandler } from 'express'
 import webPush, { type PushSubscription, type RequestOptions } from 'web-push'
 import { z } from 'zod'
 import type { AuthenticatedRequest, Host, RpcMessage } from './types.js'
+import { isInteractiveServerRequest } from '../shared/server-requests.js'
 
 const GRANT_TTL = 30 * 24 * 60 * 60 * 1000
 const EVENT_TTL = 24 * 60 * 60 * 1000
@@ -96,12 +97,6 @@ async function atomicPrivateJson(file: string, value: unknown) {
     await fs.chmod(file, 0o600)
   } finally { await fs.rm(temporary, { force: true }) }
 }
-
-const actionableRequests = new Set([
-  'item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval',
-  'item/tool/requestUserInput', 'tool/requestUserInput', 'execCommandApproval', 'applyPatchApproval',
-])
-const elicitationModes = new Set(['form', 'url', 'openai/form', 'openaiForm', 'openai/userVerification'])
 
 /** Durable device grants expire independently and are revoked when the access password changes. */
 export class PushService {
@@ -416,8 +411,7 @@ export class PushService {
       if (!turnId) return
       kind = 'errors'; identity = `turn:${turnId}`
       body = '运行失败'
-    } else if (message.id !== undefined && (actionableRequests.has(message.method || '') ||
-      (message.method === 'mcpServer/elicitation/request' && elicitationModes.has(String(params.mode))))) {
+    } else if (isInteractiveServerRequest(message)) {
       if ((typeof message.id !== 'string' && typeof message.id !== 'number') || String(message.id).length > 256) return
       kind = 'approval'; identity = `request:${id(params.turnId) || id(params.callId) || ''}:${message.method}:${JSON.stringify(message.id)}`
       body = ['item/commandExecution/requestApproval', 'execCommandApproval'].includes(message.method || '') ? '等待命令执行确认'

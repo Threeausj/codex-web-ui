@@ -123,7 +123,7 @@ function quoteAnswer() {
     </details>
     <div ref="transcript" class="side-chat-transcript" aria-label="侧边聊天消息" @scroll.passive="onScroll">
       <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :cwd="mainState.projectPath" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
-      <ApprovalCard v-for="request in requests" :key="request.id" :request="request" :api="api" />
+      <ApprovalCard v-for="request in requests" :key="request.id" :request="request" :items="state.items" :api="api" />
       <p v-if="state.loading" class="side-chat-status" role="status"><Icon name="LoaderCircle" :size="15" class="spin" />正在准备侧边对话…</p>
       <div v-if="!state.items?.length && !state.loading && !state.busy" class="side-chat-empty"><Icon name="CircleHelp" :size="24" /><p>想了解这段内容的哪一部分？</p></div>
     </div>

@@ -222,6 +222,8 @@ test('completed turns and pending approvals push after all browser sockets close
     fixture.receive({ id: 'approve-1', method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-a', turnId: 'turn-b' } })
     fixture.receive({ id: 'input-1', method: 'item/tool/requestUserInput', params: { threadId: 'thread-a' } })
     fixture.receive({ id: 'internal-tool', method: 'item/tool/call', params: { threadId: 'thread-a' } })
+    fixture.receive({ id: 'clock', method: 'currentTime/read', params: { threadId: 'thread-a' } })
+    fixture.receive({ id: 'attestation', method: 'attestation/generate', params: {} })
     fixture.receive({ id: 'elicitation-1', method: 'mcpServer/elicitation/request', params: { threadId: 'thread-a', mode: 'url', url: 'https://private.example.com' } })
     fixture.receive({ id: 'unknown-elicitation', method: 'mcpServer/elicitation/request', params: { threadId: 'thread-a', mode: 'internal' } })
     fixture.receive({ method: 'error', params: { threadId: 'thread-a', turnId: 'retrying', willRetry: true, error: { message: 'secret retry' } } })
