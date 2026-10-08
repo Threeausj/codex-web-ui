@@ -41,6 +41,7 @@ import {
 type Method = ClientRequest["method"] | "bridge/ping";
 type Params<M extends Method> = M extends "bridge/ping" ? Record<string, never> : Extract<ClientRequest, { method: M }>["params"];
 type Pending = {
+  method: Method;
   resolve: (value: any) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -164,6 +165,9 @@ let selectionGeneration = 0;
 let hostSelectionGeneration = 0;
 let connecting: Promise<void> | null = null;
 let connectionRecovery: { generation: number; promise: Promise<void> } | null = null;
+let replayedConnection: { socket: WebSocket; engineId: string } | null = null;
+let disconnectedWithMutation = false;
+let selectionOperation: { hostId: string; threadId: string; generation: number; socket: WebSocket | null; authentication: number; promise: Promise<void> } | null = null;
 let engineId: string | null = null;
 let eventSequence: number | null = null;
 let socketHasEventGap = false;
@@ -888,6 +892,7 @@ function closeConnection() {
     );
   }
   pending.clear();
+  replayedConnection = null;
   state.connected = false;
   if (state.activeThread) state.threadReady = false;
 }
@@ -919,6 +924,7 @@ function rpc<M extends Method>(
       );
     }, timeoutMs);
     pending.set(id, {
+      method,
       resolve,
       reject,
       timer,
@@ -1380,6 +1386,7 @@ function connect(): Promise<void> {
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/rpc?host=${encodeURIComponent(host)}&clientId=${clientId}${resumeEvents}`,
     );
     socket = ws;
+    replayedConnection = null;
     const timer = setTimeout(() => {
       ws.close();
       reject(new Error("app-server 连接超时"));
@@ -1389,6 +1396,10 @@ function connect(): Promise<void> {
       try {
         const message = JSON.parse(event.data);
         receive(message);
+        if (message.method === 'bridge/status' && message.params?.replayComplete === true &&
+            message.params?.engineId === engineId && !socketHasEventGap) {
+          replayedConnection = { socket: ws, engineId: engineId! };
+        }
         if (message.method === "bridge/status" && message.params?.connected) {
           clearTimeout(timer);
           resolve();
@@ -1420,6 +1431,13 @@ function connect(): Promise<void> {
       saveConversationSnapshot();
       state.connected = false;
       if (state.activeThread) state.threadReady = false;
+      // Rejecting an old history request must not publish its error after the
+      // replacement socket has already restored this conversation.
+      ++selectionGeneration;
+      state.selectingThread = false;
+      disconnectedWithMutation ||= [...pending.values()].some(entry =>
+        !['bridge/ping', 'thread/read', 'thread/turns/list', 'thread/goal/get'].includes(entry.method) &&
+        !entry.method.endsWith('/read') && !entry.method.endsWith('/list'));
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
         entry.reject(
@@ -1477,6 +1495,7 @@ async function probeConnection() {
     state.threadReady = false;
   }
   if (!status.connected || status.paused) throw new Error('工作站尚未连接');
+  return status;
 }
 function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   if (state.runtimePaused && !options.explicit) return Promise.resolve();
@@ -1492,6 +1511,7 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   const recovery = (async () => {
     try {
       const previous = socket;
+      let retainedWriterConfirmed = false;
       if (state.connected && previous?.readyState === WebSocket.OPEN) {
         // Android can resume a socket that still reports OPEN but no longer carries data.
         // Probe with a bounded, read-only request; never replay user commands.
@@ -1522,10 +1542,23 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
       if (previous !== socket && writerAttachment?.engineId === engineId && engineId) {
         // The engine can retain other threads while this particular writer was
         // released. Confirm this attachment before keeping send enabled.
-        await probeConnection();
+        const status = await probeConnection();
+        retainedWriterConfirmed = Array.isArray(status?.loadedThreadIds) &&
+          status.loadedThreadIds.includes(state.activeThread?.id);
         if (!current()) return;
       }
       startNavigationRefresh();
+      if (previous !== socket && replayedConnection?.socket === socket && replayedConnection.engineId === engineId &&
+          !socketHasEventGap && !disconnectedWithMutation && retainedWriterConfirmed && state.activeThread?.id &&
+          writerAttachment?.hostId === hostId && writerAttachment.threadId === state.activeThread.id &&
+          writerAttachment.engineId === engineId && !state.threadConflict && !state.threadReleased) {
+        // Only a complete replay plus the bridge's loaded-writer probe can
+        // certify the retained view. Disk cache and a bare OPEN socket cannot.
+        state.threadReady = true;
+        void refreshContextUsage(hostId, state.activeThread.id);
+        if (state.goalReadError) void refreshCurrentGoal();
+        return;
+      }
       if (state.activeThread?.id && writerAttachment?.hostId === hostId &&
           writerAttachment.threadId === state.activeThread.id && writerAttachment.engineId &&
           writerAttachment.engineId === engineId) {
@@ -1718,7 +1751,7 @@ async function sync(refreshActive = true) {
   if (state.runtimePaused || !state.connected) return;
   const hostId = state.hostId;
   const selectedId = state.activeThread?.id;
-  const historyRefresh = refreshActive && selectedId ? selectThread(selectedId) : Promise.resolve();
+  const historyRefresh = refreshActive && selectedId ? selectThread(selectedId, { preserveWriter: true }) : Promise.resolve();
   await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills(), historyRefresh]);
   if (
     hostId === state.hostId &&
@@ -1875,7 +1908,19 @@ function rememberThread(id: string) {
   selections[state.hostId] = id;
   browserStorage.local.setItem("codex.selectedThreadIds", JSON.stringify(selections));
 }
-async function selectThread(id: string, options: { preserveWriter?: boolean } = {}) {
+function selectThread(id: string, options: { preserveWriter?: boolean } = {}): Promise<void> {
+  if (selectionOperation?.hostId === state.hostId && selectionOperation.threadId === id &&
+      selectionOperation.generation === selectionGeneration && selectionOperation.socket === socket &&
+      selectionOperation.authentication === authenticationGeneration) return selectionOperation.promise;
+  const hostId = state.hostId, selectionSocket = socket, authentication = authenticationGeneration;
+  const operation = selectThreadOnce(id, options);
+  const promise = operation.finally(() => {
+    if (selectionOperation?.promise === promise) selectionOperation = null;
+  });
+  selectionOperation = { hostId, threadId: id, generation: selectionGeneration, socket: selectionSocket, authentication, promise };
+  return promise;
+}
+async function selectThreadOnce(id: string, options: { preserveWriter?: boolean } = {}) {
   cancelGoalRefresh();
   const preserveWriter = options.preserveWriter === true && state.activeThread?.id === id &&
     !state.threadConflict && !state.threadReleased && !state.runtimePaused &&
@@ -2088,6 +2133,7 @@ async function selectThread(id: string, options: { preserveWriter?: boolean } = 
     historyWindowTruncated = false;
     state.moreTurns = !!turnCursor;
     state.threadReady = true;
+    disconnectedWithMutation = false;
     writerAttachment = { hostId, threadId: id, engineId };
     if (eventGapRevision === continuityRevision) socketHasEventGap = false;
     const inProgressCompaction = state.items.find(item => item.type === 'contextCompaction' && item.status === 'inProgress' &&

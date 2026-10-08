@@ -271,7 +271,9 @@ export async function createApp(options: AppOptions = {}) {
 export async function createServer(options: AppOptions = {}) {
   const context = await createApp(options)
   const server = http.createServer(context.app)
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024, perMessageDeflate: false })
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024,
+    perMessageDeflate: { threshold: 4096, serverNoContextTakeover: true, clientNoContextTakeover: true,
+      concurrencyLimit: 2, zlibDeflateOptions: { level: 3 } } })
   const sessionSockets = new Map<string, Set<WebSocket>>()
   const socketHeartbeat = new WebSocketHeartbeat()
   const stopListeningForRevocation = context.auth.onSessionRevoked(sessionId => {
