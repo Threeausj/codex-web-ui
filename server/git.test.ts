@@ -203,7 +203,7 @@ test("backend Git reads work without namespaces while workspace writes fail hone
   const f = await fixture(false, { directRead: true, unavailableSandbox: true });
   try {
     await fs.writeFile(path.join(f.root, "one.txt"), "read safely\n");
-    for (const permission of ["read-only", "workspace-write"]) {
+    for (const permission of ["read-only", "workspace-write", "danger-full-access"]) {
       const status = await f.get("status", { permission });
       assert.equal(status.code, 200, JSON.stringify(status.body));
       assert.equal(status.body.branch, "main");
@@ -222,6 +222,19 @@ test("backend Git reads work without namespaces while workspace writes fail hone
     assert.equal(f.calls[0]!.sandboxPolicy.type, "workspaceWrite");
     assert.equal((await f.run("diff", "--cached", "--name-only")).trim(), "");
     assert.equal((await f.get("status", { hostId: "missing" })).code, 404);
+  } finally { await f.close(); }
+});
+
+test('a non-repository directory reports its scope and never initializes or mutates Git', async () => {
+  const f = await fixture(false, { directRead: true });
+  try {
+    const standalone = path.join(f.directory, 'outside'); await fs.mkdir(standalone);
+    const result = await f.get('status', { cwd: standalone, permission: 'danger-full-access' });
+    assert.equal(result.code, 409); assert.match(result.body.error, /不是 Git 仓库/);
+    assert.ok(result.body.error.includes(standalone));
+    assert.equal(f.calls.length, 0);
+    assert.equal(await fs.stat(path.join(standalone, '.git')).catch(() => null), null);
+    assert.equal((await f.get('status', { cwd: f.root })).body.branch, 'main');
   } finally { await f.close(); }
 });
 

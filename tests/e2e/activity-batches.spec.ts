@@ -106,8 +106,8 @@ test('assistant commentary, plans, compaction and separate turns retain independ
   const group = page.locator('.conversation-turn[data-turn-id="turn-history"]');
   await group.locator('.turn-activity > summary').click();
   await expect(group.locator('.activity-batch')).toHaveCount(4);
-  const order = await group.locator('.turn-activity-content').evaluate(element => [...element.children].map(child => child.className));
-  expect(order).toEqual(['activity-batch', 'message agent-message', 'activity-batch', 'plan-card', 'activity-batch', 'activity-batch']);
+  const order = await group.locator('.turn-activity-content').evaluate(element => [...element.children].map(child => child.classList.contains('activity-batch') ? 'operations' : child.classList.contains('compaction-divider') ? 'compaction' : child.classList.contains('plan-card') ? 'plan' : child.querySelector('[data-selection-item-id]')?.getAttribute('data-selection-item-id')));
+  expect(order).toEqual(['operations', 'boundary-commentary', 'operations', 'plan', 'operations', 'compaction', 'operations', 'history-agent']);
   await expect(group.locator('.compaction-divider')).toBeVisible();
   const next = page.locator('.conversation-turn[data-turn-id="next-batch-turn"]');
   await next.locator('.turn-activity > summary').click();

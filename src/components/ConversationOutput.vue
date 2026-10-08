@@ -203,7 +203,7 @@ function activityLabel(block: any) {
             <span>{{ detailLoads.get(block.id)?.error }}</span>
             <button class="button button-small button-secondary" @click="loadDetails(block.id)">重试加载过程</button>
           </div>
-          <template v-for="entry in block.activityBlocks" :key="entry.id">
+          <template v-for="entry in block.dividers.length ? block.timelineBlocks : block.activityBlocks" :key="entry.id">
             <ActivityBatch
               v-if="entry.kind === 'batch'"
               :host-id="hostId" :cwd="cwd"
@@ -216,8 +216,10 @@ function activityLabel(block: any) {
               v-else
               :host-id="hostId" :cwd="cwd"
               :item="entry.item"
+              :class="{ 'timeline-output': block.outputs.some(item => item.id === entry.id) }"
               :busy="running(block)"
-              :can-fork="false"
+              :can-fork="!hideFork && entry.item.type === 'agentMessage' && block.answers.some(item => item.id === entry.id) && !busy && !editing && !!entry.item.turnId"
+              @fork="emit('fork', $event)"
               @open-file="(path, line) => emit('openFile', path, line)"
               @error="emit('error', $event)"
             />
@@ -230,7 +232,7 @@ function activityLabel(block: any) {
         {{ block.turn.error.message }}
       </p>
       <ChatItem
-        v-for="item in block.outputs"
+        v-for="item in block.dividers.length && expandedTurns.has(block.id) ? [] : block.outputs"
         :key="item.id"
         :host-id="hostId" :cwd="cwd"
         :item="item"
@@ -308,6 +310,10 @@ function activityLabel(block: any) {
 .turn-activity-content :deep(.agent-message) {
   color: var(--muted);
   font-size: 13px;
+}
+.turn-activity-content :deep(.agent-message.timeline-output) {
+  color: var(--text);
+  font-size: 14px;
 }
 .turn-activity-content :deep(.message:last-child) {
   margin-bottom: 0;

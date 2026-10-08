@@ -24,6 +24,38 @@ type GitCall = {
 };
 const root = "/workspace/demo";
 const head = "abcdef1234567890";
+
+test('Git finds the recent operation repository when a resumed conversation uses the host root, without changing its cwd', async ({ page, mock }) => {
+  mock.threads.find(thread => thread.id === 'thread-existing')!.cwd = '/';
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method === 'thread/items/list') {
+      mock.requests.push(request);
+      socket.send(JSON.stringify({ id: request.id, result: { data: [{ turnId: 'turn-history', item: { id: 'repository-operation', type: 'commandExecution', cwd: '/volume2/docker/codex-web-ui' } }], nextCursor: null } }));
+    } else receive(socket, request);
+  };
+  const readPaths: string[] = [];
+  await page.route('**/api/git/status?*', route => {
+    const cwd = new URL(route.request().url()).searchParams.get('cwd')!; readPaths.push(cwd);
+    return cwd === '/volume2/docker/codex-web-ui' ? route.fulfill({ json: { root: cwd, branch: 'main', head, files: [], branches: ['main'], worktrees: [] } })
+      : route.fulfill({ status: 409, json: { error: `目录 ${cwd} 不是 Git 仓库，请选择仓库目录或其中的子目录。` } });
+  });
+  await login(page); await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
+  const panel = await openGit(page);
+  await expect(panel.getByLabel('Git 仓库目录', { exact: true })).toHaveValue('/volume2/docker/codex-web-ui');
+  await expect(panel.getByRole('status')).toContainText('对话工作目录保持为 /');
+  expect(readPaths.slice(-2)).toEqual(['/', '/volume2/docker/codex-web-ui']);
+  expect(mock.request('thread/items/list')?.params).toMatchObject({ limit: 40, sortDirection: 'desc' });
+  expect(mock.request('thread/settings/update')).toBeUndefined(); expect(mock.request('turn/start')).toBeUndefined();
+  await panel.getByLabel('Git 仓库目录', { exact: true }).fill('/not-a-repository');
+  await panel.getByRole('button', { name: '打开', exact: true }).click();
+  await expect(panel.getByRole('alert')).toContainText('/not-a-repository');
+  await expect(panel.getByRole('combobox', { name: '当前 Git 分支' })).toHaveCount(0);
+  await panel.getByLabel('Git 仓库目录', { exact: true }).fill('/volume2/docker/codex-web-ui');
+  await panel.getByRole('button', { name: '打开', exact: true }).click();
+  await expect(panel.getByRole('combobox', { name: '当前 Git 分支' })).toHaveValue('main');
+});
 const changed = (path: string, index = " ", working = "M"): GitFile => ({
   path,
   index,

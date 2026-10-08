@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+import { repositoryCandidates, missingRepository } from '../lib/git-context';
 
 type GitFile = {
   path: string;
@@ -33,6 +34,10 @@ const emit = defineEmits<{
   file: [path: string];
 }>();
 const repository = ref<Repository | null>(null);
+const directory = ref('');
+const directoryDraft = ref(props.state.projectPath || '');
+const resolvedFromConversation = ref(false);
+const directoryChoices = computed(() => repositoryCandidates(props.state.items || [], props.state.projects || [], props.state.hostId, ''));
 const loading = ref(false);
 const busy = ref(false);
 const error = ref("");
@@ -51,7 +56,7 @@ const worktreeStart = ref("");
 const startConversation = ref(false);
 let generation = 0;
 let diffGeneration = 0;
-const repositoryScope = computed(() => `${props.state.hostId}\0${props.state.projectPath}`);
+const repositoryScope = computed(() => `${props.state.hostId}\0${props.state.activeThread?.id || ''}\0${props.state.projectPath}`);
 const scope = computed(() => `${repositoryScope.value}\0${props.state.permission}`);
 let loadedRepositoryScope = "";
 const readonly = computed(() => props.state.permission === "read-only");
@@ -117,7 +122,7 @@ const diffLines = computed(() => {
 function context() {
   return {
     hostId: props.state.hostId,
-    cwd: repository.value?.root || props.state.projectPath,
+    cwd: repository.value?.root || directory.value || props.state.projectPath,
     permission: props.state.permission,
   };
 }
@@ -130,6 +135,7 @@ function report(cause: any) {
 }
 function apply(result: Repository) {
   repository.value = result;
+  directoryDraft.value = result.root;
   selected.value = selected.value.filter((path) =>
     result.files.some((file) => file.path === path),
   );
@@ -147,11 +153,36 @@ async function refresh() {
   if (!props.state.connected || !props.state.projectPath) return;
   loading.value = true;
   error.value = "";
+  const input = context();
+  const current = () => request === generation && captured === scope.value;
+  const read = (cwd: string) => props.api.requestHttp(`/git/status?${query({ ...input, cwd })}`, {}, false);
   try {
-    const result = await props.api.requestHttp(
-      `/git/status?${query(context())}`,
-    );
-    if (request === generation && captured === scope.value) apply(result);
+    let result: Repository;
+    try { result = await read(input.cwd); }
+    catch (cause: any) {
+      if (!current() || directory.value || !missingRepository(cause.message || '')) throw cause;
+      let candidates = repositoryCandidates(props.state.items || [], props.state.projects || [], props.state.hostId, input.cwd);
+      // Summary history deliberately omits command items. Read one bounded
+      // recent page for directory metadata, without resuming or changing cwd.
+      if (props.state.activeThread?.id && props.api.rpc) {
+        try {
+          const page = await props.api.rpc('thread/items/list', { threadId: props.state.activeThread.id, limit: 40, sortDirection: 'desc' }, 10000, { silentError: true });
+          if (!current()) return;
+          candidates = repositoryCandidates([...(page.data || [])].reverse(), props.state.projects || [], props.state.hostId, input.cwd).concat(candidates);
+        } catch { /* Older runtimes retain project/live-item suggestions. */ }
+      }
+      let found: Repository | undefined;
+      for (const candidate of [...new Set(candidates)].slice(0, 8)) {
+        if (!current()) return;
+        try { found = await read(candidate); break; }
+        catch (failure: any) { if (!missingRepository(failure.message || '')) throw failure; }
+      }
+      if (!found) throw cause;
+      result = found;
+      if (!current()) return;
+      directory.value = found.root; resolvedFromConversation.value = true;
+    }
+    if (current()) apply(result);
   } catch (cause: any) {
     if (request === generation && captured === scope.value) {
       repository.value = null;
@@ -160,6 +191,13 @@ async function refresh() {
   } finally {
     if (request === generation) loading.value = false;
   }
+}
+function chooseDirectory() {
+  if (busy.value || loading.value || !directoryDraft.value.trim().startsWith('/')) return;
+  ++generation; ++diffGeneration;
+  directory.value = directoryDraft.value.trim(); resolvedFromConversation.value = false;
+  repository.value = null; selected.value = []; diff.value = ''; diffFile.value = ''; message.value = ''; notice.value = '';
+  void refresh();
 }
 async function mutate(
   action: string,
@@ -299,6 +337,7 @@ watch(
     ++generation;
     ++diffGeneration;
     repository.value = null;
+    if (!sameRepository) { directory.value = ''; directoryDraft.value = props.state.projectPath || ''; resolvedFromConversation.value = false; }
     if (!sameRepository) selected.value = [];
     diff.value = "";
     diffFile.value = "";
@@ -334,6 +373,12 @@ defineExpose({ refresh });
         <Icon :name="loading ? 'LoaderCircle' : 'RefreshCw'" :size="15" />
       </button>
     </div>
+    <form class="git-directory" @submit.prevent="chooseDirectory">
+      <label for="git-repository-directory">仓库目录</label>
+      <div><input id="git-repository-directory" v-model="directoryDraft" list="git-directory-choices" aria-label="Git 仓库目录" :disabled="busy || loading" placeholder="输入仓库的绝对路径" /><button class="button button-small button-secondary" :disabled="busy || loading || !state.connected || !directoryDraft.trim().startsWith('/')">打开</button></div>
+      <datalist id="git-directory-choices"><option v-for="path in directoryChoices" :key="path" :value="path" /></datalist>
+      <p v-if="resolvedFromConversation" class="git-note" role="status">已根据对话中的操作目录找到仓库；对话工作目录保持为 {{ state.projectPath }}。</p>
+    </form>
     <div v-if="error" class="git-error" role="alert">{{ error }}</div>
     <div v-if="notice" class="git-notice" role="status">{{ notice }}</div>
     <div v-if="!repository" class="git-empty">
@@ -660,6 +705,11 @@ defineExpose({ refresh });
 .git-toolbar strong {
   font-size: 13px;
 }
+.git-directory { margin-bottom:12px; }
+.git-directory label { display:block; color:var(--muted); font-size:11px; margin-bottom:6px; }
+.git-directory > div { display:flex; align-items:center; gap:8px; }
+.git-directory input { flex:1; width:0; }
+.git-directory .button { flex-shrink:0; }
 .git-error,
 .git-notice {
   padding: 9px 10px;

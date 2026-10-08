@@ -132,6 +132,19 @@ test("compaction stays in its recorded position before later final answers, incl
     { id: "commentary", type: "agentMessage", phase: "commentary", text: "activity" },
   ];
   assert.deepEqual(turnPresentation(items).outputs.map((item) => item.id), ["first-final", "compact", "second-final"]);
+  assert.deepEqual(turnPresentation(items).timelineBlocks.map(block => block.id), ['first-final', 'compact', 'second-final', 'commentary']);
+});
+
+test('open process history anchors compaction between earlier and continuing operations', () => {
+  const result = turnPresentation([
+    { id: 'before', type: 'commandExecution' },
+    { id: 'compact', type: 'contextCompaction' },
+    { id: 'progress', type: 'agentMessage', phase: 'commentary', text: 'continuing' },
+    { id: 'after', type: 'commandExecution' },
+    { id: 'final', type: 'agentMessage', phase: 'final_answer', text: 'done' },
+  ]);
+  assert.deepEqual(result.timelineBlocks.map(block => block.id), ['activity:before', 'compact', 'progress', 'activity:after', 'final']);
+  assert.equal(result.timelineBlocks.filter(block => block.id === 'compact').length, 1);
 });
 
 test("late compaction items follow canonical turn chronology instead of becoming a permanent history footer", () => {

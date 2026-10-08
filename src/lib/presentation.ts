@@ -82,7 +82,11 @@ export function turnPresentation(items: DisplayItem[]) {
     (item) => !visible.has(item.id) && item.type !== "contextCompaction" &&
       (item.type !== 'reasoning' || !!publicReasoningSummary(item)),
   );
-  return { users, answers, activity, activityBlocks: activityBlocks(items, activity), dividers, outputs };
+  // While process details are open, compaction belongs among the operations
+  // that happened before and after it, rather than after all commentary.
+  const process = activityBlocks(items, activity);
+  const timelineBlocks = dividers.length ? activityBlocks(items, [...activity, ...outputs]) : process;
+  return { users, answers, activity, activityBlocks: process, dividers, outputs, timelineBlocks };
 }
 
 export function elapsedLabel(turn: any) {

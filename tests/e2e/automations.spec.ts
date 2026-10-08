@@ -34,6 +34,30 @@ test('automation menu saves a timezone schedule and exposes persisted run logs a
   await expect.poll(() => actions).toEqual(['run', 'retry']);
 });
 
+test('automation empty view and edit form fit desktop and phone without oversized blank space or horizontal overflow', async ({ page }) => {
+  await page.route('**/api/automations**', route => route.fulfill({ json: { tasks: [], runs: [], error: '' } }));
+  await login(page); await page.getByRole('button', { name: '自动化', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: '自动化', exact: true });
+  await expect(panel.getByText('没有执行记录', { exact: true })).toBeVisible();
+  await expect(panel.getByRole('alert')).toHaveCount(0);
+  expect((await panel.boundingBox())!.height).toBeLessThan(page.viewportSize()!.height * 0.8);
+  await page.screenshot({ path: '.data/automation-desktop-empty.png' });
+  await panel.getByRole('button', { name: '新建自动化', exact: true }).click();
+  await expect(panel.getByRole('heading', { name: '新建自动化', exact: true })).toBeVisible();
+  const name = await panel.getByLabel('自动化名称', { exact: true }).boundingBox();
+  const host = await panel.getByLabel('自动化主机', { exact: true }).boundingBox();
+  expect(Math.abs(name!.y - host!.y)).toBeLessThan(2);
+  await page.screenshot({ path: '.data/automation-desktop-form.png' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await panel.getByRole('button', { name: '保存自动化', exact: true }).scrollIntoViewIfNeeded();
+  await expect(panel.getByRole('button', { name: '保存自动化', exact: true })).toBeVisible();
+  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: '.data/automation-phone-form.png' });
+  await panel.getByRole('button', { name: '取消', exact: true }).click();
+  await page.screenshot({ path: '.data/automation-phone-empty.png' });
+});
+
 test('automation warnings clear after a successful refresh while failed action feedback remains', async ({ page }) => {
   let warning = '自动化等待队列已满';
   await page.route('**/api/automations**', route => route.request().method() === 'POST'

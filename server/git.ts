@@ -110,7 +110,7 @@ async function git(
   let result: CommandExecResponse;
   try {
     result =
-      !writableRoots && context.read && context.permission !== "danger-full-access"
+      !writableRoots && context.read
         ? await context.read(context.cwd, args)
         : (await context.bridge.request("command/exec", {
             command: [
@@ -220,9 +220,13 @@ async function repository(context: Context) {
     path: context.cwd,
   })) as { isDirectory?: boolean };
   if (!metadata.isDirectory) throw error("项目目录不存在或不是目录");
-  const root = (
-    await git(context, ["rev-parse", "--show-toplevel"])
-  ).stdout.trim();
+  let root: string;
+  try { root = (await git(context, ["rev-parse", "--show-toplevel"])).stdout.trim(); }
+  catch (cause: any) {
+    if (/not a git repository/i.test(cause.message))
+      throw error(`目录 ${context.cwd} 不是 Git 仓库，请选择仓库目录或其中的子目录。`, 409);
+    throw cause;
+  }
   if (!root.startsWith("/")) throw error("无法识别 Git 仓库目录");
   context.cwd = root;
   return root;
