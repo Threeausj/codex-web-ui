@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { test, expect, login, slash } from "./fixtures";
+import { test, expect, login, slash, editSource } from "./fixtures";
 
 test("workspace list and editor download the saved file bytes without changing it", async ({
   page,
@@ -19,9 +19,7 @@ test("workspace list and editor download the saved file bytes without changing i
   );
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
   await page.getByRole("button", { name: "源码", exact: true }).click();
-  await page
-    .getByRole("textbox", { name: "README.md 文件内容" })
-    .fill("还未保存的新内容");
+  await editSource(page, "README.md 文件内容", "还未保存的新内容");
   pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
   downloaded = await pending;

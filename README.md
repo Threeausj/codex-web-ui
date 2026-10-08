@@ -6,6 +6,36 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 
 这是完整桌面工作流的开发基线。当前功能与仍待完成的桌面能力列在下面，不将协议中存在的 API 等同于已完成的产品功能。[官方 app-server 文档](https://learn.chatgpt.com/docs/app-server)。
 
+## 界面预览
+
+下图来自真实 Vue 界面，使用固定演示数据，未包含实际主机、账户或私人对话。资源数值及执行记录用于展示界面，不代表性能基准。
+
+<table>
+  <tr>
+    <td align="center"><strong>桌面对话与操作批次</strong><br><img src="docs/images/desktop-chat.png" alt="桌面对话，连续操作默认折叠并显示上下文比例" width="600"></td>
+    <td align="center"><strong>深色模式与文件变更</strong><br><img src="docs/images/dark-changes.png" alt="深色模式下按文件查看红绿差异与增删行数" width="600"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>多文件编辑</strong><br><img src="docs/images/workspace-editor.png" alt="多文件标签、语法高亮、行号和保留聊天的编辑工作区" width="600"></td>
+    <td align="center"><strong>主机资源趋势</strong><br><img src="docs/images/resources.png" alt="主机 CPU、内存、网络和磁盘的资源趋势" width="600"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>显卡与会话连接</strong><br><img src="docs/images/resources-runtime.png" alt="显卡占用、显存及会话名称对应的 PID 与关闭按钮" width="600"></td>
+    <td align="center"><strong>定时自动化与执行记录</strong><br><img src="docs/images/automations.png" alt="自动化计划、执行日志与失败恢复入口" width="600"></td>
+  </tr>
+</table>
+
+<details>
+<summary>查看手机布局</summary>
+
+<p align="center"><img src="docs/images/mobile-chat.png" alt="430 像素手机布局中的对话和输入工具栏" width="320"></p>
+
+</details>
+
+截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
+
+[Docker 部署](#docker-快速部署) · [功能与限制](#功能状态) · [开发与验证](#开发与验证) · [本轮审查与改进建议](docs/project-audit.md)
+
 ## Docker 快速部署
 
 安装 Docker Engine/Desktop 和 Docker Compose v2，在仓库目录执行：
@@ -62,14 +92,14 @@ VAPID 密钥默认自动生成并持久化到 `DATA_DIR`，Docker 的 `webdata` 
 ```sh
 codex --version
 codex login
-npm install
+npm ci
 cp .env.example .env
 npm run dev
 ```
 
 打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。后端监听 `127.0.0.1:8787`。第一次启动未设置 `CODEX_WEB_PASSWORD` 时会创建随机密码，显示在后端终端，并保存到 `.data/bootstrap-password.txt`，文件权限为 `0600`。也可以在 `.env` 设置至少 12 位的访问密码。
 
-网页登录有效期为 30 天，服务重启后仍需重新登录。在“设置 → 账户 → 网页访问 → 修改访问密码”填写当前密码和两次新密码即可保存。新密码至少 12 个字符；保存后当前设备继续登录并续期，其他设备的登录及后台通知授权被撤销。访问密码散列保存到 `DATA_DIR/web-password.json`（`0600`），优先于 `.env` 和初始密码；之后修改环境变量不会覆盖已保存密码。Docker 保留 `webdata` 卷即可保留修改，忘记密码的重置方式见 [部署指南](docs/docker.md#访问密码与登录)。
+网页登录有效期最长 30 天；持久保存 `DATA_DIR` 时，正常服务重启保留有效登录。在“设置 → 账户 → 网页访问 → 修改访问密码”填写当前密码和两次新密码即可保存。新密码至少 12 个字符；保存后当前设备继续登录并续期，其他设备的登录及后台通知授权被撤销。访问密码散列保存到 `DATA_DIR/web-password.json`（`0600`），优先于 `.env` 和初始密码；之后修改环境变量不会覆盖已保存密码。Docker 保留 `webdata` 卷即可保留修改，忘记密码的重置方式见 [部署指南](docs/docker.md#访问密码与登录)。
 
 网页访问密码与 Codex 模型账户分别管理。默认继承当前用户的 Codex 登录和配置；不要为了启动网页复制账户 token 到前端。
 
@@ -80,7 +110,7 @@ npm run build
 npm start
 ```
 
-此时访问 [http://127.0.0.1:8787](http://127.0.0.1:8787)。公网使用 HTTPS 反向代理并设置密码和 `PUBLIC_ORIGIN`，具体见 [部署文档](docs/deployment.md)、[Caddyfile](deploy/Caddyfile) 与 [systemd 示例](deploy/codex-web.service)。仓库只提供部署文件，尚未在公网发布。
+此时访问 [http://127.0.0.1:8787](http://127.0.0.1:8787)。公网使用 HTTPS 反向代理并设置密码和 `PUBLIC_ORIGIN`，具体见 [部署文档](docs/deployment.md)、[Caddyfile](deploy/Caddyfile) 与 [systemd 示例](deploy/codex-web.service)。
 
 ## 功能状态
 
@@ -95,7 +125,7 @@ npm start
 | 多 Web 端同步 | 同一主机的页面共享持久 app-server，实时同步消息与状态；连续连接轻量检查，事件丢失时补齐历史 | 保留各页面草稿；原生进程变化后重新确认写入资格；桌面/CLI 的独立 app-server 仍受会话写入锁约束 |
 | 强制进入会话 | 写入锁冲突时显示重试与强制进入；先检查占用进程和受影响会话数量，确认后终止并恢复原对话 | Linux 本机/SSH 主机需 Python 3.9+；共享 Codex 进程中的其他会话会一同结束；Docker 无法识别宿主机进程时可改用 SSH 连接宿主机 |
 | 配置与项目加载 | 按 cwd 读取配置来源/版本和受管要求，版本校验保存；加载本机桌面项目、按主机浏览选择项目及额外工作目录；新对话直接选择项目与本机/远端 | 桌面项目元数据为只读兼容适配，网页自增项目不反写桌面状态；更改新对话位置保留文字，同主机保留附件，跨主机重新上传原文件 |
-| SSH 主机 | 添加/编辑弹窗、私钥上传与替换、未保存配置的连接测试；通过远端交互登录 shell 自动识别 Codex，也可指定路径 | 支持最大 64 KB 的无口令 OpenSSH / PEM 私钥；测试不保存主机、不打断聊天；需预先配置 known_hosts、远端 CLI 和登录 |
+| SSH 主机 | 添加/编辑弹窗、私钥上传与替换、未保存配置的连接测试；通过远端交互登录 shell 自动识别 Codex，也可指定路径 | 支持最大 64 KB 的无口令 OpenSSH / PEM 私钥；测试不保存主机、不打断聊天；可在连接弹窗获取并确认新主机指纹；指纹变化需重新确认，需准备远端 CLI 与登录 |
 | 审批 | 命令/文件改动、额外权限、工具提问与基础 MCP 输入面板；同主机登录设备共享待审批请求 | 首个有效答复生效；依赖当前 Codex sandbox/审批策略，高级 MCP schema 与桌面宿主请求尚未完全覆盖 |
 | 文件与变更 | 多文件标签、行号/语法高亮、选中代码引用/侧边提问、Markdown 源码/预览、图片/PDF 预览；文件名筛选、下载与红绿增删行数 | 最多 16 个标签，单文件最多 8 MB；私人草稿保留原始版本以核对保存冲突；二进制文件禁止文本编辑；[文件工作流](docs/automations-and-editor.md) |
 | 终端与 Tmux | 交互式 Shell、PTY、stdin、resize、重连恢复、手机控制键；tmux 会话列表、窗格输出快照、新建、切换、确认删除 | 目标主机需安装 tmux；切换只断开 tmux 客户端，普通终端保留；macOS 沙箱拦截 socket 时需用户选择完全访问 |
@@ -159,6 +189,19 @@ Web bridge 不提供跨机器云同步。把 Node 服务部署到另一台服务
 - “资源管理”独立选择主机查看负载和 Web Codex 进程，不切换聊天。会话列表显示名称及对应 PID；“关闭会话”仅停止该会话及子智能体，保留其他会话和历史，关闭状态同步到所有网页并跨重启保存（[释放机制](docs/session-release.md)）。“关闭 Web Codex”释放该主机全部 Web 会话及进程，保持暂停以便桌面端接管；点击“连接 Web Codex”显式恢复。proxy 模式只释放本客户端的订阅和连接，保留共享 daemon。
 - 输入框权限左侧显示当前对话的上下文比例，点击可压缩；压缩中显示提醒并保留用量，完成标记留在发生位置。上下文补读、连接复用和 NAS Git 权限说明见 [恢复机制](docs/runtime-stability.md)。直接粘贴图片添加附件，普通文字保留正常粘贴行为。
 
+## 常见问题
+
+| 现象 | 检查方法 |
+| --- | --- |
+| 页面空白、无法安装或启用通知 | 公网使用 HTTPS，确认 `PUBLIC_ORIGIN` 与访问地址一致。查看浏览器控制台及 `docker compose --env-file .env.docker logs --tail=100 app`；旧 PWA 可在设置中主动更新 |
+| Docker 中没有本机的目录／历史 | “本机”指容器；`WORKSPACE_PATH` 映射到 `/workspace`。选择容器路径，或添加 SSH 主机访问宿主目录；Codex 数据由实际执行账户及 `CODEX_HOME` 决定 |
+| 新 SSH 主机提示不受信任 | 在连接弹窗获取指纹，核对后点击“信任并测试连接”；已有指纹变化时先检查重装或密钥变化原因，程序会单独要求确认替换 |
+| 打开对话提示已有 active writer | 在桌面／CLI 释放会话，或使用 Web 的“强制进入”。强制进入前会显示占用 PID 与影响范围；共享进程中的其他任务也可能结束 |
+| NAS／Docker 命令报 `bwrap` namespace 错误 | 只读 Git 查询已使用独立主机助手；原生命令的沙箱仍依赖内核。按实际需要明确选择完全访问，并检查主机受管策略；不会自动放宽权限 |
+| 重进后回到欢迎页或草稿未恢复 | 保留 `DATA_DIR` 和 Docker 数据卷，检查浏览器是否清理站点数据。安装应用会尝试恢复主机、会话、草稿及阅读位置，发送前仍需确认原生连接；浏览器存储满时会提示草稿仅留在当前窗口 |
+
+缓存、恢复、会话交接与手机后台行为的详细边界见 [可靠性与工作流](docs/reliability-and-workflows.md)、[PWA 指南](docs/pwa.md)。
+
 ## 开发与验证
 
 ```sh
@@ -179,7 +222,7 @@ npm run doctor:preview
 
 目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。
 
-2026-10-06 已验证真实模型推理、跨进程历史、PTY、隔离 daemon 协作、实际 Git/worktree、Vite HMR、隔离 tmux 生命周期与目录浏览；本阶段通过 127 项单元/协议测试、112 项浏览器流程测试和生产构建，包含真实 Service Worker 的离线启动、更新及通知订阅恢复。Docker 已在 Linux/ARM64 隔离环境实际构建启动并验证协议、终端、中文 Tmux 与卷持久化，详见 [验证清单](docs/validation.md)。桌面和手机尺寸页面已在本机验收；真实手机后台推送送达尚待验收。原验证截图含本机项目信息，保留在本地，不随仓库发布。
+最新类型、单元／协议、浏览器、依赖审计与生产构建结果见 [验证清单](docs/validation.md)，代码审查与后续优先级见 [项目审查](docs/project-audit.md)。既往实际环境检查覆盖模型推理、跨进程历史、PTY、隔离 daemon、Git/worktree、Vite HMR、Tmux 与 Docker 数据卷；浏览器尺寸测试不等同于真实手机后台推送验收。早期含本机信息的截图保留在本地，上方公开截图使用独立演示数据。
 
 本阶段工作流及环境验收边界见 [工作流完整度](docs/roadmap.md)。插件市场不在当前范围内。
 

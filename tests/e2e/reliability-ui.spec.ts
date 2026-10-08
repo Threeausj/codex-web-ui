@@ -1,4 +1,4 @@
-import { test, expect, login, slash } from './fixtures';
+import { test, expect, login, slash, editSource } from './fixtures';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK1sAAAAASUVORK5CYII=', 'base64');
 
@@ -16,14 +16,15 @@ test('external changes preserve the browser draft and require an explicit confli
   await page.locator('.file-tree-row').filter({ hasText: 'README.md' }).click();
   await page.locator('.file-view-switch').getByRole('button', { name: '源码', exact: true }).click();
   const editor = page.getByRole('textbox', { name: 'README.md 文件内容' });
-  await editor.fill('# My draft'); disk = '# Codex changed this';
+  await editSource(page, 'README.md 文件内容', '# My draft');
+  disk = '# Codex changed this';
   await page.getByRole('button', { name: '保存', exact: true }).click();
   const conflict = page.getByRole('alert', { name: '文件保存冲突' });
   await expect(conflict).toContainText('# Codex changed this');
   await expect(conflict).toContainText('# My draft');
   await expect(editor).toHaveText('# My draft'); expect(writes).toBe(0);
   await conflict.getByRole('button', { name: '保留草稿并手动合并' }).click();
-  await editor.fill('# Codex changed this\n# My merged draft');
+  await editSource(page, 'README.md 文件内容', '# Codex changed this\n# My merged draft');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => writes).toBe(1); expect(disk).toContain('My merged draft');
 });
@@ -141,14 +142,14 @@ test('late saves of a different file cannot replace the editor or unlock another
   await page.locator('.workspace-tabs').getByRole('button', { name: '文件', exact: true }).click();
   await page.locator('.file-tree-row').filter({ hasText: 'README.md' }).click();
   await page.locator('.file-view-switch').getByRole('button', { name: '源码', exact: true }).click();
-  await page.getByRole('textbox', { name: 'README.md 文件内容' }).fill('# First save');
+  await editSource(page, 'README.md 文件内容', '# First save');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => pending.has('/workspace/demo/README.md')).toBe(true);
   page.once('dialog', dialog => dialog.accept());
   await page.getByRole('link', { name: '打开另一个文件', exact: true }).click();
   const second = page.getByRole('textbox', { name: 'index.html 文件内容' });
   await expect(second).toHaveText('<h1>Demo preview</h1>');
-  await second.fill('<h1>Second save</h1>');
+  await editSource(page, 'index.html 文件内容', '<h1>Second save</h1>');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => pending.has('/workspace/demo/index.html')).toBe(true);
   const firstFinished = page.waitForResponse(response => response.url().includes('/files') && response.request().method() === 'POST' && !!response.request().postData()?.includes('/workspace/demo/README.md'));
@@ -157,6 +158,6 @@ test('late saves of a different file cannot replace the editor or unlock another
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
   pending.get('/workspace/demo/index.html')!();
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
-  await second.fill('<h1>New draft</h1>');
+  await editSource(page, 'index.html 文件内容', '<h1>New draft</h1>');
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeEnabled();
 });

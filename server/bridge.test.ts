@@ -9,13 +9,58 @@ import type { SSHHostKeyPin } from './ssh-host-keys.js'
 
 class Browser extends EventEmitter {
   readyState = 1
+  bufferedAmount = 0
   sent: RpcMessage[] = []
   send(data: string) { this.sent.push(JSON.parse(data)) }
   request(message: RpcMessage) { this.emit('message', Buffer.from(JSON.stringify(message))) }
   close() { this.readyState = 3; this.emit('close') }
+  terminate() { this.close() }
   ws() { return this as unknown as WebSocket }
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
+
+for (const failure of ['throw', 'callback', 'error', 'backlog'] as const) {
+  test(`browser ${failure} failure is isolated from the shared Codex writer and other clients`, async () => {
+    const value = fixture()
+    const healthy = new Browser()
+    const broken = new Browser()
+    value.bridge.attach('healthy', healthy.ws(), 'healthy')
+    value.bridge.attach('broken', broken.ws(), 'broken')
+    try {
+      await value.bridge.connect()
+      if (failure === 'throw') broken.send = () => { throw new Error('Socket failed') }
+      if (failure === 'callback') broken.send = ((_data: string, callback: (error: Error) => void) => callback(new Error('Socket failed'))) as typeof broken.send
+      if (failure === 'error') broken.emit('error', new Error('Socket failed'))
+      if (failure === 'backlog') broken.bufferedAmount = 8 * 1024 * 1024 + 1
+      value.receive({ method: 'item/agentMessage/delta', params: { threadId: 't', itemId: 'answer', delta: 'Still running' } })
+      assert.equal(broken.readyState, 3)
+      assert.equal(value.bridge.connected, true)
+      assert.equal(healthy.sent.at(-1)?.method, 'item/agentMessage/delta')
+      healthy.request({ id: 'read', method: 'thread/read', params: { threadId: 't' } })
+      await tick()
+      const request = value.sent.find(message => message.method === 'thread/read')!
+      value.receive({ id: request.id, result: { thread: { id: 't' } } })
+      await tick()
+      assert.deepEqual(healthy.sent.find(message => message.id === 'read')?.result, { thread: { id: 't' } })
+    } finally { value.bridge.close() }
+  })
+}
+
+test('a large valid history response is delivered when the browser has no pending backlog', async () => {
+  const value = fixture()
+  const browser = new Browser()
+  value.bridge.attach('reader', browser.ws(), 'reader')
+  try {
+    await value.bridge.connect()
+    browser.request({ id: 'history', method: 'thread/read', params: { threadId: 't' } })
+    await tick()
+    const request = value.sent.find(message => message.method === 'thread/read')!
+    value.receive({ id: request.id, result: { text: 'x'.repeat(8 * 1024 * 1024 + 1) } })
+    await tick()
+    assert.equal(browser.readyState, 1)
+    assert.equal((browser.sent.find(message => message.id === 'history')?.result as any).text.length, 8 * 1024 * 1024 + 1)
+  } finally { value.bridge.close() }
+})
 
 test('same-engine reconnect replays missed events before status and never replays private RPC responses', async () => {
   const value = fixture();

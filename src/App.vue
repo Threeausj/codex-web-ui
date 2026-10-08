@@ -8,6 +8,7 @@ import {
   watch,
 } from "vue";
 import { useCodex } from "./lib/useCodex";
+import { browserStorage } from "./lib/browser-storage";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
@@ -91,7 +92,7 @@ const actionPending = ref(false);
 const actionBusy = computed(() => actionPending.value || state.editingMessage);
 let navigationSelection = 0;
 let activeActionCount = 0;
-const theme = ref(localStorage.getItem("codex.theme") || "system");
+const theme = ref(browserStorage.local.getItem("codex.theme") || "system");
 const prefersDark = window.matchMedia("(prefers-color-scheme: dark)");
 function updateViewport() {
   const viewport = window.visualViewport;
@@ -680,7 +681,7 @@ function applyTheme() {
     getComputedStyle(document.documentElement).getPropertyValue('--bg').trim());
 }
 watch(theme, () => {
-  localStorage.setItem("codex.theme", theme.value);
+  browserStorage.local.setItem("codex.theme", theme.value);
   applyTheme();
 });
 watch(paletteQuery, () => {

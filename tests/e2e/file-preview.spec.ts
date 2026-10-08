@@ -1,4 +1,4 @@
-import { test, expect, login, slash } from "./fixtures";
+import { test, expect, login, slash, editSource } from "./fixtures";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+UqsAAAAASUVORK5CYII=";
 function files(mock: any, values: Record<string, string>, images = new Set<string>()) {
@@ -38,7 +38,7 @@ test("Markdown defaults to rendered content and source/preview preserve the draf
   await expect(page.getByRole("textbox", { name: "README.md 文件内容" })).toHaveCount(0);
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
   const source = page.getByRole("textbox", { name: "README.md 文件内容" });
-  await source.fill("# Draft heading\n\n尚未保存");
+  await editSource(page, "README.md 文件内容", "# Draft heading\n\n尚未保存");
   await page.locator(".file-view-switch").getByRole("button", { name: "预览", exact: true }).click();
   await expect(rendered.getByRole("heading", { name: "Draft heading" })).toBeVisible();
   await expect(page.getByText("未保存", { exact: true })).toBeVisible();
@@ -111,7 +111,7 @@ test("a failed Markdown save preserves the draft and can be retried from preview
   await openFiles(page);
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
-  await page.getByRole("textbox", { name: "README.md 文件内容" }).fill("# Retained draft");
+  await editSource(page, "README.md 文件内容", "# Retained draft");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect(page.locator(".panel-error")).toContainText("写入失败");
   await page.locator(".file-view-switch").getByRole("button", { name: "预览", exact: true }).click();
@@ -137,10 +137,10 @@ test("editing during a pending save keeps later changes marked unsaved", async (
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
   const source = page.getByRole("textbox", { name: "README.md 文件内容" });
-  await source.fill("# First draft");
+  await editSource(page, "README.md 文件内容", "# First draft");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect.poll(() => !!release).toBe(true);
-  await source.fill("# Later draft");
+  await editSource(page, "README.md 文件内容", "# Later draft");
   release!();
   await expect(page.getByRole("button", { name: "保存", exact: true })).toBeEnabled();
   await expect(page.getByText("未保存", { exact: true })).toBeVisible();

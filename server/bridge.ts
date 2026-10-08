@@ -270,6 +270,11 @@ export class Bridge {
     const previous = this.clients.get(key)
     if (previous && previous !== socket) previous.close(4001, 'Client reconnected')
     this.clients.set(key, socket)
+    // A failed browser connection must never tear down the shared app-server.
+    socket.on('error', () => this.dropClient(key, socket))
+    socket.on('close', () => {
+      if (this.clients.get(key) === socket) this.clients.delete(key)
+    })
     let replayComplete = false
     if (cursor && cursor.engineId === this.engineId && Number.isSafeInteger(cursor.afterSequence) && cursor.afterSequence >= 0 && cursor.afterSequence <= this.eventSequence) {
       this.pruneReplay()
@@ -291,16 +296,23 @@ export class Bridge {
       try { void this.fromClient(key, JSON.parse(data.toString())).catch(error => this.clientSend(key, { method: 'bridge/error', params: { message: (error as Error).message } })) }
       catch { this.clientSend(key, { method: 'bridge/error', params: { message: 'Invalid JSON message' } }) }
     })
-    socket.on('close', () => {
-      if (this.clients.get(key) !== socket) return
-      this.clients.delete(key)
-    })
     void this.connect().catch(() => {})
+  }
+
+  private dropClient(key: string, socket: WebSocket) {
+    if (this.clients.get(key) === socket) this.clients.delete(key)
+    socket.terminate()
   }
 
   private clientSend(key: string, message: RpcMessage) {
     const client = this.clients.get(key)
-    if (client?.readyState === 1) client.send(JSON.stringify(message))
+    if (client?.readyState !== 1) return
+    // Check existing backlog, rather than frame size: a large valid history
+    // response may still drain normally. Reconnect uses the existing replay path.
+    if (client.bufferedAmount > 8 * 1024 * 1024) { this.dropClient(key, client); return }
+    try {
+      client.send(JSON.stringify(message), error => { if (error) this.dropClient(key, client) })
+    } catch { this.dropClient(key, client) }
   }
 
   diagnostics() {

@@ -739,6 +739,16 @@ export const test = base.extend<{ mock: MockCodex }>({
 });
 export { expect };
 
+export async function editSource(page: Page, name: string, text: string) {
+  // Use CodeMirror's actual key/input handlers; DOM-only fill can race a
+  // language compartment update and concatenate the old document.
+  const editor = page.getByRole('textbox', { name, exact: true });
+  await editor.click();
+  await editor.press('ControlOrMeta+A');
+  await page.keyboard.insertText(text);
+  await expect(editor).toHaveText(text, { useInnerText: true });
+}
+
 export async function login(page: Page) {
   await page.goto("/");
   await page
