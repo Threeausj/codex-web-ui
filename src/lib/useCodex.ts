@@ -427,9 +427,12 @@ async function refreshContextUsage(hostId: string, threadId: string) {
 // Android may discard the renderer rather than emit a normal unload event.
 // Commit small private snapshots while hidden; the server retains the runtime.
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('pagehide', () => { void flushConversationCache(); });
-if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') void flushConversationCache();
-});
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void flushConversationCache();
+  });
+  document.addEventListener('freeze', () => { void flushConversationCache(); });
+}
 function appendTerminal(chunk: string) {
   state.terminalOutput = (state.terminalOutput + chunk).slice(-500000);
   for (const listener of terminalListeners) listener(chunk);

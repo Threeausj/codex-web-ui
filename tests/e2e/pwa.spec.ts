@@ -112,6 +112,7 @@ test("built PWA installs its real worker, caches public resources only and start
   await loginBuilt(page);
   const manifest = await (await context.request.get(origin + "/manifest.webmanifest")).json();
   expect(manifest.display).toBe("standalone");
+  expect(manifest.launch_handler).toEqual({ client_mode: "focus-existing" });
   expect(manifest.icons.some((icon: any) => icon.sizes === "512x512" && icon.purpose === "maskable")).toBe(true);
   for (const icon of manifest.icons) expect((await context.request.get(origin + icon.src)).status()).toBe(200);
   await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
