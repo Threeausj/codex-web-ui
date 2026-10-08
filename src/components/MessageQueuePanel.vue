@@ -7,7 +7,7 @@ const open = ref(false);
 const editing = ref('');
 const draft = ref('');
 const queue = computed(() => props.controller.state);
-const visible = computed(() => props.main.activeThread && (props.main.busy || queue.value.items.length || queue.value.error || queue.value.uncertain));
+const visible = computed(() => props.main.activeThread && (queue.value.items.length || queue.value.error || queue.value.uncertain || queue.value.notice));
 const enabled = computed(() => props.controller.canMutate.value);
 function edit(item: any) { editing.value = item.id; draft.value = queuedText(item); open.value = true; }
 async function action(operation: () => Promise<any>) {
@@ -22,17 +22,16 @@ watch(() => queue.value.items.map((item: any) => item.id).join('\n'), () => {
 
 <template>
   <section v-if="visible" class="message-queue" aria-label="原生消息队列">
-    <button class="queue-heading" :aria-expanded="open" @click="open = !open">
+    <button v-if="queue.items.length" class="queue-heading" :aria-expanded="open" @click="open = !open">
       <Icon name="ListOrdered" :size="14" />
       <span>{{ main.busy ? '运行中' : '当前任务已停止' }} · 下一轮队列 {{ queue.items.length }}</span>
       <Icon v-if="queue.loading" name="LoaderCircle" class="spin" :size="13" />
       <Icon :name="open ? 'ChevronUp' : 'ChevronDown'" :size="14" />
     </button>
-    <div v-if="open" class="queue-body">
+    <div v-if="open && queue.items.length" class="queue-body">
       <div class="queue-note">队列保存在 Codex 中，任务结束后继续执行，沿用该对话已保存的模型、模式和权限。停止当前任务会保留队列。队列非空时锁定模型和权限；请清空队列后调整。</div>
       <div v-if="queue.status !== 'supported'" class="queue-note" role="status">{{ queue.reason }} <button class="text-button" @click="controller.checkCapabilities(true)">重新检查</button></div>
-      <div v-else-if="!queue.items.length && !queue.loading" class="queue-note">没有等待执行的消息。</div>
-      <ol v-if="queue.items.length" class="queue-list">
+      <ol class="queue-list">
         <li v-for="(item, index) in queue.items" :key="item.id" class="queue-item">
           <template v-if="editing === item.id">
             <textarea v-model="draft" rows="3" aria-label="编辑排队消息" :disabled="!enabled"></textarea>

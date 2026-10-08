@@ -4,6 +4,7 @@ import Icon from './Icon.vue';
 const props = defineProps<{ api: any; state: any }>();
 const emit = defineEmits<{ close: []; open: [hostId: string, threadId: string] }>();
 const tasks = ref<any[]>([]), runs = ref<any[]>([]), selected = ref(''), editing = ref(false), busy = ref(false), error = ref('');
+const serviceError = ref('');
 const form = reactive({ name: '', hostId: props.state.hostId, cwd: props.state.projectPath || '/workspace', prompt: '', model: props.state.model || '', effort: props.state.effort || 'medium', permission: 'read-only', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai', kind: 'daily', minutes: 60, time: '09:00', days: [1,2,3,4,5], enabled: false, maxRetries: 1 });
 let timer: ReturnType<typeof setTimeout> | undefined, controller: AbortController | undefined, disposed = false;
 const hostProjects = computed(() => props.state.projects.filter((project: any) => (project.hostId || 'local') === form.hostId));
@@ -14,8 +15,8 @@ async function refresh() {
   clearTimeout(timer);
   if (disposed || !props.state.authenticated || controller) return;
   controller = new AbortController();
-  try { const result = await props.api.http('/automations', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) }, false); if (!disposed) { tasks.value = result.tasks; runs.value = result.runs; if (result.error) error.value = result.error; } }
-  catch (cause: any) { if (!disposed && cause.name !== 'AbortError') error.value = cause.message; }
+  try { const result = await props.api.http('/automations', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) }, false); if (!disposed) { tasks.value = result.tasks; runs.value = result.runs; serviceError.value = result.error || ''; } }
+  catch (cause: any) { if (!disposed && cause.name !== 'AbortError') serviceError.value = cause.message; }
   finally { controller = undefined; if (!disposed) timer = setTimeout(() => void refresh(), 5000); }
 }
 async function action(operation: () => Promise<any>) {
@@ -52,7 +53,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); controller?.abort(
     <section class="automations-panel" role="dialog" aria-modal="true" aria-label="自动化">
       <header><div><Icon name="Clock" :size="18" /><strong>自动化</strong></div><button class="icon-button" aria-label="关闭自动化" @click="emit('close')"><Icon name="X" :size="18" /></button></header>
       <p class="automation-note">由 Web 服务器按时执行，关闭网页后继续。每次创建独立会话；错过的时间合并为一次，运行中的任务不重复启动。</p>
-      <p v-if="error" role="alert" class="panel-error">{{ error }}</p>
+      <p v-if="error || serviceError" role="alert" class="panel-error">{{ error || serviceError }}</p>
       <div class="automation-content">
         <aside>
           <button class="button button-small" :disabled="busy" @click="edit()"><Icon name="Plus" :size="14" />新建自动化</button>

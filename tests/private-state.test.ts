@@ -32,3 +32,34 @@ test('logout invalidates queued private writes and late reads', async () => {
   reader.activate('hash'); const read = reader.read('queue', 'thread'); await new Promise(resolve => setImmediate(resolve));
   await reader.clear(); release(); assert.equal(await read, null); assert.equal(rows.size, 0);
 });
+test('a slow disk read returns the newer draft and cannot replace it in memory', async () => {
+  const { store } = persistence();
+  const writer = new PrivateState(store); writer.activate('hash'); await writer.write('file-workspace', 'host/project', { text: 'old' });
+  let release!: () => void, started!: () => void;
+  const reading = new Promise<void>(resolve => { started = resolve; });
+  const reader = new PrivateState({ ...store, read: async key => {
+    const captured = await store.read(key); if (!captured) return captured; started(); await new Promise<void>(resolve => { release = resolve; }); return captured;
+  } });
+  reader.activate('hash'); const pending = reader.read('file-workspace', 'host/project'); await reading;
+  await reader.write('file-workspace', 'host/project', { text: 'new edit' }); release();
+  assert.deepEqual(await pending, { text: 'new edit' });
+  assert.deepEqual(await reader.read('file-workspace', 'host/project'), { text: 'new edit' });
+});
+test('a slow read cannot resurrect a removed operation receipt; unrelated edits do not invalidate it', async () => {
+  const { store } = persistence();
+  const writer = new PrivateState(store); writer.activate('hash'); await writer.write('queue', 'thread', { clientId: 'old' }, true);
+  let release!: () => void, started!: () => void;
+  let reading = new Promise<void>(resolve => { started = resolve; });
+  const reader = new PrivateState({ ...store, read: async key => {
+    const captured = await store.read(key); if (!captured) return captured; started(); await new Promise<void>(resolve => { release = resolve; }); return captured;
+  } });
+  reader.activate('hash'); const pending = reader.read('queue', 'thread'); await reading;
+  await reader.write('file-workspace', 'other/project', { text: 'independent' }); release();
+  assert.deepEqual(await pending, { clientId: 'old' });
+  const nextReader = new PrivateState((reader as any).persistence); nextReader.activate('hash');
+  reading = new Promise<void>(resolve => { started = resolve; });
+  const removed = nextReader.read('queue', 'thread'); await reading;
+  await nextReader.remove('queue', 'thread'); release();
+  assert.equal(await removed, null);
+  assert.equal(await nextReader.read('queue', 'thread'), null);
+});
