@@ -4,6 +4,23 @@ import type { ToolRequestUserInputResponse } from '../../shared/protocol/v2/Tool
 export type UserInputDraft = { selection?: number | 'other'; text?: string }
 export type UserInputDrafts = Record<string, UserInputDraft>
 
+/** Deadlines come from the bridge so reopening a request never restarts its timer. */
+export function userInputAutoResolveAt(params: unknown): number | null {
+  if (!params || typeof params !== 'object') return null
+  const context = (params as Record<string, unknown>).bridgeUserInputContext
+  if (!context || typeof context !== 'object') return null
+  const { requestedAt, autoResolveAt } = context as Record<string, unknown>
+  return typeof requestedAt === 'number' && Number.isSafeInteger(requestedAt) && requestedAt >= 0
+    && typeof autoResolveAt === 'number' && Number.isSafeInteger(autoResolveAt) && autoResolveAt >= requestedAt
+    ? autoResolveAt : null
+}
+
+export function userInputAutoResolutionMs(params: unknown): number | null {
+  if (!params || typeof params !== 'object') return null
+  const value = (params as Record<string, unknown>).autoResolutionMs
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
 export function userInputAnswer(question: ToolRequestUserInputQuestion, draft?: UserInputDraft): string | null {
   if (!draft) return null
   const options = question.options || []

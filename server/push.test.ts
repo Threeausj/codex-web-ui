@@ -686,6 +686,79 @@ test('outbox TTL expires notifications rather than retrying indefinitely', async
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
 
+test('timed question reminders expire with the question and identify the time limit without leaking its content', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-question-expiry-'))
+  let clock = Date.now(); const notices: any[] = []
+  const service = await PushService.create(directory, new Set([origin]), { now: () => clock, sendNotification: async (_device, payload) => {
+    notices.push(JSON.parse(payload)); throw Object.assign(new Error('503'), { statusCode: 503 })
+  } })
+  try {
+    await service.subscribe('session', subscription('timed-question'))
+    service.observe(host, { id: 'timed', method: 'item/tool/requestUserInput', params: {
+      threadId: 't', turnId: 'turn', autoResolutionMs: 1000, isBlocking: false,
+      bridgeUserInputContext: { requestedAt: clock, autoResolveAt: clock + 1000 },
+      questions: [{ id: 'secret', question: 'Private question', options: [{ label: 'Private answer' }] }],
+    } }); await service.flush()
+    assert.equal(notices.length, 1); assert.equal(notices[0].body, '等待你的选择（限时）')
+    assert.ok(!JSON.stringify(notices).includes('Private question')); assert.ok(!JSON.stringify(notices).includes('Private answer'))
+    const stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.equal(stored.outbox[0].expiresAt, clock + 1000); assert.equal(stored.outbox[0].requestId, 'timed')
+    clock += 1001; await service.flush()
+    assert.equal(notices.length, 1); assert.equal(service.status('session').queued, 0)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('resolved request reminders are cancelled durably and remain scoped to their host and thread', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-question-resolved-'))
+  let clock = Date.now(), attempts = 0
+  const service = await PushService.create(directory, new Set([origin]), { now: () => clock, sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } })
+  try {
+    await service.subscribe('session', subscription('resolved-question'))
+    service.observe(host, { id: 33, method: 'item/tool/requestUserInput', params: { threadId: 't', isBlocking: true, autoResolutionMs: null } }); await service.flush()
+    assert.equal(service.status('session').queued, 1)
+    service.observe({ ...host, id: 'other-host' }, { method: 'serverRequest/resolved', params: { threadId: 't', requestId: 33 } })
+    service.observe(host, { method: 'serverRequest/resolved', params: { threadId: 'other-thread', requestId: 33 } })
+    assert.equal(service.status('session').queued, 1)
+    service.observe(host, { method: 'serverRequest/resolved', params: { threadId: 't', requestId: 33 } }); await service.flush()
+    clock += 6000; await service.flush()
+    assert.equal(attempts, 1); assert.equal(service.status('session').queued, 0)
+    assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8')).outbox.length, 0)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('resolving a question during its metadata lookup prevents a late notification', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-question-metadata-'))
+  let release!: (value: unknown) => void, began!: () => void, attempts = 0
+  const started = new Promise<void>(resolve => { began = resolve })
+  const metadata = new Promise(resolve => { release = resolve })
+  const service = await PushService.create(directory, new Set([origin]), { resolveThread: async () => { began(); return metadata }, sendNotification: async () => { attempts++ } })
+  try {
+    await service.subscribe('session', subscription('metadata-question'))
+    service.observe(host, { id: 'waiting', method: 'item/tool/requestUserInput', params: { threadId: 't', autoResolutionMs: null } })
+    await started
+    service.observe(host, { method: 'serverRequest/resolved', params: { threadId: 't', requestId: 'waiting' } })
+    release({ id: 't', name: 'Conversation', source: 'cli' }); await service.flush()
+    assert.equal(attempts, 0); assert.equal(service.status('session').queued, 0)
+  } finally { release?.(undefined); await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('question reminder deadlines and cancellation survive push-service restart', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-question-restart-'))
+  let clock = Date.now(), attempts = 0
+  const options: PushOptions = { now: () => clock, sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    await service.subscribe('session', subscription('restart-question'))
+    service.observe(host, { id: 'restored', method: 'tool/requestUserInput', params: { threadId: 't', autoResolutionMs: 10000 } }); await service.flush(); await service.close()
+    service = await PushService.create(directory, new Set([origin]), options)
+    service.observe(host, { method: 'serverRequest/resolved', params: { threadId: 't', requestId: 'restored' } }); await service.flush()
+    clock += 6000; await service.flush()
+    assert.equal(attempts, 1); assert.equal(service.status('session').queued, 0)
+    service.observe(host, { id: 'already-skipped', method: 'item/tool/requestUserInput', params: { threadId: 't', autoResolutionMs: 0 } }); await service.flush()
+    assert.equal(attempts, 1)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
 test('retry attempts remain bounded even when the provider is continuously unavailable', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-outbox-attempts-'))
   let clock = Date.now(); let sent = 0

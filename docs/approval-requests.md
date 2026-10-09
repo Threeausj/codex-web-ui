@@ -8,6 +8,10 @@
 
 只有真实的交互请求会触发“等待确认／选择”提醒，服务回调不会推送。通知投递由后台执行，不依赖浏览器保持打开。服务端成功投递给推送提供方不代表手机已显示通知；诊断仍需区分订阅状态、投递失败或重试，以及 Android 的通知显示情况。
 
+`item/tool/requestUserInput` 支持选择题、自由回答和保密输入；`isBlocking:false` 表示 Codex 可继续独立工作，问题仍可回答。原生 `autoResolutionMs` 明确给出有效毫秒数时，Web 后台统一计算自动跳过时间并显示倒计时；切换会话、重连或手机挂后台不会重新计时。到时只发送空回答 `{answers:{}}`，不替用户选择推荐项，也不发送尚未提交的文字或保密草稿。`null`、缺失或无效时限不会创建计时器，命令、文件与权限审批不会因此自动允许。
+
+`autoResolutionMs` 在已核对的 CLI 0.160.1 schema 中标记为弃用，仅作为兼容字段处理；是否阻塞仍以 `isBlocking` 为准，不给所有提问强加截止时间。自动跳过属于 Web 客户端行为，不代表 Codex 服务器会自行让问题过期。问题已回答、原生发出 `serverRequest/resolved` 或连接释放时清理计时器和待回答状态。阻塞问题在所属轮次结束或下一轮开始时也会清理；非阻塞问题可跨轮次保留，直到原生明确解决、用户回答或显式时限到达。限时提醒标明“限时”，推送队列的存活时间不超过问题时限；已解决的问题会取消尚未送出的通知。已经交给手机推送提供方的通知无法保证撤回。
+
 本次问题对应的 NAS 运行记录确认使用了 `danger-full-access + never`，但截图中的旧请求已被清除，无法恢复其具体方法名。已复现并修复“非审批请求被显示为空审批卡片、推送端却不通知”的分类错误，不据此推断某个未知请求应自动允许。
 
-参考：[Codex app-server 的审批与客户端工具协议](https://learn.chatgpt.com/docs/app-server)、[Codex 沙箱与审批设置](https://learn.chatgpt.com/docs/sandboxing)。当前时间回调字段参见仓库生成的 `shared/protocol/v2/CurrentTimeReadResponse.ts`。
+参考：[Codex app-server 的审批与客户端工具协议](https://learn.chatgpt.com/docs/app-server)、[用户提问与自动结束间隔](https://learn.chatgpt.com/docs/app-server#toolrequestuserinput)、[Codex 沙箱与审批设置](https://learn.chatgpt.com/docs/sandboxing)。当前时间回调字段参见仓库生成的 `shared/protocol/v2/CurrentTimeReadResponse.ts`。

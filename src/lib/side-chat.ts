@@ -6,6 +6,7 @@ import { applyItemEvent, mergeSnapshotItems, upsertItem, type DisplayItem } from
 import { mergeTurnSnapshot } from './thread-sync';
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from './conversation-selection';
 import { randomUUID } from './uuid';
+import { interruptConflictCandidate } from './turn-interrupt';
 
 export type SelectedConversationText = ConversationSelectionSource;
 export type SideChatState = {
@@ -37,6 +38,8 @@ export function useSideChat(api: any, mainState: any) {
   let threadEnded = false;
   let identity: { authenticationGeneration?: number; engineId?: string | null } | null = null;
   let recovering: Promise<void> | null = null;
+  let interruptGeneration = 0;
+  let interruptRequest: { source: SelectedConversationText; threadId: string; version: number; authenticationGeneration?: number; engineId?: string | null; promise: Promise<void> } | null = null;
   let eventRevision = 0;
   const revisions = new Map<string, number>();
   const turnRevisions = new Map<string, number>();
@@ -89,6 +92,8 @@ export function useSideChat(api: any, mainState: any) {
   }
   function reset() {
     ++generation;
+    ++interruptGeneration;
+    interruptRequest = null;
     state.open = false;
     state.source = null;
     state.threadId = '';
@@ -486,13 +491,69 @@ export function useSideChat(api: any, mainState: any) {
     const answer = [...state.items].reverse().find(item => item.type === 'agentMessage' && item.text?.trim());
     return answer ? normalizeConversationSelection({ ...state.source, itemId: undefined, turnId: undefined, text: answer.text }) : null;
   }
-  async function interrupt() {
-    if (!state.source || !state.threadId) return;
+  function interrupt(): Promise<void> {
+    const source = state.source;
+    const threadId = state.threadId;
+    if (!source || !threadId) return Promise.resolve();
+    if (threadId === source.threadId) return Promise.reject(new Error('无法确认独立的侧边分支，请重新打开侧边聊天'));
+    if (!canConnect() || !state.connected) return Promise.reject(new Error('工作站尚未连接，请等待连接恢复'));
+    if (requestPending || state.loading || state.saving) return Promise.reject(new Error('侧边任务正在准备，请等待轮次确认后再停止'));
     if (!activeTurnId) {
-      if (state.busy) throw new Error('无法确定侧边任务的轮次，请等待状态更新或关闭侧边聊天');
-      return;
+      return state.busy ? Promise.reject(new Error('无法确定侧边任务的轮次，请等待状态更新或关闭侧边聊天')) : Promise.resolve();
     }
-    await call(state.source.hostId, 'turn/interrupt', { threadId: state.threadId, turnId: activeTurnId });
+    const version = generation;
+    const requestIdentity = runtimeIdentity();
+    if (interruptRequest?.source === source && interruptRequest.threadId === threadId && interruptRequest.version === version &&
+        interruptRequest.authenticationGeneration === requestIdentity.authenticationGeneration && interruptRequest.engineId === requestIdentity.engineId)
+      return interruptRequest.promise;
+    const operation = ++interruptGeneration;
+    const turnId = activeTurnId;
+    const current = () => operation === interruptGeneration && stillCurrent(version, source) && state.source === source &&
+      state.threadId === threadId && canConnect() && state.connected && !requestPending && !state.loading && !state.saving &&
+      runtimeIdentity().authenticationGeneration === requestIdentity.authenticationGeneration && runtimeIdentity().engineId === requestIdentity.engineId;
+    const changed = () => new Error('侧边任务轮次已变化，请同步侧边聊天后再停止。');
+    const promise = (async () => {
+      try {
+        try { await call(source.hostId, 'turn/interrupt', { threadId, turnId }); return; }
+        catch (cause) {
+          if (!current()) return;
+          const candidate = interruptConflictCandidate(cause, turnId);
+          if (!candidate) throw cause;
+          const otherLiveTurn = () => !!activeTurnId && activeTurnId !== turnId && activeTurnId !== candidate;
+          if (otherLiveTurn()) throw changed();
+          const revision = eventRevision;
+          // Verify only the newest native turn. Ephemeral stores which cannot
+          // page history stay protected; never resume or read the parent here.
+          const page = await call(source.hostId, 'thread/turns/list', {
+            threadId, cursor: null, limit: 1, sortDirection: 'desc', itemsView: 'summary',
+          });
+          if (!current()) return;
+          // A newer turn observed before the read also outranks stored history.
+          if (otherLiveTurn()) throw changed();
+          const latest = Array.isArray(page?.data) ? page.data[0] : undefined;
+          if (!latest || latest.id !== candidate) throw changed();
+          const known = state.turns.find(turn => turn.id === candidate);
+          const runtimeChanged = eventRevision !== revision;
+          if (runtimeChanged && (activeTurnId !== candidate || !state.busy)) {
+            if ((!activeTurnId || activeTurnId === turnId) && ['completed', 'failed', 'interrupted'].includes(known?.status)) {
+              activeTurnId = ''; state.busy = false;
+              return;
+            }
+            throw changed();
+          }
+          if (['completed', 'failed', 'interrupted'].includes(latest.status)) {
+            if (!runtimeChanged) { activeTurnId = ''; state.busy = false; }
+            return;
+          }
+          if (latest.status !== 'inProgress' || ['completed', 'failed', 'interrupted'].includes(known?.status)) throw changed();
+          if (!runtimeChanged) { activeTurnId = candidate; state.busy = true; }
+          try { await call(source.hostId, 'turn/interrupt', { threadId, turnId: candidate }); }
+          catch (error) { throw interruptConflictCandidate(error, candidate) ? changed() : error; }
+        }
+      } catch (error) { if (current()) throw error; }
+    })().finally(() => { if (interruptRequest?.promise === promise) interruptRequest = null; });
+    interruptRequest = { source, threadId, version, ...requestIdentity, promise };
+    return promise;
   }
   async function recover() {
     if (recovering) return recovering;
@@ -542,6 +603,8 @@ export function useSideChat(api: any, mainState: any) {
   const unsubscribe = api.subscribeProtocol?.((hostId: string, message: any) => {
     const { method, params: params = {} } = message;
     if (method === 'bridge/disconnecting' && state.source) {
+      ++interruptGeneration;
+      interruptRequest = null;
       const nextIdentity = runtimeIdentity();
       if (params.permanent || identity?.authenticationGeneration !== nextIdentity.authenticationGeneration) void close();
       else state.connected = false;

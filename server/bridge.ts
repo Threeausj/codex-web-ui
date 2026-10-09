@@ -18,7 +18,7 @@ export { shellQuote } from './ssh.js'
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
-type Approval = { message: RpcMessage }
+type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
 export type ReleasedThread = { name: string; restoreThreadIds: string[] }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
@@ -324,6 +324,54 @@ export class Bridge {
     this.clientChannels.get(key)?.send(message)
   }
 
+  private observeProtocol(message: RpcMessage, responseMethod?: string) {
+    // Push providers and other observers cannot stall the native protocol.
+    try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message, responseMethod)).catch(() => {}) } catch {}
+  }
+
+  private removeApproval(key: string) {
+    const approval = this.approvals.get(key)
+    clearTimeout(approval?.timer)
+    this.approvals.delete(key)
+    return approval
+  }
+
+  private announceResolution(approval: Approval) {
+    const params = approval.message.params as { threadId?: string; conversationId?: string } | undefined
+    const resolved = { method: 'serverRequest/resolved', params: { requestId: approval.message.id, threadId: params?.threadId || params?.conversationId } }
+    this.observeProtocol(resolved)
+    this.broadcast(resolved)
+  }
+
+  private questionDeadline(approval: Approval) {
+    if (!['item/tool/requestUserInput', 'tool/requestUserInput'].includes(approval.message.method || '')) return null
+    const params = approval.message.params as { bridgeUserInputContext?: { autoResolveAt?: number | null } } | undefined
+    return params?.bridgeUserInputContext?.autoResolveAt ?? null
+  }
+
+  private scheduleQuestionResolution(key: string, approval: Approval) {
+    const deadline = this.questionDeadline(approval)
+    if (deadline === null) return
+    clearTimeout(approval.timer)
+    approval.timer = setTimeout(() => {
+      if (this.approvals.get(key) !== approval) return
+      if (deadline > Date.now()) { this.scheduleQuestionResolution(key, approval); return }
+      this.resolveUnansweredQuestion(key, approval)
+    }, Math.min(0x7fffffff, Math.max(0, deadline - Date.now())))
+    approval.timer.unref?.()
+  }
+
+  private resolveUnansweredQuestion(key: string, approval: Approval) {
+    if (this.approvals.get(key) !== approval || !this.connected) return
+    try {
+      // A timer never grants permission, chooses an option or sends drafts.
+      this.send({ id: approval.message.id, result: { answers: {} } })
+    } catch (error) { this.disconnect(error as Error); return }
+    this.removeApproval(key)
+    this.announceResolution(approval)
+    for (const client of this.clients.keys()) this.status(client)
+  }
+
   diagnostics() {
     this.pruneReplay()
     return { engineId: this.engineId || null, userAgent: this.userAgent || null, connected: this.connected, paused: this.paused,
@@ -449,8 +497,15 @@ export class Bridge {
       const approvalKey = JSON.stringify(message.id)
       const approval = this.approvals.get(approvalKey)
       if (!approval) { this.clientSend(key, { method: 'bridge/error', params: { requestId: message.id, message: 'This request is unknown or was already answered' } }); return }
+      const deadline = this.questionDeadline(approval)
+      if (deadline !== null && deadline <= Date.now()) {
+        this.resolveUnansweredQuestion(approvalKey, approval)
+        this.clientSend(key, { method: 'bridge/error', params: { requestId: message.id, message: '此问题已按时限跳过，请同步对话后查看最新状态' } })
+        return
+      }
       this.send({ id: message.id, ...('error' in message ? { error: message.error } : { result: message.result }) })
-      this.approvals.delete(approvalKey)
+      this.removeApproval(approvalKey)
+      this.announceResolution(approval)
       for (const client of this.clients.keys()) this.status(client)
       return
     }
@@ -505,6 +560,15 @@ export class Bridge {
 
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
+    if (message.id !== undefined && ['item/tool/requestUserInput', 'tool/requestUserInput'].includes(message.method || '')) {
+      const p = message.params as Record<string, unknown> | undefined
+      const previous = this.approvals.get(JSON.stringify(message.id))?.message.params as { bridgeUserInputContext?: unknown } | undefined
+      const requestedAt = Date.now(), ms = p?.autoResolutionMs
+      const finiteTimeout = typeof ms === 'number' && Number.isSafeInteger(ms) && ms >= 0 && Number.isSafeInteger(requestedAt + ms)
+      message = { ...message, params: { ...p, bridgeUserInputContext: previous?.bridgeUserInputContext || {
+        requestedAt, autoResolveAt: finiteTimeout ? requestedAt + ms : null,
+      } } }
+    }
     this.observeContext(message)
     this.rememberApprovalItem(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
@@ -513,8 +577,7 @@ export class Bridge {
       if (id) this.hiddenArchiveEvents.add(id)
     }
     const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
-    // Observers must not stall or break RPC, even when a notification provider is offline.
-    try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message, pending?.method)).catch(() => {}) } catch {}
+    this.observeProtocol(message, pending?.method)
     if (message.id !== undefined && !message.method) {
       if (!pending) return
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
@@ -564,7 +627,11 @@ export class Bridge {
         ? { ...message, params: { ...p, bridgeApprovalContext: details.context } } : message
       // This application has one authenticated user. Their desktop and phone may
       // both review a request; only the first response to a pending server ID wins.
-      this.approvals.set(JSON.stringify(message.id), { message: prompt })
+      const key = JSON.stringify(message.id)
+      this.removeApproval(key)
+      const approval = { message: prompt }
+      this.approvals.set(key, approval)
+      this.scheduleQuestionResolution(key, approval)
       this.broadcast(prompt)
       return
     }
@@ -594,7 +661,21 @@ export class Bridge {
       }
       if (message.method === 'serverRequest/resolved') {
         const params = message.params as { requestId?: RpcId } | undefined
-        if (params?.requestId !== undefined) this.approvals.delete(JSON.stringify(params.requestId))
+        if (params?.requestId !== undefined) this.removeApproval(JSON.stringify(params.requestId))
+      }
+      // Native versions normally emit serverRequest/resolved themselves. Only
+      // blocking questions belong to a turn's lifetime; asynchronous questions
+      // can survive turn changes until native resolution or their own deadline.
+      if (['turn/started', 'turn/completed', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method)) {
+        for (const [key, approval] of this.approvals) {
+          if (!['item/tool/requestUserInput', 'tool/requestUserInput'].includes(approval.message.method || '')) continue
+          const question = approval.message.params as { threadId?: string; turnId?: string; isBlocking?: boolean } | undefined
+          if (!p?.threadId || !question || question.threadId !== p.threadId) continue
+          if (['turn/started', 'turn/completed'].includes(message.method) && question.isBlocking === false) continue
+          if (message.method === 'turn/started' && (!p.turn?.id || question.turnId === p.turn.id)) continue
+          if (message.method === 'turn/completed' && question.turnId !== p.turn?.id) continue
+          this.removeApproval(key); this.announceResolution(approval)
+        }
       }
       this.broadcast(message)
     }
@@ -611,7 +692,10 @@ export class Bridge {
     for (const process of [...this.processes.values()]) this.finishProcess(process.requestId, undefined, { code: -32000, message: error.message })
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error) }
     this.pending.clear()
-    this.approvals.clear()
+    for (const key of this.approvals.keys()) {
+      const approval = this.removeApproval(key)
+      if (approval) this.announceResolution(approval)
+    }
     this.approvalItems.clear(); this.approvalItemBytes = 0
     this.subscribedThreads.clear()
     this.activeThreads.clear()

@@ -11,6 +11,7 @@ import { subagentStatus } from "./subagents";
 import { mergeContextUsage } from "./context-usage";
 import { editableMessage, editedMessageInput } from "./message-edit";
 import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
+import { interruptConflictCandidate } from './turn-interrupt';
 import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
 import { revokeDevicePush } from "./pwa";
 import { useMessageQueue } from "./message-queue";
@@ -197,6 +198,7 @@ let loadedGlobalPages = false;
 let threadEventSequence = 0;
 let itemEventSequence = 0;
 let sendInFlight = false;
+let interruptOperation: { scope: string; socket: WebSocket | null; promise: Promise<void> } | null = null;
 let localCwd = "/tmp";
 let clientId = browserStorage.session.getItem("codex.clientId") ?? randomUUID();
 browserStorage.session.setItem("codex.clientId", clientId);
@@ -2147,7 +2149,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     if (reuseHistory) page.data = retainHistoryDetails(page.data, loadedHistory!.turns, live);
     state.turns = [...prefixTurns, ...[...page.data].reverse()];
     for (const turn of liveTurns) updateTurn(id, turn);
-    const running = state.turns.find((turn) => turn.status === "inProgress");
+    const running = [...state.turns].reverse().find((turn) => turn.status === "inProgress");
     if (!runtimeChanged) {
       if (running) activeTurns.set(id, running.id);
       else activeTurns.delete(id);
@@ -2828,19 +2830,82 @@ async function resendEditedMessage(itemId: string, text: string) {
   } finally { state.editingMessage = false; }
 }
 async function interrupt() {
+  const requestSocket = socket;
+  const requestScope = JSON.stringify([authenticationGeneration, state.hostId, state.activeThread?.id, selectionGeneration, engineId]);
+  if (interruptOperation?.scope === requestScope && interruptOperation.socket === requestSocket)
+    return interruptOperation.promise;
+  const promise = interruptOnce();
+  interruptOperation = { scope: requestScope, socket: requestSocket, promise };
+  try { return await promise; }
+  finally { if (interruptOperation?.promise === promise) interruptOperation = null; }
+}
+async function interruptOnce() {
   const id = state.activeThread?.id;
   const turnId = id && activeTurns.get(id);
   if (!id || !turnId) return;
   const hostId = state.hostId;
+  const generation = selectionGeneration;
+  const authentication = authenticationGeneration;
+  const requestSocket = socket;
+  const requestEngine = engineId;
+  const current = () => hostId === state.hostId && id === state.activeThread?.id &&
+    generation === selectionGeneration && authentication === authenticationGeneration &&
+    requestSocket === socket && requestEngine === engineId &&
+    state.connected && !state.runtimePaused && !state.threadReleased;
+  const changed = () => new Error('任务轮次已变化，请同步对话后再停止。');
   // Send both requests on the captured connection before awaiting either one.
   // A failed pause must not prevent the user's Stop from interrupting the turn.
   const pause = state.goal?.status === 'active'
     ? mutateGoal(hostId, id, { status: 'paused' }) : Promise.resolve(null);
-  const stop = rpc('turn/interrupt', { threadId: id, turnId });
+  const stop = rpc('turn/interrupt', { threadId: id, turnId }, 45000, { silentError: true });
   const [paused, interrupted] = await Promise.allSettled([pause, stop]);
-  if (paused.status === 'rejected' && hostId === state.hostId && state.activeThread?.id === id)
+  if (!current()) return;
+  if (paused.status === 'rejected')
     state.modeError = `停止已提交，目标暂停状态需确认：${paused.reason.message}`;
-  if (interrupted.status === 'rejected') throw interrupted.reason;
+  if (interrupted.status === 'fulfilled') return;
+  try {
+    const candidate = interruptConflictCandidate(interrupted.reason, turnId);
+    if (!candidate) throw interrupted.reason;
+    const otherLiveTurn = () => {
+      const live = activeTurns.get(id);
+      return !!live && live !== turnId && live !== candidate;
+    };
+    if (otherLiveTurn()) throw changed();
+    const revision = turnRevisions.get(id) ?? 0;
+    // A missed continuation can leave the browser's cached ID behind. Confirm
+    // only the most recent native turn, without loading a large conversation or
+    // reacquiring its writer. Never replay an uncertain Stop or follow new IDs
+    // indefinitely; there is at most one confirmed retry for this click.
+    const page = await historyReader.turns(JSON.stringify([authentication, hostId, requestEngine]),
+      (method, params) => rpc(method, params, 15000, { silentError: true }), {
+        threadId: id, cursor: null, limit: 1, sortDirection: 'desc',
+      });
+    if (!current()) return;
+    // Live events may already have advanced before this read began. A lagging
+    // history snapshot must neither replace nor clear that newer active turn.
+    if (otherLiveTurn()) throw changed();
+    const latest = page.data[0];
+    if (!latest || latest.id !== candidate || discardedTurns.has(candidate)) throw changed();
+    const runtimeChanged = (turnRevisions.get(id) ?? 0) !== revision;
+    if (!runtimeChanged && completedTurns.has(candidate)) {
+      noteRuntime(id, false);
+      return;
+    }
+    if (runtimeChanged && (activeTurns.get(id) !== candidate || !threadBusy.get(id))) {
+      if (!activeTurns.has(id) && !threadBusy.get(id) && completedTurns.has(candidate)) return;
+      throw changed();
+    }
+    if (['completed', 'failed', 'interrupted'].includes(latest.status)) {
+      if (!runtimeChanged) noteRuntime(id, false);
+      return;
+    }
+    if (latest.status !== 'inProgress' || completedTurns.has(candidate)) throw changed();
+    if (!runtimeChanged) noteRuntime(id, true, candidate);
+    try { await rpc('turn/interrupt', { threadId: id, turnId: candidate }, 45000, { silentError: true }); }
+    catch (error) { throw interruptConflictCandidate(error, candidate) ? changed() : error; }
+  } catch (error) {
+    if (current()) throw fail(error);
+  }
 }
 async function fork(lastTurnId?: string) {
   if (!state.activeThread) return;
