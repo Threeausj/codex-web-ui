@@ -26,6 +26,29 @@ function remoteFixture(mock: MockCodex) {
 }
 const recent = (page: any) => page.locator('[data-section="recent"]');
 
+for (const width of [1280, 390]) {
+  test(`the ${width}px sidebar footer shows actions without a redundant current-host selector`, async ({ page, mock }) => {
+    remoteFixture(mock);
+    await page.setViewportSize({ width, height: 844 });
+    await login(page);
+    if (width < 760) await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
+    const footer = page.locator(".sidebar-footer");
+    await expect(footer.getByRole("combobox")).toHaveCount(0);
+    await expect(footer.locator(".host-selector, .connection-dot")).toHaveCount(0);
+    await expect(footer.getByRole("button", { name: "自动化", exact: true })).toBeVisible();
+    await expect(footer.getByRole("button", { name: "资源管理", exact: true })).toBeVisible();
+    await expect(footer.locator(".settings-button")).toBeVisible();
+    if (width < 760) await page.getByRole("button", { name: "关闭侧边栏", exact: true }).click();
+    await page.getByRole("combobox", { name: "新对话主机", exact: true }).selectOption("ssh-test");
+    await expect(page.locator(".header-host")).toHaveText("开发服务器");
+    if (width < 760) {
+      await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
+      await expect(page.locator(".sidebar")).toHaveCSS("transform", "matrix(1, 0, 0, 1, 0, 0)");
+    }
+    await page.screenshot({ path: `.data/sidebar-clipboard-${width}.png` });
+  });
+}
+
 test("all hosts share navigation, same IDs and paths remain isolated, switching preserves local drafts", async ({
   page,
   mock,
@@ -153,9 +176,7 @@ test("a slow remote connection can be cancelled without resuming its ID on the l
   });
   await login(page);
   await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
-  await expect(
-    page.getByRole("combobox", { name: "选择主机", exact: true }),
-  ).toHaveValue("ssh-test");
+  await expect(page.locator(".header-host")).toHaveText("开发服务器");
   const input = page.getByRole("textbox", { name: "消息输入框", exact: true });
   await expect(input).toBeDisabled();
   await expect(

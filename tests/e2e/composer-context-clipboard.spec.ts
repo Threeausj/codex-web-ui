@@ -13,6 +13,17 @@ async function pasteImage(page: Page, name = "first-paste.png", filesEmpty = tru
   }, { name, filesEmpty, text });
 }
 
+async function captureUploads(page: Page) {
+  const bodies: Buffer[] = [];
+  await page.route("**/api/uploads", async route => {
+    const body = route.request().postDataBuffer()!;
+    bodies.push(body);
+    const names = [...body.toString().matchAll(/filename="([^"]+)"/g)].map(match => match[1]);
+    await route.fulfill({ status: 201, json: { files: names.map((name, index) => ({ name, path: `/test/uploads/${index}-${name}`, mime: "image/png", size: 4 })) } });
+  });
+  return bodies;
+}
+
 test("the first image paste reads clipboard items immediately and duplicated FileList entries upload only once", async ({ page }) => {
   const bodies: Buffer[] = [];
   await page.route("**/api/uploads", async (route) => {
@@ -45,6 +56,59 @@ test("normal text and mixed clipboard text keep the browser's default paste beha
   expect(mock.uploads).toHaveLength(0);
   expect(await pasteImage(page, "mixed.png", true, "图片说明")).toBe(false);
   await expect.poll(() => mock.uploads.length).toBe(1);
+});
+
+test("one paste uploads a clipboard image once even when its FileList alias has different metadata", async ({ page }) => {
+  const bodies = await captureUploads(page);
+  await login(page);
+  await page.getByRole("textbox", { name: "消息输入框" }).evaluate(element => {
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    const clipboard = new DataTransfer();
+    clipboard.items.add(new File([bytes], "clipboard.png", { type: "image/png", lastModified: 1 }));
+    Object.defineProperty(clipboard, "files", { value: [
+      new File([bytes], "image.png", { type: "image/png", lastModified: 2 }),
+    ] });
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }));
+  });
+  await expect(page.locator(".attachment")).toHaveCount(1);
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0].toString().match(/filename=/g)).toHaveLength(1);
+});
+
+test("different images with matching filenames and timestamps are both uploaded", async ({ page }) => {
+  const bodies = await captureUploads(page);
+  await login(page);
+  await page.getByRole("textbox", { name: "消息输入框" }).evaluate(element => {
+    const clipboard = new DataTransfer();
+    for (const bytes of [[137, 80, 78, 71], [137, 80, 78, 72]])
+      clipboard.items.add(new File([new Uint8Array(bytes)], "image.png", { type: "image/png", lastModified: 1 }));
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }));
+  });
+  await expect(page.locator(".attachment")).toHaveCount(2);
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0].toString().match(/filename=/g)).toHaveLength(2);
+});
+
+test("switching conversations during clipboard comparison cancels the stale upload", async ({ page, mock }) => {
+  await login(page);
+  await page.getByRole("textbox", { name: "消息输入框" }).evaluate(element => {
+    const clipboard = new DataTransfer();
+    const first = new File([new Uint8Array([137, 80, 78, 71])], "image.png", { type: "image/png", lastModified: 1 });
+    const originalRead = first.arrayBuffer.bind(first);
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    (window as any).releaseClipboardRead = release;
+    Object.defineProperty(first, "arrayBuffer", { value: async () => { await waiting; return originalRead(); } });
+    Object.defineProperty(clipboard, "files", { value: [first, new File([new Uint8Array([137, 80, 78, 71])], "alias.png", { type: "image/png", lastModified: 2 })] });
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }));
+  });
+  await expect(page.getByRole("button", { name: "上传文件或图片", exact: true })).toBeDisabled();
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(page.locator(".agent-message")).toContainText("历史保持可读");
+  await page.evaluate(() => (window as any).releaseClipboardRead());
+  await expect(page.getByRole("button", { name: "上传文件或图片", exact: true })).toBeEnabled();
+  await expect(page.locator(".attachment")).toHaveCount(0);
+  expect(mock.uploads).toHaveLength(0);
 });
 
 test("overlapping pastes cannot enable sending until every upload finishes", async ({ page }) => {

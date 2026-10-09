@@ -418,7 +418,7 @@ test("a late local snapshot cannot replace the remote host's output after switch
     )
     .toBe("$1");
   await page
-    .getByRole("combobox", { name: "选择主机", exact: true })
+    .getByRole("combobox", { name: "新对话主机", exact: true })
     .selectOption("ssh-test");
   await expect(panel.locator(".tmux-host")).toHaveText("开发服务器");
   await expect(panel.getByLabel("Tmux 输出快照")).toContainText(
