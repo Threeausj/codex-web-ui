@@ -478,6 +478,9 @@ export class Bridge {
       threadId, method: pending.method === 'thread/queue/start' ? 'turn/start' : pending.method, result: changed, request, changeId,
       ...(originClientId ? { originClientId } : {}),
     } }
+    // Some runtimes acknowledge steering without emitting a userMessage item.
+    // Background observers need the accepted input as well as browser clients.
+    this.observeProtocol(message)
     const sequence = ++this.eventSequence
     this.rememberEvent({ ...message, bridgeEventSequence: sequence })
     for (const [key, socket] of this.clients)

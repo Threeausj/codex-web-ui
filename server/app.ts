@@ -17,6 +17,7 @@ import { registerPreferences } from './preferences.js'
 import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
 import { registerThreadGoals } from './thread-goals.js'
+import { registerAsyncQuestionAnswers } from './async-question-answers.js'
 import { registerThreadTakeover } from './thread-takeover.js'
 import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
@@ -137,6 +138,7 @@ export async function createApp(options: AppOptions = {}) {
   })
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
+  registerAsyncQuestionAnswers(app, getBridge)
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
   registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)

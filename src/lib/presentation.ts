@@ -1,5 +1,6 @@
 import type { DisplayItem } from "./events";
 import { activityBlocks, publicReasoningSummary } from './activity-presentation';
+import { asyncUserInputQuestions } from '../../shared/async-user-input';
 
 export type ConversationBlock =
   | { kind: "message"; id: string; item: DisplayItem }
@@ -72,12 +73,16 @@ export function turnPresentation(items: DisplayItem[]) {
   const answers = (explicit.length ? explicit : legacy.slice(-1)).filter(
     (item) => typeof item.text === "string" && !!item.text.trim(),
   );
-  const visible = new Set([...users, ...answers].map((item) => item.id));
+  // Asynchronous questions are user interactions even when native marks their
+  // prose as commentary or omits it entirely. Keep their controls visible.
+  const questions = messages.filter(item => asyncUserInputQuestions(item).length > 0);
+  const visible = new Set([...users, ...answers, ...questions].map((item) => item.id));
   const dividers = items.filter((item) => item.type === "contextCompaction");
   const answerIds = new Set(answers.map((item) => item.id));
   // Compaction can happen before a reply in the same turn. Preserve that
   // position instead of moving every divider behind the final answer.
-  const outputs = items.filter((item) => answerIds.has(item.id) || item.type === "contextCompaction");
+  const questionIds = new Set(questions.map(item => item.id));
+  const outputs = items.filter((item) => answerIds.has(item.id) || questionIds.has(item.id) || item.type === "contextCompaction");
   const activity = items.filter(
     (item) => !visible.has(item.id) && item.type !== "contextCompaction" &&
       (item.type !== 'reasoning' || !!publicReasoningSummary(item)),

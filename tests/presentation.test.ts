@@ -71,6 +71,21 @@ test("legacy unknown phases retain the last response; empty streaming answers do
   );
 });
 
+test('structured async questions stay visible outside process disclosures, including empty prose and earlier questions', () => {
+  const items = [
+    { id: 'question', type: 'agentMessage', delivery: 'async', phase: 'commentary', text: '需要补充选择', questions: [{ title: '选择执行范围？', options: ['当前项目', '全部项目'] }] },
+    { id: 'command', type: 'commandExecution' },
+    { id: 'empty-question', type: 'agentMessage', delivery: 'async', phase: 'commentary', text: '', questions: [{ title: '请补充说明', options: null }] },
+    { id: 'final', type: 'agentMessage', phase: 'final_answer', text: '继续处理中的结果' },
+    { id: 'plain', type: 'agentMessage', phase: 'commentary', text: '选择什么？\n- 选项一\n- 选项二' },
+    { id: 'malformed', type: 'agentMessage', delivery: 'async', phase: 'commentary', text: '无有效问题', questions: [{ title: 42, options: ['A'] }] },
+  ];
+  const result = turnPresentation(items);
+  assert.deepEqual(result.outputs.map(item => item.id), ['question', 'empty-question', 'final']);
+  assert.deepEqual(result.activity.map(item => item.id), ['command', 'plain', 'malformed']);
+  assert.equal(result.outputs.filter(item => item.id === 'question').length, 1);
+});
+
 test("turn grouping keeps independent histories and unacknowledged user messages separate", () => {
   const metadata = [
     { id: "one", durationMs: 5000 },
