@@ -4,7 +4,7 @@ import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
 import MessageQueuePanel from "./MessageQueuePanel.vue";
 import ModelServiceOptions from "./ModelServiceOptions.vue";
-import { clipboardFiles } from "../lib/clipboard";
+import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
@@ -30,6 +30,8 @@ const fileInput = ref<HTMLInputElement>();
 const dropping = ref(false);
 const uploadCount = ref(0);
 const uploading = computed(() => uploadCount.value > 0);
+let uploadContextGeneration = 0;
+watch(() => [props.state.hostId, props.state.projectPath, props.state.activeThread?.id], () => { ++uploadContextGeneration; }, { flush: "sync" });
 const submitting = ref(false);
 const delivery = ref<"immediate" | "queue">("immediate");
 const queue = computed(() => props.api.messageQueue);
@@ -445,15 +447,18 @@ async function send() {
     pendingDraftSubmission = undefined;
   }
 }
-async function upload(list: FileList | File[] | null) {
+async function upload(list: FileList | File[] | null, fromClipboard = false) {
   if (!list?.length || props.contextBusy || props.state.switchingHost || props.state.selectingThread) return;
   // Copy browser-owned lists before any asynchronous work. Parallel pastes keep
   // sending disabled until every upload completes.
   const files = Array.from(list);
   const key = draftKey.value;
+  const generation = uploadContextGeneration;
   uploadCount.value++;
   try {
-    await props.api.uploadFiles(files, false);
+    const unique = fromClipboard ? await uniqueClipboardFiles(files) : files;
+    if (generation !== uploadContextGeneration || props.contextBusy || props.state.switchingHost || props.state.selectingThread) return;
+    await props.api.uploadFiles(unique, false);
   } catch (cause: any) {
     if (key === draftKey.value) emit("error", cause.message || "上传失败");
   } finally {
@@ -471,7 +476,7 @@ function paste(event: ClipboardEvent) {
   // Leave the browser's normal text insertion intact for mixed text/image
   // clipboards. Image-only pastes should not insert a browser-specific filename.
   if (!event.clipboardData?.getData("text/plain")) event.preventDefault();
-  void upload(files);
+  void upload(files, true);
 }
 function drop(event: DragEvent) {
   dropping.value = false;
@@ -607,6 +612,7 @@ onMounted(() => {
   window.visualViewport?.addEventListener("resize", fitPickerAfterLayout);
 });
 onBeforeUnmount(() => {
+  ++uploadContextGeneration;
   if (searchTimer) clearTimeout(searchTimer);
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);

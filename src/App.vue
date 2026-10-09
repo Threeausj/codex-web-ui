@@ -356,12 +356,6 @@ async function selectProject(project: any) {
     }
   });
 }
-async function switchHost(event: Event) {
-  if (state.editingMessage) return;
-  ++navigationSelection;
-  const id = (event.target as HTMLSelectElement).value;
-  await action(() => api.setHost(id));
-}
 async function chooseNewContext(hostId: string, path?: string) {
   if (state.activeThread || state.changingContext || state.switchingHost ||
       state.selectingThread || state.busy) return;
@@ -857,27 +851,6 @@ watch(() => [state.authenticated, state.loading], () => {
         />
       </div>
       <footer class="sidebar-footer">
-        <div class="host-selector">
-          <Icon
-            :name="currentHost?.kind === 'ssh' ? 'Server' : 'Monitor'"
-            :size="17"
-          /><select
-            :value="state.hostId"
-            :disabled="state.editingMessage"
-            @change="switchHost"
-            aria-label="选择主机"
-            title="新对话与工作区使用的主机；侧栏始终显示所有主机"
-          >
-            <option v-for="host in state.hosts" :key="host.id" :value="host.id">
-              {{ host.name }}
-            </option></select
-          ><span
-            class="connection-dot"
-            :class="{ connected: state.connected }"
-            :title="state.connected ? '已连接' : '未连接'"
-          ></span
-          ><Icon name="ChevronDown" :size="12" />
-        </div>
         <button class="sidebar-action automations-button" @click="automationsOpen = true; settingsOpen = resourcesOpen = sidebarOpen = false"><Icon name="Clock" :size="17" /><span>自动化</span><Icon name="ChevronRight" :size="14" /></button>
         <button class="sidebar-action resources-button" @click="openResources">
           <Icon name="Server" :size="17" /><span>资源管理</span><Icon name="ChevronRight" :size="14" />
