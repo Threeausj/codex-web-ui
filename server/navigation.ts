@@ -1,6 +1,6 @@
 import type { Express, RequestHandler } from "express";
 import { z } from "zod";
-import type { Bridge } from "./bridge.js";
+import { RpcFailure, type Bridge } from "./bridge.js";
 
 const cursor = z.string().max(8192).nullable().optional();
 const threadId = z.string().min(1).max(256);
@@ -64,6 +64,18 @@ const request = z.discriminatedUnion("method", [
       params: z.object({ threadId }).strict(),
     })
     .strict(),
+  z
+    .object({
+      method: z.literal("thread/name/set"),
+      params: z.object({ threadId, name: z.string().trim().min(1).max(1000) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("thread/delete"),
+      params: z.object({ threadId }).strict(),
+    })
+    .strict(),
 ]);
 
 /** Sidebar operations use the selected host's official app-server bridge without
@@ -76,7 +88,13 @@ export function registerNavigation(
     void (async () => {
       const { method, params } = request.parse(req.body);
       const bridge = await getBridge(String(req.params.hostId));
-      const result = await bridge.request(method, params);
+      let result: unknown;
+      try { result = await bridge.request(method, params); }
+      catch (error) {
+        if (method === "thread/delete" && error instanceof RpcFailure && error.rpc.code === -32601)
+          throw new RpcFailure({ ...error.rpc, message: "目标主机上的 Codex 不支持永久删除会话（thread/delete），请先升级 Codex；会话未被删除" });
+        throw error;
+      }
       res.json(result);
     })().catch(next);
   };

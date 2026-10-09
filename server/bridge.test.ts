@@ -916,3 +916,89 @@ test('approval previews survive reconnects, match the exact item scope and never
     assert.deepEqual(value.sent.find(message => message.id === 'approval')?.result, { decision: 'accept' });
   } finally { value.bridge.close(); }
 });
+
+test('successful permanent deletion synchronizes other clients and clears only that thread runtime and pending questions', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const observed: RpcMessage[] = []
+  const f = fixture({ onProtocolMessage: (_host, message) => { observed.push(message) } })
+  const owner = new Browser(), observer = new Browser()
+  f.bridge.attach('session:owner', owner.ws(), 'owner'); f.bridge.attach('session:observer', observer.ws(), 'observer')
+  try {
+    await f.bridge.connect()
+    for (const id of ['parent', 'child', 'unrelated']) {
+      const resumed = f.bridge.request('thread/resume', { threadId: id }); await tick()
+      f.receive({ id: f.sent.findLast(message => message.method === 'thread/resume')!.id, result: { thread: { id, name: `Name ${id}` } } })
+      await resumed
+      f.receive({ method: 'thread/tokenUsage/updated', params: { threadId: id, tokenUsage: { last: { totalTokens: 10 }, modelContextWindow: 100 } } })
+    }
+    f.receive({ method: 'item/started', params: { threadId: 'parent', turnId: 'old', item: { id: 'command', type: 'commandExecution', command: 'private old command' } } })
+    f.receive({ id: 'parent-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'parent', turnId: 'old', itemId: 'command' } })
+    f.receive({ id: 'parent-question', method: 'item/tool/requestUserInput', params: { threadId: 'parent', turnId: 'old', autoResolutionMs: 1000 } })
+    f.receive({ id: 'unrelated-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'unrelated', turnId: 'other', itemId: 'other' } })
+    owner.request({ id: 'delete', method: 'thread/delete', params: { threadId: 'parent' } }); await tick()
+    const request = f.sent.findLast(message => message.method === 'thread/delete')!
+    assert.ok(f.bridge.runtime.threads.some(thread => thread.id === 'parent'))
+    f.receive({ id: request.id, result: {} }); await tick()
+    const change = observer.sent.find(message => message.method === 'bridge/thread/changed' && (message.params as any).method === 'thread/delete')!
+    assert.equal((change.params as any).threadId, 'parent')
+    assert.equal(owner.sent.some(message => message.method === 'bridge/thread/changed' && (message.params as any).method === 'thread/delete'), false)
+    const responseIndex = owner.sent.findIndex(message => message.id === 'delete')
+    assert.ok(responseIndex >= 0 && responseIndex < owner.sent.findIndex(message => message.method === 'serverRequest/resolved'))
+    assert.deepEqual(f.bridge.runtime.threads.map(thread => thread.id).sort(), ['child', 'unrelated'])
+    assert.deepEqual(f.bridge.threadContext('parent'), { tokenUsage: null, compacting: false })
+    assert.ok(f.bridge.threadContext('unrelated').tokenUsage)
+    assert.deepEqual(observed.filter(message => message.method === 'serverRequest/resolved').map(message => (message.params as any).requestId).sort(), ['parent-approval', 'parent-question'])
+    f.receive({ method: 'thread/deleted', params: { threadId: 'parent' } })
+    f.receive({ method: 'thread/deleted', params: { threadId: 'child' } })
+    assert.deepEqual(f.bridge.runtime.threads.map(thread => thread.id), ['unrelated'])
+    assert.deepEqual(observer.sent.filter(message => message.method === 'thread/deleted').map(message => (message.params as any).threadId), ['parent', 'child'])
+    assert.equal(observed.filter(message => message.method === 'serverRequest/resolved').length, 2, 'Response plus native event must clear each pending request only once')
+    t.mock.timers.tick(1000)
+    assert.equal(f.sent.some(message => message.id === 'parent-question'), false)
+    const recovered = new Browser(); f.bridge.attach('recovered', recovered.ws(), 'recovered')
+    assert.deepEqual((recovered.sent[0]!.params as any).pendingRequests.map((request: any) => request.id), ['unrelated-approval'])
+    f.receive({ id: 'late-parent-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'parent', turnId: 'old', itemId: 'command' } })
+    assert.equal((observer.sent.find(message => message.id === 'late-parent-approval')!.params as any).bridgeApprovalContext, undefined, 'Deletion must discard cached operation previews')
+  } finally { f.bridge.close() }
+})
+
+test('active or failed native deletion preserves conversation state and never broadcasts accepted deletion', async () => {
+  const f = fixture(), browser = new Browser(), observer = new Browser()
+  f.bridge.attach('owner', browser.ws(), 'owner'); f.bridge.attach('observer', observer.ws(), 'observer')
+  try {
+    await f.bridge.connect()
+    const resumed = f.bridge.request('thread/resume', { threadId: 'running' }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/resume')!.id, result: { thread: { id: 'running', name: 'Keep this thread', status: { type: 'active' } } } }); await resumed
+    f.receive({ method: 'thread/tokenUsage/updated', params: { threadId: 'running', tokenUsage: { last: { totalTokens: 10 } } } })
+    browser.request({ id: 'active-delete', method: 'thread/delete', params: { threadId: 'running' } }); await tick()
+    assert.match(browser.sent.find(message => message.id === 'active-delete')!.error!.message, /正在运行.*暂停/)
+    assert.equal(f.sent.some(message => message.method === 'thread/delete'), false)
+    f.receive({ method: 'turn/completed', params: { threadId: 'running', turn: { id: 'turn', status: 'completed' } } })
+    browser.request({ id: 'unsupported-delete', method: 'thread/delete', params: { threadId: 'running' } }); await tick()
+    const error = { code: -32601, message: 'Method not found' }
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/delete')!.id, error }); await tick()
+    assert.deepEqual(browser.sent.find(message => message.id === 'unsupported-delete')!.error, error)
+    assert.equal(f.bridge.runtime.threads[0]!.name, 'Keep this thread')
+    assert.ok(f.bridge.threadContext('running').tokenUsage)
+    assert.equal(observer.sent.some(message => message.method === 'bridge/thread/changed' && (message.params as any).method === 'thread/delete'), false)
+    assert.equal(f.sent.some(message => ['thread/archive', 'turn/interrupt', 'fs/remove'].includes(message.method || '')), false)
+  } finally { f.bridge.close() }
+})
+
+test('permanent deletion cannot race the temporary archive and restore used to release a Web writer', async () => {
+  const f = fixture()
+  try {
+    await f.bridge.connect()
+    const resumed = f.bridge.request('thread/resume', { threadId: 'closing' }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/resume')!.id, result: { thread: { id: 'closing', name: 'Closing thread' } } }); await resumed
+    const closing = f.bridge.releaseThread('closing', async () => {}); void closing.catch(() => {})
+    await tick()
+    await assert.rejects(f.bridge.request('thread/delete', { threadId: 'unrelated-root' }), /正在关闭/)
+    assert.equal(f.sent.some(message => message.method === 'thread/delete'), false)
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/list')!.id, result: { data: [], nextCursor: null } }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/archive')!.id, result: {} }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/unarchive')!.id, result: { thread: { id: 'closing' } } }); await closing
+    await assert.rejects(f.bridge.request('thread/delete', { threadId: 'closing' }), /资源管理中重新连接.*重试/)
+    assert.equal(f.bridge.releasedThreads.has('closing'), true)
+  } finally { f.bridge.close() }
+})

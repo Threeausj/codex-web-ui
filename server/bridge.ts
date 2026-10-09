@@ -260,12 +260,14 @@ export class Bridge {
   }
 
   private checkThreadRequest(method: string, params: unknown) {
-    if (this.releasing.size && ['thread/archive', 'thread/unarchive'].includes(method))
-      throw Object.assign(new Error('会话正在关闭，请稍后再归档或恢复'), { status: 409 })
+    if (this.releasing.size && ['thread/archive', 'thread/unarchive', 'thread/delete'].includes(method))
+      throw Object.assign(new Error('会话正在关闭，请稍后再归档、恢复或删除'), { status: 409 })
     const id = (params as { threadId?: string } | undefined)?.threadId
+    if (id && method === 'thread/delete' && this.activeThreads.has(id))
+      throw Object.assign(new Error('此会话正在运行，请先暂停或等待完成后再删除'), { status: 409 })
     if (id && !['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/goal/get'].includes(method) &&
       (this.releasing.has(id) || this.releasedThreads.has(id) || [...this.releasedThreads.values()].some(entry => entry.restoreThreadIds.includes(id))))
-      throw Object.assign(new Error('此会话的 Web 连接已关闭，请在资源管理中重新连接会话'), { code: 'thread_released', status: 409 })
+      throw Object.assign(new Error('此会话的 Web 连接已关闭，请在资源管理中重新连接会话后重试'), { code: 'thread_released', status: 409 })
   }
   async request(method: string, params?: unknown, timeout = 120000): Promise<unknown> { await this.connect(); this.checkThreadRequest(method, params); return this.rawRequest(method, params, undefined, undefined, timeout) }
 
@@ -460,6 +462,7 @@ export class Bridge {
         changed = {}
         break
       case 'thread/archive':
+      case 'thread/delete':
       case 'turn/interrupt':
         changed = {}
         break
@@ -558,6 +561,23 @@ export class Bridge {
     }
   }
 
+  private forgetDeletedThread(threadId: string) {
+    this.subscribedThreads.delete(threadId)
+    this.activeThreads.delete(threadId)
+    this.threadNames.delete(threadId)
+    this.contexts.delete(threadId)
+    this.compactions.delete(threadId)
+    for (const [key, approval] of this.approvals) {
+      const params = approval.message.params as { threadId?: string; conversationId?: string } | undefined
+      if ((params?.threadId || params?.conversationId) !== threadId) continue
+      this.removeApproval(key); this.announceResolution(approval)
+    }
+    for (const [key, item] of this.approvalItems) {
+      if (JSON.parse(key)[0] !== threadId) continue
+      this.approvalItems.delete(key); this.approvalItemBytes -= item.bytes
+    }
+  }
+
   private receive(message: RpcMessage) {
     if (!message || typeof message !== 'object') throw new Error('Invalid protocol frame')
     if (message.id !== undefined && ['item/tool/requestUserInput', 'tool/requestUserInput'].includes(message.method || '')) {
@@ -602,6 +622,7 @@ export class Bridge {
         // Send the origin's accepted result before advancing its event cursor.
         // Otherwise an ACK followed by a disconnect could hide a lost result.
         if (pending.originalId !== undefined) pending.respond?.({ id: pending.originalId, result: message.result })
+        if (pending.method === 'thread/delete' && params?.threadId) this.forgetDeletedThread(params.threadId)
         if (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method)) this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
@@ -637,6 +658,7 @@ export class Bridge {
     }
     if (message.method) {
       const p = message.params as any
+      if (message.method === 'thread/deleted' && typeof p?.threadId === 'string') this.forgetDeletedThread(p.threadId)
       if (message.method === 'thread/name/updated' && p?.threadId) this.threadNames.set(p.threadId, String(p.threadName || p.name || '').slice(0, 160))
       if (['thread/archived', 'thread/unarchived'].includes(message.method) && this.hiddenArchiveEvents.has(p?.threadId)) return
       const event = message.params as { threadId?: string; turn?: { status?: string }; status?: { type?: string } } | undefined

@@ -644,8 +644,14 @@ export class MockCodex {
           configVersion: "test",
         });
       case "thread/name/set": {
-        const thread = this.threads.find((t) => t.id === p.threadId);
+        const thread = [...this.threads, ...this.archivedThreads].find((t) => t.id === p.threadId);
         if (thread) thread.name = p.name;
+        return this.reply(socket, request, {});
+      }
+      case "thread/delete": {
+        this.threads = this.threads.filter((thread) => thread.id !== p.threadId);
+        this.archivedThreads = this.archivedThreads.filter((thread) => thread.id !== p.threadId);
+        this.turns.delete(p.threadId);
         return this.reply(socket, request, {});
       }
       case "thread/archive": {
