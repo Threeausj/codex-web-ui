@@ -30,6 +30,8 @@ export const pwaState = reactive({
   canInstall: false,
   installing: false,
   updateAvailable: false,
+  updateBusy: false,
+  updateError: '',
   registrationStatus: 'idle' as 'idle' | 'development' | 'registering' | 'ready' | 'unavailable' | 'error',
   error: '',
   pushSupported: inBrowser && window.isSecureContext === true && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window,
@@ -48,6 +50,11 @@ let initialization: Promise<ServiceWorkerRegistration | null> | null = null;
 let deviceInitialization: Promise<void> | null = null;
 let deviceOperation: Promise<void> | null = null;
 let wantsReload = false;
+let pageNeedsReload = false;
+let lastController = inBrowser && 'serviceWorker' in navigator ? navigator.serviceWorker.controller : null;
+let updateTimer: ReturnType<typeof setTimeout> | undefined;
+const observedRegistrations = new WeakSet<ServiceWorkerRegistration>();
+const observedWorkers = new WeakSet<ServiceWorker>();
 let listenersInstalled = false;
 let preferenceWrite: Promise<void> | null = null;
 let externalPreferencesPending = false;
@@ -68,6 +75,33 @@ function pushHttp(api: HttpApi, path: string, init: RequestInit = {}, reportErro
   const controller = new AbortController();
   const signal = init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
   return deadline(api.requestHttp(path, { ...init, signal }, reportError)).finally(() => controller.abort());
+}
+
+function refreshUpdateAvailability() {
+  pwaState.updateAvailable = pageNeedsReload || !!(registration?.waiting && registration.waiting.state !== 'redundant');
+}
+function reloadUpdatedApp() {
+  clearTimeout(updateTimer);
+  updateTimer = undefined;
+  wantsReload = false;
+  pwaState.updateBusy = false;
+  pwaState.updateError = '';
+  location.reload();
+}
+function observeRegistration(result: ServiceWorkerRegistration) {
+  const observeWorker = (worker: ServiceWorker | null) => {
+    if (!worker || observedWorkers.has(worker)) return;
+    observedWorkers.add(worker);
+    worker.addEventListener('statechange', () => {
+      refreshUpdateAvailability();
+      if (worker.state === 'installed' && (navigator.serviceWorker.controller || result.active)) pwaState.updateAvailable = true;
+    });
+  };
+  observeWorker(result.waiting);
+  observeWorker(result.installing);
+  if (observedRegistrations.has(result)) return;
+  observedRegistrations.add(result);
+  result.addEventListener('updatefound', () => { observeWorker(result.installing); refreshUpdateAvailability(); });
 }
 
 function installListeners() {
@@ -96,7 +130,8 @@ function installListeners() {
   });
   window.addEventListener('focus', () => {
     if ('Notification' in window) pwaState.pushPermission = Notification.permission;
-    if (registration && navigator.onLine) void registration.update().catch(() => {});
+    refreshUpdateAvailability();
+    if (registration && navigator.onLine) void registration.update().then(refreshUpdateAvailability).catch(() => {});
   });
   const displayMode = matchMedia('(display-mode: standalone)');
   displayMode.addEventListener('change', () => { pwaState.installed = installed(); });
@@ -113,7 +148,11 @@ function installListeners() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       // An update in another tab must not interrupt this tab's current chat.
-      if (wantsReload) { wantsReload = false; location.reload(); }
+      const controller = navigator.serviceWorker.controller;
+      if (lastController && controller !== lastController) pageNeedsReload = true;
+      lastController = controller;
+      refreshUpdateAvailability();
+      if (wantsReload) reloadUpdatedApp();
     });
     navigator.serviceWorker.addEventListener('message', (event) => {
       if (event.data?.type !== 'PUSH_NAVIGATE') return;
@@ -134,18 +173,16 @@ export function initPwa(): Promise<ServiceWorkerRegistration | null> {
     pwaState.registrationStatus = 'registering';
     try {
       const result = await deadline(navigator.serviceWorker.register(`/sw.js?build=${import.meta.env.VITE_BUILD_ID}`, { scope: '/', updateViaCache: 'none' }));
-      if (result.waiting) pwaState.updateAvailable = true;
-      result.addEventListener('updatefound', () => {
-        const worker = result.installing;
-        worker?.addEventListener('statechange', () => {
-          if (worker.state === 'installed' && (navigator.serviceWorker.controller || result.active)) pwaState.updateAvailable = true;
-        });
-      });
+      registration = result;
+      observeRegistration(result);
+      refreshUpdateAvailability();
       // Push subscriptions require an active worker, rather than a still-installing one.
       registration = await new Promise<ServiceWorkerRegistration>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('应用资源准备超时，请连接网络后刷新重试。')), 15_000);
         navigator.serviceWorker.ready.then((worker) => { clearTimeout(timeout); resolve(worker); }, (cause) => { clearTimeout(timeout); reject(cause); });
       });
+      observeRegistration(registration);
+      refreshUpdateAvailability();
       pwaState.registrationStatus = 'ready';
       return registration;
     } catch (cause: any) {
@@ -172,10 +209,37 @@ export async function installPwa() {
   }
 }
 
-export function updatePwa() {
-  if (!registration?.waiting) return;
-  wantsReload = true;
-  registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+export async function updatePwa() {
+  if (pwaState.updateBusy) return;
+  pwaState.updateError = '';
+  if (!navigator.onLine) { pwaState.updateError = '连接网络后再更新应用。'; return; }
+  pwaState.updateBusy = true;
+  try {
+    if (!registration) await initPwa();
+    if (!registration) throw new Error(pwaState.error || '应用更新尚未准备好，请刷新页面后重试。');
+    refreshUpdateAvailability();
+    const worker = registration.waiting;
+    if (!worker || worker.state === 'redundant') {
+      if (pageNeedsReload) { reloadUpdatedApp(); return; }
+      pwaState.updateBusy = false;
+      return;
+    }
+    wantsReload = true;
+    clearTimeout(updateTimer);
+    updateTimer = setTimeout(() => {
+      wantsReload = false;
+      pwaState.updateBusy = false;
+      refreshUpdateAvailability();
+      pwaState.updateError = '应用更新超时，请检查网络后重试，或手动刷新页面。';
+    }, 15000);
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  } catch (cause: any) {
+    clearTimeout(updateTimer);
+    wantsReload = false;
+    pwaState.updateBusy = false;
+    refreshUpdateAvailability();
+    pwaState.updateError = cause.message || '应用更新失败，请重试或刷新页面。';
+  }
 }
 
 export function onPushNavigate(callback: (destination: PushDestination) => void): () => void {
