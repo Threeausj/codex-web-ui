@@ -139,6 +139,46 @@ async function refresh() {
 async function restored() {
   if (archived.value) await query();
 }
+function resultChanged(thread: { id: string; hostId: string; name?: string }, remove = false) {
+  // A query started before the mutation must not bring the removed row or its
+  // former name back after the action has succeeded.
+  ++generation;
+  clearTimeout(searchTimer);
+  searching.value = false;
+  const matches = (item: any) => item.id === thread.id && item.hostId === thread.hostId;
+  results.value = remove
+    ? results.value.filter((item) => !matches(item))
+    : results.value.map((item) => matches(item) ? { ...item, name: thread.name } : item);
+}
+const seenChanges = new Set<string>();
+const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
+  const params = message.params || {};
+  if (message.method === "bridge/disconnecting" ||
+      (message.method === "bridge/status" && params.connected && !props.state.connected)) {
+    seenChanges.clear();
+    return;
+  }
+  if (typeof params.threadId !== "string") return;
+  if (message.method === "bridge/thread/changed") {
+    if (!["thread/name/set", "thread/delete", "thread/archive", "thread/unarchive"].includes(params.method)) return;
+    if (typeof params.changeId === "string") {
+      const key = `${hostId}:${params.changeId}`;
+      if (seenChanges.has(key)) return;
+      seenChanges.add(key);
+      if (seenChanges.size > 512) seenChanges.delete(seenChanges.values().next().value!);
+    }
+    if (params.method === "thread/name/set" && typeof params.request?.name === "string")
+      resultChanged({ id: params.threadId, hostId, name: params.request.name });
+    else if (params.method === "thread/delete" ||
+      (params.method === "thread/archive" && !archived.value) ||
+      (params.method === "thread/unarchive" && archived.value))
+      resultChanged({ id: params.threadId, hostId }, true);
+  } else if (message.method === "thread/deleted")
+    resultChanged({ id: params.threadId, hostId }, true);
+  else if (message.method === "thread/name/updated" && typeof (params.threadName ?? params.name) === "string")
+    resultChanged({ id: params.threadId, hostId, name: params.threadName ?? params.name });
+}) || (() => {});
+watch(() => [props.state.hostId, props.state.authenticated], () => seenChanges.clear());
 watch(
   () => [
     search.value,
@@ -165,6 +205,7 @@ watch(
 onBeforeUnmount(() => {
   clearTimeout(searchTimer);
   ++generation;
+  unsubscribe();
 });
 </script>
 <template>
@@ -218,6 +259,9 @@ onBeforeUnmount(() => {
         :archived="archived"
         @select="emit('select', $event)"
         @error="emit('error', $event)"
+        @renamed="resultChanged($event)"
+        @deleted="resultChanged($event, true)"
+        @restored="resultChanged($event, true)"
       />
       <p v-if="!results.length" class="nav-empty">
         {{

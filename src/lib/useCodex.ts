@@ -249,7 +249,9 @@ const itemRevisions = new Map<string, Map<string, number>>();
 const historyReader = new LazyHistoryReader();
 const historyDetailRequests = new Map<string, Promise<void>>();
 const threadRevisions = new Map<string, number>();
+const threadNameRevisions = new Map<string, number>();
 const removedThreads = new Set<string>();
+const deletedThreads = new Set<string>();
 const compactedSinceInput = new Set<string>();
 const permissionSelections = new Map<string, { mode: string; profileId: string }>();
 const localReverts = new Set<string>();
@@ -333,7 +335,9 @@ function clearConversationCaches() {
   historyReader.clear();
   historyDetailRequests.clear();
   threadRevisions.clear();
+  threadNameRevisions.clear();
   removedThreads.clear();
+  deletedThreads.clear();
   threadListScope = '';
   loadedMorePages = false;
   loadedGlobalPages = false;
@@ -674,7 +678,7 @@ async function normalizeThreadRecency(hostId: string, thread: any) {
   return { ...thread, recencyAt: await entry.pending };
 }
 async function normalizeThreadPage(hostId: string, result: any) {
-  const data = [...(result.data ?? [])];
+  const data = (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id)));
   let next = 0;
   // Missing recency is a compatibility path, bounded to four lightweight
   // metadata reads rather than fetching every chat's messages at once.
@@ -724,7 +728,7 @@ function mergeNavigation(hostId: string, threads: any[], replace = false) {
     (replace ? [] : nav.threads).map((thread) => [thread.id, thread]),
   );
   for (const thread of threads)
-    records.set(thread.id, { ...records.get(thread.id), ...thread });
+    if (!deletedThreads.has(recencyKey(hostId, thread.id))) records.set(thread.id, { ...records.get(thread.id), ...thread });
   nav.threads = [...records.values()];
 }
 function refreshHostNavigation(hostId: string): Promise<void> {
@@ -976,7 +980,7 @@ function currentItems(threadId: string): DisplayItem[] {
   return items;
 }
 function updateThread(thread: any) {
-  if (!thread?.id || thread.ephemeral) return;
+  if (!thread?.id || thread.ephemeral || deletedThreads.has(recencyKey(state.hostId, thread.id))) return;
   const previous = state.threads.find((item) => item.id === thread.id);
   thread = {
     ...thread,
@@ -1032,9 +1036,9 @@ function receiveThreadChange(change: any) {
     return;
   }
   if (method === 'thread/archive') { cleanupArchivedThread(threadId); return; }
+  if (method === 'thread/delete') { cleanupDeletedThread(threadId); return; }
   if (method === 'thread/name/set') {
-    const thread = state.threads.find(thread => thread.id === threadId) || (state.activeThread?.id === threadId ? state.activeThread : null);
-    if (thread && typeof request.name === 'string') updateThread({ ...thread, name: request.name });
+    if (typeof request.name === 'string') applyThreadRename(threadId, request.name);
     return;
   }
   if (method === 'thread/revert' || method === 'thread/rollback') {
@@ -1106,8 +1110,10 @@ function receive(message: any) {
       state.pendingRequests.push(message);
     return;
   }
-  if (consumed && message.method !== 'bridge/status' && message.method !== 'serverRequest/resolved') return;
+  if (consumed && !['bridge/status', 'serverRequest/resolved', 'thread/deleted'].includes(message.method)) return;
   const { method, params: p = {} } = message;
+  if (method === 'thread/deleted') { cleanupDeletedThread(p.threadId); return; }
+  if (p.threadId && deletedThreads.has(recencyKey(state.hostId, p.threadId))) return;
   if (p.threadId || method === 'bridge/thread/changed') scheduleConversationSnapshot(p.threadId);
   if (method === 'bridge/thread/changed') { receiveThreadChange(p); return; }
   if (method === "bridge/status") {
@@ -1234,8 +1240,8 @@ function receive(message: any) {
   }
   if (discardedTurns.has(p.turnId || p.turn?.id)) return;
   if (method === "thread/name/updated") {
-    const thread = state.threads.find((t) => t.id === p.threadId);
-    if (thread) updateThread({ ...thread, name: p.threadName ?? p.name });
+    const name = p.threadName ?? p.name;
+    if (typeof name === 'string') applyThreadRename(p.threadId, name);
   }
   if (method === "thread/status/changed") {
     const thread = state.threads.find((t) => t.id === p.threadId);
@@ -1962,6 +1968,7 @@ function selectThread(id: string, options: { preserveWriter?: boolean } = {}): P
   return promise;
 }
 async function selectThreadOnce(id: string, options: { preserveWriter?: boolean } = {}) {
+  if (deletedThreads.has(recencyKey(state.hostId, id))) throw new Error('此对话已删除，请选择其他对话');
   cancelGoalRefresh();
   const preserveWriter = options.preserveWriter === true && state.activeThread?.id === id &&
     !state.threadConflict && !state.threadReleased && !state.runtimePaused &&
@@ -1988,6 +1995,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     state.goalReadError = "";
   }
   const modeKey = recencyKey(hostId, id);
+  const nameRevision = threadNameRevisions.get(modeKey) ?? 0;
   const rememberedMode = conversationModes.get(modeKey) || (previousId === id ? (state.goalMode ? 'goal' : state.collaborationMode) : 'default');
   state.collaborationMode = rememberedMode === 'plan' ? 'plan' : 'default';
   if (previousId !== id) state.permissionChangePending = false;
@@ -2091,6 +2099,8 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     }
     const runtimeChanged = (turnRevisions.get(id) ?? 0) !== runtimeRevision;
     const latestStatus = state.activeThread?.status;
+    const latestName = state.activeThread?.name;
+    const nameChanged = (threadNameRevisions.get(modeKey) ?? 0) !== nameRevision;
     const previousProject = state.projectPath;
     state.activePermissionProfileId =
       previousId === id ? previousProfileId : "";
@@ -2110,6 +2120,8 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
         ? Math.max(resumedRecency, knownRecency ?? 0)
         : resumedRecency,
       ...(runtimeChanged && latestStatus ? { status: latestStatus } : {}),
+      // A rename accepted after this load began wins over its older snapshot.
+      ...(nameChanged && typeof latestName === 'string' ? { name: latestName } : {}),
     };
     if (result.thread.recencyAt == null)
       legacyRecency.set(recencyKey(hostId, id), {
@@ -2961,13 +2973,95 @@ function setAutoCompact(enabled: boolean, threshold = 85) {
     JSON.stringify(state.compactThreshold),
   );
 }
-async function renameThread(name: string) {
-  if (!state.activeThread || !name.trim()) return;
-  await rpc("thread/name/set", {
-    threadId: state.activeThread.id,
-    name: name.trim(),
-  });
-  updateThread({ ...state.activeThread, name: name.trim() });
+function applyThreadRename(id: string, name: string, hostId = state.hostId) {
+  const key = recencyKey(hostId, id);
+  if (deletedThreads.has(key)) return;
+  threadNameRevisions.set(key, (threadNameRevisions.get(key) ?? 0) + 1);
+  if (hostId === state.hostId) {
+    threadRevisions.set(id, ++threadEventSequence);
+    const thread = state.threads.find(thread => thread.id === id);
+    if (thread) thread.name = name;
+    if (state.activeThread?.id === id) {
+      state.activeThread = { ...state.activeThread, name };
+      saveConversationSnapshot();
+    } else conversationCache.remove(hostId, id);
+  } else conversationCache.remove(hostId, id);
+  const thread = state.navigation[hostId]?.threads.find(thread => thread.id === id);
+  if (thread) thread.name = name;
+  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+}
+async function renameThread(name: string, id = state.activeThread?.id, hostId = state.hostId) {
+  const trimmed = name.trim();
+  if (!id || !trimmed) return;
+  if (trimmed.length > 1000) throw new Error('对话名称不能超过 1000 个字符');
+  const authentication = authenticationGeneration;
+  await scopedRpc(hostId, 'thread/name/set', { threadId: id, name: trimmed });
+  if (authentication !== authenticationGeneration || !state.hosts.some(host => host.id === hostId)) return;
+  applyThreadRename(id, trimmed, hostId);
+}
+function cleanupDeletedThread(id: string, hostId = state.hostId) {
+  if (!id) return;
+  const key = recencyKey(hostId, id);
+  deletedThreads.add(key);
+  threadNameRevisions.delete(key);
+  if (hostId === state.hostId) {
+    cleanupArchivedThread(id);
+    activeTurns.delete(id);
+    threadBusy.delete(id);
+    turnRevisions.set(id, (turnRevisions.get(id) ?? 0) + 1);
+    itemRevisions.delete(id);
+    compactedSinceInput.delete(id);
+    revertedTurnCandidates.delete(id);
+    delete state.agentActivity[id];
+    state.pendingRequests = state.pendingRequests.filter(request =>
+      (request.params?.threadId || request.params?.conversationId) !== id);
+    if (writerAttachment?.hostId === hostId && writerAttachment.threadId === id) writerAttachment = null;
+  }
+  const nav = state.navigation[hostId];
+  if (nav) nav.threads = nav.threads.filter(thread => thread.id !== id);
+  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  conversationCache.remove(hostId, id);
+  void conversationCache.flush().catch(() => {});
+  for (const records of [goals, conversationModes, tokenUsages, compactions, permissionSelections, legacyRecency]) records.delete(key);
+  for (const revisions of [goalRevisions, tokenUsageRevisions, compactionRevisions])
+    revisions.set(key, (revisions.get(key) ?? 0) + 1);
+  for (const storage of [browserStorage.local, browserStorage.session]) {
+    storage.removeItem(`codex.draft.${hostId}.${id}`);
+    storage.removeItem(`codex.draft.${hostId}.${id}.quotes`);
+    storage.removeItem(`codex.historyDepth.${hostId}.${id}`);
+  }
+  const selections = saved<Record<string, string>>('codex.selectedThreadIds', {});
+  if (selections[hostId] === id) {
+    delete selections[hostId];
+    browserStorage.local.setItem('codex.selectedThreadIds', JSON.stringify(selections));
+  }
+  void privateState.remove('queue-outcome', JSON.stringify([hostId, id])).catch(() => {});
+  if (state.preferences.pins.some(pin => pin.hostId === hostId && pin.kind === 'thread' && pin.id === id)) {
+    void updatePreferences({ pins: state.preferences.pins.filter(pin =>
+      pin.hostId !== hostId || pin.kind !== 'thread' || pin.id !== id) }).catch(() => {
+      toast('对话已删除；置顶偏好未保存，请刷新确认');
+    });
+  }
+}
+async function deleteThread(id: string, hostId = state.hostId) {
+  const authentication = authenticationGeneration;
+  const running = () => hostId === state.hostId &&
+    (activeTurns.has(id) || threadBusy.get(id) || (state.activeThread?.id === id && state.busy));
+  if (running()) throw new Error('此会话正在运行，请先暂停或等待完成后再删除');
+  // Metadata also catches active writers in the desktop app or CLI without
+  // resuming the conversation or taking over their connection.
+  const result = await scopedRpc(hostId, 'thread/read', { threadId: id, includeTurns: false });
+  if (authentication !== authenticationGeneration || !state.hosts.some(host => host.id === hostId))
+    throw new Error('登录状态或目标主机已变化，请重新确认后删除');
+  if (result.thread?.id !== id) throw new Error('无法确认目标对话，请刷新列表后重试');
+  if (running() || result.thread?.status?.type === 'active')
+    throw new Error('此会话正在运行，请先暂停或等待完成后再删除');
+  try { await scopedRpc(hostId, 'thread/delete', { threadId: id }); }
+  catch (error: any) {
+    if (error?.code === -32601) error.message = '目标主机上的 Codex 不支持永久删除会话，请先升级 Codex；会话未被删除';
+    throw error;
+  }
+  if (authentication === authenticationGeneration && state.hosts.some(host => host.id === hostId)) cleanupDeletedThread(id, hostId);
 }
 function cleanupArchivedThread(id: string) {
   removedThreads.add(id);
@@ -4540,6 +4634,7 @@ export function useCodex() {
     compact,
     setAutoCompact,
     renameThread,
+    deleteThread,
     archiveThread,
     setProject,
     addProject,

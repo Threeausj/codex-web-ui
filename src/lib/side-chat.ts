@@ -34,6 +34,7 @@ export function useSideChat(api: any, mainState: any) {
   let generation = 0;
   let activeTurnId = '';
   let requestPending = false;
+  let savingOperation = 0;
   let disposed = false;
   let threadEnded = false;
   let identity: { authenticationGeneration?: number; engineId?: string | null } | null = null;
@@ -92,6 +93,7 @@ export function useSideChat(api: any, mainState: any) {
   }
   function reset() {
     ++generation;
+    ++savingOperation;
     ++interruptGeneration;
     interruptRequest = null;
     state.open = false;
@@ -354,6 +356,7 @@ export function useSideChat(api: any, mainState: any) {
     const version = generation;
     const current = () => stillCurrent(version, source);
     const savedScopeKey = saveScope(source);
+    const savingVersion = ++savingOperation;
     const batch = pendingSaveBatch || (() => {
       const entries = visibleMessages().filter(item => savedMessages.get(item.key) !== item.text);
       const marker = randomUUID();
@@ -439,7 +442,7 @@ export function useSideChat(api: any, mainState: any) {
       throw cause;
     } finally {
       if (saved) await call(source.hostId, 'thread/unsubscribe', { threadId: saved }).catch(() => {});
-      if (generation === version) state.saving = false;
+      if (savingOperation === savingVersion) state.saving = false;
     }
   }
   async function resumeSavedBranch(threadId: string) {
@@ -448,6 +451,7 @@ export function useSideChat(api: any, mainState: any) {
       throw new Error('请先完成当前任务并连接主机');
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(threadId) || threadId === source.threadId) throw new Error('请输入已创建分支的有效对话 ID');
     const version = generation;
+    const savingVersion = ++savingOperation;
     const current = () => stillCurrent(version, source);
     const policy = readOnlyPolicy();
     state.saving = true; state.error = '';
@@ -483,7 +487,7 @@ export function useSideChat(api: any, mainState: any) {
       throw cause;
     } finally {
       if (verified) await call(source.hostId, 'thread/unsubscribe', { threadId }).catch(() => {});
-      if (generation === version) state.saving = false;
+      if (savingOperation === savingVersion) state.saving = false;
     }
   }
   function answerQuote() {
@@ -653,9 +657,19 @@ export function useSideChat(api: any, mainState: any) {
       }
     }
     if (method === 'error') state.error = params.error?.message || '侧边聊天运行失败';
-    if (method === 'thread/closed') {
+    if (method === 'thread/closed' || method === 'thread/deleted') {
+      // A delayed start/read acknowledgement must not revive an ended branch.
+      // Keep any in-flight formal save and its durable receipt until it settles;
+      // it has its own identity so invalidating this renderer cannot strand it.
+      ++generation;
+      ++interruptGeneration;
+      interruptRequest = null;
+      ++eventRevision;
+      requestPending = false;
+      recovering = null;
       state.threadId = '';
       state.busy = false;
+      state.loading = false;
       activeTurnId = '';
       threadEnded = true;
       state.error = '临时侧边聊天已结束，重新发送会创建新分支';

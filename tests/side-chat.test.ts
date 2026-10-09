@@ -491,3 +491,84 @@ test('a failed durable pin remains an incomplete save and retries the same nativ
     assert.equal(value.calls.filter(call => call.method === 'turn/start').length, 1);
   } finally { value.controller.dispose(); }
 });
+
+for (const method of ['thread/deleted', 'thread/closed']) {
+  test(`${method} invalidates a pending start acknowledgement and permits a fresh independent side branch`, async () => {
+    const f = fixture(), held = deferred<any>();
+    try {
+      f.controller.prepare(selected);
+      f.overrides.set('turn/start', () => held.promise);
+      const sending = f.controller.send('待确认的问题');
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.controller.state.threadId, 'side');
+      assert.equal(f.controller.state.loading, true);
+      f.emit(method, { threadId: 'side' });
+      assert.equal(f.controller.state.threadId, '');
+      assert.equal(f.controller.state.loading, false);
+      assert.equal(f.controller.state.busy, false);
+      held.resolve({ turn: { id: 'late-old-turn', status: 'inProgress', items: [] } });
+      await sending;
+      assert.equal(f.controller.state.busy, false);
+      assert.equal(f.controller.state.turns.some(turn => turn.id === 'late-old-turn'), false);
+      f.overrides.set('thread/fork', () => ({ thread: { id: 'fresh-side', ephemeral: true } }));
+      f.overrides.set('turn/start', () => ({ turn: { id: 'fresh-turn', status: 'inProgress', items: [] } }));
+      await f.controller.send('新的侧边问题');
+      assert.equal(f.controller.state.threadId, 'fresh-side');
+      assert.equal(f.controller.state.busy, true);
+      assert.deepEqual(f.controller.state.turns.map(turn => turn.id), ['fresh-turn']);
+      assert.equal(f.controller.state.items.filter(item => item.type === 'userMessage').length, 1);
+      assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2);
+      assert.equal(f.calls.some(call => call.method === 'turn/interrupt' && call.params.threadId === 'parent'), false);
+    } finally { held.resolve({ turn: { id: 'late-old-turn', status: 'inProgress' } }); f.controller.dispose(); }
+  });
+}
+
+test('a delayed recovery cannot revive a deleted side branch or block recovery of its replacement', async () => {
+  const f = fixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('旧的问题');
+    f.overrides.set('thread/turns/list', () => held.promise);
+    const recovering = f.controller.recover(); await new Promise(resolve => setImmediate(resolve));
+    f.emit('thread/deleted', { threadId: 'side' });
+    f.overrides.set('thread/fork', () => ({ thread: { id: 'fresh-side', ephemeral: true } }));
+    f.overrides.set('turn/start', () => ({ turn: { id: 'fresh-turn', status: 'inProgress', items: [] } }));
+    await f.controller.send('新的问题');
+    f.overrides.set('thread/turns/list', () => ({ data: [{ id: 'fresh-turn', status: 'completed', items: [] }], nextCursor: null }));
+    await f.controller.recover();
+    assert.equal(f.controller.state.busy, false);
+    held.resolve({ data: [{ id: 'old-turn', status: 'inProgress', items: [{ id: 'stale-answer', type: 'agentMessage', text: '过时内容' }] }], nextCursor: null });
+    await recovering;
+    assert.equal(f.controller.state.threadId, 'fresh-side');
+    assert.equal(f.controller.state.busy, false);
+    assert.deepEqual(f.controller.state.turns.map(turn => turn.id), ['fresh-turn']);
+    assert.equal(f.controller.state.items.some(item => item.id === 'stale-answer'), false);
+  } finally { held.resolve({ data: [], nextCursor: null }); f.controller.dispose(); }
+});
+
+test('ending the temporary side branch does not lose or duplicate an in-flight formal save receipt', async () => {
+  const f = savedSidebarFixture(), held = deferred<any>();
+  let reloaded: ReturnType<typeof useSideChat> | undefined;
+  try {
+    f.controller.prepare(selected); await f.controller.send('需要保留的问答');
+    f.overrides.set('thread/fork', () => held.promise);
+    const saving = f.controller.saveBranch(); await new Promise(resolve => setImmediate(resolve));
+    f.emit('thread/deleted', { threadId: 'side' });
+    assert.equal(f.controller.state.threadId, '');
+    assert.equal(f.controller.state.saving, true, 'The native formal fork must settle before another formal save can start');
+    await assert.rejects(f.controller.saveBranch(), /先完成侧边提问/);
+    held.resolve({ thread: { id: 'formal-kept', ephemeral: false, path: '/sessions/formal-kept.jsonl' } });
+    assert.equal(await saving, 'formal-kept');
+    assert.equal(f.controller.state.saving, false, 'A changed rendering generation must not strand saving state');
+    assert.equal(f.controller.state.threadId, '');
+    assert.equal(f.calls.some(call => call.method === 'thread/delete' || call.method === 'thread/archive'), false);
+    const receipt = await f.journal.read('side-branch-save', JSON.stringify(['local', 'parent']));
+    assert.equal(receipt.saved, 'formal-kept');
+    assert.match(JSON.stringify(receipt), /需要保留的问答/);
+    f.controller.dispose(); reloaded = useSideChat(f.api, f.main); reloaded.prepare(selected);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reloaded.state.saveTargetThreadId, 'formal-kept');
+    assert.equal(await reloaded.saveBranch(), 'formal-kept');
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
+    assert.equal(f.calls.find(call => call.method === 'thread/inject_items')?.params.threadId, 'formal-kept');
+  } finally { held.resolve({ thread: { id: 'formal-kept', ephemeral: false } }); reloaded?.dispose(); f.controller.dispose(); }
+});
