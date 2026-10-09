@@ -109,9 +109,10 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
         <div v-else class="pwa-instructions"><Icon name="Monitor" :size="17" /><span>在支持安装的浏览器中，通过地址栏安装图标或菜单中的<strong>安装应用</strong>添加到设备。</span></div>
       </template>
       <div class="pwa-update-row">
-        <span>{{ pwaState.updateAvailable ? '有新版本可用' : '更新会在准备好后提示，不会打断对话' }}</span>
-        <button v-if="pwaState.updateAvailable" class="button button-small button-secondary" :disabled="state.busy" @click="updatePwa"><Icon name="RefreshCw" :size="14" />更新应用</button>
+        <span>{{ pwaState.updateBusy ? '正在更新应用…' : pwaState.updateAvailable ? '有新版本可用' : '更新会在准备好后提示，不会打断对话' }}</span>
+        <button v-if="pwaState.updateAvailable || pwaState.updateError" class="button button-small button-secondary" :disabled="state.busy || pwaState.updateBusy" @click="updatePwa"><Icon name="RefreshCw" :size="14" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateBusy ? '正在更新…' : '更新应用' }}</button>
       </div>
+      <p v-if="pwaState.updateError" class="pwa-subtle" role="alert">{{ pwaState.updateError }}</p>
       <p v-if="pwaState.updateAvailable && state.busy" class="pwa-subtle">等待当前任务完成后再更新。</p>
     </section>
 

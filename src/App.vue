@@ -1030,9 +1030,9 @@ watch(() => [state.authenticated, state.loading], () => {
             : "App Server 已断开，正在尝试重连…"
         }}
       </div>
-      <div v-if="pwaState.updateAvailable" class="connection-banner" role="status">
-        <Icon name="Download" :size="15" />应用有新版本
-        <button class="button button-small button-secondary" :disabled="state.busy || actionBusy" @click="updatePwa()">{{ state.busy ? '任务完成后更新' : '更新应用' }}</button>
+      <div v-if="pwaState.updateAvailable || pwaState.updateError" class="connection-banner" role="status">
+        <Icon :name="pwaState.updateBusy ? 'LoaderCircle' : 'Download'" :size="15" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateError || (pwaState.updateBusy ? '正在更新应用…' : '应用有新版本') }}
+        <button class="button button-small button-secondary" :disabled="state.busy || actionBusy || pwaState.updateBusy" @click="updatePwa()">{{ state.busy ? '任务完成后更新' : pwaState.updateBusy ? '正在更新…' : '更新应用' }}</button>
       </div>
       <button
         v-if="otherRequests.length"

@@ -110,6 +110,7 @@ async function openPushSettings(page: Page) {
 test("built PWA installs its real worker, caches public resources only and starts offline without private history", async ({ page, context }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await loginBuilt(page);
+  await expect(page.getByRole("button", { name: "更新应用", exact: true })).toHaveCount(0);
   const manifest = await (await context.request.get(origin + "/manifest.webmanifest")).json();
   expect(manifest.display).toBe("standalone");
   expect(manifest.launch_handler).toEqual({ client_mode: "focus-existing" });
@@ -353,6 +354,64 @@ test("a waiting production worker prompts for update and cannot reload an active
     await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
     await expect(ready).toHaveCount(0);
     expect(mock.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+  } finally { workerRevision = ""; }
+});
+
+test("an update activated by another window remains actionable without interrupting this window", async ({ page, context, mock }) => {
+  await loginBuilt(page);
+  await page.getByRole("textbox", { name: "消息输入框", exact: true }).fill("另一窗口更新时保留的草稿");
+  const other = await context.newPage();
+  await mock.install(other);
+  await loginBuilt(other, publicKey, true);
+  workerRevision = "\n// another-window-update-fixture\n";
+  let navigations = 0;
+  page.on("domcontentloaded", () => { navigations++; });
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    const update = page.getByRole("button", { name: "更新应用", exact: true });
+    await expect(update).toBeVisible();
+    await other.evaluate(async () => {
+      const registration = (await navigator.serviceWorker.getRegistration())!;
+      await new Promise<void>(resolve => {
+        navigator.serviceWorker.addEventListener("controllerchange", () => resolve(), { once: true });
+        registration.waiting!.postMessage({ type: "SKIP_WAITING" });
+      });
+    });
+    await expect.poll(() => page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())!.waiting)).toBe(false);
+    expect(navigations).toBe(0);
+    await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toHaveValue("另一窗口更新时保留的草稿");
+    await expect(update).toBeEnabled();
+    await Promise.all([page.waitForEvent("domcontentloaded"), update.click()]);
+    await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toHaveValue("另一窗口更新时保留的草稿");
+    await expect(update).toHaveCount(0);
+    expect(mock.request("turn/start")).toBeUndefined();
+  } finally { workerRevision = ""; await other.close(); }
+});
+
+test("stalled worker activation shows progress, reports a timeout and permits retry", async ({ page }) => {
+  await loginBuilt(page);
+  workerRevision = "\n// stalled-activation-fixture\n";
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await expect(page.getByRole("button", { name: "更新应用", exact: true })).toBeVisible();
+    await page.evaluate(() => {
+      const original = ServiceWorker.prototype.postMessage;
+      (window as any).restoreWorkerMessaging = () => { ServiceWorker.prototype.postMessage = original; };
+      ServiceWorker.prototype.postMessage = function (message: any, options: any) {
+        if (message?.type !== "SKIP_WAITING") original.call(this, message, options);
+      };
+    });
+    await page.clock.install();
+    await page.getByRole("button", { name: "更新应用", exact: true }).click();
+    await expect(page.getByRole("button", { name: "正在更新…", exact: true })).toBeDisabled();
+    await page.clock.fastForward(15000);
+    await expect(page.getByRole("status").filter({ hasText: "应用更新超时" })).toBeVisible();
+    const retry = page.getByRole("button", { name: "更新应用", exact: true });
+    await expect(retry).toBeEnabled();
+    await page.evaluate(() => (window as any).restoreWorkerMessaging());
+    await Promise.all([page.waitForEvent("domcontentloaded"), retry.click()]);
+    await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
+    await expect(retry).toHaveCount(0);
   } finally { workerRevision = ""; }
 });
 
