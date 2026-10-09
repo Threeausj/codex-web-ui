@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { asyncUserInputQuestions } from '../../shared/async-user-input';
+import { asyncQuestionReplyText } from '../../shared/async-question-reply';
+import { asyncQuestionAnswered } from '../../shared/async-question-reply';
 import {
   test as base,
   expect,
@@ -58,6 +61,10 @@ export class MockCodex {
   hostMocks = new Map<string, MockCodex>();
   requests: Rpc[] = [];
   responses: Rpc[] = [];
+  asyncAnswers: { hostId: string; threadId: string; itemId: string; body: any }[] = [];
+  failAsyncAnswerNext = false;
+  asyncStatusRequests: { hostId: string; threadId: string; itemId: string; turnId: string | null }[] = [];
+  asyncStatusOverride: boolean | null = null;
   uploads: { body: Buffer; contentType: string }[] = [];
   sockets: WebSocketRoute[] = [];
   authenticated = false;
@@ -129,6 +136,48 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      const asyncStatusRoute = /^\/api\/threads\/([^/]+)\/([^/]+)\/async-questions\/([^/]+)\/status$/.exec(url.pathname);
+      if (asyncStatusRoute) {
+        const [, encodedHost, encodedThread, encodedItem] = asyncStatusRoute;
+        const hostId = decodeURIComponent(encodedHost!), threadId = decodeURIComponent(encodedThread!), itemId = decodeURIComponent(encodedItem!);
+        const target = hostId === 'local' ? this : this.hostMocks.get(hostId);
+        if (!target) return respond({ error: 'Host not found' }, 404);
+        target.asyncStatusRequests.push({ hostId, threadId, itemId, turnId: url.searchParams.get('turnId') });
+        const items = (target.turns.get(threadId) || []).flatMap(turn => turn.items);
+        const item = items.find(item => item.id === itemId);
+        return respond({ answered: target.asyncStatusOverride ?? asyncQuestionAnswered(item, items) });
+      }
+      const asyncAnswerRoute = /^\/api\/threads\/([^/]+)\/([^/]+)\/async-questions\/([^/]+)\/answer$/.exec(url.pathname);
+      if (asyncAnswerRoute) {
+        const [, encodedHost, encodedThread, encodedItem] = asyncAnswerRoute;
+        const hostId = decodeURIComponent(encodedHost!), threadId = decodeURIComponent(encodedThread!), itemId = decodeURIComponent(encodedItem!);
+        const target = hostId === 'local' ? this : this.hostMocks.get(hostId);
+        if (!target) return respond({ error: 'Host not found' }, 404);
+        const body = request.postDataJSON();
+        target.asyncAnswers.push({ hostId, threadId, itemId, body });
+        if (target.failAsyncAnswerNext) {
+          target.failAsyncAnswerNext = false;
+          return respond({ error: '模拟回答被拒绝，请重试' }, 422);
+        }
+        const turns = target.turns.get(threadId) || [];
+        const item = turns.flatMap(turn => turn.items).find(item => item.id === itemId);
+        const questions = asyncUserInputQuestions(item);
+        if (!questions.length || body.answers?.length !== questions.length) return respond({ error: 'Question not found' }, 404);
+        const input = [{ type: 'text', text: asyncQuestionReplyText(item, body.answers), text_elements: [] }];
+        const clientUserMessageId = `async-answer-${++target.count}`;
+        const active = turns.findLast(turn => turn.status === 'inProgress');
+        const method = active ? 'turn/steer' : 'turn/start';
+        const params = { threadId, input, clientUserMessageId, ...(active ? { expectedTurnId: active.id } : {}) };
+        return new Promise<void>(resolve => {
+          const sink = { send(raw: string) {
+            const message = JSON.parse(raw);
+            if (message.error) { void respond({ error: message.error.message }, 422).then(resolve); return; }
+            target.emit('bridge/thread/changed', { threadId, method, result: message.result, request: { input, clientUserMessageId }, changeId: `async-change-${clientUserMessageId}` });
+            void respond({ accepted: true, input, clientUserMessageId, ...message.result }).then(resolve);
+          } } as unknown as WebSocketRoute;
+          target.receive(sink, { id: `native-${clientUserMessageId}`, method, params });
+        });
+      }
       const fileRoute = /^\/api\/hosts\/([^/]+)\/files$/.exec(url.pathname);
       if (fileRoute) {
         const hostId = decodeURIComponent(fileRoute[1]!);

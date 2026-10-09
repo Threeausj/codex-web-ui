@@ -14,6 +14,7 @@ import { PushService, validatePushEndpoint, type PushOptions } from './push.js'
 import { createServer } from './app.js'
 import type { Transport } from './bridge.js'
 import type { RpcMessage } from './types.js'
+import { asyncQuestionReplyText } from '../shared/async-question-reply.js'
 
 const origin = 'http://localhost:8787'
 const password = 'push-isolated-password-123'
@@ -757,6 +758,166 @@ test('question reminder deadlines and cancellation survive push-service restart'
     service.observe(host, { id: 'already-skipped', method: 'item/tool/requestUserInput', params: { threadId: 't', autoResolutionMs: 0 } }); await service.flush()
     assert.equal(attempts, 1)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('native async message questions notify with every browser closed and deduplicate by item without leaking question content', async () => {
+  const app = await application()
+  try {
+    await app.push.subscribe('session', subscription('async-background'))
+    const bridge = await app.getBridge('local'); await bridge.connect()
+    assert.equal(bridge.diagnostics().browsers.connected, 0)
+    const fixture = app.transports[0]!
+    fixture.receive({ method: 'thread/started', params: { thread: { id: 't', name: '项目方案', source: 'cli' } } })
+    const question = { method: 'item/completed', params: { threadId: 't', turnId: 'running', item: {
+      id: 'async-choice', type: 'agentMessage', phase: 'final_answer', delivery: 'async',
+      text: 'Private question prose', questions: [{ title: 'Private question?', options: ['Private choice A', 'Private choice B'] }],
+    } } }
+    fixture.receive(question); fixture.receive(question)
+    fixture.receive({ method: 'item/completed', params: { threadId: 't', item: {
+      id: 'async-input', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private free text?', options: null }],
+    } } })
+    await app.push.flush()
+    assert.deepEqual(app.sent.map(entry => [entry.payload.title, entry.payload.body, (entry.payload.data as any).kind]), [
+      ['项目方案', '等待你的选择', 'approval'], ['项目方案', '等待补充输入', 'approval'],
+    ])
+    assert.notEqual(app.sent[0]!.payload.tag, app.sent[1]!.payload.tag)
+    assert.ok(!JSON.stringify(app.sent.map(entry => entry.payload)).includes('Private'))
+    assert.equal(fixture.messages.some(message => message.method === 'turn/start' || message.method === 'turn/steer'), false)
+  } finally { await app.cleanup() }
+})
+
+test('only completed structured async questions notify, with host isolation and normal approval preferences', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-async-validation-'))
+  const notices: any[] = []
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async (_device, payload) => { notices.push(JSON.parse(payload)) } })
+  try {
+    const device = subscription('async-validation'); await service.subscribe('session', device)
+    const item = { id: 'choice', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question', options: ['Private A', 'Private B'] }] }
+    for (const invalid of [{ ...item, delivery: null }, { ...item, questions: [] }, { ...item, questions: [{ title: '', options: ['A'] }] }, { ...item, questions: [{ title: 'Question', options: [42] }] }, { ...item, id: '' }, { id: 'prose', type: 'agentMessage', text: 'Question?\n- A\n- B' }])
+      service.observe(host, { method: 'item/completed', params: { threadId: 't', item: invalid } })
+    service.observe(host, { method: 'item/started', params: { threadId: 't', item } }); await service.flush()
+    assert.equal(notices.length, 0)
+    service.observe(host, { method: 'item/completed', params: { threadId: 't', item } }); await service.flush()
+    const other = { ...host, id: 'remote' }
+    service.observe(other, { method: 'item/completed', params: { threadId: 't', item } }); await service.flush()
+    assert.deepEqual(notices.map(notice => notice.data.hostId), ['local', 'remote'])
+    await service.updatePreferences('session', device.endpoint, { ...preferences, approval: false })
+    service.observe(host, { method: 'item/completed', params: { threadId: 't', item: { ...item, id: 'disabled' } } }); await service.flush()
+    assert.equal(notices.length, 2)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('a new user message durably cancels only async question reminders on its host and thread, including after restart', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-async-reply-'))
+  let clock = Date.now(), attempts = 0
+  const options: PushOptions = { now: () => clock, sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  const ask = { method: 'item/completed', params: { threadId: 't', turnId: 'old', item: { id: 'async-question', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question', options: ['A', 'B'] }] } } }
+  const reply = { method: 'item/started', params: { threadId: 't', item: { id: 'reply', type: 'userMessage', content: [{ type: 'text', text: asyncQuestionReplyText(ask.params.item, ['Private answer']) }] } } }
+  try {
+    await service.subscribe('session', subscription('async-reply'), { ...preferences, completed: false })
+    service.observe(host, ask)
+    service.observe(host, { id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'old' } }); await service.flush()
+    assert.equal(attempts, 2); assert.equal(service.status('session').queued, 2)
+    service.observe(host, { method: 'turn/completed', params: { threadId: 't', turn: { id: 'old', status: 'completed' } } })
+    service.observe(host, { method: 'turn/started', params: { threadId: 't', turn: { id: 'new', status: 'inProgress' } } }); await service.flush()
+    assert.equal(service.status('session').queued, 2)
+    await service.close(); service = await PushService.create(directory, new Set([origin]), options)
+    service.observe({ ...host, id: 'other-host' }, reply)
+    service.observe(host, { ...reply, params: { ...reply.params, threadId: 'other-thread' } }); await service.flush()
+    assert.equal(service.status('session').queued, 2)
+    service.observe(host, reply); await service.flush()
+    assert.equal(service.status('session').queued, 1)
+    const saved = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.deepEqual(saved.outbox.map((job: any) => job.requestId), ['approval'])
+    assert.equal(saved.outbox.some((job: any) => job.questionItemId), false)
+    service.observe(host, { method: 'serverRequest/resolved', params: { threadId: 't', requestId: 'approval' } }); await service.flush()
+    clock += 6000; await service.flush(); assert.equal(attempts, 2)
+    service.observe(host, ask); await service.flush(); assert.equal(attempts, 2)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('answering an async question during metadata lookup prevents a late background notification', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-async-metadata-'))
+  let release!: (value: unknown) => void, began!: () => void, attempts = 0
+  const started = new Promise<void>(resolve => { began = resolve })
+  const metadata = new Promise(resolve => { release = resolve })
+  const service = await PushService.create(directory, new Set([origin]), { resolveThread: async () => { began(); return metadata }, sendNotification: async () => { attempts++ } })
+  try {
+    await service.subscribe('session', subscription('async-metadata'))
+    const question = { id: 'ask', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question', options: null }] }
+    service.observe(host, { method: 'item/completed', params: { threadId: 't', item: question } })
+    await started
+    service.observe(host, { method: 'item/completed', params: { threadId: 't', item: { id: 'answer', type: 'userMessage', content: [{ type: 'text', text: asyncQuestionReplyText(question, ['Private answer']) }] } } })
+    release({ id: 't', name: 'Conversation', source: 'cli' }); await service.flush()
+    assert.equal(attempts, 0); assert.equal(service.status('session').queued, 0)
+  } finally { release?.(undefined); await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('closed, archived and deleted threads discard unsent async question reminders without requiring server request IDs', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-async-closed-'))
+  let clock = Date.now(), attempts = 0
+  const service = await PushService.create(directory, new Set([origin]), { now: () => clock, sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } })
+  try {
+    await service.subscribe('session', subscription('async-closed'))
+    for (const method of ['thread/closed', 'thread/archived', 'thread/deleted']) {
+      service.observe(host, { method: 'item/completed', params: { threadId: method, item: { id: 'ask', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question', options: null }] } } }); await service.flush()
+      assert.equal(service.status('session').queued, 1)
+      service.observe(host, { method, params: { threadId: method } }); await service.flush()
+      assert.equal(service.status('session').queued, 0)
+    }
+    clock += 6000; await service.flush(); assert.equal(attempts, 3)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('ordinary input and partial answers keep async reminders; only matching complete question IDs cancel them, including after restart', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-async-matching-'))
+  let clock = Date.now(), attempts = 0
+  const options: PushOptions = { now: () => clock, sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  const first = { id: 'question-a', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question A', options: ['One', 'Two'] }, { title: 'Private question A2', options: null }] }
+  const second = { id: 'question-b', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question B', options: null }] }
+  const fullReply = asyncQuestionReplyText(first, ['Private answer A', 'Private answer A2'])
+  const parts = JSON.parse(fullReply.slice('<send_user_message_question_reply>'.length, -'</send_user_message_question_reply>'.length))
+  const part = (index: number) => '<send_user_message_question_reply>' + JSON.stringify([parts[index]]) + '</send_user_message_question_reply>'
+  const userMessage = (text: string, status?: string) => ({ method: 'item/completed', params: { threadId: 't', item: { id: 'reply', type: 'userMessage', content: [{ type: 'text', text }], ...(status ? { status } : {}) } } })
+  try {
+    await service.subscribe('session', subscription('async-matching'))
+    for (const item of [first, second]) service.observe(host, { method: 'item/completed', params: { threadId: 't', item } })
+    await service.flush(); assert.equal(service.status('session').queued, 2)
+    service.observe(host, userMessage('Another instruction'))
+    service.observe(host, userMessage(fullReply, 'sending'))
+    service.observe(host, userMessage(fullReply, 'unconfirmed'))
+    service.observe({ ...host, id: 'other-host' }, userMessage(fullReply))
+    await service.flush(); assert.equal(service.status('session').queued, 2)
+    service.observe(host, userMessage(part(0))); await service.flush()
+    assert.equal(service.status('session').queued, 2)
+    let stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.deepEqual(stored.outbox.find((job: any) => job.questionItemId === 'question-a').answeredQuestionIndices, [0])
+    assert.equal(stored.outbox.find((job: any) => job.questionItemId === 'question-a').questionCount, 2)
+    assert.ok(!JSON.stringify(stored.outbox).includes('Private question')); assert.ok(!JSON.stringify(stored.outbox).includes('Private answer'))
+    await service.close(); service = await PushService.create(directory, new Set([origin]), options)
+    service.observe(host, userMessage(part(1))); await service.flush(); assert.equal(service.status('session').queued, 1)
+    stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.deepEqual(stored.outbox.map((job: any) => job.questionItemId), ['question-b'])
+    service.observe(host, userMessage(asyncQuestionReplyText(second, ['Private B answer']))); await service.flush()
+    clock += 6000; await service.flush(); assert.equal(service.status('session').queued, 0); assert.equal(attempts, 2)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('accepted native steering cancels the matching reminder when the runtime emits only an acknowledgement', async () => {
+  let attempts = 0
+  const app = await application({ sendNotification: async () => { attempts++; throw Object.assign(new Error('503'), { statusCode: 503 }) } }, undefined, undefined, message =>
+    message.method === 'turn/steer' ? { turnId: 'running' } : message.method === 'thread/read' ? { thread: { id: 't', name: 'Conversation', source: 'cli' } } : {})
+  try {
+    await app.push.subscribe('session', subscription('async-ack-only'))
+    const bridge = await app.getBridge('local'); await bridge.connect()
+    const item = { id: 'question', type: 'agentMessage', delivery: 'async', questions: [{ title: 'Private question', options: null }] }
+    app.transports[0]!.receive({ method: 'item/completed', params: { threadId: 't', item } }); await app.push.flush()
+    assert.equal(app.push.status('session').queued, 1)
+    await bridge.request('turn/steer', { threadId: 't', expectedTurnId: 'running', clientUserMessageId: 'reply', input: [{ type: 'text', text: asyncQuestionReplyText(item, ['Private answer']), text_elements: [] }] })
+    await app.push.flush(); assert.equal(app.push.status('session').queued, 0); assert.equal(attempts, 1)
+  } finally { await app.cleanup() }
 })
 
 test('retry attempts remain bounded even when the provider is continuously unavailable', async () => {

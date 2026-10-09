@@ -8,10 +8,14 @@ import ConversationImage from './ConversationImage.vue'
 import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
 import { publicReasoningSummary } from '../lib/activity-presentation'
+import { asyncUserInputQuestions } from '../../shared/async-user-input'
+import AsyncQuestionCard from './AsyncQuestionCard.vue'
+import { asyncQuestionAnswerDisplayText } from '../../shared/async-question-reply'
 
 const props = defineProps<{
   item: any
   hostId?: string
+  threadId?: string
   cwd?: string
   busy?: boolean
   collapseTools?: boolean
@@ -23,6 +27,9 @@ const props = defineProps<{
   beginEdit?: (item: any, text: string) => void
   cancelEdit?: () => void
   saveEdit?: () => Promise<void>
+  asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain'
+  answerAsyncQuestion?: (item: any, answers: string[], threadId?: string, hostId?: string) => Promise<void>
+  asyncQuestionsDisabled?: boolean
 }>()
 const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string, line?: number]; error: [message: string] }>()
 const copied = ref(false)
@@ -35,7 +42,14 @@ const editInput = ref<HTMLTextAreaElement>()
 const editPending = computed(() => props.editSession?.saving || props.editing)
 const hasEditInput = computed(() => !!editDraft.value.trim() ||
   (props.item.content || []).some((input: any) => ['image', 'localImage'].includes(input.type)))
-const text = computed(() => props.item.text || (props.item.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'))
+const text = computed(() => {
+  const raw = props.item.text || (props.item.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+  return props.item.type === 'userMessage' ? asyncQuestionAnswerDisplayText(raw) ?? raw : raw
+})
+const asyncQuestions = computed(() => asyncUserInputQuestions(props.item))
+const asyncStatus = computed(() => props.asyncQuestionStatus?.(props.item, props.threadId, props.hostId) || 'pending')
+const answerAsync = computed(() => props.answerAsyncQuestion
+  ? (answers: string[]) => props.answerAsyncQuestion!(props.item, answers, props.threadId, props.hostId) : undefined)
 const renderedText = ref(text.value)
 let markdownFrame: number | undefined
 watch(text, value => {
@@ -147,7 +161,8 @@ function onLink(event: MouseEvent) {
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
     <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
-    <div v-else class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
+    <div v-else-if="!asyncQuestions.length" class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
+    <AsyncQuestionCard v-if="asyncQuestions.length" :item="item" :status="asyncStatus" :disabled="asyncQuestionsDisabled" :answer="answerAsync" />
     <div v-if="text && (!busy || canFork)" class="message-actions">
       <button class="icon-button" @click="copy" :title="copied ? '已复制' : '复制回复'" aria-label="复制回复"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
       <button v-if="canFork" class="icon-button" @click="emit('fork', item.turnId)" title="从此处创建分支" aria-label="从此处创建分支"><Icon name="GitBranch" :size="15" /></button>

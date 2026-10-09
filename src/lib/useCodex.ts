@@ -19,6 +19,8 @@ import { clearConversationMarkdownCache } from "./conversation-markdown";
 import { privateState } from "./private-state";
 import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './lazy-history';
 import { isInteractiveServerRequest } from '../../shared/server-requests';
+import { asyncUserInputQuestions } from '../../shared/async-user-input';
+import { asyncQuestionAnswered, asyncQuestionAnswerDisplayText, asyncQuestionFingerprint, asyncQuestionReplyText } from '../../shared/async-question-reply';
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -59,6 +61,9 @@ type HostNavigation = {
   error: string;
   projectPages: Record<string, { cursor: string | null; loaded: boolean }>;
 };
+type AsyncQuestionStatus = 'pending' | 'sending' | 'answered' | 'uncertain';
+type AsyncQuestionRecord = { hostId: string; threadId: string; item: DisplayItem };
+type AsyncQuestionOperation = { fingerprint: string; status: AsyncQuestionStatus; receiptReadFailed?: boolean };
 const saved = <T>(key: string, fallback: T): T => {
   try {
     return JSON.parse(browserStorage.local.getItem(key) ?? "null") ?? fallback;
@@ -116,6 +121,8 @@ const state = reactive({
   compacting: false,
   busy: false,
   pendingRequests: [] as any[],
+  asyncQuestions: {} as Record<string, AsyncQuestionRecord>,
+  asyncQuestionOperations: {} as Record<string, AsyncQuestionOperation>,
   agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number; turnId?: string; turnStatus?: string }>,
   attachments: [] as any[],
   config: null as any,
@@ -291,6 +298,184 @@ const legacyRecency = new Map<
 >();
 const recencyKey = (hostId: string, threadId: string) =>
   JSON.stringify([hostId, threadId]);
+const asyncQuestionKey = (hostId: string, threadId: string, itemId: string) => JSON.stringify([hostId, threadId, itemId]);
+const asyncQuestionReceiptReads = new Map<string, Promise<void>>();
+const asyncQuestionChecks = new Map<string, Promise<void>>();
+function clearAsyncQuestionReads(key: string) {
+  for (const readKey of asyncQuestionReceiptReads.keys()) if (JSON.parse(readKey)[0] === key) asyncQuestionReceiptReads.delete(readKey);
+}
+function checkAsyncQuestionAnswers(threadId: string) {
+  const hostId = state.hostId, authentication = authenticationGeneration, generation = selectionGeneration;
+  const current = () => authentication === authenticationGeneration && generation === selectionGeneration &&
+    state.authenticated && state.hostId === hostId && state.activeThread?.id === threadId &&
+    state.connected && state.threadReady && !state.selectingThread;
+  if (!current()) return;
+  for (const record of Object.values(state.asyncQuestions)) {
+    if (record.hostId !== hostId || record.threadId !== threadId || !record.item.turnId ||
+        asyncQuestionStatus(record.item, threadId, hostId) !== 'uncertain') continue;
+    const key = asyncQuestionKey(hostId, threadId, record.item.id);
+    const fingerprint = asyncQuestionFingerprint(record.item)!;
+    const checkKey = JSON.stringify([authentication, generation, key, fingerprint]);
+    if (asyncQuestionChecks.has(checkKey)) continue;
+    const operation = (async () => {
+      try {
+        const result = await http(`/threads/${encodeURIComponent(hostId)}/${encodeURIComponent(threadId)}/async-questions/${encodeURIComponent(record.item.id)}/status?turnId=${encodeURIComponent(record.item.turnId!)}`, { signal: AbortSignal.timeout(45000) }, false);
+        if (current() && result.answered === true && asyncQuestionFingerprint(state.asyncQuestions[key]?.item) === fingerprint) {
+          state.asyncQuestionOperations[key] = { fingerprint, status: 'answered' };
+          void privateState.remove('async-question-answer', key).catch(() => {});
+        }
+      } catch { /* Synchronization can retry; a read never resends an answer. */ }
+    })();
+    asyncQuestionChecks.set(checkKey, operation);
+    // Only the active synchronization needs deduplication; old generations
+    // must not accumulate indefinitely on long-lived PWA renderers.
+    if (asyncQuestionChecks.size > 256) asyncQuestionChecks.delete(asyncQuestionChecks.keys().next().value!);
+  }
+}
+function questionItems(threadId: string, hostId: string) {
+  return hostId === state.hostId ? (state.activeThread?.id === threadId ? state.items : itemCache.get(threadId) || []) : [];
+}
+function asyncQuestionStatus(item: DisplayItem, threadId = state.activeThread?.id, hostId = state.hostId): AsyncQuestionStatus {
+  const fingerprint = asyncQuestionFingerprint(item);
+  if (!threadId || !fingerprint) return 'answered';
+  if (asyncQuestionAnswered(item, questionItems(threadId, hostId))) return 'answered';
+  const operation = state.asyncQuestionOperations[asyncQuestionKey(hostId, threadId, item.id)];
+  return operation?.fingerprint === fingerprint ? operation.status : 'pending';
+}
+function restoreAsyncQuestionReceipt(record: AsyncQuestionRecord) {
+  const { hostId, threadId, item } = record;
+  const key = asyncQuestionKey(hostId, threadId, item.id);
+  const fingerprint = asyncQuestionFingerprint(item)!;
+  const readKey = JSON.stringify([key, fingerprint]);
+  const existing = asyncQuestionReceiptReads.get(readKey);
+  if (existing) return existing;
+  const authentication = authenticationGeneration;
+  const operation = (async () => {
+    await cacheActivation;
+    if (authentication !== authenticationGeneration || !state.authenticated) return;
+    const receipt = await privateState.read<{ fingerprint: string }>('async-question-answer', key);
+    if (authentication !== authenticationGeneration || !state.authenticated ||
+        asyncQuestionFingerprint(state.asyncQuestions[key]?.item) !== fingerprint) return;
+    if (receipt?.fingerprint === fingerprint && asyncQuestionStatus(item, threadId, hostId) === 'pending')
+      state.asyncQuestionOperations[key] = { fingerprint, status: 'uncertain' };
+    // Storage failures happen before dispatch. Once a successful read proves
+    // no receipt exists, this case can recover without weakening lost-ACK guards.
+    const previous = state.asyncQuestionOperations[key];
+    if (!receipt && previous?.fingerprint === fingerprint && previous.receiptReadFailed)
+      state.asyncQuestionOperations[key] = { fingerprint, status: 'pending' };
+    if (hostId === state.hostId) checkAsyncQuestionAnswers(threadId);
+  })().catch(error => {
+    if (authentication === authenticationGeneration && state.asyncQuestions[key] &&
+        asyncQuestionStatus(item, threadId, hostId) === 'pending')
+      state.asyncQuestionOperations[key] = { fingerprint, status: 'uncertain', receiptReadFailed: true };
+    throw new Error('无法读取回答记录，请检查网站存储并同步对话后重试', { cause: error });
+  });
+  asyncQuestionReceiptReads.set(readKey, operation);
+  void operation.catch(() => { if (asyncQuestionReceiptReads.get(readKey) === operation) asyncQuestionReceiptReads.delete(readKey); });
+  return operation;
+}
+function rememberAsyncQuestions(threadId: string, items: DisplayItem[], hostId = state.hostId) {
+  if (hostId === state.hostId && state.activeThread?.id === threadId) {
+    const turns = new Set(state.turns.map(turn => turn.id));
+    for (const record of Object.values(state.asyncQuestions)) if (record.hostId === hostId && record.threadId === threadId &&
+        turns.has(record.item.turnId) && !items.some(item => item.id === record.item.id) &&
+        asyncQuestionStatus(record.item, threadId, hostId) !== 'answered') upsertItem(items, record.item);
+  }
+  for (const item of items) if (asyncUserInputQuestions(item).length) {
+    const key = asyncQuestionKey(hostId, threadId, item.id);
+    state.asyncQuestions[key] = { hostId, threadId, item };
+    void restoreAsyncQuestionReceipt(state.asyncQuestions[key]).catch(() => {});
+  }
+  const records = Object.entries(state.asyncQuestions);
+  for (const [key, record] of records) if (record.hostId === hostId && record.threadId === threadId && asyncQuestionAnswered(record.item, items)) {
+    const fingerprint = asyncQuestionFingerprint(record.item)!;
+    const previous = state.asyncQuestionOperations[key];
+    if (previous?.fingerprint !== fingerprint || previous.status !== 'answered') {
+      state.asyncQuestionOperations[key] = { fingerprint, status: 'answered' };
+      void privateState.remove('async-question-answer', key).catch(() => {});
+    }
+  }
+  // Retain waiting forms, while bounding receipts for old completed questions.
+  let excess = records.length - 256;
+  for (const [key, record] of records) if (excess > 0 && asyncQuestionStatus(record.item, record.threadId, record.hostId) === 'answered') {
+    clearAsyncQuestionReads(key);
+    delete state.asyncQuestions[key]; delete state.asyncQuestionOperations[key]; excess--;
+  }
+}
+function pendingAsyncQuestions() {
+  return Object.values(state.asyncQuestions).filter(record =>
+    state.hosts.some(host => host.id === record.hostId) &&
+    asyncQuestionStatus(record.item, record.threadId, record.hostId) !== 'answered');
+}
+function forgetAsyncQuestions(threadId: string, hostId = state.hostId) {
+  for (const [key, record] of Object.entries(state.asyncQuestions)) if (record.hostId === hostId && record.threadId === threadId) {
+    clearAsyncQuestionReads(key);
+    delete state.asyncQuestions[key]; delete state.asyncQuestionOperations[key];
+    void privateState.remove('async-question-answer', key).catch(() => {});
+  }
+}
+async function answerAsyncQuestion(item: DisplayItem, answers: string[], threadId = state.activeThread?.id, hostId = state.hostId) {
+  const authentication = authenticationGeneration;
+  const generation = selectionGeneration;
+  const current = () => authentication === authenticationGeneration && generation === selectionGeneration &&
+    state.authenticated && state.hostId === hostId && state.activeThread?.id === threadId;
+  const available = () => current() && state.connected && state.online && state.threadReady &&
+    !state.runtimePaused && !state.threadReleased && !state.threadConflict && !state.selectingThread &&
+    !state.switchingHost && !state.changingContext && !state.compacting && !state.modeBusy && !state.editingMessage;
+  if (!threadId || !available() || sendInFlight) throw new Error('请等待连接和同步完成后回答此问题');
+  const nativeItem = state.items.find(entry => entry.id === item.id);
+  const fingerprint = asyncQuestionFingerprint(item);
+  if (!nativeItem?.turnId || !fingerprint || fingerprint !== asyncQuestionFingerprint(nativeItem))
+    throw new Error('问题内容已变化，请同步对话后重新选择');
+  asyncQuestionReplyText(nativeItem, answers);
+  const key = asyncQuestionKey(hostId, threadId, item.id);
+  rememberAsyncQuestions(threadId, state.items, hostId);
+  await restoreAsyncQuestionReceipt(state.asyncQuestions[key]);
+  if (!available() || sendInFlight) throw new Error('对话或连接状态已变化，请同步后再回答');
+  const questionCurrent = () => asyncQuestionFingerprint(state.items.find(entry => entry.id === item.id)) === fingerprint;
+  if (!questionCurrent()) throw new Error('问题内容已变化，请重新选择');
+  const status = asyncQuestionStatus(nativeItem, threadId, hostId);
+  if (status === 'answered') return;
+  if (status !== 'pending') throw Object.assign(new Error('回答可能已被接收，请同步对话确认，勿重复提交'), { uncertain: status === 'uncertain' });
+  state.asyncQuestionOperations[key] = { fingerprint, status: 'sending' };
+  sendInFlight = true;
+  const runtimeRevision = turnRevisions.get(threadId) || 0;
+  let dispatched = false;
+  try {
+    await privateState.write('async-question-answer', key, { fingerprint }, true);
+    if (!available() || !questionCurrent()) throw new Error('对话、连接或问题内容已变化，回答未发送，请重新选择');
+    dispatched = true;
+    const result = await http(`/threads/${encodeURIComponent(hostId)}/${encodeURIComponent(threadId)}/async-questions/${encodeURIComponent(item.id)}/answer`, {
+      method: 'POST', body: JSON.stringify({ turnId: nativeItem.turnId, answers }), signal: AbortSignal.timeout(45000),
+    }, false);
+    if (result.accepted !== true) throw new Error('无法确认回答是否已接收，请同步对话');
+    if (authentication !== authenticationGeneration || !state.authenticated) return;
+    state.asyncQuestionOperations[key] = { fingerprint, status: 'answered' };
+    void privateState.remove('async-question-answer', key).catch(() => {});
+    if (hostId === state.hostId && result.input && (result.turn?.id || result.turnId)) {
+      const turn = result.turn || { id: result.turnId };
+      hydrateTurnItems(threadId, turn, { input: result.input, clientUserMessageId: result.clientUserMessageId, placement: result.turn ? 'start' : 'steer' });
+      if (result.turn) {
+        updateTurn(threadId, result.turn);
+        if ((turnRevisions.get(threadId) || 0) === runtimeRevision && !completedTurns.has(result.turn.id))
+          noteRuntime(threadId, result.turn.status === 'inProgress', result.turn.id);
+      }
+      scheduleConversationSnapshot(threadId);
+    }
+  } catch (error: any) {
+    const definite = !dispatched || (error?.status >= 400 && error?.status < 500 && error.code !== 'async_answer_uncertain') ||
+      (error?.status === 502 && typeof error.code === 'number');
+    if (authentication === authenticationGeneration && state.authenticated) {
+      // A confirmed native message can arrive before the lost HTTP response.
+      const answered = asyncQuestionStatus(nativeItem, threadId, hostId) === 'answered';
+      state.asyncQuestionOperations[key] = { fingerprint, status: answered ? 'answered' : definite ? 'pending' : 'uncertain' };
+      if (definite || answered) void privateState.remove('async-question-answer', key).catch(() => {});
+      if (answered) return;
+    }
+    if (!definite) throw Object.assign(new Error('回答发送结果尚未确认，请同步对话后检查，勿重复提交'), { uncertain: true });
+    throw error;
+  } finally { sendInFlight = false; }
+}
 function activateConversationCache() {
   const authentication = authenticationGeneration;
   const credential = csrfToken;
@@ -306,6 +491,10 @@ function clearConversationCaches() {
   clearConversationMarkdownCache();
   clearTimeout(snapshotTimer);
   itemCache.clear();
+  state.asyncQuestions = {};
+  state.asyncQuestionOperations = {};
+  asyncQuestionReceiptReads.clear();
+  asyncQuestionChecks.clear();
   historyRestoration = null;
   historyWindowTruncated = false;
   tokenUsages.clear();
@@ -386,6 +575,7 @@ function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
   const metadata = state.threads.find(thread => thread.id === id);
   state.activeThread = { ...snapshot.thread, ...metadata, id };
   state.items = itemCache.get(id) ?? snapshot.items;
+  rememberAsyncQuestions(id, state.items);
   state.turns = snapshot.turns;
   historyWindowTruncated = snapshot.historyTruncated === true;
   const key = recencyKey(state.hostId, id);
@@ -1022,6 +1212,7 @@ function hydrateTurnItems(threadId: string, turn: any, accepted?: any, preserveL
   if (!turn?.id || discardedTurns.has(turn.id)) return;
   for (const itemId of mergeAcceptedTurnItems(currentItems(threadId), turn, accepted, preserveLive))
     noteItem(threadId, itemId);
+  rememberAsyncQuestions(threadId, currentItems(threadId));
 }
 function receiveThreadChange(change: any) {
   const { threadId, method, result = {}, request = {}, changeId } = change;
@@ -1289,6 +1480,8 @@ function receive(message: any) {
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
     const item = items.find(item => item.id === itemId);
+    if ((method === 'item/started' || method === 'item/completed') &&
+        (item?.type === 'userMessage' || asyncUserInputQuestions(item).length)) rememberAsyncQuestions(p.threadId, items);
     state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], updatedAt: Date.now(),
       ...(item?.type === 'agentMessage' ? { text: item.text } : {}) };
     if (p.item?.type === "contextCompaction" && method === "item/started") {
@@ -1940,6 +2133,7 @@ function loadTurnDetails(turnId: string): Promise<void> {
       .filter(([, value]) => value > revision).map(([id]) => id));
     const merged = mergeHistoryDetails(state.items, state.turns, state.turns[index], page, changed);
     state.items = merged.items;
+    rememberAsyncQuestions(threadId, state.items);
     state.turns[index] = merged.turn;
     itemCache.set(threadId, state.items);
     saveConversationSnapshot();
@@ -2016,6 +2210,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   const loadedHistory = itemCache.history(id);
   state.activeThread = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
   state.items = itemCache.get(id) ?? cached?.items ?? [];
+  rememberAsyncQuestions(id, state.items);
   state.turns = loadedHistory?.turns ?? cached?.turns ?? (previousId === id ? state.turns : []);
   historyWindowTruncated = (loadedHistory?.historyTruncated ?? cached?.historyTruncated) === true;
   if (previousId !== id) clearAttachments();
@@ -2045,6 +2240,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       if (!current()) return;
       state.turns = [...page.data].reverse();
       state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
+      rememberAsyncQuestions(id, state.items);
       itemCache.set(id, state.items); turnCursor = page.nextCursor; state.moreTurns = !!turnCursor;
     } catch (error) { if (current()) fail(error); }
     finally { if (current()) state.selectingThread = false; }
@@ -2176,6 +2372,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
         .map(([itemId]) => itemId),
     );
     state.items = mergeSnapshotItems(loaded, live, changedIds);
+    rememberAsyncQuestions(id, state.items);
     // Deprecated runtimes may expose compression only as thread/compacted.
     // Keep that positional marker while its recorded turn remains retained;
     // canonical ContextCompaction items replace it when they become available.
@@ -2237,7 +2434,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       }
     }
   } finally {
-    if (current()) state.selectingThread = false;
+    if (current()) { state.selectingThread = false; checkAsyncQuestionAnswers(id); }
   }
 }
 async function takeoverThread(confirmOwner: (owner: { pid: number; affectedThreadCount: number }) => boolean | Promise<boolean>) {
@@ -2299,6 +2496,7 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
     const changedIds = new Set([...(itemRevisions.get(id)?.entries() || [])]
       .filter(([, revision]) => revision > itemRevision).map(([itemId]) => itemId));
     state.items = mergeSnapshotItems(loaded, live, changedIds);
+    rememberAsyncQuestions(id, state.items);
     const turnIds = new Set(state.turns.map(turn => turn.id));
     const compactionIds = new Set(state.items.filter(item => item.type === 'contextCompaction').map(item => item.turnId));
     for (const item of live) if (item.legacyCompaction && item.turnId && turnIds.has(item.turnId) && !compactionIds.has(item.turnId))
@@ -2339,6 +2537,7 @@ async function loadOlderTurns() {
       .filter((item: any) => !known.has(item.id)),
   );
   state.turns.unshift(...older.filter(turn => !knownTurns.has(turn.id)));
+  rememberAsyncQuestions(id, state.items);
   turnCursor = page.nextCursor;
   state.moreTurns = !!turnCursor;
   saveConversationSnapshot();
@@ -2712,6 +2911,8 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   }
 }
 function canEditMessage(itemId: string) {
+  const item = state.items.find(entry => entry.id === itemId);
+  if (item?.content?.some((input: any) => input.type === 'text' && asyncQuestionAnswerDisplayText(input.text) !== null)) return false;
   const blocked = !state.threadReady || state.runtimePaused || state.threadReleased || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
   if (blocked) return false;
   if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
@@ -2725,6 +2926,7 @@ function cancelMessageEdit(itemId: string) {
   if (!state.editingMessage && pendingMessageEdit?.item.id === itemId) pendingMessageEdit = null;
 }
 function resetEditedHistory(threadId: string, removed: string[] = []) {
+  forgetAsyncQuestions(threadId);
   for (const turnId of removed) discardedTurns.add(turnId);
   itemCache.delete(threadId);
   conversationCache.remove(state.hostId, threadId);
@@ -3001,6 +3203,7 @@ async function renameThread(name: string, id = state.activeThread?.id, hostId = 
 }
 function cleanupDeletedThread(id: string, hostId = state.hostId) {
   if (!id) return;
+  forgetAsyncQuestions(id, hostId);
   const key = recencyKey(hostId, id);
   deletedThreads.add(key);
   threadNameRevisions.delete(key);
@@ -3064,6 +3267,7 @@ async function deleteThread(id: string, hostId = state.hostId) {
   if (authentication === authenticationGeneration && state.hosts.some(host => host.id === hostId)) cleanupDeletedThread(id, hostId);
 }
 function cleanupArchivedThread(id: string) {
+  forgetAsyncQuestions(id);
   removedThreads.add(id);
   threadRevisions.set(id, ++threadEventSequence);
   state.threads = state.threads.filter((thread) => thread.id !== id);
@@ -4626,6 +4830,9 @@ export function useCodex() {
     newThreadInWorktree,
     startReview,
     send,
+    asyncQuestionStatus,
+    answerAsyncQuestion,
+    pendingAsyncQuestions,
     canEditMessage,
     resendEditedMessage,
     cancelMessageEdit,

@@ -158,11 +158,23 @@ const otherRequests = computed(() =>
 );
 const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput')));
 const activeChoices = computed(() => activeRequests.value.filter((request: any) => request.method?.includes('requestUserInput')));
+const asyncChoices = computed(() => api.pendingAsyncQuestions());
+const activeAsyncChoices = computed(() => asyncChoices.value.filter(question =>
+  question.hostId === state.hostId && question.threadId === state.activeThread?.id));
+const otherAsyncChoices = computed(() => asyncChoices.value.filter(question =>
+  question.hostId === state.hostId && question.threadId !== state.activeThread?.id && question.threadId !== sideChat.state.threadId));
+const activeChoiceCount = computed(() => activeChoices.value.length + activeAsyncChoices.value.length);
+const otherRequestCount = computed(() => otherRequests.value.length + otherAsyncChoices.value.length);
+const nextOtherRequestThread = computed(() => otherRequests.value[0]?.params?.threadId || otherRequests.value[0]?.params?.conversationId || otherAsyncChoices.value[0]?.threadId);
+const asyncQuestionsDisabled = computed(() => actionBusy.value || state.loading || state.compacting || state.modeBusy || !state.online || !state.connected ||
+  state.selectingThread || state.switchingHost || state.changingContext || state.runtimePaused || state.threadReleased ||
+  !!state.threadConflict || !state.activeThread || !state.threadReady);
 function showChoices() {
-  scroll.value?.querySelector('.question-card')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  scroll.value?.querySelector('.question-card, .async-question-card[data-question-pending="true"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
-watch(() => [state.authenticated, choiceRequests.value.length, threadTitle.value], () => {
-  const reminder = choiceRequests.value.length ? `（${choiceRequests.value.length} 待选择）` : '';
+watch(() => [state.authenticated, choiceRequests.value.length, asyncChoices.value.length, threadTitle.value], () => {
+  const count = choiceRequests.value.length + asyncChoices.value.length;
+  const reminder = count ? `（${count} 待选择）` : '';
   document.title = state.authenticated ? `${reminder}${threadTitle.value} · Codex Web` : 'Codex Web';
 }, { immediate: true });
 const welcome = computed(() => !state.activeThread && !state.items.length && !state.selectingThread && !state.switchingHost);
@@ -1035,17 +1047,17 @@ watch(() => [state.authenticated, state.loading], () => {
         <button class="button button-small button-secondary" :disabled="state.busy || actionBusy || pwaState.updateBusy" @click="updatePwa()">{{ state.busy ? '任务完成后更新' : pwaState.updateBusy ? '正在更新…' : '更新应用' }}</button>
       </div>
       <button
-        v-if="otherRequests.length"
+        v-if="otherRequestCount"
         class="other-requests-banner"
-        @click="selectThread(otherRequests[0].params.threadId)"
+        @click="selectThread(nextOtherRequestThread)"
       >
         <Icon name="Shield" :size="15" />{{
-          otherRequests.length
+          otherRequestCount
         }}
         个其他对话等待选择或确认<Icon name="ArrowRight" :size="14" />
       </button>
-      <div v-if="activeChoices.length" class="connection-banner choice-reminder" role="status">
-        <Icon name="Bell" :size="15" />{{ activeChoices.length }} 个问题等待你的选择
+      <div v-if="activeChoiceCount" class="connection-banner choice-reminder" role="status">
+        <Icon name="Bell" :size="15" />{{ activeChoiceCount }} 个问题等待你的选择
         <button class="button button-small button-secondary" @click="showChoices">查看问题</button>
       </div>
       <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
@@ -1121,6 +1133,7 @@ watch(() => [state.authenticated, state.loading], () => {
             <ConversationOutput
               :key="`${state.hostId}:${state.activeThread?.id || 'new'}`"
               :host-id="state.hostId"
+              :thread-id="state.activeThread?.id"
               :cwd="state.activeThread?.cwd || state.projectPath"
               :items="state.items"
               :turns="state.turns"
@@ -1131,6 +1144,9 @@ watch(() => [state.authenticated, state.loading], () => {
               :edit-message="api.resendEditedMessage"
               :cancel-message-edit="api.cancelMessageEdit"
               :load-turn-details="api.loadTurnDetails"
+              :async-question-status="api.asyncQuestionStatus"
+              :answer-async-question="api.answerAsyncQuestion"
+              :async-questions-disabled="asyncQuestionsDisabled"
               @fork="fork"
               @open-file="(path, line) => openWorkspace('files', path, line)"
               @error="showError"

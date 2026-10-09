@@ -511,7 +511,8 @@ test('accepted conversation responses sync across browser sessions while respons
 })
 
 test('steering, rename and revert sync only after success, and private reads never broadcast', async () => {
-  const f = fixture()
+  const observed: RpcMessage[] = []
+  const f = fixture({ onProtocolMessage: (_host, message) => { observed.push(message) } })
   try {
     const a = new Browser(); const b = new Browser()
     f.bridge.attach('session:a', a.ws(), 'a')
@@ -535,6 +536,10 @@ test('steering, rename and revert sync only after success, and private reads nev
       assert.equal((change.params as any).method, mutation.method)
       assert.equal((change.params as any).threadId, 'same')
     }
+    assert.deepEqual((observed.find(message => message.method === 'bridge/thread/changed' &&
+      (message.params as any).method === 'turn/steer')?.params as any).request,
+      { input, clientUserMessageId: 'steered' }, 'Background reminders receive accepted input even without a native userMessage event')
+    const observedChanges = observed.filter(message => message.method === 'bridge/thread/changed').length
     const before = b.sent.length
     a.request({ id: 'failure', method: 'turn/start', params: { threadId: 'same', input } })
     a.request({ id: 'private', method: 'config/read', params: {} })
@@ -545,6 +550,7 @@ test('steering, rename and revert sync only after success, and private reads nev
     f.receive({ id: read.id, result: { config: { secret: 'not-conversation-data' } } })
     await tick()
     assert.equal(b.sent.length, before)
+    assert.equal(observed.filter(message => message.method === 'bridge/thread/changed').length, observedChanges)
     assert.ok(a.sent.some(message => message.id === 'failure' && message.error))
     assert.ok(a.sent.some(message => message.id === 'private' && message.result))
   } finally { f.bridge.close() }

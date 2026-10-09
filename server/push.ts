@@ -6,6 +6,8 @@ import webPush, { type PushSubscription, type RequestOptions } from 'web-push'
 import { z } from 'zod'
 import type { AuthenticatedRequest, Host, RpcId, RpcMessage } from './types.js'
 import { isInteractiveServerRequest } from '../shared/server-requests.js'
+import { asyncUserInputQuestions } from '../shared/async-user-input.js'
+import { asyncQuestionReplyReferences } from '../shared/async-question-reply.js'
 
 const GRANT_TTL = 30 * 24 * 60 * 60 * 1000
 const EVENT_TTL = 24 * 60 * 60 * 1000
@@ -27,8 +29,8 @@ const subscriptionSchema = z.object({
 }).strict()
 type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string; grantId: string; delivery: DeliveryHealth }
 type PushNotice = { title: string; body: string; tag: string; data: { hostId?: string; threadId?: string; url: string; kind: 'completed' | 'approval' | 'errors' | 'test' } }
-type PendingNotice = { requestId: RpcId; deadline?: number }
-type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure; requestId?: RpcId }
+type PendingNotice = { requestId?: RpcId; questionItemId?: string; questionCount?: number; deadline?: number }
+type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure; requestId?: RpcId; questionItemId?: string; questionCount?: number; answeredQuestionIndices?: number[] }
 type DeliveryOutcome = { ok: true; queued?: true; retryAt?: number } | { error: Error }
 export type PushOptions = {
   vapidPublicKey?: string; vapidPrivateKey?: string; subject?: string
@@ -86,7 +88,7 @@ type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; epheme
 const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired', 'queue_full'])
 const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), overflow: z.number().int().nonnegative().optional(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
 const noticeSchema = z.object({ title: z.string().max(100), body: z.string().max(100), tag: z.string().max(100), data: z.object({ hostId: z.string().max(256).optional(), threadId: z.string().max(256).optional(), url: z.string().max(4096), kind: z.enum(['completed', 'approval', 'errors', 'test']) }).strict() }).strict()
-const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional(), requestId: z.union([z.string().max(256), z.number().int().safe()]).optional() }).strict()
+const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional(), requestId: z.union([z.string().max(256), z.number().int().safe()]).optional(), questionItemId: z.string().min(1).max(256).optional(), questionCount: z.number().int().min(1).max(1000).optional(), answeredQuestionIndices: z.array(z.number().int().min(0).max(999)).max(1000).optional() }).strict()
 function emptyHealth(): DeliveryHealth { return { delivered: 0, failed: 0, expired: 0 } }
 function providerError(expired = false) { return Object.assign(new Error(expired ? 'This device subscription expired; enable notifications again' : 'Unable to deliver the notification; check server access to the push provider'), { status: expired ? 410 : 502 }) }
 
@@ -394,6 +396,17 @@ export class PushService {
   observe(host: Host, message: RpcMessage, responseMethod?: string) {
     if (this.closed) return
     this.observeThread(host, message, responseMethod)
+    const params = record(message.params)
+    const threadId = id(params?.threadId) || id(params?.conversationId)
+    if (threadId) {
+      if (['thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '')) this.cancelQuestionReminders(host.id, threadId)
+      const item = record(params?.item)
+      if (['item/started', 'item/completed'].includes(message.method || '') && item?.type === 'userMessage' &&
+          (item.status === undefined || ['sent', 'completed', 'confirmed'].includes(String(item.status))))
+        this.resolveQuestionReminders(host.id, threadId, item.content)
+      if (message.method === 'bridge/thread/changed' && ['turn/start', 'turn/steer'].includes(String(params?.method)))
+        this.resolveQuestionReminders(host.id, threadId, record(params?.request)?.input)
+    }
     if (message.method === 'serverRequest/resolved') {
       const resolved = record(message.params)
       let changed = false
@@ -409,14 +422,19 @@ export class PushService {
       return
     }
     if (!this.hasActiveSubscriptions) return
-    const params = record(message.params)
-    const threadId = id(params?.threadId) || id(params?.conversationId)
     if (!params || !threadId) return
     let kind: 'completed' | 'approval' | 'errors' | undefined
     let identity: string | undefined
     let body: string | undefined
     let request: PendingNotice | undefined
-    if (message.method === 'turn/completed') {
+    if (message.method === 'item/completed') {
+      const item = record(params.item), itemId = id(item?.id)
+      const questions = asyncUserInputQuestions(item)
+      if (!itemId || !questions.length) return
+      kind = 'approval'; identity = `question:${itemId}`
+      body = questions.some(question => question.options?.length) ? '等待你的选择' : '等待补充输入'
+      request = { questionItemId: itemId, questionCount: questions.length }
+    } else if (message.method === 'turn/completed') {
       const turn = record(params.turn); const turnId = id(turn?.id)
       if (!turnId || !['completed', 'failed'].includes(String(turn?.status))) return
       kind = turn?.status === 'failed' || turn?.error ? 'errors' : 'completed'
@@ -462,7 +480,9 @@ export class PushService {
     const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => {
       const job = this.newDelivery(device, notice, host)
       if (request) {
-        job.requestId = request.requestId
+        if (request.requestId !== undefined) job.requestId = request.requestId
+        if (request.questionItemId !== undefined) job.questionItemId = request.questionItemId
+        if (request.questionCount !== undefined) job.questionCount = request.questionCount
         if (request.deadline !== undefined) job.expiresAt = Math.min(job.expiresAt, request.deadline)
       }
       return job
@@ -483,6 +503,40 @@ export class PushService {
     try { await this.save() } catch (error) { this.events.delete(key); for (const job of accepted) this.outbox.delete(job.id); throw error }
     finally { for (const job of accepted) this.uncommitted.delete(job.id) }
     this.runDeliveries()
+  }
+
+  private cancelQuestionReminders(hostId: string, threadId: string) {
+    let changed = false
+    for (const [key, job] of this.outbox) {
+      if (!job.questionItemId || job.notice.data.hostId !== hostId || job.notice.data.threadId !== threadId) continue
+      this.outbox.delete(key); this.finish(job, { ok: true }); changed = true
+    }
+    if (!changed) return
+    const task = this.save().catch(() => {})
+    this.pending.add(task); void task.finally(() => this.pending.delete(task))
+  }
+
+  private resolveQuestionReminders(hostId: string, threadId: string, input: unknown) {
+    if (!Array.isArray(input)) return
+    const references = input.flatMap(value => {
+      const content = record(value)
+      return content?.type === 'text' ? asyncQuestionReplyReferences(content.text) : []
+    })
+    if (!references.length) return
+    let changed = false
+    for (const [key, job] of this.outbox) {
+      if (!job.questionItemId || !job.questionCount || job.notice.data.hostId !== hostId || job.notice.data.threadId !== threadId) continue
+      const indices = new Set((job.answeredQuestionIndices || []).filter(index => index >= 0 && index < job.questionCount!))
+      for (const reference of references)
+        if (reference.itemId === job.questionItemId && reference.index >= 0 && reference.index < job.questionCount) indices.add(reference.index)
+      if (indices.size === (job.answeredQuestionIndices?.length || 0)) continue
+      changed = true
+      if (indices.size === job.questionCount) { this.outbox.delete(key); this.finish(job, { ok: true }) }
+      else job.answeredQuestionIndices = [...indices].sort((a, b) => a - b)
+    }
+    if (!changed) return
+    const task = this.save().catch(() => {})
+    this.pending.add(task); void task.finally(() => this.pending.delete(task))
   }
 
   private runDeliveries() {

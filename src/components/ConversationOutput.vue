@@ -11,6 +11,7 @@ import {
   turnPresentation,
 } from "../lib/presentation";
 import type { DisplayItem } from "../lib/events";
+import { asyncUserInputQuestions } from '../../shared/async-user-input';
 
 const props = defineProps<{
   items: DisplayItem[];
@@ -18,6 +19,7 @@ const props = defineProps<{
   busy: boolean;
   hideFork?: boolean;
   hostId?: string;
+  threadId?: string;
   cwd?: string;
   editableItemId?: string;
   editing?: boolean;
@@ -25,6 +27,9 @@ const props = defineProps<{
   editMessage?: (itemId: string, text: string) => Promise<void>;
   cancelMessageEdit?: (itemId: string) => void;
   loadTurnDetails?: (turnId: string) => Promise<void>;
+  asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain';
+  answerAsyncQuestion?: (item: any, answers: string[], threadId?: string, hostId?: string) => Promise<void>;
+  asyncQuestionsDisabled?: boolean;
 }>();
 const emit = defineEmits<{
   fork: [turnId?: string];
@@ -132,13 +137,19 @@ function activityLabel(block: any) {
         : "";
   return prefix + elapsedLabel(block.turn);
 }
+function hasPendingQuestion(block: any) {
+  const items = block.kind === 'message' ? [block.item] : block.items;
+  return !!props.answerAsyncQuestion && items.some((item: any) => asyncUserInputQuestions(item).length > 0 &&
+    props.asyncQuestionStatus?.(item, props.threadId, props.hostId) !== 'answered');
+}
 </script>
 
 <template>
-  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
+  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || hasPendingQuestion(block) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
     <ChatItem
       v-if="block.kind === 'message'"
-      :host-id="hostId" :cwd="cwd"
+      :host-id="hostId" :cwd="cwd" :thread-id="threadId"
+      :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
       :item="block.item"
       :busy="busy"
       :can-fork="!hideFork && !busy && !editing && !!block.item.turnId"
@@ -157,7 +168,8 @@ function activityLabel(block: any) {
       <ChatItem
         v-for="item in block.users"
         :key="item.id"
-        :host-id="hostId" :cwd="cwd"
+        :host-id="hostId" :cwd="cwd" :thread-id="threadId"
+        :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && !busy && !editing && !!item.turnId"
@@ -214,7 +226,8 @@ function activityLabel(block: any) {
             />
             <ChatItem
               v-else
-              :host-id="hostId" :cwd="cwd"
+              :host-id="hostId" :cwd="cwd" :thread-id="threadId"
+              :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
               :item="entry.item"
               :class="{ 'timeline-output': block.outputs.some(item => item.id === entry.id) }"
               :busy="running(block)"
@@ -234,7 +247,8 @@ function activityLabel(block: any) {
       <ChatItem
         v-for="item in block.dividers.length && expandedTurns.has(block.id) ? [] : block.outputs"
         :key="item.id"
-        :host-id="hostId" :cwd="cwd"
+        :host-id="hostId" :cwd="cwd" :thread-id="threadId"
+        :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
@@ -248,7 +262,8 @@ function activityLabel(block: any) {
        the editor mounted at the history tail so failures retain the draft. -->
   <ChatItem
     v-if="editSession && editingItem && !items.some((item) => item.id === editSession?.itemId)"
-    :host-id="hostId" :cwd="cwd"
+    :host-id="hostId" :cwd="cwd" :thread-id="threadId"
+    :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
     :item="editingItem"
     :editing="editing"
     :edit-disabled="editDisabled"
