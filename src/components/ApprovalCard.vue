@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import type { ToolRequestUserInputQuestion } from '../../shared/protocol/v2/ToolRequestUserInputQuestion'
-import { userInputAnswer, userInputReady, userInputResponse, type UserInputDrafts } from '../lib/user-input'
+import { userInputAnswer, userInputAutoResolveAt, userInputAutoResolutionMs, userInputReady, userInputResponse, type UserInputDrafts } from '../lib/user-input'
 import Icon from './Icon.vue'
 const props = defineProps<{ request: any; api: any; items?: any[] }>()
 const answers = reactive<UserInputDrafts>(Object.create(null))
@@ -13,6 +13,37 @@ const params = computed(() => props.request.params || {})
 const isQuestion = computed(() => props.request.method?.includes('requestUserInput'))
 const questions = computed<ToolRequestUserInputQuestion[]>(() => Array.isArray(params.value.questions) ? params.value.questions : [])
 const isBlocking = computed(() => params.value.isBlocking !== false)
+const autoResolveAt = computed(() => isQuestion.value ? userInputAutoResolveAt(params.value) : null)
+const now = ref(Date.now())
+const questionExpired = computed(() => autoResolveAt.value !== null && now.value >= autoResolveAt.value)
+const legacyTimeout = computed(() => isQuestion.value && !params.value.bridgeUserInputContext && userInputAutoResolutionMs(params.value) !== null)
+const countdown = computed(() => {
+  const seconds = Math.max(0, Math.ceil(((autoResolveAt.value ?? now.value) - now.value) / 1000))
+  return seconds >= 60 ? `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, '0')} 秒` : `${seconds} 秒`
+})
+const questionStatus = computed(() => questionExpired.value ? '回答时限已到，等待服务器跳过'
+  : autoResolveAt.value !== null ? isBlocking.value ? '请在时限内回答，也可等待自动跳过' : 'Codex 可继续运行，请在时限内补充回答'
+    : isBlocking.value ? '等待你的回答后继续' : 'Codex 可继续运行，回答后会补充给它')
+const refreshQuestionTime = () => { now.value = Date.now() }
+watch(autoResolveAt, (deadline, _previous, onCleanup) => {
+  refreshQuestionTime()
+  if (deadline === null || deadline <= Date.now()) return
+  const timer = setInterval(() => {
+    refreshQuestionTime()
+    if (now.value >= deadline) clearInterval(timer)
+  }, 250)
+  onCleanup(() => clearInterval(timer))
+}, { immediate: true })
+onMounted(() => {
+  document.addEventListener('visibilitychange', refreshQuestionTime)
+  window.addEventListener('focus', refreshQuestionTime)
+  window.addEventListener('pageshow', refreshQuestionTime)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', refreshQuestionTime)
+  window.removeEventListener('focus', refreshQuestionTime)
+  window.removeEventListener('pageshow', refreshQuestionTime)
+})
 const answerCount = computed(() => questions.value.filter(question => userInputAnswer(question, answers[question.id]) !== null).length)
 const isPermissions = computed(() => props.request.method?.includes('permissions/requestApproval'))
 const isElicitation = computed(() => props.request.method?.includes('elicitation'))
@@ -44,8 +75,9 @@ function fieldId(question: ToolRequestUserInputQuestion, suffix = '') {
 function allowedDecision(decision: string) {
   return isQuestion.value || isPermissions.value || isElicitation.value || !params.value.availableDecisions?.length || params.value.availableDecisions.includes(decision)
 }
-const ready = computed(() => isQuestion.value ? userInputReady(questions.value, answers) : isElicitation.value ? (params.value.requestedSchema?.required || []).every((key: string) => formAnswers[key] != null && formAnswers[key] !== '') : true)
+const ready = computed(() => isQuestion.value ? !questionExpired.value && userInputReady(questions.value, answers) : isElicitation.value ? (params.value.requestedSchema?.required || []).every((key: string) => formAnswers[key] != null && formAnswers[key] !== '') : true)
 async function respond(decision: string) {
+  refreshQuestionTime()
   if (responding.value || submitted.value || (decision === 'accept' && !ready.value)) return
   responding.value = true; error.value = ''
   try {
@@ -64,10 +96,15 @@ async function respond(decision: string) {
 
 <template>
   <section class="approval-card" :class="{ 'question-card': isQuestion }" role="region" :aria-label="title" :aria-busy="responding">
-    <div class="approval-heading"><div class="approval-icon"><Icon :name="isQuestion ? 'CircleHelp' : 'Shield'" :size="18" /></div><div><strong>{{ title }}</strong><span>{{ isQuestion ? isBlocking ? '等待你的回答后继续' : 'Codex 可继续运行，回答后会补充给它' : '等待你的确认' }}</span></div></div>
+    <div class="approval-heading"><div class="approval-icon"><Icon :name="isQuestion ? 'CircleHelp' : 'Shield'" :size="18" /></div><div><strong>{{ title }}</strong><span>{{ isQuestion ? questionStatus : '等待你的确认' }}</span></div></div>
     <p v-if="params.reason || params.message" class="approval-reason">{{ params.reason || params.message }}</p>
     <template v-if="isQuestion">
-      <fieldset v-for="(question, questionIndex) in questions" :key="question.id" class="question-field" :disabled="responding || submitted"><legend><span v-if="question.header" class="question-header">{{ question.header }}<span v-if="questions.length > 1"> · {{ questionIndex + 1 }}/{{ questions.length }}</span></span><span class="question-prompt">{{ question.question }}</span></legend>
+      <div v-if="autoResolveAt !== null" class="question-timing" :class="{ expired: questionExpired }">
+        <div class="question-countdown"><Icon name="Clock" :size="14" /><span v-if="questionExpired" role="status">回答时限已到，等待服务器跳过…</span><span v-else role="timer" aria-live="off">剩余 {{ countdown }}</span></div>
+        <p>到时未提交的回答将跳过，Codex 可继续处理。</p>
+      </div>
+      <p v-else-if="legacyTimeout" class="question-timeout-hint">此问题支持自动跳过；请更新 Web 服务端以显示倒计时。</p>
+      <fieldset v-for="(question, questionIndex) in questions" :key="question.id" class="question-field" :disabled="responding || submitted || questionExpired"><legend><span v-if="question.header" class="question-header">{{ question.header }}<span v-if="questions.length > 1"> · {{ questionIndex + 1 }}/{{ questions.length }}</span></span><span class="question-prompt">{{ question.question }}</span></legend>
         <label v-for="(option, optionIndex) in question.options || []" :key="optionIndex" class="question-option" :class="{ selected: answers[question.id]?.selection === optionIndex }"><input type="radio" :name="fieldId(question)" :value="optionIndex" v-model="answers[question.id].selection" /><div><strong>{{ option.label }}</strong><span v-if="option.description">{{ option.description }}</span></div><Icon v-if="answers[question.id]?.selection === optionIndex" name="Check" :size="17" class="question-check" /></label>
         <label v-if="question.options?.length && question.isOther" class="question-option" :class="{ selected: answers[question.id]?.selection === 'other' }"><input type="radio" :name="fieldId(question)" value="other" v-model="answers[question.id].selection" /><div><strong>其他</strong><span>填写自己的回答</span></div><Icon v-if="answers[question.id]?.selection === 'other'" name="Check" :size="17" class="question-check" /></label>
         <div v-if="!question.options?.length || (question.isOther && answers[question.id]?.selection === 'other')" class="question-text-answer"><label :for="fieldId(question, '-text')">{{ question.options?.length ? '其他回答' : '你的回答' }}</label><input :id="fieldId(question, '-text')" class="text-input" :type="question.isSecret ? 'password' : 'text'" v-model="answers[question.id].text" :aria-label="question.options?.length ? `${question.header || question.question}：其他回答` : question.question" :autocomplete="question.isSecret ? 'new-password' : 'off'" :spellcheck="!question.isSecret" :autocapitalize="question.isSecret ? 'none' : undefined" :placeholder="question.isSecret ? '输入保密回答…' : '输入你的回答…'" /><small v-if="question.isSecret" class="question-secret-hint"><Icon name="Lock" :size="12" />回答以隐藏方式输入，不会保存为页面草稿</small></div>
@@ -94,7 +131,7 @@ async function respond(decision: string) {
     </template>
     <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
     <div class="approval-actions">
-      <span v-if="isQuestion && questions.length" class="question-progress" role="status">{{ submitted ? '回答已发送' : responding ? '正在发送回答…' : `已回答 ${answerCount}/${questions.length}` }}</span>
+      <span v-if="isQuestion && questions.length" class="question-progress" role="status">{{ submitted ? '回答已发送' : responding ? '正在发送回答…' : questionExpired ? '未提交的回答不会发送' : `已回答 ${answerCount}/${questions.length}` }}</span>
       <button v-if="!isQuestion && allowedDecision('decline')" class="button button-ghost" :disabled="responding" @click="respond('decline')">拒绝</button>
       <button v-if="!isQuestion && allowedDecision('cancel')" class="button button-ghost" :disabled="responding" @click="respond('cancel')">取消任务</button>
       <button v-if="!isQuestion && !isElicitation && allowedDecision('acceptForSession')" class="button button-secondary" :disabled="responding" @click="respond('acceptForSession')">本会话允许</button>
@@ -128,6 +165,11 @@ async function respond(decision: string) {
 .question-text-answer .text-input { width: 100%; min-height: 40px; font-size: 13px; }
 .question-text-answer .text-input:focus { outline: 2px solid var(--green); outline-offset: 2px; }
 .question-secret-hint { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.question-timing { margin-top: 14px; padding: 10px 12px; border-radius: 8px; background: var(--soft); color: var(--text); overflow-wrap: anywhere; }
+.question-countdown { display: flex; align-items: center; gap: 6px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.question-countdown > svg { flex-shrink: 0; }
+.question-timing p, .question-timeout-hint { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.question-timing.expired { color: var(--muted); }
 .question-progress { margin-right: auto; color: var(--muted); font-size: 12px; }
 .question-card .approval-actions .button { font-size: 12px; min-height: 38px; padding: 9px 14px; }
 @media (max-width: 600px) {

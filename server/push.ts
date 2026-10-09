@@ -4,7 +4,7 @@ import { createECDH, createHash, randomUUID } from 'node:crypto'
 import type { Express, RequestHandler } from 'express'
 import webPush, { type PushSubscription, type RequestOptions } from 'web-push'
 import { z } from 'zod'
-import type { AuthenticatedRequest, Host, RpcMessage } from './types.js'
+import type { AuthenticatedRequest, Host, RpcId, RpcMessage } from './types.js'
 import { isInteractiveServerRequest } from '../shared/server-requests.js'
 
 const GRANT_TTL = 30 * 24 * 60 * 60 * 1000
@@ -27,7 +27,8 @@ const subscriptionSchema = z.object({
 }).strict()
 type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string; grantId: string; delivery: DeliveryHealth }
 type PushNotice = { title: string; body: string; tag: string; data: { hostId?: string; threadId?: string; url: string; kind: 'completed' | 'approval' | 'errors' | 'test' } }
-type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure }
+type PendingNotice = { requestId: RpcId; deadline?: number }
+type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure; requestId?: RpcId }
 type DeliveryOutcome = { ok: true; queued?: true; retryAt?: number } | { error: Error }
 export type PushOptions = {
   vapidPublicKey?: string; vapidPrivateKey?: string; subject?: string
@@ -85,7 +86,7 @@ type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; epheme
 const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired', 'queue_full'])
 const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), overflow: z.number().int().nonnegative().optional(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
 const noticeSchema = z.object({ title: z.string().max(100), body: z.string().max(100), tag: z.string().max(100), data: z.object({ hostId: z.string().max(256).optional(), threadId: z.string().max(256).optional(), url: z.string().max(4096), kind: z.enum(['completed', 'approval', 'errors', 'test']) }).strict() }).strict()
-const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional() }).strict()
+const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional(), requestId: z.union([z.string().max(256), z.number().int().safe()]).optional() }).strict()
 function emptyHealth(): DeliveryHealth { return { delivered: 0, failed: 0, expired: 0 } }
 function providerError(expired = false) { return Object.assign(new Error(expired ? 'This device subscription expired; enable notifications again' : 'Unable to deliver the notification; check server access to the push provider'), { status: expired ? 410 : 502 }) }
 
@@ -393,6 +394,20 @@ export class PushService {
   observe(host: Host, message: RpcMessage, responseMethod?: string) {
     if (this.closed) return
     this.observeThread(host, message, responseMethod)
+    if (message.method === 'serverRequest/resolved') {
+      const resolved = record(message.params)
+      let changed = false
+      for (const [key, job] of this.outbox) {
+        if (job.notice.data.hostId !== host.id || job.requestId === undefined || job.requestId !== resolved?.requestId ||
+            resolved.threadId && job.notice.data.threadId !== resolved.threadId) continue
+        this.outbox.delete(key); this.finish(job, { ok: true }); changed = true
+      }
+      if (changed) {
+        const task = this.save().catch(() => {})
+        this.pending.add(task); void task.finally(() => this.pending.delete(task))
+      }
+      return
+    }
     if (!this.hasActiveSubscriptions) return
     const params = record(message.params)
     const threadId = id(params?.threadId) || id(params?.conversationId)
@@ -400,6 +415,7 @@ export class PushService {
     let kind: 'completed' | 'approval' | 'errors' | undefined
     let identity: string | undefined
     let body: string | undefined
+    let request: PendingNotice | undefined
     if (message.method === 'turn/completed') {
       const turn = record(params.turn); const turnId = id(turn?.id)
       if (!turnId || !['completed', 'failed'].includes(String(turn?.status))) return
@@ -414,10 +430,20 @@ export class PushService {
     } else if (isInteractiveServerRequest(message)) {
       if ((typeof message.id !== 'string' && typeof message.id !== 'number') || String(message.id).length > 256) return
       kind = 'approval'; identity = `request:${id(params.turnId) || id(params.callId) || ''}:${message.method}:${JSON.stringify(message.id)}`
+      request = { requestId: message.id }
       body = ['item/commandExecution/requestApproval', 'execCommandApproval'].includes(message.method || '') ? '等待命令执行确认'
         : ['item/fileChange/requestApproval', 'applyPatchApproval'].includes(message.method || '') ? '等待文件修改确认'
         : message.method === 'item/permissions/requestApproval' ? '等待权限确认'
         : message.method?.endsWith('requestUserInput') ? (Array.isArray(params.questions) && params.questions.some(question => Array.isArray(record(question)?.options) && (record(question)!.options as unknown[]).length) ? '等待你的选择' : '等待补充输入') : '等待确认或补充输入'
+      if (['item/tool/requestUserInput', 'tool/requestUserInput'].includes(message.method || '')) {
+        const context = record(params.bridgeUserInputContext), ms = params.autoResolutionMs
+        const deadline = context ? context.autoResolveAt : typeof ms === 'number' && Number.isSafeInteger(ms) && ms >= 0 ? this.now() + ms : null
+        if (typeof deadline === 'number' && Number.isSafeInteger(deadline) && deadline >= 0) {
+          if (deadline <= this.now()) return
+          request.deadline = deadline
+          body += '（限时）'
+        }
+      }
     }
     if (!kind || !identity || !body) return
     const key = JSON.stringify([host.id, threadId, identity])
@@ -425,15 +451,22 @@ export class PushService {
     if (this.events.has(key) || this.pendingEvents.has(key)) return
     this.pendingEvents.add(key)
     const notice: PushNotice = { title: 'Codex', body, tag: `codex-${hash(key).slice(0, 24)}`, data: { hostId: host.id, threadId, url: `/?host=${encodeURIComponent(host.id)}&thread=${encodeURIComponent(threadId)}`, kind } }
-    const task = this.notify(key, host, threadId, kind, notice).catch(() => {}).finally(() => this.pendingEvents.delete(key))
+    const task = this.notify(key, host, threadId, kind, notice, request).catch(() => {}).finally(() => this.pendingEvents.delete(key))
     this.pending.add(task)
     void task.finally(() => this.pending.delete(task))
   }
 
-  private async notify(key: string, host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice) {
+  private async notify(key: string, host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice, request?: PendingNotice) {
     const auxiliary = () => { const metadata = this.threadTitles.get(JSON.stringify([host.id, threadId])); return metadata?.subagent || metadata?.ephemeral }
     this.prune()
-    const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => this.newDelivery(device, notice, host))
+    const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => {
+      const job = this.newDelivery(device, notice, host)
+      if (request) {
+        job.requestId = request.requestId
+        if (request.deadline !== undefined) job.expiresAt = Math.min(job.expiresAt, request.deadline)
+      }
+      return job
+    })
     // The first 1,024 jobs are the delivery queue; up to four more queue-sized
     // batches form a durable backlog. Provider recovery drains the same journal.
     const accepted: OutboxDelivery[] = [];

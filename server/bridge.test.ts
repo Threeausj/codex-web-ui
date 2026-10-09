@@ -689,6 +689,124 @@ test('all authenticated tabs see approvals, first response wins and pending requ
   } finally { f.bridge.close() }
 })
 
+test('timed questions skip with an empty answer once even without a browser', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const observed: RpcMessage[] = []
+  const f = fixture({ onProtocolMessage: (_host, message) => { observed.push(message) } })
+  try {
+    await f.bridge.connect()
+    f.receive({ id: 'timed', method: 'item/tool/requestUserInput', params: {
+      threadId: 't', turnId: 'turn', isBlocking: false, autoResolutionMs: 1000,
+      questions: [{ id: 'choice', options: [{ label: 'Recommended' }] }],
+    } })
+    const prompt = observed.find(message => message.id === 'timed')!
+    assert.deepEqual((prompt.params as any).bridgeUserInputContext, { requestedAt: 1791550000000, autoResolveAt: 1791550001000 })
+    t.mock.timers.tick(999)
+    assert.equal(f.sent.some(message => message.id === 'timed'), false)
+    t.mock.timers.tick(1)
+    assert.deepEqual(f.sent.filter(message => message.id === 'timed'), [{ id: 'timed', result: { answers: {} } }])
+    assert.ok(observed.some(message => message.method === 'serverRequest/resolved' && (message.params as any).requestId === 'timed'))
+    const browser = new Browser(); f.bridge.attach('reader', browser.ws(), 'reader')
+    assert.equal((browser.sent.find(message => message.method === 'bridge/status')!.params as any).pendingRequests.length, 0)
+    t.mock.timers.tick(100000)
+    assert.equal(f.sent.filter(message => message.id === 'timed').length, 1)
+  } finally { f.bridge.close() }
+})
+
+test('a question retains its deadline through duplicate delivery and browser reconnect and an explicit answer wins once', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const f = fixture(); const first = new Browser(); const second = new Browser()
+  try {
+    await f.bridge.connect()
+    f.bridge.attach('first', first.ws(), 'first'); f.bridge.attach('second', second.ws(), 'second')
+    const prompt = { id: 44, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'turn', isBlocking: true, autoResolutionMs: 10000, questions: [] } }
+    f.receive(prompt)
+    first.close(); second.close(); t.mock.timers.tick(5000)
+    f.receive(prompt)
+    const recovered = new Browser(); f.bridge.attach('first', recovered.ws(), 'first')
+    const pending = (recovered.sent.find(message => message.method === 'bridge/status')!.params as any).pendingRequests[0]
+    assert.equal(pending.params.bridgeUserInputContext.autoResolveAt, 1791550010000)
+    const result = { answers: { choice: { answers: ['My explicit answer'] } } }
+    recovered.request({ id: 44, result }); await tick()
+    t.mock.timers.tick(10000)
+    recovered.request({ id: 44, result: { answers: {} } }); await tick()
+    assert.deepEqual(f.sent.filter(message => message.id === 44), [{ id: 44, result }])
+  } finally { f.bridge.close() }
+})
+
+test('only a finite question timeout creates a timer, independently of blocking status', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const f = fixture(); const browser = new Browser()
+  try {
+    await f.bridge.connect(); f.bridge.attach('reader', browser.ws(), 'reader')
+    for (const [index, value] of [undefined, null, -1, 1.5, '1000', Number.MAX_SAFE_INTEGER].entries()) {
+      f.receive({ id: 'untimed-' + index, method: 'item/tool/requestUserInput', params: { threadId: 't', isBlocking: false, autoResolutionMs: value } })
+    }
+    f.receive({ id: 'command', method: 'item/commandExecution/requestApproval', params: { threadId: 't', autoResolutionMs: 0, bridgeUserInputContext: { autoResolveAt: 0 } } })
+    t.mock.timers.tick(120000)
+    assert.equal(f.sent.some(message => String(message.id).startsWith('untimed-') || message.id === 'command'), false)
+    f.receive({ id: 'immediate', method: 'tool/requestUserInput', params: { threadId: 't', isBlocking: true, autoResolutionMs: 0 } })
+    t.mock.timers.tick(1)
+    assert.deepEqual(f.sent.find(message => message.id === 'immediate')?.result, { answers: {} })
+  } finally { f.bridge.close() }
+})
+
+test('resolved questions, completed turns and a closed bridge never receive a late automatic answer', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const f = fixture()
+  try {
+    await f.bridge.connect()
+    const ask = (id: string, turnId: string) => f.receive({ id, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId, autoResolutionMs: 1000 } })
+    ask('resolved', 'old')
+    f.receive({ method: 'serverRequest/resolved', params: { requestId: 'resolved', threadId: 't' } })
+    ask('completed', 'old')
+    f.receive({ method: 'turn/completed', params: { threadId: 't', turn: { id: 'old', status: 'completed' } } })
+    ask('current', 'new')
+    f.receive({ method: 'turn/completed', params: { threadId: 't', turn: { id: 'old', status: 'completed' } } })
+    t.mock.timers.tick(1000)
+    assert.equal(f.sent.some(message => ['resolved', 'completed'].includes(String(message.id))), false)
+    assert.deepEqual(f.sent.find(message => message.id === 'current')?.result, { answers: {} })
+    ask('closed', 'latest'); f.bridge.close(); t.mock.timers.tick(1000)
+    assert.equal(f.sent.some(message => message.id === 'closed'), false)
+  } finally { f.bridge.close() }
+})
+
+test('nonblocking questions survive turn changes until native resolution or their own deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const f = fixture()
+  try {
+    await f.bridge.connect()
+    for (const id of ['native', 'deadline']) f.receive({ id, method: 'item/tool/requestUserInput', params: {
+      threadId: 't', turnId: 'old', isBlocking: false, autoResolutionMs: 1000,
+    } })
+    f.receive({ method: 'turn/completed', params: { threadId: 't', turn: { id: 'old', status: 'completed' } } })
+    f.receive({ method: 'turn/started', params: { threadId: 't', turn: { id: 'new', status: 'inProgress' } } })
+    const recovered = new Browser(); f.bridge.attach('reader', recovered.ws(), 'reader')
+    assert.deepEqual((recovered.sent[0].params as any).pendingRequests.map((request: any) => request.id).sort(), ['deadline', 'native'])
+    f.receive({ method: 'serverRequest/resolved', params: { threadId: 't', requestId: 'native' } })
+    t.mock.timers.tick(1000)
+    assert.deepEqual(f.sent.filter(message => message.id === 'deadline'), [{ id: 'deadline', result: { answers: {} } }])
+    assert.equal(f.sent.some(message => message.id === 'native'), false)
+    f.receive({ id: 'closed', method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'new', isBlocking: false, autoResolutionMs: 1000 } })
+    f.receive({ method: 'thread/closed', params: { threadId: 't' } })
+    t.mock.timers.tick(1000)
+    assert.equal(f.sent.some(message => message.id === 'closed'), false)
+  } finally { f.bridge.close() }
+})
+
+test('a delayed event loop rejects answers after the original question deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1791550000000 })
+  const f = fixture(); const browser = new Browser()
+  try {
+    await f.bridge.connect(); f.bridge.attach('reader', browser.ws(), 'reader')
+    f.receive({ id: 'late', method: 'item/tool/requestUserInput', params: { threadId: 't', autoResolutionMs: 1000 } })
+    t.mock.timers.setTime(1791550002000)
+    browser.request({ id: 'late', result: { answers: { choice: { answers: ['Late answer'] } } } }); await tick()
+    assert.deepEqual(f.sent.filter(message => message.id === 'late'), [{ id: 'late', result: { answers: {} } }])
+    assert.ok(browser.sent.some(message => message.method === 'bridge/error' && (message.params as any).requestId === 'late'))
+  } finally { f.bridge.close() }
+})
+
 test('app-server errors retain the original browser ID and protocol error', async () => {
   const f = fixture()
   try {

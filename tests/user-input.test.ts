@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { ToolRequestUserInputQuestion } from '../shared/protocol/v2/ToolRequestUserInputQuestion'
-import { userInputAnswer, userInputReady, userInputResponse } from '../src/lib/user-input'
+import { userInputAnswer, userInputAutoResolveAt, userInputAutoResolutionMs, userInputReady, userInputResponse } from '../src/lib/user-input'
 
 const question = (id = 'split', patch: Partial<ToolRequestUserInputQuestion> = {}): ToolRequestUserInputQuestion => ({
   id, header: '划分单位', question: '随机划分按什么单位进行？', isOther: true, isSecret: false,
@@ -53,4 +53,29 @@ test('text-only and secret questions use the same response envelope without modi
   const drafts = { credential: { text: ' sensitive-placeholder ' } }
   assert.deepEqual(userInputResponse([q], drafts), { answers: { credential: { answers: [' sensitive-placeholder '] } } })
   assert.deepEqual(drafts, { credential: { text: ' sensitive-placeholder ' } })
+})
+
+test('only valid bridge absolute deadlines start the question countdown', () => {
+  const requestedAt = 1_791_542_400_000
+  const autoResolveAt = requestedAt + 60_000
+  assert.equal(userInputAutoResolveAt({ bridgeUserInputContext: { requestedAt, autoResolveAt } }), autoResolveAt)
+  assert.equal(userInputAutoResolveAt({ bridgeUserInputContext: { requestedAt, autoResolveAt: requestedAt } }), requestedAt)
+  for (const params of [undefined, null, {}, { autoResolutionMs: 60_000 },
+    { bridgeUserInputContext: { requestedAt, autoResolveAt: null } },
+    { bridgeUserInputContext: { requestedAt, autoResolveAt: requestedAt - 1 } },
+    { bridgeUserInputContext: { requestedAt: -1, autoResolveAt } },
+    { bridgeUserInputContext: { requestedAt: String(requestedAt), autoResolveAt } },
+    { bridgeUserInputContext: { autoResolveAt } },
+    { bridgeUserInputContext: { requestedAt, autoResolveAt: Infinity } },
+    { bridgeUserInputContext: { requestedAt, autoResolveAt: Number.MAX_SAFE_INTEGER + 1 } },
+  ]) assert.equal(userInputAutoResolveAt(params), null)
+})
+
+test('legacy timeout metadata never supplies a new deadline from the current time', () => {
+  for (const value of [0, 60_000, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(userInputAutoResolutionMs({ autoResolutionMs: value }), value)
+    assert.equal(userInputAutoResolveAt({ autoResolutionMs: value }), null)
+  }
+  for (const value of [undefined, null, -1, 0.5, '60000', Infinity, NaN, Number.MAX_SAFE_INTEGER + 1])
+    assert.equal(userInputAutoResolutionMs({ autoResolutionMs: value }), null)
 })
