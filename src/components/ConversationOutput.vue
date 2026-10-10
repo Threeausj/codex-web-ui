@@ -176,8 +176,9 @@ function hasPendingQuestion(block: any) {
       @error="emit('error', $event)"
     />
     <section v-else class="conversation-turn" :data-turn-id="block.id">
+      <template v-for="(segment, segmentIndex) in block.segments" :key="segment.id">
       <ChatItem
-        v-for="item in block.users"
+        v-for="item in segment.users"
         :key="item.id"
         :host-id="hostId" :cwd="cwd" :thread-id="threadId"
         :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
@@ -195,20 +196,22 @@ function hasPendingQuestion(block: any) {
         @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"
       />
-      <details
-        v-if="
+      <component
+        :is="segmentIndex === 0 ? 'details' : 'div'"
+        v-if="segmentIndex === 0 ? (
           block.activity.length ||
           block.turn?.historySummary ||
           running(block) ||
           block.turn?.durationMs != null ||
           block.turn?.completedAt != null ||
           ['failed', 'interrupted'].includes(block.turn?.status)
-        "
-        class="turn-activity"
-        @toggle="toggleTurn($event, block.id)"
+        ) : segment.activity.length || (segment.dividers.length && expandedTurns.has(block.id))"
+        :class="segmentIndex === 0 ? 'turn-activity' : 'turn-segment-activity'"
+        @toggle="segmentIndex === 0 && toggleTurn($event, block.id)"
         :open="running(block) || expandedTurns.has(block.id)"
       >
         <summary
+          v-if="segmentIndex === 0"
           :title="block.turn?.historySummary ? '展开查看完整过程和补充消息' : undefined"
           :aria-label="
             running(block) ? '工作过程（运行中）' : '工作过程与用时'
@@ -221,12 +224,12 @@ function hasPendingQuestion(block: any) {
           <Icon name="ChevronRight" :size="14" />
         </summary>
         <div v-if="expandedTurns.has(block.id)" class="turn-activity-content">
-          <p v-if="detailLoads.get(block.id)?.loading" class="activity-loading" role="status"><Icon name="LoaderCircle" :size="14" class="spin" />正在加载过程记录…</p>
-          <div v-if="detailLoads.get(block.id)?.error" class="activity-load-error" role="alert">
+          <p v-if="segmentIndex === 0 && detailLoads.get(block.id)?.loading" class="activity-loading" role="status"><Icon name="LoaderCircle" :size="14" class="spin" />正在加载过程记录…</p>
+          <div v-if="segmentIndex === 0 && detailLoads.get(block.id)?.error" class="activity-load-error" role="alert">
             <span>{{ detailLoads.get(block.id)?.error }}</span>
             <button class="button button-small button-secondary" @click="loadDetails(block.id)">重试加载过程</button>
           </div>
-          <template v-for="entry in block.dividers.length ? block.timelineBlocks : block.activityBlocks" :key="entry.id">
+          <template v-for="entry in segment.dividers.length ? segment.timelineBlocks : segment.activityBlocks" :key="entry.id">
             <ActivityBatch
               v-if="entry.kind === 'batch'"
               :host-id="hostId" :thread-id="threadId" :cwd="cwd"
@@ -240,7 +243,7 @@ function hasPendingQuestion(block: any) {
               :host-id="hostId" :cwd="cwd" :thread-id="threadId"
               :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
               :item="entry.item"
-              :class="{ 'timeline-output': block.outputs.some(item => item.id === entry.id) }"
+              :class="{ 'timeline-output': segment.outputs.some(item => item.id === entry.id) }"
               :busy="running(block)"
               :can-fork="!hideFork && entry.item.type === 'agentMessage' && block.answers.some(item => item.id === entry.id) && !busy && !editing && !!entry.item.turnId"
               @fork="emit('fork', $event)"
@@ -248,15 +251,12 @@ function hasPendingQuestion(block: any) {
               @error="emit('error', $event)"
             />
           </template>
-          <button v-if="block.turn?.historySummary && props.loadTurnDetails && !detailLoads.get(block.id)?.loading && !detailLoads.get(block.id)?.error" class="button button-small button-secondary activity-load-more" @click="loadDetails(block.id)">{{ block.turn.historyItemsStarted ? '加载更多过程记录' : '加载过程记录' }}</button>
-          <p v-if="!block.activity.length && !block.turn?.historySummary && !detailLoads.get(block.id)?.loading" class="activity-empty">{{ running(block) ? '正在等待新的进展。' : '此轮没有额外的过程记录。' }}</p>
+          <button v-if="segmentIndex === 0 && block.turn?.historySummary && props.loadTurnDetails && !detailLoads.get(block.id)?.loading && !detailLoads.get(block.id)?.error" class="button button-small button-secondary activity-load-more" @click="loadDetails(block.id)">{{ block.turn.historyItemsStarted ? '加载更多过程记录' : '加载过程记录' }}</button>
+          <p v-if="segmentIndex === 0 && !block.activity.length && !block.turn?.historySummary && !detailLoads.get(block.id)?.loading" class="activity-empty">{{ running(block) ? '正在等待新的进展。' : '此轮没有额外的过程记录。' }}</p>
         </div>
-      </details>
-      <p v-if="block.turn?.error?.message" class="turn-error" role="alert">
-        {{ block.turn.error.message }}
-      </p>
+      </component>
       <ChatItem
-        v-for="item in block.dividers.length && expandedTurns.has(block.id) ? [] : block.outputs"
+        v-for="item in segment.dividers.length && expandedTurns.has(block.id) ? [] : segment.outputs"
         :key="item.id"
         :host-id="hostId" :cwd="cwd" :thread-id="threadId"
         :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
@@ -267,6 +267,10 @@ function hasPendingQuestion(block: any) {
         @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"
       />
+      </template>
+      <p v-if="block.turn?.error?.message" class="turn-error" role="alert">
+        {{ block.turn.error.message }}
+      </p>
     </section>
   </VirtualHistoryBlock>
   <!-- Revert removes the original turn before the replacement starts. Keep

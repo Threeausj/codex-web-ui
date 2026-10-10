@@ -635,7 +635,8 @@ export function useSideChat(api: any, mainState: any) {
           ...state.turns.filter(turn => !seen.has(turn.id) && (turnRevisions.get(turn.id) || 0) > revision),
         ];
         const changed = new Set([...revisions].filter(([, value]) => value > revision).map(([id]) => id));
-        state.items = mergeSnapshotItems(turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id }))), state.items, changed);
+        state.items = mergeSnapshotItems(turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id }))), state.items, changed,
+          { retainedTurnIds: new Set(state.turns.map(turn => turn.id)) });
         const active = [...state.turns].reverse().find(turn => turn.status === 'inProgress');
         state.busy = !!active;
         activeTurnId = active?.id || '';

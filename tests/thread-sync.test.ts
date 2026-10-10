@@ -105,3 +105,33 @@ test('a delayed compaction completion follows native item order within its own t
   applyItemEvent(items, 'item/completed', { turnId: 'current', item: { id: 'compact', type: 'contextCompaction' } });
   assert.equal(items[2].status, 'completed');
 });
+
+test('completion snapshots keep omitted accepted steering between its surrounding progress', () => {
+  const item = (id: string, type = 'agentMessage', turnId = 'current'): DisplayItem => ({ id, type, turnId });
+  const older = item('older', 'agentMessage', 'older'), next = item('next', 'userMessage', 'next');
+  const initial = item('initial', 'userMessage'), before = item('before'), first = item('first-steer', 'userMessage');
+  const tool = item('tool', 'commandExecution'), after = item('after'), second = item('second-steer', 'userMessage'), last = item('last');
+  const items = [older, initial, before, first, tool, after, second, last, next];
+  const completed = { id: 'current', status: 'completed', items: [initial, before, tool, after, last] };
+  mergeAcceptedTurnItems(items, completed, undefined, false);
+  assert.deepEqual(items.map(item => item.id), ['older', 'initial', 'before', 'first-steer', 'tool', 'after', 'second-steer', 'last', 'next']);
+  mergeAcceptedTurnItems(items, completed, undefined, false);
+  assert.deepEqual(items.map(item => item.id), ['older', 'initial', 'before', 'first-steer', 'tool', 'after', 'second-steer', 'last', 'next']);
+  assert.strictEqual(items[0], older);
+  assert.strictEqual(items.at(-1), next);
+});
+
+test('completion restores native compaction order while anchoring omitted steering before its following answer', () => {
+  const items: DisplayItem[] = [
+    { id: 'older', type: 'agentMessage', turnId: 'older' },
+    { id: 'initial', type: 'userMessage', turnId: 'current' },
+    { id: 'before', type: 'agentMessage', turnId: 'current' },
+    { id: 'steer', clientId: 'steer', type: 'userMessage', turnId: 'current' },
+    { id: 'after', type: 'agentMessage', turnId: 'current' },
+    { id: 'compact', type: 'contextCompaction', turnId: 'current' },
+    { id: 'next', type: 'userMessage', turnId: 'next' },
+  ];
+  mergeAcceptedTurnItems(items, { id: 'current', status: 'completed', items: [items[1], items[2], items[5], items[4]] }, undefined, false);
+  assert.deepEqual(items.map(item => item.id), ['older', 'initial', 'before', 'compact', 'steer', 'after', 'next']);
+  assert.equal(items[3].status, 'completed');
+});
