@@ -260,6 +260,7 @@ const itemRevisions = new Map<string, Map<string, number>>();
 const historyReader = new LazyHistoryReader();
 const historyDetailRequests = new Map<string, Promise<void>>();
 const threadRevisions = new Map<string, number>();
+// Both an explicit name and a confirmed preview can change the displayed title.
 const threadNameRevisions = new Map<string, number>();
 const removedThreads = new Set<string>();
 const deletedThreads = new Set<string>();
@@ -1198,11 +1199,17 @@ function currentItems(threadId: string): DisplayItem[] {
   }
   return items;
 }
-function updateThread(thread: any) {
+function updateThread(thread: any, options: { authoritativePreview?: boolean } = {}) {
   if (!thread?.id || thread.ephemeral || deletedThreads.has(recencyKey(state.hostId, thread.id))) return;
-  const previous = state.threads.find((item) => item.id === thread.id);
+  const previous = state.threads.find((item) => item.id === thread.id)
+    ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined);
+  const authoritativePreview = options.authoritativePreview && typeof thread.preview === 'string';
   thread = {
     ...thread,
+    // Native metadata can lag the accepted first message. Keep its confirmed
+    // display preview until the server supplies a nonempty canonical preview.
+    ...(!authoritativePreview && !thread.preview && previous?.preview ? { preview: previous.preview } : {}),
+    ...(authoritativePreview && !thread.name && previous?.name ? { name: previous.name } : {}),
     recencyAt:
       typeof thread.recencyAt === "number" && Number.isFinite(thread.recencyAt)
         ? Math.max(
@@ -1211,6 +1218,11 @@ function updateThread(thread: any) {
           )
         : (previous?.recencyAt ?? threadActivityAt(thread)),
   };
+  if (previous && (('name' in thread && thread.name !== previous.name)
+      || ('preview' in thread && thread.preview !== previous.preview))) {
+    const key = recencyKey(state.hostId, thread.id);
+    threadNameRevisions.set(key, (threadNameRevisions.get(key) ?? 0) + 1);
+  }
   threadRevisions.set(thread.id, ++threadEventSequence);
   removedThreads.delete(thread.id);
   if (state.activeThread?.id === thread.id)
@@ -1218,6 +1230,34 @@ function updateThread(thread: any) {
   const index = state.threads.findIndex((t) => t.id === thread.id);
   if (index < 0) state.threads.unshift(thread);
   else state.threads[index] = { ...state.threads[index], ...thread };
+}
+function projectAcceptedThreadPreview(threadId: string, items: any[]) {
+  const thread = state.threads.find(thread => thread.id === threadId)
+    ?? (state.activeThread?.id === threadId ? state.activeThread : undefined);
+  if (!thread || thread.name || thread.preview) return;
+  // Only native events or accepted RPC inputs reach this helper. Optimistic
+  // messages and paginated history cannot establish the first message's title.
+  const message = items.find(item => item?.type === 'userMessage'
+    && !['sending', 'unconfirmed'].includes(item.status));
+  const text = message?.content?.find((input: any) => input.type === 'text'
+    && typeof input.text === 'string' && input.text.trim()
+    && asyncQuestionAnswerDisplayText(input.text) === null)?.text;
+  const preview = text?.replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 160);
+  if (!preview) return;
+  updateThread({ ...thread, preview });
+  scheduleConversationSnapshot(threadId);
+}
+function listedThreadLabels(thread: any, hostId: string, nameRevisions: Map<string, number>) {
+  const live = state.threads.find(current => current.id === thread.id)
+    ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined);
+  const key = recencyKey(hostId, thread.id);
+  const renamed = (threadNameRevisions.get(key) ?? 0) !== (nameRevisions.get(key) ?? 0);
+  const name = renamed ? live?.name : thread.name ?? live?.name;
+  const preview = renamed && typeof live?.preview === 'string' ? live.preview : thread.preview || live?.preview;
+  return {
+    ...(name !== undefined ? { name } : {}),
+    ...(preview !== undefined ? { preview } : {}),
+  };
 }
 function updateTurn(threadId: string, turn: any) {
   if (state.activeThread?.id !== threadId || !turn?.id) return;
@@ -1241,6 +1281,10 @@ function hydrateTurnItems(threadId: string, turn: any, accepted?: any, preserveL
   if (!turn?.id || discardedTurns.has(turn.id)) return;
   for (const itemId of mergeAcceptedTurnItems(currentItems(threadId), turn, accepted, preserveLive))
     noteItem(threadId, itemId);
+  projectAcceptedThreadPreview(threadId, [
+    ...(turn.items || []),
+    ...(Array.isArray(accepted?.input) ? [{ type: 'userMessage', content: accepted.input }] : []),
+  ]);
   rememberAsyncQuestions(threadId, currentItems(threadId));
 }
 function receiveThreadChange(change: any) {
@@ -1269,7 +1313,7 @@ function receiveThreadChange(change: any) {
     const removed = state.activeThread?.id === threadId
       ? (before >= 0 ? state.turns.slice(before) : []).map(turn => turn.id) : [];
     resetEditedHistory(threadId, removed);
-    updateThread(result.thread);
+    updateThread(result.thread, { authoritativePreview: true });
     refreshRevertedThread(threadId);
     return;
   }
@@ -1509,6 +1553,8 @@ function receive(message: any) {
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
     const item = items.find(item => item.id === itemId);
+    if ((method === 'item/started' || method === 'item/completed') && p.item?.type === 'userMessage')
+      projectAcceptedThreadPreview(p.threadId, [p.item]);
     if ((method === 'item/started' || method === 'item/completed') &&
         (item?.type === 'userMessage' || asyncUserInputQuestions(item).length)) rememberAsyncQuestions(p.threadId, items);
     state.agentActivity[p.threadId] = { ...state.agentActivity[p.threadId], updatedAt: Date.now(),
@@ -2005,6 +2051,7 @@ async function refreshThreads() {
   const generation = ++listGeneration;
   const requestScope = state.hostId;
   const revision = threadEventSequence;
+  const nameRevisions = new Map(threadNameRevisions);
   const result = await threadPage(requestScope, "thread/list", {
     limit: 60,
     modelProviders: [],
@@ -2020,10 +2067,13 @@ async function refreshThreads() {
     )
     .map((thread: any) => {
       removedThreads.delete(thread.id);
-      const live = state.threads.find((current) => current.id === thread.id);
-      return live && (threadRevisions.get(thread.id) ?? 0) > revision
-        ? { ...thread, ...live }
-        : thread;
+      const live = state.threads.find((current) => current.id === thread.id)
+        ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined);
+      return {
+        ...thread,
+        ...(live && (threadRevisions.get(thread.id) ?? 0) > revision ? live : {}),
+        ...listedThreadLabels(thread, requestScope, nameRevisions),
+      };
     });
   const seen = new Set(fresh.map((thread: any) => thread.id));
   const changed = state.threads.filter(
@@ -2042,6 +2092,15 @@ async function refreshThreads() {
         )
       : []),
   ];
+  const active = state.activeThread;
+  const listed = active && fresh.find((thread: any) => thread.id === active.id);
+  if (listed && (listed.name !== active.name || listed.preview !== active.preview)) {
+    // A list refresh updates labels, never the writer's live turn/status state.
+    const key = recencyKey(requestScope, active.id);
+    threadNameRevisions.set(key, (threadNameRevisions.get(key) ?? 0) + 1);
+    state.activeThread = { ...active, name: listed.name, preview: listed.preview };
+    saveConversationSnapshot();
+  }
   if (threadListScope !== requestScope || !loadedGlobalPages) {
     threadCursor = result.nextCursor;
     state.moreThreads = !!threadCursor;
@@ -2079,6 +2138,7 @@ async function loadMoreThreads() {
   const cursor = threadCursor;
   const requestScope = state.hostId;
   const generation = listGeneration;
+  const nameRevisions = new Map(threadNameRevisions);
   const result = await threadPage(requestScope, "thread/list", {
     limit: 60,
     cursor,
@@ -2094,7 +2154,7 @@ async function loadMoreThreads() {
   state.threads.push(
     ...result.data.filter(
       (t: any) => !known.has(t.id) && !removedThreads.has(t.id),
-    ),
+    ).map((thread: any) => ({ ...thread, ...listedThreadLabels(thread, requestScope, nameRevisions) })),
   );
   loadedMorePages = true;
   loadedGlobalPages = true;
@@ -2108,6 +2168,7 @@ async function loadProjectThreads(projectPath: string, more = false) {
   const cursor = more ? current?.cursor : undefined;
   if (more && !cursor) return;
   const roots = projectRoots(projectPath);
+  const nameRevisions = new Map(threadNameRevisions);
   const result = await threadPage(hostId, "thread/list", {
     limit: 60,
     cursor,
@@ -2119,7 +2180,7 @@ async function loadProjectThreads(projectPath: string, more = false) {
   state.threads.push(
     ...result.data.filter(
       (thread: any) => !known.has(thread.id) && !removedThreads.has(thread.id),
-    ),
+    ).map((thread: any) => ({ ...thread, ...listedThreadLabels(thread, hostId, nameRevisions) })),
   );
   loadedMorePages = true;
   state.projectThreadPages[projectPath] = {
@@ -2301,7 +2362,13 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   const cached = conversationCache.peek(hostId, id);
   const loadedHistory = itemCache.history(id);
-  state.activeThread = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
+  const previousPreview = previousId === id ? state.activeThread?.preview : undefined;
+  const threadMetadata = state.threads.find((t) => t.id === id) ?? cached?.thread ?? { id };
+  state.activeThread = {
+    ...threadMetadata,
+    ...(!threadMetadata.preview && (cached?.thread?.preview || previousPreview)
+      ? { preview: cached?.thread?.preview || previousPreview } : {}),
+  };
   state.items = itemCache.get(id) ?? cached?.items ?? [];
   rememberAsyncQuestions(id, state.items);
   state.turns = loadedHistory?.turns ?? cached?.turns ?? (previousId === id ? state.turns : []);
@@ -2389,7 +2456,11 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     const runtimeChanged = (turnRevisions.get(id) ?? 0) !== runtimeRevision;
     const latestStatus = state.activeThread?.status;
     const latestName = state.activeThread?.name;
+    const latestPreview = state.activeThread?.preview;
     const nameChanged = (threadNameRevisions.get(modeKey) ?? 0) !== nameRevision;
+    // Only a confirmed, complete empty head after a revert invalidates the
+    // previous first-message preview; an ordinary empty page does not.
+    const revertedEmpty = !!candidates && !runtimeChanged && !page.data.length && !page.nextCursor;
     const previousProject = state.projectPath;
     state.activePermissionProfileId =
       previousId === id ? previousProfileId : "";
@@ -2403,13 +2474,16 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     );
     state.activeThread = {
       ...result.thread,
+      ...(revertedEmpty ? { preview: '' }
+        : nameChanged && typeof latestPreview === 'string' ? { preview: latestPreview }
+        : !result.thread.preview && latestPreview ? { preview: latestPreview } : {}),
       // A canonical response is authoritative for its snapshot, but new live
       // content may have arrived while resume/history hydration was in flight.
       recencyAt: runtimeChanged
         ? Math.max(resumedRecency, knownRecency ?? 0)
         : resumedRecency,
       ...(runtimeChanged && latestStatus ? { status: latestStatus } : {}),
-      // A rename accepted after this load began wins over its older snapshot.
+      // Labels observed after this load began win over its older snapshot.
       ...(nameChanged && typeof latestName === 'string' ? { name: latestName } : {}),
     };
     if (result.thread.recencyAt == null)
@@ -2417,7 +2491,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
         stamp: result.thread.updatedAt,
         value: state.activeThread.recencyAt,
       });
-    updateThread(state.activeThread);
+    updateThread(state.activeThread, { authoritativePreview: revertedEmpty });
     state.projectPath = result.thread.cwd ?? state.projectPath;
     if (result.collaborationMode?.mode === 'plan' || result.collaborationMode?.mode === 'default') {
       state.collaborationMode = result.collaborationMode.mode;
@@ -2900,7 +2974,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       updateThread(result.thread);
       permissionSelections.set(recencyKey(hostId, id!), { mode: permission, profileId: state.activePermissionProfileId });
       if (generation === selectionGeneration && hostId === state.hostId) {
-        state.activeThread = result.thread;
+        state.activeThread = state.threads.find(thread => thread.id === id) ?? result.thread;
         state.items = itemCache.get(id!) ?? [];
         rememberThread(id!);
       }
@@ -2940,6 +3014,8 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
         clientUserMessageId: messageId,
         input: inputs,
       });
+      if (hostId === state.hostId)
+        projectAcceptedThreadPreview(id!, [{ type: 'userMessage', content: inputs }]);
     } else {
       const revision = turnRevisions.get(id!) ?? 0;
       const itemRevision = itemEventSequence;
@@ -2958,6 +3034,11 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
         sandboxPolicy: policy,
         ...(supportsCollaborationModes ? { collaborationMode: nativeCollaborationMode(collaborationMode, model, effort) } : {}),
       });
+      if (hostId === state.hostId)
+        projectAcceptedThreadPreview(id!, [
+          ...(result.turn.items || []),
+          { type: 'userMessage', content: inputs },
+        ]);
       if ((turnRevisions.get(id!) ?? 0) === revision) {
         const running =
           !result.turn.status || result.turn.status === "inProgress";
@@ -3110,7 +3191,7 @@ async function resendEditedMessage(itemId: string, text: string) {
       if (!stillSelected()) throw new Error('会话已切换，原会话已回退；请返回原会话查看');
       const removed = state.turns.slice(state.turns.findIndex(turn => turn.id === original.turnId)).map(turn => turn.id);
       resetEditedHistory(threadId, removed);
-      updateThread(result.thread);
+      updateThread(result.thread, { authoritativePreview: true });
     }
     if (edit.reverted) {
       const revision = turnRevisions.get(threadId) ?? 0;
@@ -3125,6 +3206,8 @@ async function resendEditedMessage(itemId: string, text: string) {
       }
       state.turns = [...page.data].reverse();
       state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
+      if (!page.data.length && !page.nextCursor)
+        updateThread({ ...state.activeThread, preview: '' }, { authoritativePreview: true });
       itemCache.set(threadId, state.items);
       turnCursor = page.nextCursor;
       state.moreTurns = !!turnCursor;
@@ -3285,6 +3368,9 @@ function applyThreadRename(id: string, name: string, hostId = state.hostId) {
     if (thread) thread.name = name;
     if (state.activeThread?.id === id) {
       state.activeThread = { ...state.activeThread, name };
+      // A forced navigation refresh temporarily removes every row. Its parallel
+      // project-list response must not reinsert this thread's older label.
+      if (!thread && !state.activeThread.ephemeral) state.threads.unshift(state.activeThread);
       saveConversationSnapshot();
     } else conversationCache.remove(hostId, id);
   } else conversationCache.remove(hostId, id);
