@@ -84,6 +84,37 @@ test('refresh started while dismissal is pending cannot race its committed resul
   assert.equal(store.dismissed(notice()), true);
 });
 
+test('reconnection bootstrap during a pending dismissal cannot strand busy or restore the banner', async () => {
+  const writing = deferred<any>();
+  const store = useAsyncQuestionNoticeDismissals({
+    runtimeIdentity: () => ({ authenticationGeneration: 1 }),
+    requestHttp: async () => writing.promise,
+  });
+  const pending = store.dismiss([notice()]);
+  store.hydrate([]);
+  assert.equal(store.state.busy, true);
+  writing.resolve({}); await pending;
+  assert.equal(store.state.busy, false);
+  assert.equal(store.dismissed(notice()), true);
+  store.hydrate([notice(), notice('another-host')]);
+  assert.equal(store.dismissed(notice('another-host')), true);
+});
+
+test('failed dismissal still releases busy after a concurrent reconnection bootstrap', async () => {
+  let reject!: (cause: Error) => void;
+  const writing = new Promise((_resolve, no) => { reject = no; });
+  const store = useAsyncQuestionNoticeDismissals({
+    runtimeIdentity: () => ({ authenticationGeneration: 1 }),
+    requestHttp: async () => writing,
+  });
+  const pending = store.dismiss([notice()]);
+  store.hydrate([]);
+  reject(new Error('Disconnected'));
+  await assert.rejects(pending, /Disconnected/);
+  assert.equal(store.state.busy, false);
+  assert.equal(store.dismissed(notice()), false);
+});
+
 test('logout ignores a late list and dismissal acknowledgement from an older login', async () => {
   let authenticationGeneration = 1;
   const reading = deferred<any>(), writing = deferred<any>();

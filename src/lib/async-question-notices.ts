@@ -18,6 +18,9 @@ export function useAsyncQuestionNoticeDismissals(api: Api) {
     .map(entry => [asyncQuestionNoticeKey(entry), entry]));
   function clear() { revision++; state.dismissals = {}; state.busy = false; state.loading = false; reading = undefined; lastRead = 0; }
   function hydrate(dismissals: unknown) {
+    // Reconnecting may bootstrap while a dismissal is still committing. Its
+    // snapshot must not invalidate the POST and strand its busy indicator.
+    if (state.busy) return;
     revision++; state.dismissals = validated(dismissals); state.loading = false; lastRead = Date.now();
   }
   async function refresh(force = false) {

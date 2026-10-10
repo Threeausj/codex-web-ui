@@ -7,6 +7,8 @@ import { createServer, loadConfigFromFile } from 'vite';
 import { MockCodex, expect } from '../tests/e2e/fixtures';
 
 const output = path.resolve('docs/images');
+const only = process.argv.find(argument => argument.startsWith('--only='))?.slice('--only='.length);
+if (only && only !== 'bookmarks') throw new Error(`Unknown screenshot group: ${only}`);
 const cwd = '/workspace/demo';
 const at = Date.parse('2026-10-08T04:00:00Z');
 const second = at / 1000;
@@ -43,6 +45,13 @@ function demo() {
     { id: 'demo-test', type: 'commandExecution', command: 'npm test', status: 'completed', aggregatedOutput: 'All tests passed.', exitCode: 0 },
     { id: 'demo-answer', type: 'agentMessage', phase: 'final_answer', text: '首页已更新，并完成手机与深色模式适配。\n\n- **更清晰的入口**：项目、主机和对话集中展示。\n- **更紧凑的对话**：连续操作默认折叠，回复保持直接可读。\n- **更方便的编辑**：源码与 Markdown 预览可切换，文件标签保留草稿。\n\n| 检查 | 结果 |\n| --- | --- |\n| 手机布局 | 通过 |\n| 浅色 / 深色主题 | 通过 |\n| 构建与测试 | 通过 |\n\n可以在右侧工作区查看变更，也可以继续提出修改。' },
   ] }]);
+  mock.bookmarks = [
+    { name: '手机布局检查清单', text: '手机输入工具栏保持对齐，侧滑返回先关闭侧栏，再返回对话。', threadId: 'connection-review', threadName: '排查连接恢复' },
+    { name: '每日巡检重点', text: '只读检查 Git 状态与测试结果，保留执行记录，失败后可以重试。', threadId: 'daily-review', threadName: '每日代码巡检' },
+  ].map((entry, index) => ({ id: `00000000-0000-4000-8000-00000000000${index + 1}`, hostId: 'local', projectPath: cwd,
+    name: entry.name, source: { threadId: entry.threadId, threadName: entry.threadName, turnId: `bookmark-demo-turn-${index}`, itemId: `bookmark-demo-answer-${index}`, text: entry.text },
+    createdAt: at - (index + 1) * 3600000, updatedAt: at - (index + 1) * 3600000,
+  }));
   const receive = (mock as any).receive.bind(mock);
   (mock as any).receive = (socket: any, request: any) => {
     const reply = (result: unknown) => { mock.requests.push(request); socket.send(JSON.stringify({ id: request.id, result })); };
@@ -88,11 +97,22 @@ try {
     mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: { last: { totalTokens: 48000 }, total: { totalTokens: 68000 }, modelContextWindow: 200000 } });
     return { context, page, mock };
   }
-  async function capture(page: Page, name: string) {
+  async function capture(page: Page, name: string, clip?: { x: number; y: number; width: number; height: number }) {
     await page.evaluate(async () => { await document.fonts.ready; await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))); });
-    await page.screenshot({ path: path.join(output, `${name}.png`), animations: 'disabled' });
+    await page.screenshot({ path: path.join(output, `${name}.png`), animations: 'disabled', ...(clip ? { clip } : {}) });
     process.stdout.write(`Captured docs/images/${name}.png\n`);
   }
+  async function captureRegion(page: Page, name: string, selectors: string[], padding = 36) {
+    const boxes = await Promise.all(selectors.map(selector => page.locator(selector).boundingBox()));
+    if (boxes.some(box => !box)) throw new Error(`Screenshot region is missing: ${name}`);
+    const viewport = page.viewportSize()!;
+    const x = Math.max(0, Math.floor(Math.min(...boxes.map(box => box!.x)) - padding));
+    const y = Math.max(0, Math.floor(Math.min(...boxes.map(box => box!.y)) - padding));
+    const right = Math.min(viewport.width, Math.ceil(Math.max(...boxes.map(box => box!.x + box!.width)) + padding));
+    const bottom = Math.min(viewport.height, Math.ceil(Math.max(...boxes.map(box => box!.y + box!.height)) + padding));
+    await capture(page, name, { x, y, width: right - x, height: bottom - y });
+  }
+  if (!only) {
   const desktop = await open();
   await desktop.page.locator('.turn-activity > summary').click();
   await capture(desktop.page, 'desktop-chat');
@@ -141,5 +161,39 @@ try {
   const mobile = await open('light', true);
   await capture(mobile.page, 'mobile-chat');
   await mobile.context.close();
+  }
+
+  const bookmarks = await open();
+  const page = bookmarks.page;
+  const answer = page.locator('[data-selection-item-id="demo-answer"]');
+  const selected = answer.locator('li').nth(1);
+  await selected.scrollIntoViewIfNeeded();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await selected.evaluate(element => {
+    const range = document.createRange(); range.selectNodeContents(element);
+    const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+  });
+  const toolbar = page.getByRole('toolbar', { name: '所选对话内容', exact: true });
+  await expect(toolbar.getByRole('button', { name: '收藏', exact: true })).toBeVisible();
+  await captureRegion(page, 'bookmarks-selection', ['[data-selection-item-id="demo-answer"]', '.conversation-selection-toolbar'], 20);
+  await toolbar.getByRole('button', { name: '收藏', exact: true }).click();
+  await expect(page.locator('.bookmark-name-dialog')).toBeVisible();
+  await page.getByRole('textbox', { name: '收藏名称', exact: true }).fill('紧凑对话的设计原则');
+  await captureRegion(page, 'bookmarks-name', ['.bookmark-name-dialog']);
+  await page.locator('.bookmark-name-dialog').getByRole('button', { name: '收藏', exact: true }).click();
+  await expect(page.locator('.bookmark-name-dialog')).toHaveCount(0);
+  await expect.poll(() => bookmarks.mock.bookmarks.length).toBe(3);
+  await page.getByRole('button', { name: 'Codex Web UI 项目操作', exact: true }).click();
+  await page.getByRole('menuitem', { name: '收藏对话', exact: true }).click();
+  await expect(page.locator('.bookmarks-panel')).toBeVisible();
+  await expect(page.locator('.bookmark-entry')).toHaveCount(3);
+  await expect(page.getByRole('searchbox', { name: '搜索收藏', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '重命名收藏 紧凑对话的设计原则', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '跳转到收藏 紧凑对话的设计原则', exact: true })).toBeVisible();
+  await captureRegion(page, 'bookmarks-list', ['.bookmarks-panel']);
+  if (bookmarks.mock.requests.some(request => ['turn/start', 'turn/steer', 'thread/delete', 'thread/revert'].includes(request.method || '')))
+    throw new Error('Bookmark screenshots must not run a model or modify conversations');
+  await bookmarks.context.close();
   if (failures.length) throw new Error(`UI errors: ${failures.join('; ')}`);
 } finally { await browser.close(); await server.close(); }

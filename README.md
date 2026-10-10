@@ -23,6 +23,13 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
     <td align="center"><strong>显卡与会话连接</strong><br><img src="docs/images/resources-runtime.png" alt="显卡占用、显存及会话名称对应的 PID 与关闭按钮" width="600"></td>
     <td align="center"><strong>定时自动化与执行记录</strong><br><img src="docs/images/automations.png" alt="自动化计划、执行日志与失败恢复入口" width="600"></td>
   </tr>
+  <tr>
+    <td align="center"><strong>选中文字收藏</strong><br><img src="docs/images/bookmarks-selection.png" alt="选中对话中的文字，在悬浮菜单点击收藏" width="600"></td>
+    <td align="center"><strong>首次命名收藏</strong><br><img src="docs/images/bookmarks-name.png" alt="收藏时编辑名称，并保留所选原文作为预览" width="506"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>项目收藏：搜索、重命名与原文定位</strong><br><img src="docs/images/bookmarks-list.png" alt="从项目菜单查看收藏，搜索片段、重命名、取消收藏或跳转到原文" width="672"></td>
+  </tr>
 </table>
 
 <details>
@@ -32,7 +39,7 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 
 </details>
 
-截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
+截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`；仅更新收藏截图可执行 `npm run docs:screenshots -- --only=bookmarks`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
 
 [Docker 部署](#docker-快速部署) · [功能与限制](#功能状态) · [开发与验证](#开发与验证) · [本轮审查与改进建议](docs/project-audit.md)
 

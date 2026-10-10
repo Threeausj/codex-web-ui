@@ -23,6 +23,13 @@ These images show the real Vue application with fixed demonstration data. They c
     <td align="center"><strong>GPU and session connections</strong><br><img src="docs/images/resources-runtime.png" alt="GPU utilization and named sessions with PIDs and individual close actions" width="600"></td>
     <td align="center"><strong>Schedules and execution history</strong><br><img src="docs/images/automations.png" alt="Automation schedules, execution logs, and recovery actions" width="600"></td>
   </tr>
+  <tr>
+    <td align="center"><strong>Bookmark selected text</strong><br><img src="docs/images/bookmarks-selection.png" alt="Selected conversation text with the bookmark action in the floating menu" width="600"></td>
+    <td align="center"><strong>Name a new bookmark</strong><br><img src="docs/images/bookmarks-name.png" alt="Naming a bookmark with a preview of the selected original text" width="506"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Project bookmarks: search, rename, and jump to the original</strong><br><img src="docs/images/bookmarks-list.png" alt="Project bookmark list with search, rename, remove, and jump-to-source actions" width="672"></td>
+  </tr>
 </table>
 
 <details>
@@ -32,7 +39,7 @@ These images show the real Vue application with fixed demonstration data. They c
 
 </details>
 
-To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run docs:screenshots`. The script starts an isolated frontend with test protocol fixtures. It never connects to a real backend or runs a model, and the images are excluded from Docker images.
+To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run docs:screenshots`. Use `npm run docs:screenshots -- --only=bookmarks` to update only the bookmark images. The script starts an isolated frontend with test protocol fixtures. It never connects to a real backend or runs a model, and the images are excluded from Docker images.
 
 [Deployment](#docker-quick-start) · [Features and limits](#features-and-limits) · [Development](#development-and-validation) · [Code review and priorities](docs/project-audit.md)
 
