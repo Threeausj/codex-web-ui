@@ -67,17 +67,20 @@ defineExpose({ focusLine });
 </script>
 <template>
   <div class="code-editor">
-    <div v-if="selection && allowQuestion" class="code-selection-toolbar" data-selection-ignore>
-      <span>第 {{ selection.startLine }}–{{ selection.endLine }} 行</span>
-      <button class="button button-small button-secondary" @mousedown.prevent @click="selected('add')">添加到对话</button>
-      <button class="button button-small button-secondary" @mousedown.prevent @click="selected('ask')">在侧边聊天中提问</button>
-    </div>
     <div ref="parent" class="code-editor-view"></div>
+    <div v-if="allowQuestion" class="code-selection-toolbar" :class="{ 'has-selection': !!selection }" :aria-hidden="!selection" :inert="!selection" data-selection-ignore>
+      <span>{{ selection ? `第 ${selection.startLine}–${selection.endLine} 行` : '\u00a0' }}</span>
+      <button class="button button-small button-secondary" :disabled="!selection" @mousedown.prevent @click="selected('add')">添加到对话</button>
+      <button class="button button-small button-secondary" :disabled="!selection" @mousedown.prevent @click="selected('ask')">在侧边聊天中提问</button>
+    </div>
   </div>
 </template>
 <style scoped>
 .code-editor { display:flex; flex-direction:column; flex:1; min-height:120px; overflow:hidden }
 .code-editor-view { flex:1; min-height:0; overflow:hidden }
-.code-selection-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:6px 8px; border-bottom:1px solid var(--border); font-size:11px }
-.code-selection-toolbar span { margin-right:auto; color:var(--muted) }
+.code-selection-toolbar { display:flex; flex-shrink:0; align-items:center; gap:6px; min-height:44px; box-sizing:border-box; padding:6px 8px; border-top:1px solid var(--border); font-size:11px }
+.code-selection-toolbar > * { visibility:hidden }
+.code-selection-toolbar.has-selection > * { visibility:visible }
+.code-selection-toolbar span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted) }
+.code-selection-toolbar button { flex-shrink:0; min-height:30px; padding:5px 8px; font-size:11px; white-space:nowrap }
 </style>
