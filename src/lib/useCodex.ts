@@ -21,6 +21,8 @@ import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './
 import { isInteractiveServerRequest } from '../../shared/server-requests';
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionAnswered, asyncQuestionAnswerDisplayText, asyncQuestionFingerprint, asyncQuestionReplyText } from '../../shared/async-question-reply';
+import type { ConversationBookmarkSource } from '../../shared/bookmarks';
+import { mergeBookmarkMessages, retainBookmarkTargets } from './conversation-bookmarks';
 import {
   availablePermissionProfiles,
   resolvePermissionProfile,
@@ -2141,6 +2143,67 @@ function loadTurnDetails(turnId: string): Promise<void> {
   historyDetailRequests.set(key, operation);
   return operation;
 }
+async function revealBookmarkSource(source: ConversationBookmarkSource) {
+  const hostId = state.hostId, generation = selectionGeneration, authentication = authenticationGeneration;
+  const current = () => hostId === state.hostId && generation === selectionGeneration && authentication === authenticationGeneration &&
+    state.activeThread?.id === source.threadId && state.threadReady && !state.selectingThread;
+  if (!current() || state.threadConflict || state.runtimePaused || state.threadReleased) throw new Error('请先恢复并同步此会话，再定位收藏');
+  const restoring = historyRestoration;
+  if (restoring?.threadId === source.threadId && restoring.generation === generation) await restoring.promise;
+  if (!current()) throw new Error('会话已切换，已取消收藏定位');
+  const removePreviousTarget = () => {
+    const old = new Set(state.turns.filter(turn => turn.historyBookmarkTarget && turn.id !== source.turnId).map(turn => turn.id));
+    state.turns = state.turns.filter(turn => !old.has(turn.id));
+    state.items = state.items.filter(item => !old.has(item.turnId));
+  };
+  if (!state.turns.find(turn => turn.id === source.turnId)?.historyBookmarkTarget &&
+      state.items.some(item => item.id === source.itemId && item.turnId === source.turnId && !item.cacheTruncated)) {
+    removePreviousTarget(); saveConversationSnapshot(); return;
+  }
+  const revision = itemEventSequence;
+  // Locate one native turn directly. Loading a bookmark must not download all
+  // intervening turns or every command output in a large conversation.
+  let cursor: string | null = null;
+  const cursors = new Set<string>(), messages = new Map<string, DisplayItem>(), nativeOrder: string[] = [];
+  let found = false;
+  for (let pageIndex = 0; pageIndex < 250; pageIndex++) {
+    const page: any = await rpc('thread/items/list', { threadId: source.threadId, turnId: source.turnId,
+      cursor, limit: 40, sortDirection: 'asc' }, 45000, { silentError: true });
+    if (!current()) throw new Error('会话已切换，已取消收藏定位');
+    if (!Array.isArray(page.data) || page.data.some((entry: any) => entry.turnId !== source.turnId || typeof entry.item?.id !== 'string' || !entry.item.id))
+      throw new Error('收藏对应的历史记录已变化，请同步后重试');
+    for (const entry of page.data) {
+      nativeOrder.push(entry.item.id);
+      if (['agentMessage', 'userMessage', 'contextCompaction'].includes(entry.item.type))
+        messages.set(entry.item.id, { ...entry.item, turnId: source.turnId });
+      if (entry.item.id === source.itemId) found = true;
+    }
+    if (found) break;
+    cursor = page.nextCursor;
+    if (!cursor) break;
+    if (typeof cursor !== 'string' || cursors.has(cursor)) throw new Error('收藏定位的历史分页未能继续，请同步后重试');
+    cursors.add(cursor);
+  }
+  if (!found) throw new Error('未找到收藏的原消息，消息可能已被回退或删除；收藏内容仍保留');
+  removePreviousTarget();
+  const existing = state.turns.find(turn => turn.id === source.turnId);
+  if (!existing) state.turns.unshift({ id: source.turnId, items: [...messages.values()], itemsView: 'summary',
+    historySummary: true, historyItemsStarted: false, historyItemsCursor: null, historyItemIds: [], historyBookmarkTarget: true });
+  const live = [...state.items];
+  const known = live.filter(item => item.turnId === source.turnId);
+  const changed = new Set(known.filter(item => (itemRevisions.get(source.threadId)?.get(item.id) || 0) > revision).map(item => item.id));
+  const merged = mergeBookmarkMessages(known, [...messages.values()], changed, nativeOrder);
+  const before = state.turns.findIndex(turn => turn.id === source.turnId);
+  const later = new Set(state.turns.slice(before + 1).map(turn => turn.id));
+  const other = live.filter(item => item.turnId !== source.turnId);
+  const insertion = other.findIndex(item => item.turnId && later.has(item.turnId));
+  other.splice(insertion < 0 ? other.length : insertion, 0, ...merged);
+  state.items = other;
+  if (!existing) historyWindowTruncated = true;
+  rememberAsyncQuestions(source.threadId, state.items);
+  itemCache.set(source.threadId, state.items);
+  saveConversationSnapshot();
+}
 function rememberThread(id: string) {
   const selections = saved<Record<string, string>>(
     "codex.selectedThreadIds",
@@ -2355,8 +2418,9 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
     if (reuseHistory) page.data = retainHistoryDetails(page.data, loadedHistory!.turns, live);
-    state.turns = [...prefixTurns, ...[...page.data].reverse()];
-    for (const turn of liveTurns) updateTurn(id, turn);
+    const bookmarkTurns = [...state.turns];
+    state.turns = retainBookmarkTargets([...prefixTurns, ...[...page.data].reverse()], bookmarkTurns, live);
+    for (const turn of liveTurns) if (!turn.historyBookmarkTarget) updateTurn(id, turn);
     const running = [...state.turns].reverse().find((turn) => turn.status === "inProgress");
     if (!runtimeChanged) {
       if (running) activeTurns.set(id, running.id);
@@ -2381,7 +2445,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       !state.items.some(entry => entry.type === 'contextCompaction' && entry.turnId === item.turnId)) upsertItem(state.items, item);
     itemCache.set(id, state.items);
     turnCursor = prefixTurns.length ? loadedHistory!.cursor : page.nextCursor;
-    historyWindowTruncated = false;
+    historyWindowTruncated = state.turns.some(turn => turn.historyBookmarkTarget);
     state.moreTurns = !!turnCursor;
     state.threadReady = true;
     disconnectedWithMutation = false;
@@ -2491,7 +2555,8 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
     const liveTurns = [...state.turns];
     state.turns = retainHistoryDetails([...turns.values()].reverse(), liveTurns, live);
     for (const turn of state.turns) discardedTurns.delete(turn.id);
-    for (const turn of liveTurns) updateTurn(id, turn);
+    for (const turn of liveTurns) if (!turn.historyBookmarkTarget) updateTurn(id, turn);
+    state.turns = retainBookmarkTargets(state.turns, liveTurns, live);
     const loaded = state.turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })));
     const changedIds = new Set([...(itemRevisions.get(id)?.entries() || [])]
       .filter(([, revision]) => revision > itemRevision).map(([itemId]) => itemId));
@@ -2503,7 +2568,7 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
       upsertItem(state.items, item);
     turnCursor = cursor;
     state.moreTurns = !!cursor;
-    historyWindowTruncated = false;
+    historyWindowTruncated = state.turns.some(turn => turn.historyBookmarkTarget);
     saveConversationSnapshot();
   } catch (error) {
     // Older-page recovery must not revoke a successfully confirmed writer or
@@ -2536,7 +2601,12 @@ async function loadOlderTurns() {
       )
       .filter((item: any) => !known.has(item.id)),
   );
-  state.turns.unshift(...older.filter(turn => !knownTurns.has(turn.id)));
+  // An isolated bookmark target precedes the continuous history window until
+  // normal pagination reaches it; newer pages must not appear before it.
+  const incomingIds = new Set(older.map(turn => turn.id));
+  const detached = state.turns.filter(turn => turn.historyBookmarkTarget && !incomingIds.has(turn.id));
+  const rest = state.turns.filter(turn => !turn.historyBookmarkTarget);
+  state.turns = [...detached, ...older.filter(turn => !knownTurns.has(turn.id) || state.turns.find(entry => entry.id === turn.id)?.historyBookmarkTarget), ...rest];
   rememberAsyncQuestions(id, state.items);
   turnCursor = page.nextCursor;
   state.moreTurns = !!turnCursor;
@@ -4826,6 +4896,7 @@ export function useCodex() {
     takeoverThread,
     loadOlderTurns,
     loadTurnDetails,
+    revealBookmarkSource,
     newThread,
     newThreadInWorktree,
     startReview,

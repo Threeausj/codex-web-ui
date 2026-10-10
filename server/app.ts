@@ -14,6 +14,7 @@ import { Auth, trustedOrigins } from './auth.js'
 import { Storage, hostInput, writePrivateJson } from './storage.js'
 import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
+import { registerBookmarks } from './bookmarks.js'
 import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
 import { registerThreadGoals } from './thread-goals.js'
@@ -120,6 +121,7 @@ export async function createApp(options: AppOptions = {}) {
   registerAutomations(app, automations)
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
+  await registerBookmarks(app, dataDir, id => !!storage.host(id))
   registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions,
     busyWorktreeThreads: async (hostId, directory) => {
       const bridge = await getBridge(hostId)
