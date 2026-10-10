@@ -112,7 +112,7 @@ test('mobile Back hides a side question and keeps its draft when reopened', asyn
   await browserBack(page);
   await expect(page.locator('#side-chat-panel')).not.toBeVisible();
   await expect.poll(() => guard(page)).toBe(false);
-  await page.getByRole('button', { name: '打开侧边聊天', exact: true }).click();
+  await page.getByRole('button', { name: '新建侧边聊天', exact: true }).click();
   await expect(question).toHaveValue('稍后继续的侧边问题');
   expect(mock.request('thread/fork')).toBeUndefined();
   expect(mock.request('turn/start')).toBeUndefined();

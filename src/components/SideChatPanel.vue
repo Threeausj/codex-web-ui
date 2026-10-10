@@ -16,7 +16,11 @@ const closing = ref(false);
 const synchronizing = ref(false);
 const recoveryId = ref('');
 const followTail = ref(true);
-const sourceKey = computed(() => conversationSelectionKey(state.value.source));
+const conversationContext = computed(() => (state.value.anchor || state.value.source)?.kind === 'conversation');
+const quoteSource = computed(() => state.value.source?.text ? state.value.source : state.value.anchor?.text ? state.value.anchor : null);
+const sourceKey = computed(() => state.value.source?.kind === 'conversation'
+  ? JSON.stringify(['conversation', state.value.source.hostId, state.value.source.threadId])
+  : conversationSelectionKey(state.value.source));
 const requests = computed(() => state.value.threadId && state.value.source?.hostId === props.mainState.hostId
   ? (props.mainState.pendingRequests || []).filter((request: any) => (request.params?.threadId || request.params?.conversationId) === state.value.threadId)
   : []);
@@ -81,8 +85,10 @@ async function close() {
   finally { closing.value = false; }
 }
 async function newBranch() {
-  if (!window.confirm("另开侧边分支会关闭当前临时问答，并按当前选段重新继承历史，是否继续？")) return;
-  try { await props.controller.newBranch(); }
+  if (!window.confirm(conversationContext.value
+    ? '另开侧边分支会关闭当前临时问答，并重新继承当前对话上下文，是否继续？'
+    : '另开侧边分支会关闭当前临时问答，并按当前选段重新继承历史，是否继续？')) return;
+  try { await props.controller.newBranch(); question.value = ''; localError.value = ''; followTail.value = true; focusQuestion(); }
   catch (cause: any) { localError.value = cause.message; }
 }
 async function saveBranch() {
@@ -107,7 +113,7 @@ function quoteAnswer() {
       <div><Icon name="PanelRight" :size="16" /><strong>侧边聊天</strong></div>
       <div class="side-chat-heading-actions"><button v-if="state.threadId" type="button" class="icon-button" aria-label="同步侧边聊天" title="同步侧边聊天" :disabled="closing || synchronizing || !state.connected || state.loading" @click="synchronize"><Icon :name="synchronizing ? 'LoaderCircle' : 'RefreshCw'" :size="15" :class="{ spin: synchronizing }" /></button><button type="button" class="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" :disabled="closing || state.saving" @click="close"><Icon :name="closing ? 'LoaderCircle' : 'X'" :size="17" :class="{ spin: closing }" /></button></div>
     </header>
-    <p class="side-chat-note">{{ state.anchor ? `历史锚点：${state.boundary.lastTurnId ? '截至首次所选轮次' : state.boundary.beforeTurnId ? '首次所选运行轮次之前' : '首次提问时的对话历史'}。后续问题继续此分支。` : '首次提问继承所选位置的对话历史。' }}</p>
+    <p class="side-chat-note">{{ conversationContext ? (state.anchor ? '沿用首次提问时当前对话的上下文，后续问题继续此分支。' : '首次提问继承当前对话的完整上下文，父对话继续独立运行。') : state.anchor ? `历史锚点：${state.boundary.lastTurnId ? '截至首次所选轮次' : state.boundary.beforeTurnId ? '首次所选运行轮次之前' : '首次提问时的对话历史'}。后续问题继续此分支。` : '首次提问继承所选位置的对话历史。' }}</p>
     <div v-if="state.threadId" class="side-chat-branch-actions">
       <button type="button" class="button button-small button-secondary" :disabled="state.busy || state.loading || state.saving || !state.connected" @click="newBranch">另开侧边分支</button>
       <button type="button" class="button button-small button-secondary" :disabled="state.busy || state.loading || state.saving || !!state.savedThreadId || state.saveUncertain === 'fork' || !state.connected" @click="saveBranch">{{ state.savedThreadId ? '分支已保存' : state.saving ? '正在保存…' : state.saveUncertain === 'fork' ? '创建结果待确认' : state.saveUncertain === 'inject' ? '核对并继续保存' : state.saveTargetThreadId ? '保存新增问答到分支' : '保存并置顶正式分支' }}</button>
@@ -117,22 +123,22 @@ function quoteAnswer() {
       <label>创建结果待确认：请先核对已创建的原生对话，再填写其对话 ID。<input v-model="recoveryId" maxlength="128" aria-label="已创建正式分支的对话 ID" placeholder="正式分支的对话 ID" :disabled="state.saving" /></label>
       <button type="submit" class="button button-small button-secondary" :disabled="!recoveryId.trim() || state.saving || state.busy || !state.connected">指定已创建分支继续保存</button>
     </form>
-    <details v-if="state.source" class="side-chat-quote" open>
-      <summary><Icon name="CornerDownLeft" :size="14" /><span>引用 {{ state.source.threadName || '原对话' }}</span><Icon name="ChevronDown" :size="13" /></summary>
-      <blockquote>{{ state.source.text }}</blockquote>
+    <details v-if="quoteSource" class="side-chat-quote" open>
+      <summary><Icon name="CornerDownLeft" :size="14" /><span>引用 {{ quoteSource.threadName || '原对话' }}</span><Icon name="ChevronDown" :size="13" /></summary>
+      <blockquote>{{ quoteSource.text }}</blockquote>
     </details>
     <div ref="transcript" class="side-chat-transcript" aria-label="侧边聊天消息" @scroll.passive="onScroll">
-      <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :cwd="mainState.projectPath" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
+      <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :thread-id="state.threadId" :cwd="mainState.projectPath" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
       <ApprovalCard v-for="request in requests" :key="request.id" :request="request" :items="state.items" :api="api" />
       <p v-if="state.loading" class="side-chat-status" role="status"><Icon name="LoaderCircle" :size="15" class="spin" />正在准备侧边对话…</p>
-      <div v-if="!state.items?.length && !state.loading && !state.busy" class="side-chat-empty"><Icon name="CircleHelp" :size="24" /><p>想了解这段内容的哪一部分？</p></div>
+      <div v-if="!state.items?.length && !state.loading && !state.busy" class="side-chat-empty"><Icon name="CircleHelp" :size="24" /><p>{{ conversationContext ? '基于当前对话，继续提问' : '想了解这段内容的哪一部分？' }}</p></div>
     </div>
     <p v-if="error" class="side-chat-error" role="alert">{{ error }}</p>
     <p v-if="state.notice" class="side-chat-status" role="status">{{ state.notice }}</p>
     <p v-if="!state.connected" class="side-chat-status" role="status"><Icon name="WifiOff" :size="14" />连接已断开，恢复后可继续发送。</p>
     <form class="side-chat-composer" @submit.prevent="send">
-      <label class="side-chat-label" for="side-chat-question">围绕引用内容提问</label>
-      <textarea id="side-chat-question" ref="questionField" v-model="question" maxlength="16000" rows="3" placeholder="输入问题…" :disabled="closing" @keydown="onQuestionKeydown" />
+      <label class="side-chat-label" for="side-chat-question">{{ conversationContext ? '基于当前对话提问' : '围绕引用内容提问' }}</label>
+      <textarea id="side-chat-question" ref="questionField" v-model="question" maxlength="16000" rows="3" :placeholder="conversationContext ? '基于当前对话提问…' : '输入问题…'" :disabled="closing" @keydown="onQuestionKeydown" />
       <div class="side-chat-actions"><span>{{ state.busy ? '正在回答…' : '侧边对话 · 只读权限' }}</span><button v-if="state.busy" type="button" class="icon-button side-chat-stop" aria-label="停止侧边回答" :disabled="!state.connected || closing" @click="interrupt"><Icon name="StopCircle" :size="19" /></button><button v-else type="submit" class="icon-button side-chat-send" aria-label="发送侧边问题" :disabled="sendDisabled"><Icon :name="state.loading ? 'LoaderCircle' : 'ArrowUp'" :size="19" :class="{ spin: state.loading }" /></button></div>
     </form>
   </section>

@@ -23,6 +23,13 @@ These images show the real Vue application with fixed demonstration data. They c
     <td align="center"><strong>GPU and session connections</strong><br><img src="docs/images/resources-runtime.png" alt="GPU utilization and named sessions with PIDs and individual close actions" width="600"></td>
     <td align="center"><strong>Schedules and execution history</strong><br><img src="docs/images/automations.png" alt="Automation schedules, execution logs, and recovery actions" width="600"></td>
   </tr>
+  <tr>
+    <td align="center"><strong>Bookmark selected text</strong><br><img src="docs/images/bookmarks-selection.png" alt="Selected conversation text with the bookmark action in the floating menu" width="600"></td>
+    <td align="center"><strong>Name a new bookmark</strong><br><img src="docs/images/bookmarks-name.png" alt="Naming a bookmark with a preview of the selected original text" width="506"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Project bookmarks: search, rename, and jump to the original</strong><br><img src="docs/images/bookmarks-list.png" alt="Project bookmark list with search, rename, remove, and jump-to-source actions" width="672"></td>
+  </tr>
 </table>
 
 <details>
@@ -32,7 +39,7 @@ These images show the real Vue application with fixed demonstration data. They c
 
 </details>
 
-To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run docs:screenshots`. The script starts an isolated frontend with test protocol fixtures. It never connects to a real backend or runs a model, and the images are excluded from Docker images.
+To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run docs:screenshots`. Use `npm run docs:screenshots -- --only=bookmarks` to update only the bookmark images. The script starts an isolated frontend with test protocol fixtures. It never connects to a real backend or runs a model, and the images are excluded from Docker images.
 
 [Deployment](#docker-quick-start) · [Features and limits](#features-and-limits) · [Development](#development-and-validation) · [Code review and priorities](docs/project-audit.md)
 
@@ -117,7 +124,7 @@ Implemented features have both protocol integration and UI. Environment-specific
 | Feature | Implementation | Limits |
 | --- | --- | --- |
 | Context compaction | Manual and automatic compaction, restored context usage, in-progress reminders, completion markers at their original history position | Waits for completion events, not just the start acknowledgement; Codex's own compaction remains controlled by its configuration/model |
-| Conversation quotes and side chat | Quote selected message or source text, or ask in an independent read-only side conversation | Keeps the parent draft and task; side conversations do not trigger completion push; [details](docs/selection-side-chat.md) |
+| Conversation quotes and side chat | Open a side chat with the full current context from the header, or quote selected message/source text in a separate read-only conversation | Keeps the parent draft and task; side conversations do not trigger completion push; [details](docs/selection-side-chat.md) |
 | Conversation bookmarks | Bookmark selected message text with a custom name; search, rename, remove, or open it from the project's `… → 收藏对话` menu | Scoped by host and project; older source messages load on demand; preserves chat titles and drafts, and retains excerpts if the source is reverted/deleted; [details](docs/selection-side-chat.md) |
 | Conversation forks | Fork a conversation or branch at a completed turn | Uses a new thread ID; cannot truncate a currently running turn |
 | Edit the last message | Pencil action, inline editor, cancel/resend, retained images and structured inputs in the same conversation | Requires a settled, paginated turn with a single user message; replaces that turn's reply without undoing commands or file changes |
@@ -171,6 +178,7 @@ There is no automatic cross-machine cloud synchronization. A service on another 
 - Select a project and local/remote host above the new-chat composer. Draft text is retained when switching; attachments are uploaded again when changing hosts. Existing chats retain their original host and directory.
 - Browse directories when adding a project; enter an absolute path and press Enter to navigate directly. Browsing another host does not switch the active chat.
 - Right-click a project or use `…` to pin, edit, view bookmarks, archive chats, remove its web metadata, or show it in workspace files. Removing a project does not delete disk files. Use file download buttons to save originals.
+- Click an image in a conversation to enlarge it without opening the workspace. The viewer supports zoom, original size, fit, Esc, and mobile Back. Dismiss a pending-question banner with its close button; the native question and answer draft remain available.
 - Select text within one message and choose **Bookmark** (Chinese UI: “收藏”), then confirm its first name. Open the project's **Bookmarked conversations** (“收藏对话”) to search, rename, or remove bookmarks. Clicking one switches to its source conversation and highlights the text, loading older history on demand. Bookmark names do not change conversation titles or composer drafts. A reverted or deleted source keeps its saved excerpt and shows a location error.
 - Expand overflow beyond 4 projects/chats with **Show more**, then collapse it again. The selected item remains visible.
 - Drag the workspace edge or double-click to reset. Focus the edge and use arrow keys; hold Shift for larger steps, or use Home/End for minimum/maximum width.
@@ -210,6 +218,6 @@ Browser tests run the real Vue UI against test-only HTTP/WebSocket protocol fixt
 
 `npm run doctor` diagnoses the current connection without changing it. `npm run doctor -- --turn` explicitly creates a small inference chat, verifies cross-process history, and archives the diagnostic chat afterward; it uses the configured model account's quota. It does not prove live synchronization with the desktop daemon. After a CLI upgrade, run `npm run protocol:generate`, review generated changes in `shared/protocol/`, and rerun checks.
 
-`src/` contains the Vue UI, `server/` authentication/bridges/workstations, `shared/protocol/` generated CLI types, `tests/` verification, and `docs/`/`deploy/` deployment resources. `DATA_DIR` holds web-owned metadata, uploads, private push keys, and device subscriptions; Codex owns conversation history. Bookmark names, excerpts, and message locations are stored privately in `DATA_DIR/bookmarks.json`, persisted by Docker's `webdata` volume. Keep credentials, `.env` files, and private workspace data out of version control.
+`src/` contains the Vue UI, `server/` authentication/bridges/workstations, `shared/protocol/` generated CLI types, `tests/` verification, and `docs/`/`deploy/` deployment resources. `DATA_DIR` holds web-owned metadata, uploads, private push keys, and device subscriptions; Codex owns conversation history. Bookmark names, excerpts, and message locations are stored privately in `DATA_DIR/bookmarks.json`, persisted by Docker's `webdata` volume. Exact asynchronous question reminder dismissals are stored separately in private `DATA_DIR/async-question-notices.json` and should also be backed up. Keep credentials, `.env` files, and private workspace data out of version control.
 
 Current type, unit/protocol, browser, dependency audit, and production build results are recorded in [validation](docs/validation.md); review findings and future priorities are in the [project audit](docs/project-audit.md). Earlier real-environment checks cover inference, cross-process history, PTYs, isolated daemon collaboration, Git/worktrees, Vite HMR, tmux, and Docker persistence. Browser viewport checks do not establish real phone background notification delivery. The [optional GitHub Actions template](deploy/github-actions/README.md) checks the application and container without model credentials; uploading it to `.github/workflows/ci.yml` through gh requires the additional `workflow` scope.

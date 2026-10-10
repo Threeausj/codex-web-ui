@@ -3,6 +3,7 @@ import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionReplyText } from '../../shared/async-question-reply';
 import { asyncQuestionAnswered } from '../../shared/async-question-reply';
 import type { ConversationBookmark } from '../../shared/bookmarks';
+import { asyncQuestionNoticeKey, type AsyncQuestionNotice } from '../../shared/async-question-notices';
 import {
   test as base,
   expect,
@@ -64,6 +65,9 @@ export class MockCodex {
   responses: Rpc[] = [];
   asyncAnswers: { hostId: string; threadId: string; itemId: string; body: any }[] = [];
   failAsyncAnswerNext = false;
+  asyncQuestionNoticeDismissals: AsyncQuestionNotice[] = [];
+  noticeDismissRequests: AsyncQuestionNotice[][] = [];
+  failNoticeDismissNext = false;
   bookmarks: ConversationBookmark[] = [];
   bookmarkRequests: { method: string; path: string; hostId: string | null; projectPath: string | null; body?: any }[] = [];
   failBookmarkSaveNext = false;
@@ -140,6 +144,20 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      if (url.pathname === '/api/async-question-notices') return respond({ dismissals: this.asyncQuestionNoticeDismissals });
+      if (url.pathname === '/api/async-question-notices/dismiss') {
+        const questions: AsyncQuestionNotice[] = request.postDataJSON().questions;
+        this.noticeDismissRequests.push(questions);
+        if (this.failNoticeDismissNext) {
+          this.failNoticeDismissNext = false;
+          return respond({ error: '模拟关闭提醒失败，请重试' }, 503);
+        }
+        for (const question of questions) {
+          this.asyncQuestionNoticeDismissals = this.asyncQuestionNoticeDismissals.filter(entry => asyncQuestionNoticeKey(entry) !== asyncQuestionNoticeKey(question));
+          this.asyncQuestionNoticeDismissals.push(question);
+        }
+        return respond({ dismissals: questions });
+      }
       if (url.pathname === '/api/bookmarks' || url.pathname.startsWith('/api/bookmarks/')) {
         const method = request.method();
         const hostId = url.searchParams.get('hostId'), projectPath = url.searchParams.get('projectPath');
@@ -287,6 +305,7 @@ export class MockCodex {
         case "/api/bootstrap":
           return respond({
             hosts: this.hosts,
+            asyncQuestionNoticeDismissals: this.asyncQuestionNoticeDismissals,
             runtimeReleasedThreads: this.runtimeReleasedThreads,
             projects: this.projects,
             preferences: this.preferences,

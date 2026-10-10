@@ -1,7 +1,7 @@
 import { test, expect, login } from './fixtures';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK1sAAAAASUVORK5CYII=', 'base64');
 
-test('local PNG attachments display inline on phones and missing images retain an open-file fallback', async ({ page, mock }) => {
+test('local PNG attachments display inline on phones and missing images retain an image-preview fallback', async ({ page, mock }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const requests: string[] = [];
   await page.route('**/api/hosts/*/images?*', route => {

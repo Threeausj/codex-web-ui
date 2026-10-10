@@ -23,6 +23,13 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
     <td align="center"><strong>显卡与会话连接</strong><br><img src="docs/images/resources-runtime.png" alt="显卡占用、显存及会话名称对应的 PID 与关闭按钮" width="600"></td>
     <td align="center"><strong>定时自动化与执行记录</strong><br><img src="docs/images/automations.png" alt="自动化计划、执行日志与失败恢复入口" width="600"></td>
   </tr>
+  <tr>
+    <td align="center"><strong>选中文字收藏</strong><br><img src="docs/images/bookmarks-selection.png" alt="选中对话中的文字，在悬浮菜单点击收藏" width="600"></td>
+    <td align="center"><strong>首次命名收藏</strong><br><img src="docs/images/bookmarks-name.png" alt="收藏时编辑名称，并保留所选原文作为预览" width="506"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>项目收藏：搜索、重命名与原文定位</strong><br><img src="docs/images/bookmarks-list.png" alt="从项目菜单查看收藏，搜索片段、重命名、取消收藏或跳转到原文" width="672"></td>
+  </tr>
 </table>
 
 <details>
@@ -32,7 +39,7 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 
 </details>
 
-截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
+截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`；仅更新收藏截图可执行 `npm run docs:screenshots -- --only=bookmarks`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
 
 [Docker 部署](#docker-快速部署) · [功能与限制](#功能状态) · [开发与验证](#开发与验证) · [本轮审查与改进建议](docs/project-audit.md)
 
@@ -119,7 +126,7 @@ npm start
 | 功能 | 当前实现 | 限制/说明 |
 | --- | --- | --- |
 | 自动/手动上下文压缩 | 显示 token 使用比例，历史用量只读补齐；压缩期间显示提醒，完成分隔线保留原位置；可设置自动触发阈值 | 原生响应仅表示开始，等待实际完成事件；Codex 自身自动压缩继续由模型/配置管理（[恢复机制](docs/runtime-stability.md)） |
-| 对话引用与侧边提问 | 选择消息正文后添加引用，或在独立只读侧边聊天中提问；保留原对话草稿与运行 | 临时侧边会话不持久保存，不触发完成推送；协议支持与重连限制见[说明](docs/selection-side-chat.md) |
+| 对话引用与侧边提问 | 右上角直接基于完整上下文新建侧边聊天，也可选择消息正文引用提问；独立只读分支保留原对话草稿与运行 | 临时侧边会话不持久保存，不触发完成推送；协议支持与重连限制见[说明](docs/selection-side-chat.md) |
 | 对话收藏 | 选择消息正文后收藏并命名；项目 `… → 收藏对话` 中搜索、重命名、取消收藏，点击跳回原消息 | 按主机和项目隔离，旧历史按需读取；不更改会话标题或草稿，原消息被回退/删除时保留摘录并提示定位失败；[说明](docs/selection-side-chat.md) |
 | 对话 Fork | 已接入 `thread/fork`，支持当前会话与已完成 turn 的分支 | 分支使用新 thread id；无法从正在执行的 turn 截止分支 |
 | 编辑上一条消息 | 用户消息旁的编辑按钮、取消与保存并重新发送；使用 `thread/revert` 在原会话重新生成回复，保留图片等结构化输入 | 仅支持最近一个已结束 turn 的单条用户消息；追加指令所在的多消息轮、legacy/临时会话暂不支持；已执行命令和文件修改不会撤销 |
@@ -128,7 +135,7 @@ npm start
 | 配置与项目加载 | 按 cwd 读取配置来源/版本和受管要求，版本校验保存；加载本机桌面项目、按主机浏览选择项目及额外工作目录；新对话直接选择项目与本机/远端 | 桌面项目元数据为只读兼容适配，网页自增项目不反写桌面状态；更改新对话位置保留文字，同主机保留附件，跨主机重新上传原文件 |
 | SSH 主机 | 添加/编辑弹窗、私钥上传与替换、未保存配置的连接测试；通过远端交互登录 shell 自动识别 Codex，也可指定路径 | 支持最大 64 KB 的无口令 OpenSSH / PEM 私钥；测试不保存主机、不打断聊天；可在连接弹窗获取并确认新主机指纹；指纹变化需重新确认，需准备远端 CLI 与登录 |
 | 审批 | 命令/文件改动、额外权限、工具提问与基础 MCP 输入面板；同主机登录设备共享待审批请求 | 首个有效答复生效；依赖当前 Codex sandbox/审批策略，高级 MCP schema 与桌面宿主请求尚未完全覆盖 |
-| 文件与变更 | 多文件标签、行号/语法高亮、选中代码引用/侧边提问、Markdown 源码/预览、图片/PDF 预览；文件名筛选、下载与红绿增删行数 | 最多 16 个标签，单文件最多 8 MB；私人草稿保留原始版本以核对保存冲突；二进制文件禁止文本编辑；[文件工作流](docs/automations-and-editor.md) |
+| 文件与变更 | 多文件标签、行号/语法高亮、选中代码引用/侧边提问、Markdown 源码/预览、图片/PDF 预览、对话图片点击放大；文件名筛选、下载与红绿增删行数 | 最多 16 个标签，单文件最多 8 MB；私人草稿保留原始版本以核对保存冲突；二进制文件禁止文本编辑；[文件工作流](docs/automations-and-editor.md) |
 | 终端与 Tmux | 交互式 Shell、PTY、stdin、resize、重连恢复、手机控制键；tmux 会话列表、窗格输出快照、新建、切换、确认删除 | 目标主机需安装 tmux；切换只断开 tmux 客户端，普通终端保留；macOS 沙箱拦截 socket 时需用户选择完全访问 |
 | 预览 | 静态 HTML、URL、本机/SSH 开发端口代理、HTTP/WebSocket、Vite HMR、桌面/手机预览宽度 | 开发服务限 loopback，iframe 使用独立 opaque origin；真实 SSH 目标环境待验证，外部网站可能禁止 iframe |
 | 公网鉴权 | 密码、持久化 30 天 Cookie 会话、设置内修改密码、CSRF、Origin 校验、登录限流 | 修改后当前设备保持登录，其他设备重新登录；持久挂载 DATA_DIR 时正常重启保留有效登录；单用户工作站，不包含多租户隔离和 SSO |
@@ -136,7 +143,7 @@ npm start
 | 模型与权限选择 | 模型/推理强度、持久化全局只读/默认/完全访问、会话权限覆盖、命名 Web 权限预设、受管策略与提供方能力展示 | 全局修改从下一轮任务生效，受管策略仍约束权限；模型列表不保证账户具备所有模型权限 |
 | 文件/图片上传 | 每次最多 8 个文件、每文件 20 MB（proxy 的 base64 消息还受 16 MiB 传输上限限制），上传到所选工作站；图片以 `localImage` 发送 | 普通文件通过路径交给 Codex；上传不等同于模型原生解析任意文件格式 |
 | 会话与事件 | 新建、恢复、停止、追加指令、Fork、侧栏重命名与删除、归档恢复、全文搜索、完整导出、历史分页、草稿/阅读位置；运行时过程展开，结束后折叠，最终回复直接显示 | 永久删除需确认，会连同子智能体对话删除且无法恢复；运行中需先停止，旧版 Codex 不支持时提示升级。内容时间使用 `recencyAt`，打开对话不改变排序；连续操作按批次默认折叠，展开后查看原有明细；无公开摘要的思考条目不显示；审批与失败原因保持可见；跨桌面活动进程同步需连接同 daemon |
-| 结构化选择 | 推荐选项及说明、其他回答、多题、保密输入；页面与通知提醒；支持新版异步问题 | 识别原生 `requestUserInput` 请求及 `agentMessage.delivery=async` 的题目元数据，普通正文列表不生成表单；异步回答以原生关联消息发送，跨页面同步，发送结果不确定时先同步确认；只有服务端提供时限才显示倒计时 |
+| 结构化选择 | 推荐选项及说明、其他回答、多题、保密输入；页面与通知提醒、顶部提醒可关闭；支持新版异步问题 | 识别原生 `requestUserInput` 请求及 `agentMessage.delivery=async` 的题目元数据，普通正文列表不生成表单；异步回答以原生关联消息发送，跨页面同步，发送结果不确定时先同步确认；只有服务端提供时限才显示倒计时 |
 | 子智能体工作区 | 当前对话的子智能体自动预读，点击直接显示缓存；实时更新未选中的内容，支持分组与历史分页 | 最多同时读取三个；子对话只读，不恢复写入者；切换主机、父对话和退出登录清理缓存 |
 | 会话缓存与恢复 | 点击立即进入目标会话，跨主机也先显示缓存；首屏读取历史摘要，展开工作过程后每页加载 40 条记录，已加载详情可以复用；安装应用重进恢复上次主机、对话和草稿 | 私人快照按有效登录、主机和会话隔离，最多 12 个会话 / 4 MiB / 24 小时，退出登录清理；旧版 Codex 自动回退完整读取，导出始终读取完整历史；权限和原生写入连接确认后才允许发送；[大对话加载说明](docs/large-conversation-sync.md) |
 | 资源管理 | 侧栏设置上方进入二级主机菜单，实时 CPU / 内存 / 网络 / 磁盘趋势、NVIDIA GPU 使用率与显存、会话名称及对应 Codex PID、按会话释放/恢复连接 | Linux 需 Python 3；GPU 需 nvidia-smi；容器展示可见资源，完整宿主负载使用 SSH；按会话关闭保留其他任务；关闭整个主机连接会中断全部 Web 任务；关闭状态跨服务重启保存 |
@@ -222,7 +229,7 @@ npm run doctor:preview
 
 更新 CLI 后运行 `npm run protocol:generate`，检查 `shared/protocol/` 差异，再运行类型、单元和浏览器检查。
 
-目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。
+目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。已关闭的异步问题提醒独立保存在私人 `DATA_DIR/async-question-notices.json`，同样应纳入备份。
 
 最新类型、单元／协议、浏览器、依赖审计与生产构建结果见 [验证清单](docs/validation.md)，代码审查与后续优先级见 [项目审查](docs/project-audit.md)。既往实际环境检查覆盖模型推理、跨进程历史、PTY、隔离 daemon、Git/worktree、Vite HMR、Tmux 与 Docker 数据卷；浏览器尺寸测试不等同于真实手机后台推送验收。早期含本机信息的截图保留在本地，上方公开截图使用独立演示数据。
 

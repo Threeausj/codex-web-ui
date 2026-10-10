@@ -21,6 +21,8 @@ import CommandLogo from "./components/CommandLogo.vue";
 import ConversationOutput from "./components/ConversationOutput.vue";
 import ConversationSelectionToolbar from "./components/ConversationSelectionToolbar.vue";
 import SideChatPanel from "./components/SideChatPanel.vue";
+import ConversationImageViewer from "./components/ConversationImageViewer.vue";
+import { provideConversationImageViewer } from "./lib/conversation-image-viewer";
 import ApprovalCard from "./components/ApprovalCard.vue";
 import Composer from "./components/Composer.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
@@ -39,6 +41,8 @@ import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navig
 
 const api = useCodex();
 const state = api.state;
+const conversationImages = provideConversationImageViewer();
+watch(() => [state.authenticated, state.hostId, state.activeThread?.id], () => conversationImages.close());
 const bookmarks = useConversationBookmarks(api);
 const bookmarkNaming = ref<{ mode: 'add' | 'rename'; input: ConversationBookmarkInput | ConversationBookmark; authentication: number; initialName: string } | null>(null);
 const bookmarkSaving = ref(false), bookmarkError = ref('');
@@ -78,6 +82,7 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'side-chat', visible: () => sideChat.state.open, close: () => { sideChat.state.open = false; } },
   { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
   { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
+  { id: 'image-preview', visible: () => !!conversationImages.image.value, close: () => conversationImages.close() },
 ]);
 const workspaceTab = ref("files");
 const workspacePath = ref("");
@@ -157,6 +162,15 @@ const hostProjects = computed(() =>
     (project: any) => !project.hostId || project.hostId === state.hostId,
   ),
 );
+// Legacy native questions keep their form and request; only the banner is hidden.
+const dismissedLegacyChoices = ref(new Set<string>());
+function legacyChoiceKey(request: any) {
+  return JSON.stringify([state.hostId, api.runtimeIdentity().engineId, request.id, request.method, request.params]);
+}
+function visibleRequestNotice(request: any) {
+  return !request.method?.includes('requestUserInput') || !dismissedLegacyChoices.value.has(legacyChoiceKey(request));
+}
+watch(() => state.authenticated, () => { dismissedLegacyChoices.value = new Set(); });
 const activeRequests = computed(() =>
   state.pendingRequests.filter(
     (request: any) =>
@@ -167,14 +181,14 @@ const activeRequests = computed(() =>
 const otherRequests = computed(() =>
   state.pendingRequests.filter(
     (request: any) =>
-      (request.params?.threadId || request.params?.conversationId) &&
+      visibleRequestNotice(request) && (request.params?.threadId || request.params?.conversationId) &&
       (request.params.threadId || request.params.conversationId) !== state.activeThread?.id &&
       (request.params.threadId || request.params.conversationId) !== sideChat.state.threadId,
   ),
 );
-const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput')));
-const activeChoices = computed(() => activeRequests.value.filter((request: any) => request.method?.includes('requestUserInput')));
-const asyncChoices = computed(() => api.pendingAsyncQuestions());
+const choiceRequests = computed(() => state.pendingRequests.filter((request: any) => request.method?.includes('requestUserInput') && visibleRequestNotice(request)));
+const activeChoices = computed(() => activeRequests.value.filter((request: any) => request.method?.includes('requestUserInput') && visibleRequestNotice(request)));
+const asyncChoices = computed(() => api.pendingAsyncQuestionNotices());
 const activeAsyncChoices = computed(() => asyncChoices.value.filter(question =>
   question.hostId === state.hostId && question.threadId === state.activeThread?.id));
 const otherAsyncChoices = computed(() => asyncChoices.value.filter(question =>
@@ -185,6 +199,16 @@ const nextOtherRequestThread = computed(() => otherRequests.value[0]?.params?.th
 const asyncQuestionsDisabled = computed(() => actionBusy.value || state.loading || state.compacting || state.modeBusy || !state.online || !state.connected ||
   state.selectingThread || state.switchingHost || state.changingContext || state.runtimePaused || state.threadReleased ||
   !!state.threadConflict || !state.activeThread || !state.threadReady);
+async function dismissChoiceReminder() {
+  const authentication = api.runtimeIdentity().authenticationGeneration;
+  const legacyKeys = activeChoices.value.map(legacyChoiceKey);
+  const questions = [...activeAsyncChoices.value];
+  try {
+    await api.dismissAsyncQuestionNotices(questions);
+    if (authentication !== api.runtimeIdentity().authenticationGeneration) return;
+    dismissedLegacyChoices.value = new Set([...dismissedLegacyChoices.value, ...legacyKeys]);
+  } catch (cause: any) { if (authentication === api.runtimeIdentity().authenticationGeneration) showError(cause.message || '关闭提醒失败，请重试'); }
+}
 function showChoices() {
   scroll.value?.querySelector('.question-card, .async-question-card[data-question-pending="true"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
@@ -230,6 +254,7 @@ const paletteActions = [
     icon: "GitBranch",
   },
   { id: "files", name: "浏览项目文件", detail: "工作区", icon: "Folder" },
+  { id: "side-chat", name: "新建侧边聊天", detail: "当前对话上下文", icon: "MessagesSquare" },
   { id: "agents", name: "查看子智能体", detail: "状态与对话", icon: "Bot" },
   { id: "preview", name: "打开预览", detail: "工作区", icon: "Eye" },
   {
@@ -433,6 +458,12 @@ function addToConversation(value: ConversationSelectionSource) {
   if (!source) return;
   if (composer.value?.addContext(source)) api.toast('已添加到对话');
 }
+function openSideChat() {
+  try {
+    sideChat.prepareConversation();
+    void nextTick(() => sideChatPanel.value?.focusQuestion());
+  } catch (cause: any) { showError(cause.message || '无法打开侧边聊天'); }
+}
 function askInSideChat(value: ConversationSelectionSource) {
   const source = selectedSource(value);
   if (!source) return;
@@ -568,6 +599,7 @@ async function execute(command: string) {
   threadMenu.value = false;
   paletteOpen.value = false;
   if (command === "new") await newThread();
+  else if (command === "side-chat") openSideChat();
   else if (command === "compact") {
     if (state.activeThread && !state.busy) await action(() => api.compact());
     else
@@ -732,6 +764,7 @@ function paletteKey(event: KeyboardEvent) {
   }
 }
 function onKeydown(event: KeyboardEvent) {
+  if (conversationImages.image.value) return;
   const modifier = event.metaKey || event.ctrlKey;
   const editable = (event.target as HTMLElement)?.closest(
     'input, textarea, [contenteditable="true"]',
@@ -823,6 +856,7 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  conversationImages.close();
   clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
   onBackground();
   document.removeEventListener("keydown", onKeydown);
@@ -1000,12 +1034,14 @@ watch(() => [state.authenticated, state.loading], () => {
             /><span>{{ currentHost?.name || "本机" }}</span></span
           ><button
             class="icon-button"
-            :disabled="!state.activeThread"
-            @click="openWorkspace('agents')"
-            title="查看子智能体"
-            aria-label="查看子智能体"
+            :disabled="!state.activeThread || state.selectingThread || state.switchingHost || state.changingContext"
+            :class="{ selected: sideChat.state.open }"
+            :aria-pressed="sideChat.state.open"
+            @click="openSideChat"
+            title="新建侧边聊天"
+            aria-label="新建侧边聊天"
           >
-            <Icon name="Bot" :size="18" />
+            <Icon name="MessagesSquare" :size="18" />
           </button><button
             class="icon-button"
             :class="{ selected: workspaceOpen && !sideChat.state.open }"
@@ -1015,7 +1051,6 @@ watch(() => [state.authenticated, state.loading], () => {
           >
             <Icon name="PanelRight" :size="18" />
           </button>
-          <button v-if="sideChat.state.source" class="icon-button" :class="{ selected: sideChat.state.open }" title="打开侧边聊天" aria-label="打开侧边聊天" @click="sideChat.state.open = true"><Icon name="MessagesSquare" :size="18" /></button>
           <div class="thread-menu-wrapper">
             <button
               class="icon-button"
@@ -1142,8 +1177,9 @@ watch(() => [state.authenticated, state.loading], () => {
         个其他对话等待选择或确认<Icon name="ArrowRight" :size="14" />
       </button>
       <div v-if="activeChoiceCount" class="connection-banner choice-reminder" role="status">
-        <Icon name="Bell" :size="15" />{{ activeChoiceCount }} 个问题等待你的选择
+        <Icon name="Bell" :size="15" /><span>{{ activeChoiceCount }} 个问题等待你的选择</span>
         <button class="button button-small button-secondary" @click="showChoices">查看问题</button>
+        <button class="icon-button dismiss-choice-reminder" aria-label="关闭问题提醒" title="关闭问题提醒" :disabled="api.asyncQuestionNoticesState.busy" @click="dismissChoiceReminder"><Icon :name="api.asyncQuestionNoticesState.busy ? 'LoaderCircle' : 'X'" :size="16" :class="{ spin: api.asyncQuestionNoticesState.busy }" /></button>
       </div>
       <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
         <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
@@ -1314,6 +1350,7 @@ watch(() => [state.authenticated, state.loading], () => {
         </div>
       </div>
     </section>
+    <ConversationImageViewer v-if="conversationImages.image.value" :image="conversationImages.image.value" @close="conversationImages.close" />
     <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
@@ -1459,6 +1496,10 @@ watch(() => [state.authenticated, state.loading], () => {
 </template>
 
 <style scoped>
+.choice-reminder { gap: 8px; }
+.choice-reminder > span { min-width: 0; }
+.dismiss-choice-reminder { margin-left: auto; flex: 0 0 auto; }
+@media (max-width: 400px) { .choice-reminder { gap: 6px; font-size: 12px; } .choice-reminder > .button { padding-inline: 8px; } }
 .global-error.thread-conflict { flex-wrap: wrap; }
 .global-error.thread-conflict > span { flex: 1 1 240px; }
 .global-error.thread-conflict > button { white-space: nowrap; }

@@ -78,6 +78,125 @@ function fixture() {
   return { controller, main, api, calls, overrides, identity, emit, rows, journal };
 }
 
+test('conversation shortcut forks full native context only after a question, including a running parent turn', async () => {
+  const f = fixture();
+  try {
+    f.main.turns.push({ id: 'running-parent', status: 'inProgress', items: [] });
+    f.main.items.push({ id: 'large-native-history', type: 'agentMessage', text: '原生历史'.repeat(20_000) });
+    const parent = JSON.stringify(f.main);
+    f.controller.prepareConversation();
+    assert.equal(f.calls.length, 0, 'Opening never starts an inference or native branch');
+    assert.equal(f.controller.state.source?.threadId, 'parent');
+    assert.equal(f.controller.state.source?.text, undefined, 'Complete context must not be faked as a bounded selected excerpt');
+    await f.controller.send('结合当前任务解释一下');
+    const fork = f.calls.find(call => call.method === 'thread/fork')!.params;
+    assert.equal(fork.threadId, 'parent'); assert.equal(fork.ephemeral, true); assert.equal(fork.excludeTurns, true);
+    assert.equal(Object.hasOwn(fork, 'lastTurnId'), false); assert.equal(Object.hasOwn(fork, 'beforeTurnId'), false);
+    const turn = f.calls.find(call => call.method === 'turn/start')!.params;
+    assert.deepEqual(turn.input, [{ type: 'text', text: '结合当前任务解释一下', text_elements: [] }]);
+    assert.equal(turn.threadId, 'side'); assert.equal(turn.sandboxPolicy.type, 'readOnly'); assert.equal(turn.approvalPolicy, 'never');
+    assert.deepEqual(f.calls.filter(call => call.method.startsWith('thread/goal/')).map(call => call.params.threadId), ['side', 'side']);
+    assert.equal(JSON.stringify(f.main), parent, 'Parent context, goal, mode, attachments and selection stay isolated');
+  } finally { f.controller.dispose(); }
+});
+
+test('reopening the shortcut preserves an existing selected-text branch and its in-flight work', async () => {
+  const f = fixture();
+  try {
+    f.controller.prepare(selected); await f.controller.send('解释');
+    f.controller.state.open = false;
+    const source = f.controller.state.source; const anchor = f.controller.state.anchor;
+    const items = JSON.stringify(f.controller.state.items); const count = f.calls.length;
+    f.controller.prepareConversation();
+    assert.equal(f.controller.state.open, true); assert.equal(f.controller.state.busy, true);
+    assert.equal(f.controller.state.source, source); assert.equal(f.controller.state.anchor, anchor);
+    assert.equal(f.controller.state.threadId, 'side'); assert.equal(JSON.stringify(f.controller.state.items), items);
+    assert.equal(f.calls.length, count, 'Reopening neither interrupts nor forks');
+    assert.match(f.controller.state.notice, /现有侧边聊天/);
+    await assert.rejects(f.controller.newBranch(), /等待侧边任务完成/);
+  } finally { f.controller.dispose(); }
+});
+
+test('conversation shortcut rejects missing sources and unsupported ephemeral forks without starting the parent', async () => {
+  const f = fixture();
+  try {
+    f.main.activeThread = null;
+    assert.throws(() => f.controller.prepareConversation(), /先打开/); assert.equal(f.calls.length, 0);
+    f.main.activeThread = { id: 'parent', cwd: '/workspace' };
+    f.controller.prepareConversation();
+    f.overrides.set('thread/fork', () => ({ thread: { id: 'unsupported-side', ephemeral: false } }));
+    await assert.rejects(f.controller.send('解释'), /不支持临时侧边聊天/);
+    assert.deepEqual(f.calls.map(call => call.method), ['thread/fork', 'thread/unsubscribe']);
+  } finally { f.controller.dispose(); }
+});
+
+test('a completed full-context branch records a reproducible formal save anchor without truncating the ephemeral fork', async () => {
+  const f = fixture();
+  try {
+    f.main.busy = false;
+    f.controller.prepareConversation(); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', text: '侧边回答' }] } });
+    f.main.turns.push({ id: 'new-parent-turn', status: 'completed', items: [] });
+    f.overrides.set('thread/fork', () => ({ thread: { id: 'formal-conversation', ephemeral: false, forkedFromId: 'parent' } }));
+    assert.equal(await f.controller.saveBranch(), 'formal-conversation');
+    const forks = f.calls.filter(call => call.method === 'thread/fork');
+    assert.equal(forks[0].params.lastTurnId, undefined); assert.equal(forks[0].params.beforeTurnId, undefined);
+    assert.equal(forks[1].params.lastTurnId, 'parent-turn');
+    assert.equal(f.controller.answerQuote()?.text, '侧边回答');
+    assert.equal(f.controller.answerQuote()?.threadId, 'parent');
+  } finally { f.controller.dispose(); }
+});
+
+test('a partial full-context branch never saves a truncated or subsequently changed parent as its original context', async () => {
+  const f = fixture();
+  try {
+    f.main.turns.push({ id: 'running-parent', status: 'inProgress', items: [] });
+    f.controller.prepareConversation(); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    await assert.rejects(f.controller.saveBranch(), /运行中的部分上下文.*引用回答到主对话/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 1);
+    assert.equal(f.calls.some(call => call.method === 'thread/inject_items'), false);
+  } finally { f.controller.dispose(); }
+});
+
+test('conversation sources survive durable save receipt restoration without requiring selected text', async () => {
+  const f = fixture(); let reloaded: ReturnType<typeof useSideChat> | undefined;
+  try {
+    f.main.busy = false;
+    f.controller.prepareConversation(); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    f.overrides.set('thread/fork', () => { throw Object.assign(new Error('ACK lost'), { uncertain: true }); });
+    await assert.rejects(f.controller.saveBranch(), /ACK lost/);
+    f.controller.dispose(); reloaded = useSideChat(f.api, f.main); reloaded.prepareConversation();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal('kind' in reloaded.state.source! && reloaded.state.source.kind, 'conversation');
+    assert.equal('kind' in reloaded.state.anchor! && reloaded.state.anchor.kind, 'conversation');
+    assert.equal(reloaded.state.anchor?.text, undefined);
+    assert.deepEqual(reloaded.state.boundary, { lastTurnId: 'parent-turn' });
+    assert.equal(reloaded.state.saveUncertain, 'fork');
+    await assert.rejects(reloaded.saveBranch(), /不能重复创建/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2);
+  } finally { reloaded?.dispose(); f.controller.dispose(); }
+});
+
+test('the conversation shortcut can restore a legacy selected-text save receipt without losing its original anchor', async () => {
+  const f = fixture(); let reloaded: ReturnType<typeof useSideChat> | undefined;
+  try {
+    f.controller.prepare(selected); await f.controller.send('解释');
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    f.overrides.set('thread/fork', () => { throw Object.assign(new Error('ACK lost'), { uncertain: true }); });
+    await assert.rejects(f.controller.saveBranch(), /ACK lost/);
+    f.controller.dispose(); reloaded = useSideChat(f.api, f.main); reloaded.prepareConversation();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reloaded.state.anchor?.text, selected.text);
+    assert.equal(reloaded.state.anchor?.turnId, selected.turnId);
+    assert.deepEqual(reloaded.state.boundary, { lastTurnId: 'parent-turn' });
+    assert.equal(reloaded.state.saveUncertain, 'fork');
+    await assert.rejects(reloaded.saveBranch(), /不能重复创建/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2);
+  } finally { reloaded?.dispose(); f.controller.dispose(); }
+});
+
 test('closing the panel during formal branch creation finishes the save without duplicating its fork', async () => {
   const f = fixture(); const held = deferred<any>();
   try {
