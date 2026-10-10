@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, nextTick, reactive, ref, watch } from "vue";
 import VirtualHistoryBlock from "./VirtualHistoryBlock.vue";
 import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
@@ -85,6 +85,15 @@ const blocks = computed(() =>
 );
 provideHistoryDisclosures();
 const expandedTurns = reactive(new Set<string>());
+const revealedItemId = ref('');
+let bookmarkRevealTurn = '';
+async function revealItem(itemId: string, turnId: string) {
+  revealedItemId.value = itemId;
+  bookmarkRevealTurn = turnId;
+  expandedTurns.add(turnId);
+  await nextTick();
+}
+defineExpose({ revealItem });
 const detailLoads = reactive(new Map<string, { loading: boolean; error: string }>());
 async function loadDetails(id: string) {
   if (!props.loadTurnDetails || detailLoads.get(id)?.loading) return;
@@ -95,13 +104,14 @@ async function loadDetails(id: string) {
   finally { status.loading = false; }
 }
 function ensureDetails(id: string) {
+  if (id === bookmarkRevealTurn) return;
   const turn = props.turns.find(turn => turn.id === id);
   if (turn?.historySummary && !turn.historyItemsStarted && !detailLoads.get(id)?.error)
     void loadDetails(id);
 }
 function toggleTurn(event: Event, id: string) {
   if ((event.currentTarget as HTMLDetailsElement).open) { expandedTurns.add(id); ensureDetails(id); }
-  else expandedTurns.delete(id);
+  else { expandedTurns.delete(id); if (bookmarkRevealTurn === id) bookmarkRevealTurn = ''; }
 }
 const finishedTurns = reactive(new Set<string>());
 const runningTurnId = computed(() => {
@@ -145,7 +155,8 @@ function hasPendingQuestion(block: any) {
 </script>
 
 <template>
-  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || hasPendingQuestion(block) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
+  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || hasPendingQuestion(block) || (block.kind === 'message' ? block.item.id === revealedItemId : block.items.some(item => item.id === revealedItemId)) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
+    <p v-if="block.kind === 'turn' && block.turn?.historyBookmarkTarget" class="bookmark-fragment-label">收藏所在历史片段</p>
     <ChatItem
       v-if="block.kind === 'message'"
       :host-id="hostId" :cwd="cwd" :thread-id="threadId"
@@ -287,6 +298,7 @@ function hasPendingQuestion(block: any) {
 </template>
 
 <style scoped>
+.bookmark-fragment-label { margin: 12px 0; color: var(--muted); font-size: 12px; }
 .activity-loading { display: flex; align-items: center; gap: 7px; font-size: 12px; }
 .activity-load-error { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--danger); font-size: 12px; }
 .activity-load-more { margin: 8px 0; }

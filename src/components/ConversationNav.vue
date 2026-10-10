@@ -12,7 +12,7 @@ const emit = defineEmits<{
   error: [message: string];
   projectAction: [
     action: {
-      action: "files" | "edit" | "archive" | "remove";
+      action: "files" | "edit" | "archive" | "remove" | "bookmarks";
       project: any;
     },
   ];

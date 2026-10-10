@@ -20,7 +20,7 @@ const emit = defineEmits<{
   error: [message: string];
   projectAction: [
     action: {
-      action: "files" | "edit" | "archive" | "remove";
+      action: "files" | "edit" | "archive" | "remove" | "bookmarks";
       project: any;
     },
   ];
@@ -220,7 +220,7 @@ watch(menu, (opened) => {
   window.addEventListener("resize", closeMenuListener);
 });
 onBeforeUnmount(removeListeners);
-function action(action: "files" | "edit" | "archive" | "remove") {
+function action(action: "files" | "edit" | "archive" | "remove" | "bookmarks") {
   closeMenu(true);
   emit("projectAction", { action, project: props.project });
 }
@@ -377,6 +377,9 @@ async function pin() {
       </button>
       <button role="menuitem" tabindex="-1" @click="action('edit')">
         <Icon name="Settings2" :size="17" />编辑
+      </button>
+      <button role="menuitem" tabindex="-1" @click="action('bookmarks')">
+        <Icon name="Bookmark" :size="17" />收藏对话
       </button>
       <div role="separator" class="project-menu-separator" />
       <button role="menuitem" tabindex="-1" @click="action('files')">

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionReplyText } from '../../shared/async-question-reply';
 import { asyncQuestionAnswered } from '../../shared/async-question-reply';
+import type { ConversationBookmark } from '../../shared/bookmarks';
 import {
   test as base,
   expect,
@@ -63,6 +64,9 @@ export class MockCodex {
   responses: Rpc[] = [];
   asyncAnswers: { hostId: string; threadId: string; itemId: string; body: any }[] = [];
   failAsyncAnswerNext = false;
+  bookmarks: ConversationBookmark[] = [];
+  bookmarkRequests: { method: string; path: string; hostId: string | null; projectPath: string | null; body?: any }[] = [];
+  failBookmarkSaveNext = false;
   asyncStatusRequests: { hostId: string; threadId: string; itemId: string; turnId: string | null }[] = [];
   asyncStatusOverride: boolean | null = null;
   uploads: { body: Buffer; contentType: string }[] = [];
@@ -136,6 +140,36 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      if (url.pathname === '/api/bookmarks' || url.pathname.startsWith('/api/bookmarks/')) {
+        const method = request.method();
+        const hostId = url.searchParams.get('hostId'), projectPath = url.searchParams.get('projectPath');
+        const body = ['POST', 'PATCH'].includes(method) ? request.postDataJSON() : undefined;
+        this.bookmarkRequests.push({ method, path: url.pathname, hostId, projectPath, ...(body ? { body } : {}) });
+        const matching = (entry: ConversationBookmark) => entry.hostId === hostId && entry.projectPath === projectPath;
+        if (method === 'GET') return respond({ bookmarks: this.bookmarks.filter(matching) });
+        if (this.failBookmarkSaveNext && ['POST', 'PATCH'].includes(method)) {
+          this.failBookmarkSaveNext = false;
+          return respond({ error: '模拟收藏保存失败，请重试' }, 503);
+        }
+        if (method === 'POST') {
+          const duplicate = this.bookmarks.find(entry => entry.hostId === body.hostId && entry.projectPath === body.projectPath &&
+            entry.source.threadId === body.source.threadId && entry.source.turnId === body.source.turnId &&
+            entry.source.itemId === body.source.itemId && entry.source.text === body.source.text);
+          if (duplicate) return respond({ bookmark: duplicate }, 201);
+          const bookmark = { ...body, id: `00000000-0000-4000-8000-${String(++this.count).padStart(12, '0')}`, createdAt: Date.now(), updatedAt: Date.now() };
+          this.bookmarks.push(bookmark);
+          return respond({ bookmark }, 201);
+        }
+        const id = decodeURIComponent(url.pathname.slice('/api/bookmarks/'.length));
+        const index = this.bookmarks.findIndex(entry => entry.id === id && matching(entry));
+        if (index < 0) return respond({ error: '收藏已不存在' }, 404);
+        if (method === 'PATCH') {
+          this.bookmarks[index] = { ...this.bookmarks[index]!, name: body.name, updatedAt: Date.now() };
+          return respond({ bookmark: this.bookmarks[index] });
+        }
+        if (method === 'DELETE') { this.bookmarks.splice(index, 1); return respond({ ok: true }); }
+        return respond({ error: 'Unsupported bookmark test method' }, 405);
+      }
       const asyncStatusRoute = /^\/api\/threads\/([^/]+)\/([^/]+)\/async-questions\/([^/]+)\/status$/.exec(url.pathname);
       if (asyncStatusRoute) {
         const [, encodedHost, encodedThread, encodedItem] = asyncStatusRoute;

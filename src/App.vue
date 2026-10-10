@@ -14,6 +14,8 @@ import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
 import { ReadingPositions, type ReadingPosition } from "./lib/reading-positions";
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
+import { bookmarkTextRange, useConversationBookmarks } from './lib/conversation-bookmarks';
+import type { ConversationBookmark, ConversationBookmarkInput } from '../shared/bookmarks';
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
 import ConversationOutput from "./components/ConversationOutput.vue";
@@ -29,12 +31,20 @@ import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
 import ProjectDialog from "./components/ProjectDialog.vue";
+import BookmarksPanel from './components/BookmarksPanel.vue';
+import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
 import { isPinned } from "./lib/navigation";
 import { initializeDevicePush, onPushNavigate, pwaState, updatePwa } from "./lib/pwa";
 import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navigation";
 
 const api = useCodex();
 const state = api.state;
+const bookmarks = useConversationBookmarks(api);
+const bookmarkNaming = ref<{ mode: 'add' | 'rename'; input: ConversationBookmarkInput | ConversationBookmark; authentication: number; initialName: string } | null>(null);
+const bookmarkSaving = ref(false), bookmarkError = ref('');
+const conversationOutput = ref<InstanceType<typeof ConversationOutput>>();
+let bookmarkNavigation = 0;
+let bookmarkHighlightTimer: ReturnType<typeof setTimeout> | undefined;
 const readingPositions = new ReadingPositions(() => api.privateSessionReady(), () => api.runtimeIdentity().authenticationGeneration);
 let restoredScrollKey = '';
 function clearWindowReadingPositions() {
@@ -46,7 +56,11 @@ function clearWindowReadingPositions() {
     }
   } catch { /* Window storage may be disabled. */ }
 }
-watch(() => state.authenticated, authenticated => { if (!authenticated) clearWindowReadingPositions(); });
+watch(() => state.authenticated, authenticated => { if (!authenticated) {
+  clearWindowReadingPositions(); bookmarks.clear(); bookmarkNaming.value = null; bookmarkSaving.value = false;
+  clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
+  ++bookmarkNavigation;
+} });
 const sideChat = useSideChat(api, state);
 const sideChatPanel = ref<InstanceType<typeof SideChatPanel>>();
 useSubagentPrefetch(api, state);
@@ -62,6 +76,8 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
   // Back hides the side chat so its question and running answer remain intact.
   { id: 'side-chat', visible: () => sideChat.state.open, close: () => { sideChat.state.open = false; } },
+  { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
+  { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
 ]);
 const workspaceTab = ref("files");
 const workspacePath = ref("");
@@ -425,6 +441,71 @@ function askInSideChat(value: ConversationSelectionSource) {
     void nextTick(() => sideChatPanel.value?.focusQuestion());
   } catch (error: any) { showError(error.message || '无法打开侧边聊天'); }
 }
+function bookmarkSelection(value: ConversationSelectionSource) {
+  const source = selectedSource(value);
+  if (!source?.itemId || !source.turnId || source.path) return;
+  const projectPath = currentProject.value?.path || state.activeThread?.cwd || state.projectPath;
+  if (!projectPath?.startsWith('/')) { showError('请先选择此会话所属的项目'); return; }
+  bookmarkError.value = '';
+  bookmarkNaming.value = { mode: 'add', authentication: api.runtimeIdentity().authenticationGeneration,
+    initialName: source.text.split('\n').find(line => line.trim())?.trim().replace(/\s+/g, ' ').slice(0, 80) || '新收藏',
+    input: { hostId: source.hostId, projectPath, name: '', source: {
+      threadId: source.threadId, turnId: source.turnId, itemId: source.itemId, text: source.text, threadName: source.threadName || threadTitle.value,
+    } } };
+}
+function renameBookmark(entry: ConversationBookmark) {
+  bookmarkError.value = '';
+  bookmarkNaming.value = { mode: 'rename', input: entry, initialName: entry.name, authentication: api.runtimeIdentity().authenticationGeneration };
+}
+async function saveBookmark(name: string) {
+  const dialog = bookmarkNaming.value;
+  if (!dialog || bookmarkSaving.value || dialog.authentication !== api.runtimeIdentity().authenticationGeneration) return;
+  bookmarkSaving.value = true; bookmarkError.value = '';
+  try {
+    await bookmarks.save(dialog.input, name);
+    if (bookmarkNaming.value === dialog && dialog.authentication === api.runtimeIdentity().authenticationGeneration) {
+      bookmarkNaming.value = null; api.toast(dialog.mode === 'add' ? '已收藏此段对话' : '收藏名称已更新');
+    }
+  } catch (error: any) { if (bookmarkNaming.value === dialog) bookmarkError.value = error?.message || '保存收藏失败，请重试'; }
+  finally { if (dialog.authentication === api.runtimeIdentity().authenticationGeneration) bookmarkSaving.value = false; }
+}
+async function openBookmark(entry: ConversationBookmark) {
+  if (actionBusy.value || bookmarks.state.busyId) return;
+  const operation = ++bookmarkNavigation, authentication = api.runtimeIdentity().authenticationGeneration;
+  bookmarks.state.busyId = entry.id; bookmarks.state.error = '';
+  const same = state.hostId === entry.hostId && state.activeThread?.id === entry.source.threadId && state.threadReady && state.connected;
+  const generation = navigationSelection + (same ? 0 : 1);
+  try {
+    if (!same) await selectThread({ id: entry.source.threadId, hostId: entry.hostId });
+    const current = () => operation === bookmarkNavigation && authentication === api.runtimeIdentity().authenticationGeneration &&
+      generation === navigationSelection && state.hostId === entry.hostId && state.activeThread?.id === entry.source.threadId;
+    if (!current()) return;
+    showScrollBottom.value = true;
+    await api.revealBookmarkSource(entry.source);
+    if (!current()) return;
+    await conversationOutput.value?.revealItem(entry.source.itemId, entry.source.turnId);
+    await nextTick();
+    if (!current()) return;
+    const body = [...(scroll.value?.querySelectorAll<HTMLElement>('[data-selection-item-id]') || [])]
+      .find(element => element.dataset.selectionItemId === entry.source.itemId && element.dataset.selectionTurnId === entry.source.turnId);
+    if (!body) throw new Error('已打开会话，但未能显示收藏的原消息，请同步后重试');
+    bookmarks.close(); sidebarOpen.value = false;
+    const range = bookmarkTextRange(body, entry.source.text);
+    const highlightApi = (CSS as any).highlights, HighlightType = (window as any).Highlight;
+    clearTimeout(bookmarkHighlightTimer);
+    highlightApi?.delete('conversation-bookmark');
+    if (range && highlightApi && HighlightType) {
+      highlightApi.set('conversation-bookmark', new HighlightType(range));
+      bookmarkHighlightTimer = setTimeout(() => highlightApi.delete('conversation-bookmark'), 8000);
+    }
+    body.classList.add('bookmark-location');
+    setTimeout(() => body.classList.remove('bookmark-location'), 8000);
+    body.scrollIntoView({ block: 'center', behavior: 'instant' });
+    onScroll();
+    if (!range) api.toast('已定位原消息；原文已变化，收藏内容仍保留');
+  } catch (error: any) { if (operation === bookmarkNavigation && authentication === api.runtimeIdentity().authenticationGeneration) bookmarks.state.error = error?.message || '无法定位收藏，请重试'; }
+  finally { if (operation === bookmarkNavigation && authentication === api.runtimeIdentity().authenticationGeneration) bookmarks.state.busyId = ''; }
+}
 async function projectAction({
   action: command,
   project,
@@ -432,7 +513,10 @@ async function projectAction({
   action: string;
   project: any;
 }) {
-  if (command === "edit") {
+  if (command === 'bookmarks') {
+    sidebarOpen.value = false;
+    void bookmarks.open({ hostId: project.hostId || 'local', projectPath: project.path }, project.name || project.path);
+  } else if (command === "edit") {
     sidebarOpen.value = false;
     editingProject.value = project;
   } else if (command === "files") {
@@ -739,6 +823,7 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
   onBackground();
   document.removeEventListener("keydown", onKeydown);
   prefersDark.removeEventListener("change", applyTheme);
@@ -1131,6 +1216,7 @@ watch(() => [state.authenticated, state.loading], () => {
               <Icon name="GitBranch" :size="14" />此对话由另一段对话分支而来
             </div>
             <ConversationOutput
+              ref="conversationOutput"
               :key="`${state.hostId}:${state.activeThread?.id || 'new'}`"
               :host-id="state.hostId"
               :thread-id="state.activeThread?.id"
@@ -1228,7 +1314,9 @@ watch(() => [state.authenticated, state.loading], () => {
         </div>
       </div>
     </section>
-    <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" />
+    <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
+    <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
+    <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
     <ResizableWorkspace v-if="workspaceOpen" v-show="!sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"
@@ -1375,4 +1463,6 @@ watch(() => [state.authenticated, state.loading], () => {
 .global-error.thread-conflict > span { flex: 1 1 240px; }
 .global-error.thread-conflict > button { white-space: nowrap; }
 .compaction-progress { display: flex; align-items: center; gap: 7px; padding: 6px 4px; color: var(--muted); font-size: 12px; }
+:global(::highlight(conversation-bookmark)) { background: #dba62966; color: inherit; }
+:global(.bookmark-location) { outline: 2px solid #dba62988; outline-offset: 6px; border-radius: 4px; }
 </style>

@@ -17,6 +17,7 @@ test("project right-click and action button share a keyboard-accessible menu", a
   await expect(menu.getByRole("menuitem")).toHaveText([
     "置顶项目",
     "编辑",
+    "收藏对话",
     "在工作区文件中显示",
     "归档聊天",
     "移除项目",
