@@ -110,6 +110,66 @@ test("history hydration preserves later completion and replaces optimistic alias
   assert.equal(merged[1].id, "persisted");
 });
 
+test('summary hydration retains steering input between surrounding messages without overwriting newer output', () => {
+  const item = (id: string, type = 'agentMessage'): DisplayItem => ({ id, type, turnId: 'active', text: id });
+  const start = item('start', 'userMessage'), before = item('before'), steer = item('steer', 'userMessage'), after = item('after');
+  const live = [start, before, steer, { ...after, text: 'newer output' }];
+  const snapshot = [start, before, { ...after, text: 'stale output' }];
+  const options = { retainedTurnIds: new Set(['active']), summarizedTurnIds: new Set(['active']) };
+  const merged = mergeSnapshotItems(snapshot, live, new Set(['after']), options);
+  assert.deepEqual(merged.map(item => item.id), ['start', 'before', 'steer', 'after']);
+  assert.equal(merged.at(-1)!.text, 'newer output');
+  assert.deepEqual(mergeSnapshotItems(snapshot, merged, new Set(), options).map(item => item.id), ['start', 'before', 'steer', 'after']);
+  assert.equal(live[2], steer, 'Merging never mutates the source timeline');
+});
+
+test('multiple live-only messages keep their native neighbors and turn boundaries during hydration', () => {
+  const item = (id: string, turnId: string, type = 'agentMessage'): DisplayItem => ({ id, type, turnId });
+  const older = item('older-answer', 'older'), start = item('start', 'active', 'userMessage'), before = item('before', 'active');
+  const steer = item('steer', 'active', 'userMessage'), tool = item('tool', 'active', 'commandExecution'), after = item('after', 'active');
+  const second = item('second-steer', 'active', 'userMessage'), last = item('last', 'active'), newer = item('newer-user', 'newer', 'userMessage');
+  const live = [older, start, before, steer, tool, after, second, last, newer];
+  const merged = mergeSnapshotItems([older, start, before, after, newer], live, new Set(['steer', 'tool', 'second-steer', 'last']), { retainedTurnIds: new Set(['older', 'active', 'newer']) });
+  assert.deepEqual(merged.map(item => item.id), live.map(item => item.id));
+});
+
+test('retained turn validation excludes rollback and foreign omissions even when marked changed or optimistic', () => {
+  const snapshot: DisplayItem[] = [{ id: 'retained-start', type: 'userMessage', turnId: 'retained' }];
+  const removed: DisplayItem[] = [
+    { id: 'removed-changed', type: 'agentMessage', turnId: 'removed' },
+    { id: 'foreign-sending', type: 'userMessage', turnId: 'foreign', status: 'sending' },
+    { id: 'cached-omission', type: 'agentMessage', turnId: 'retained' },
+  ];
+  const merged = mergeSnapshotItems(snapshot, [...snapshot, ...removed], new Set(['removed-changed']), {
+    retainedTurnIds: new Set(['retained']), summarizedTurnIds: new Set(['removed']),
+  });
+  assert.deepEqual(merged.map(item => item.id), ['retained-start']);
+});
+
+test('canonical client aliases replace accepted optimistic identifiers without shifting steering position', () => {
+  const older: DisplayItem = { id: 'older', type: 'agentMessage', turnId: 'older' };
+  const start: DisplayItem = { id: 'start', type: 'userMessage', turnId: 'active' };
+  const before: DisplayItem = { id: 'before', type: 'agentMessage', turnId: 'active' };
+  const alias: DisplayItem = { id: 'client-steer', clientId: 'client-steer', type: 'userMessage', turnId: 'active' };
+  const native: DisplayItem = { ...alias, id: 'native-steer' };
+  const after: DisplayItem = { id: 'after', type: 'agentMessage', turnId: 'active' };
+  const options = { retainedTurnIds: new Set(['older', 'active']), summarizedTurnIds: new Set(['active']) };
+  const canonical = mergeSnapshotItems([older, start, before, native, after], [older, start, before, alias, after], new Set(['client-steer']), options);
+  assert.deepEqual(canonical.map(item => item.id), ['older', 'start', 'before', 'native-steer', 'after']);
+  const pending = mergeSnapshotItems([older, start, before, after], [older, start, before, { ...alias, status: 'sending' }, native, after], new Set(['native-steer']), options);
+  assert.deepEqual(pending.map(item => item.id), ['older', 'start', 'before', 'native-steer', 'after']);
+  assert.equal(pending[3].status, undefined);
+});
+
+test('a concurrently started validated turn stays between known neighboring turns', () => {
+  const older: DisplayItem = { id: 'older', type: 'agentMessage', turnId: 'older' };
+  const later: DisplayItem = { id: 'later', type: 'agentMessage', turnId: 'later' };
+  const user: DisplayItem = { id: 'new-user', type: 'userMessage', turnId: 'new' };
+  const answer: DisplayItem = { id: 'new-answer', type: 'agentMessage', turnId: 'new' };
+  const merged = mergeSnapshotItems([older, later], [older, user, answer, later], new Set(['new-user', 'new-answer']), { retainedTurnIds: new Set(['older', 'new', 'later']) });
+  assert.deepEqual(merged.map(item => item.id), ['older', 'new-user', 'new-answer', 'later']);
+});
+
 test("authoritative user messages clear temporary sending status", () => {
   const items: DisplayItem[] = [
     {

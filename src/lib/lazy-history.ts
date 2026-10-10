@@ -1,4 +1,4 @@
-import type { DisplayItem } from './events';
+import { mergeSnapshotItems, type DisplayItem } from './events';
 
 type Request = (method: 'thread/turns/list' | 'thread/items/list', params: any) => Promise<any>;
 type PageParams = { threadId: string; cursor: string | null; limit: number; sortDirection: 'desc' };
@@ -88,8 +88,8 @@ export function retainHistoryDetails(turns: any[], previous: any[], items: Displ
   });
 }
 
-/** Native item pages are prefixes. Keep not-yet-paged messages and newer live
- * events after that prefix, and place compaction markers at their native position. */
+/** Native item pages are prefixes. Keep not-yet-paged messages after them,
+ * except accepted steering and its neighbors omitted from native history. */
 export function mergeHistoryDetails(items: DisplayItem[], turns: any[], turn: any, page: any, changed: ReadonlySet<string>) {
   const known = items.filter(item => item.turnId === turn.id);
   const merged = new Map(known.map(item => [item.id, item]));
@@ -100,7 +100,30 @@ export function mergeHistoryDetails(items: DisplayItem[], turns: any[], turn: an
     if (!changed.has(item.id) || !merged.has(item.id)) merged.set(item.id, item);
     if (!ids.has(item.id)) { ids.add(item.id); prefix.push(item.id); }
   }
-  const ordered = [...prefix.map(id => merged.get(id)!).filter(Boolean), ...known.filter(item => !ids.has(item.id))];
+  const native = prefix.map(id => merged.get(id)!).filter(Boolean);
+  const clients = new Set(native.filter(item => item.type === 'userMessage' && item.clientId).map(item => item.clientId));
+  const omittedUser = known.some(item => item.type === 'userMessage' && !ids.has(item.id) &&
+    !(item.clientId && clients.has(item.clientId)));
+  // A late tool can follow a summary's final answer in the live array. Native
+  // prefix order repairs that case. When accepted steering is missing from the
+  // native page, retain its surrounding progress instead of moving it behind
+  // the answer; canonical user aliases still replace the local identifier.
+  let live = omittedUser ? known : [...native, ...known.filter(item => !ids.has(item.id))];
+  if (omittedUser) {
+    // A summary answer can be painted before a late tool event whose native
+    // prefix actually precedes that answer. Keep the unpaged answer and any
+    // subsequent steering after that prefix, while anchoring earlier progress.
+    const answer = [...known].reverse().find(item => item.type === 'agentMessage' &&
+      (item.phase === 'final_answer' || turn.historySummary && item.phase == null));
+    const answerIndex = answer && !ids.has(answer.id) ? known.indexOf(answer) : -1;
+    if (answerIndex >= 0 && known.slice(answerIndex + 1).some(item => ids.has(item.id))) {
+      const deferred = new Set(known.slice(answerIndex).filter(item => !ids.has(item.id)));
+      live = [...known.filter(item => !deferred.has(item)), ...known.filter(item => deferred.has(item))];
+    }
+  }
+  const ordered = mergeSnapshotItems(native, live, changed, {
+    retainedTurnIds: new Set([turn.id]), summarizedTurnIds: new Set([turn.id]),
+  });
   const first = items.findIndex(item => item.turnId === turn.id);
   const position = new Map(turns.map((entry, index) => [entry.id, index]));
   const before = first >= 0 ? first : items.findIndex(item => item.turnId &&

@@ -102,3 +102,72 @@ test('completed details are reused only when message anchors still match and cac
   assert.equal(retainHistoryDetails([{ ...incoming[0], items: [{ id: 'replacement-user', type: 'userMessage' }] }], previous, items)[0].historySummary, true);
   assert.equal(retainHistoryDetails([{ ...incoming[0], status: 'inProgress' }], [{ ...previous[0], status: 'inProgress' }], items)[0].historySummary, true);
 });
+
+test('full item history keeps omitted accepted steering between its surrounding messages', () => {
+  const turn = { id: 'turn', status: 'completed', historySummary: true };
+  const item = (id: string, type = 'agentMessage') => ({ id, type, turnId: turn.id });
+  const older = { id: 'older', type: 'agentMessage', turnId: 'older-turn' };
+  const newer = { id: 'newer', type: 'userMessage', turnId: 'newer-turn' };
+  const user = item('user', 'userMessage'), before = item('before'), steer = item('steer', 'userMessage');
+  const tool = item('tool', 'commandExecution'), after = item('after');
+  const page = { data: [user, before, after].map(item => ({ item })), nextCursor: null };
+  const result = mergeHistoryDetails([older, user, before, steer, tool, after, newer], [{ id: 'older-turn' }, turn, { id: 'newer-turn' }], turn, page, new Set());
+  assert.deepEqual(result.items.map(item => item.id), ['older', 'user', 'before', 'steer', 'tool', 'after', 'newer']);
+  assert.deepEqual(result.turn.historyItemIds, ['user', 'before', 'after']);
+  assert.equal(result.turn.historySummary, false);
+  const repeated = mergeHistoryDetails(result.items, [turn], result.turn, page, new Set());
+  assert.deepEqual(repeated.items.map(item => item.id), result.items.map(item => item.id));
+  assert.strictEqual(result.items[0], older);
+  assert.strictEqual(result.items.at(-1), newer);
+});
+
+test('later item pages anchor steering while restoring native compaction order and protecting newer output', () => {
+  const turn = { id: 'turn', status: 'completed', historySummary: true };
+  const item = (id: string, type = 'agentMessage') => ({ id, type, turnId: turn.id });
+  const user = item('user', 'userMessage'), before = item('before'), steer = item('steer', 'userMessage');
+  const after = { ...item('after'), text: 'newer live answer' }, compact = item('compact', 'contextCompaction');
+  const first = mergeHistoryDetails([user, before, steer, after, compact], [turn], turn,
+    { data: [user, before].map(item => ({ item })), nextCursor: 'next' }, new Set());
+  assert.deepEqual(first.items.map(item => item.id), ['user', 'before', 'steer', 'after', 'compact']);
+  assert.equal(first.turn.historySummary, true);
+  const last = mergeHistoryDetails(first.items, [turn], first.turn,
+    { data: [{ item: compact }, { item: { ...after, text: 'stale answer' } }], nextCursor: null }, new Set(['after']));
+  assert.deepEqual(last.items.map(item => item.id), ['user', 'before', 'compact', 'steer', 'after']);
+  assert.equal(last.items.at(-1)?.text, 'newer live answer');
+  assert.deepEqual(last.turn.historyItemIds, ['user', 'before', 'compact', 'after']);
+  assert.deepEqual(last.turn.historyItemCursors, ['next']);
+  assert.equal(last.turn.historySummary, false);
+});
+
+test('native item history replaces an accepted client alias without duplicate users', () => {
+  const turn = { id: 'turn', status: 'completed', historySummary: true };
+  const user = { id: 'user', type: 'userMessage', turnId: turn.id };
+  const before = { id: 'before', type: 'agentMessage', turnId: turn.id };
+  const alias = { id: 'client-steer', clientId: 'client-steer', type: 'userMessage', turnId: turn.id, status: 'sending' };
+  const canonical = { ...alias, id: 'native-steer', status: undefined };
+  const after = { id: 'after', type: 'agentMessage', turnId: turn.id };
+  const result = mergeHistoryDetails([user, before, alias, after], [turn], turn,
+    { data: [user, before, canonical, after].map(item => ({ item })), nextCursor: null }, new Set(['client-steer']));
+  assert.deepEqual(result.items.map(item => item.id), ['user', 'before', 'native-steer', 'after']);
+  assert.equal(result.items[2].status, undefined);
+  assert.deepEqual(result.turn.historyItemIds, ['user', 'before', 'native-steer', 'after']);
+});
+
+test('an omitted steering message cannot move an unpaged summary answer ahead of a late native-prefix command', () => {
+  for (const phase of [undefined, 'final_answer']) {
+    const turn = { id: 'turn', status: 'completed', historySummary: true };
+    const user = { id: 'user', type: 'userMessage', turnId: turn.id };
+    const before = { id: 'before', type: 'agentMessage', phase: 'commentary', turnId: turn.id };
+    const answer = { id: 'answer', type: 'agentMessage', phase, turnId: turn.id };
+    const steer = { id: 'steer', type: 'userMessage', turnId: turn.id };
+    const command = { id: 'command', type: 'commandExecution', turnId: turn.id };
+    const first = mergeHistoryDetails([user, before, answer, steer, command], [turn], turn,
+      { data: [user, before, command].map(item => ({ item })), nextCursor: 'last' }, new Set());
+    assert.deepEqual(first.items.map(item => item.id), ['user', 'before', 'command', 'answer', 'steer']);
+    assert.deepEqual(first.turn.historyItemIds, ['user', 'before', 'command']);
+    const last = mergeHistoryDetails(first.items, [turn], first.turn,
+      { data: [{ item: answer }], nextCursor: null }, new Set());
+    assert.deepEqual(last.items.map(item => item.id), ['user', 'before', 'command', 'answer', 'steer']);
+    assert.equal(last.turn.historySummary, false);
+  }
+});

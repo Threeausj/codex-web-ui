@@ -2539,7 +2539,10 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
         .filter(([, revision]) => revision > itemRevision)
         .map(([itemId]) => itemId),
     );
-    state.items = mergeSnapshotItems(loaded, live, changedIds);
+    state.items = mergeSnapshotItems(loaded, live, changedIds, {
+      retainedTurnIds: new Set(state.turns.map(turn => turn.id)),
+      summarizedTurnIds: new Set(page.data.filter((turn: any) => turn.historySummary).map((turn: any) => turn.id)),
+    });
     rememberAsyncQuestions(id, state.items);
     // Deprecated runtimes may expose compression only as thread/compacted.
     // Keep that positional marker while its recorded turn remains retained;
@@ -2664,7 +2667,10 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
     const loaded = state.turns.flatMap(turn => (turn.items || []).map((item: any) => ({ ...item, turnId: turn.id })));
     const changedIds = new Set([...(itemRevisions.get(id)?.entries() || [])]
       .filter(([, revision]) => revision > itemRevision).map(([itemId]) => itemId));
-    state.items = mergeSnapshotItems(loaded, live, changedIds);
+    state.items = mergeSnapshotItems(loaded, live, changedIds, {
+      retainedTurnIds: new Set(state.turns.map(turn => turn.id)),
+      summarizedTurnIds: new Set([...turns.values()].filter(turn => turn.historySummary).map(turn => turn.id)),
+    });
     rememberAsyncQuestions(id, state.items);
     const turnIds = new Set(state.turns.map(turn => turn.id));
     const compactionIds = new Set(state.items.filter(item => item.type === 'contextCompaction').map(item => item.turnId));
@@ -2990,15 +2996,6 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       }
       if (hostId !== state.hostId) throw new Error('工作站已切换，请在原工作站确认目标状态');
     }
-    compactedSinceInput.delete(id!);
-    upsertItem(currentItems(id!), {
-      id: messageId,
-      clientId: messageId,
-      type: "userMessage",
-      content: inputs,
-      status: "sending",
-    });
-    noteItem(id!, messageId);
     const busy =
       activeTurns.has(id!) ||
       threadBusy.get(id!) ||
@@ -3007,15 +3004,35 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       throw new Error("会话已开始新的任务，请取消编辑并确认最新历史");
     if (busy && !activeTurns.has(id!))
       throw new Error("当前任务状态正在同步，请稍后发送");
+    const targetTurnId = busy ? activeTurns.get(id!)! : undefined;
+    compactedSinceInput.delete(id!);
+    // Steering belongs at the current timeline tail from the first paint.
+    // Waiting for its canonical alias used to remount it at the turn's head.
+    upsertItem(currentItems(id!), {
+      id: messageId,
+      clientId: messageId,
+      type: "userMessage",
+      content: inputs,
+      status: "sending",
+      ...(targetTurnId ? { turnId: targetTurnId } : {}),
+    });
+    noteItem(id!, messageId);
     if (busy) {
-      await rpc("turn/steer", {
+      const result = await rpc("turn/steer", {
         threadId: id!,
-        expectedTurnId: activeTurns.get(id!)!,
+        expectedTurnId: targetTurnId!,
         clientUserMessageId: messageId,
         input: inputs,
       });
-      if (hostId === state.hostId)
+      if (hostId === state.hostId) {
+        // Some runtimes acknowledge the input without emitting a user item.
+        // Confirm the optimistic message in place, including observing caches.
+        hydrateTurnItems(id!, { id: result.turnId }, {
+          input: inputs, clientUserMessageId: messageId, placement: 'steer',
+        });
         projectAcceptedThreadPreview(id!, [{ type: 'userMessage', content: inputs }]);
+        scheduleConversationSnapshot(id!);
+      }
     } else {
       const revision = turnRevisions.get(id!) ?? 0;
       const itemRevision = itemEventSequence;

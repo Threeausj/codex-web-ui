@@ -91,7 +91,35 @@ export function turnPresentation(items: DisplayItem[]) {
   // that happened before and after it, rather than after all commentary.
   const process = activityBlocks(items, activity);
   const timelineBlocks = dividers.length ? activityBlocks(items, [...activity, ...outputs]) : process;
-  return { users, answers, activity, activityBlocks: process, dividers, outputs, timelineBlocks };
+  // Steering is another input in the same native turn. Keep the work before
+  // that input before it, instead of hoisting every user message to the top.
+  // Consecutive inputs share a segment until an assistant/tool item intervenes.
+  const itemSegments: DisplayItem[][] = [[]];
+  let hasWork = false;
+  for (const item of items) {
+    if (item.type === 'userMessage' && hasWork) {
+      itemSegments.push([]);
+      hasWork = false;
+    }
+    itemSegments.at(-1)!.push(item);
+    if (item.type !== 'userMessage') hasWork = true;
+  }
+  const activityIds = new Set(activity.map(item => item.id));
+  const outputIds = new Set(outputs.map(item => item.id));
+  const segments = itemSegments.map((segment, index) => {
+    const segmentActivity = segment.filter(item => activityIds.has(item.id));
+    const segmentOutputs = segment.filter(item => outputIds.has(item.id));
+    const segmentDividers = segment.filter(item => item.type === 'contextCompaction');
+    const blocks = activityBlocks(segment, segmentActivity);
+    return {
+      id: `segment:${segment[0]?.clientId || segment[0]?.id || index}`,
+      users: segment.filter(item => item.type === 'userMessage'),
+      activity: segmentActivity, outputs: segmentOutputs, dividers: segmentDividers,
+      activityBlocks: blocks,
+      timelineBlocks: segmentDividers.length ? activityBlocks(segment, [...segmentActivity, ...segmentOutputs]) : blocks,
+    };
+  });
+  return { users, answers, activity, activityBlocks: process, dividers, outputs, timelineBlocks, segments };
 }
 
 export function elapsedLabel(turn: any) {

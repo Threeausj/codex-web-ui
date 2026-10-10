@@ -1,4 +1,4 @@
-import { upsertItem, type DisplayItem } from './events';
+import { mergeSnapshotItems, upsertItem, type DisplayItem } from './events';
 
 export function writerConflict(error: unknown): boolean {
   const value = error as { message?: string; data?: { takeoverAvailable?: boolean; code?: string } };
@@ -60,10 +60,15 @@ export function mergeAcceptedTurnItems(
   // completion must move back before answers emitted after it in the same turn.
   // Replace only this turn's slots, preserving other turns and live-only items.
   if (!preserveLive && snapshot.length > 1) {
-    const rank = new Map(snapshot.map((item, index) => [item.id, index]));
     const positions = items.flatMap((item, index) => item.turnId === turn.id ? [index] : []);
-    const ordered = positions.map(index => items[index]).sort((left, right) =>
-      (rank.get(left.id) ?? snapshot.length) - (rank.get(right.id) ?? snapshot.length));
+    const current = positions.map(index => items[index]);
+    const byId = new Map(current.map(item => [item.id, item]));
+    // A runtime may acknowledge steering without including that input in the
+    // completion snapshot. Anchor those accepted live items to their existing
+    // neighbors instead of ranking every omitted item after the final answer.
+    const ordered = mergeSnapshotItems(snapshot.map(item => byId.get(item.id)!), current, new Set(), {
+      retainedTurnIds: new Set([turn.id]), summarizedTurnIds: new Set([turn.id]),
+    });
     positions.forEach((position, index) => { items[position] = ordered[index]; });
   }
   return touched;

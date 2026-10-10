@@ -180,3 +180,41 @@ test('large shuffled canonical histories group once and preserve optimistic stan
   assert.equal(blocks.length, 10001); assert.equal(blocks[50]!.id, 'optimistic');
   assert.deepEqual(blocks.filter(block => block.kind === 'turn').map(block => block.id), turns.map(turn => turn.id));
 });
+
+test('steering segments preserve preceding work, consecutive inputs and later outputs in one native turn', () => {
+  const items = [
+    { id: 'initial', type: 'userMessage' },
+    { id: 'progress', type: 'agentMessage', phase: 'commentary', text: 'before' },
+    { id: 'before-command', type: 'commandExecution' },
+    { id: 'steer', clientId: 'steer-client', type: 'userMessage' },
+    { id: 'steer-again', type: 'userMessage' },
+    { id: 'after-command', type: 'commandExecution' },
+    { id: 'compact', type: 'contextCompaction' },
+    { id: 'later-steer', type: 'userMessage' },
+    { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'done' },
+  ];
+  const result = turnPresentation(items);
+  assert.deepEqual(result.segments.map(segment => segment.users.map(item => item.id)), [['initial'], ['steer', 'steer-again'], ['later-steer']]);
+  assert.deepEqual(result.segments.map(segment => segment.activity.map(item => item.id)), [['progress', 'before-command'], ['after-command'], []]);
+  assert.deepEqual(result.segments.map(segment => segment.outputs.map(item => item.id)), [[], ['compact'], ['answer']]);
+  assert.deepEqual(result.segments[1].timelineBlocks.map(block => block.id), ['activity:after-command', 'compact']);
+  assert.equal(result.segments[1].id, 'segment:steer-client');
+  const shown = result.segments.flatMap(segment => [...segment.users, ...segment.activity, ...segment.outputs]).map(item => item.id);
+  assert.deepEqual(shown, items.map(item => item.id));
+});
+
+test('segmenting user messages retains global final-answer semantics and never invents an extra turn', () => {
+  const items = [
+    { id: 'initial', type: 'userMessage', turnId: 'one' },
+    { id: 'legacy-progress', type: 'agentMessage', text: 'before', turnId: 'one' },
+    { id: 'steer', type: 'userMessage', turnId: 'one' },
+    { id: 'legacy-answer', type: 'agentMessage', text: 'after', turnId: 'one' },
+  ];
+  const result = turnPresentation(items);
+  assert.deepEqual(result.answers.map(item => item.id), ['legacy-answer']);
+  assert.deepEqual(result.segments[0].outputs, []);
+  assert.deepEqual(result.segments[0].activity.map(item => item.id), ['legacy-progress']);
+  assert.deepEqual(result.segments[1].outputs.map(item => item.id), ['legacy-answer']);
+  assert.deepEqual(conversationBlocks(items, [{ id: 'one', status: 'inProgress' }]).map(block => block.id), ['one']);
+  assert.equal(turnPresentation([]).segments.length, 1);
+});
