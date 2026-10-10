@@ -5,6 +5,7 @@ import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/conversation-markdown'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
+import { conversationImageViewer } from '../lib/conversation-image-viewer'
 import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
 import { publicReasoningSummary } from '../lib/activity-presentation'
@@ -33,6 +34,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string, line?: number]; error: [message: string] }>()
 const copied = ref(false)
+const imageViewer = conversationImageViewer()
 const editorOpen = computed(() => props.editSession?.itemId === props.item.id)
 const editDraft = computed({
   get: () => props.editSession?.draft || '',
@@ -128,9 +130,21 @@ function onEditKeydown(event: KeyboardEvent) {
     void saveEdit()
   }
 }
+function previewImage(src: string, name = '图片') {
+  imageViewer?.open({ src, name, hostId: props.hostId || 'local', threadId: props.threadId })
+}
+function previewMarkdownImage(image: HTMLImageElement) {
+  previewImage(image.getAttribute('src') || '', image.alt || image.dataset.filePath?.split('/').pop() || '图片')
+}
+function onMarkdownKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  const image = (event.target as Element).closest('img[data-conversation-image]') as HTMLImageElement | null
+  if (!image) return
+  event.preventDefault(); event.stopPropagation(); previewMarkdownImage(image)
+}
 function onLink(event: MouseEvent) {
-  const image = (event.target as Element).closest('img[data-file-path]') as HTMLImageElement | null
-  if (image) { event.preventDefault(); emit('openFile', image.dataset.filePath!); return }
+  const image = (event.target as Element).closest('img[data-conversation-image]') as HTMLImageElement | null
+  if (image) { event.preventDefault(); event.stopPropagation(); previewMarkdownImage(image); return }
   const anchor = (event.target as Element).closest('a')
   if (!anchor) return
   const href = anchor.getAttribute('href') || ''
@@ -141,8 +155,8 @@ function onLink(event: MouseEvent) {
 
 <template>
   <article v-if="item.type === 'userMessage'" class="message user-message">
-    <div v-if="userImages.length" class="message-images"><img v-for="(img, index) in userImages" :key="index" :src="img.url" alt="上传的图片" loading="lazy" /></div>
-    <div v-if="localImages.length" class="message-images"><ConversationImage v-for="(img, index) in localImages" :key="img.path + index" :path="img.path" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
+    <div v-if="userImages.length" class="message-images"><button v-for="(img, index) in userImages" :key="index" type="button" class="message-image-preview" aria-label="放大上传的图片" @click="previewImage(img.url, '上传的图片')"><img :src="img.url" alt="上传的图片" loading="lazy" decoding="async" /></button></div>
+    <div v-if="localImages.length" class="message-images"><ConversationImage v-for="(img, index) in localImages" :key="img.path + index" :path="img.path" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
     <form v-if="editorOpen" class="message-editor" @submit.prevent="saveEdit">
       <textarea ref="editInput" v-model="editDraft" aria-label="编辑消息内容" rows="3" :disabled="editPending" @input="resizeEditor" @keydown="onEditKeydown"></textarea>
       <p class="message-edit-note">重新发送会替换本轮回复，已执行的文件修改不会撤销。</p>
@@ -160,7 +174,7 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
     <div v-else-if="!asyncQuestions.length" class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
     <AsyncQuestionCard v-if="asyncQuestions.length" :item="item" :status="asyncStatus" :disabled="asyncQuestionsDisabled" :answer="answerAsync" />
     <div v-if="text && (!busy || canFork)" class="message-actions">
@@ -175,7 +189,7 @@ function onLink(event: MouseEvent) {
     </details>
   </template>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon :name="item.status === 'inProgress' ? 'LoaderCircle' : 'RefreshCw'" :size="13" :class="{ spin: item.status === 'inProgress' }" />{{ item.status === 'inProgress' ? '正在压缩上下文…' : item.status === 'failed' ? '上下文压缩失败' : item.status === 'interrupted' ? '上下文压缩已取消' : '上下文已压缩' }}<span></span></div>
-  <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" v-html="html"></div></article>
+  <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" @click="onLink" @keydown="onMarkdownKeydown" v-html="html"></div></article>
   <details v-else class="tool-item" @toggle="toolExpanded = ($event.currentTarget as HTMLDetailsElement).open" :open="toolOpenByDefault || toolExpanded" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
     <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <template v-if="toolExpanded">
@@ -185,8 +199,8 @@ function onLink(event: MouseEvent) {
         <pre v-if="expandedFiles.has(change.path)" class="diff-code"><span v-for="(line, index) in (change.diff || '').split('\n')" :key="index" :class="line.startsWith('+') ? 'diff-add' : line.startsWith('-') ? 'diff-remove' : line.startsWith('@@') ? 'diff-hunk' : ''">{{ line + '\n' }}</span></pre>
       </details>
     </div>
-    <div v-else-if="item.type === 'imageGeneration' && item.savedPath" class="tool-content"><ConversationImage :path="item.savedPath" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
-    <div v-else-if="item.type === 'imageView' && item.path" class="tool-content"><ConversationImage :path="item.path" :host-id="hostId || 'local'" @open-file="emit('openFile', $event)" /></div>
+    <div v-else-if="item.type === 'imageGeneration' && item.savedPath" class="tool-content"><ConversationImage :path="item.savedPath" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
+    <div v-else-if="item.type === 'imageView' && item.path" class="tool-content"><ConversationImage :path="item.path" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
     <div v-else-if="findings.length" class="review-findings"><article v-for="(finding, index) in findings" :key="index" class="review-finding"><strong>{{ finding.title }}</strong><p>{{ finding.body }}</p><button class="button button-small button-secondary" @click="emit('openFile', finding.file, finding.start)">{{ finding.file }}{{ finding.start ? ':' + finding.start : '' }}</button></article></div>
     <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>
     </template>
@@ -194,6 +208,10 @@ function onLink(event: MouseEvent) {
 </template>
 
 <style scoped>
+.message-image-preview { display: block; max-width: 100%; padding: 0; border: 0; border-radius: 10px; background: transparent; cursor: zoom-in; overflow: hidden; }
+.message-image-preview:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.markdown :deep(img[data-conversation-image]) { cursor: zoom-in; }
+.markdown :deep(img[data-conversation-image]:focus-visible) { outline: 2px solid var(--green); outline-offset: 3px; }
 .file-diff > summary { list-style: none; cursor: pointer; }
 .review-findings { padding: 10px 0; }
 .review-finding { border-left: 2px solid var(--border); padding: 8px 12px; font-size: 12px; }

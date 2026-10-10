@@ -229,7 +229,7 @@ function hasPendingQuestion(block: any) {
           <template v-for="entry in block.dividers.length ? block.timelineBlocks : block.activityBlocks" :key="entry.id">
             <ActivityBatch
               v-if="entry.kind === 'batch'"
-              :host-id="hostId" :cwd="cwd"
+              :host-id="hostId" :thread-id="threadId" :cwd="cwd"
               :items="entry.items"
               :busy="running(block)"
               @open-file="(path, line) => emit('openFile', path, line)"

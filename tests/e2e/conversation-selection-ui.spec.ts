@@ -181,7 +181,7 @@ test('hiding and reopening the sidebar preserves an unsent question and quotes c
   await side.fill('尚未发送的侧边问题');
   await page.getByRole('button', { name: '切换工作区', exact: true }).click();
   await expect(page.locator('.side-chat-panel')).toBeHidden();
-  await page.getByRole('button', { name: '打开侧边聊天', exact: true }).click();
+  await page.getByRole('button', { name: '新建侧边聊天', exact: true }).click();
   await expect(side).toHaveValue('尚未发送的侧边问题');
   await page.getByRole('button', { name: '关闭侧边聊天', exact: true }).click();
   await selectMessage(page);
@@ -290,4 +290,57 @@ test('sidebar can quote its answer, save visible context without another model c
   await expect(page.locator('[data-section="pinned"] .thread-row').filter({ hasText: '已有测试历史 · 侧边问答' })).toBeVisible();
   await expect(main).toHaveValue('主对话草稿');
   expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(inferenceCount);
+});
+
+test('header side chat inherits the entire native conversation only when sending and keeps main drafts', async ({ page, mock }) => {
+  const wire = selectionWire(mock);
+  await selectHistory(page);
+  const main = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await main.fill('主对话草稿保留');
+  const shortcut = page.getByRole('button', { name: '新建侧边聊天', exact: true });
+  await expect(page.locator('.header-actions').getByRole('button', { name: '查看子智能体', exact: true })).toHaveCount(0);
+  await shortcut.click();
+  const side = page.getByRole('textbox', { name: '基于当前对话提问', exact: true });
+  await expect(side).toBeFocused();
+  await expect(page.locator('.side-chat-panel')).toContainText('当前对话的完整上下文');
+  await expect(page.locator('.side-chat-quote')).toHaveCount(0);
+  expect(mock.request('thread/fork')).toBeUndefined();
+  expect(mock.request('turn/start')).toBeUndefined();
+  await side.fill('解释刚才的部署结果');
+  await page.getByRole('button', { name: '切换工作区', exact: true }).click();
+  await expect(page.locator('.side-chat-panel')).toBeHidden();
+  await shortcut.click();
+  await expect(side).toHaveValue('解释刚才的部署结果');
+  await page.getByRole('button', { name: '发送侧边问题', exact: true }).click();
+  await expect(page.locator('.side-chat-transcript')).toContainText('流式回复完成 ✅');
+  expect(mock.request('thread/fork')?.params).toMatchObject({ threadId: 'thread-existing', ephemeral: true, excludeTurns: true, sandbox: 'read-only' });
+  expect(mock.request('thread/fork')?.params.lastTurnId).toBeUndefined();
+  expect(mock.request('thread/fork')?.params.beforeTurnId).toBeUndefined();
+  expect(mock.request('turn/start')?.params.threadId).toBe(wire.sideThreadId);
+  expect(mock.request('turn/start')?.params.input).toEqual([{ type: 'text', text: '解释刚才的部署结果', text_elements: [] }]);
+  await expect(main).toHaveValue('主对话草稿保留');
+  expect(mock.turns.get('thread-existing')).toHaveLength(1);
+});
+
+test('opening header side chat while parent runs never interrupts the parent or resets an existing answer', async ({ page, mock }) => {
+  const wire = selectionWire(mock);
+  await selectHistory(page);
+  const turn = { id: 'parent-active-header-side', status: 'inProgress', itemsView: 'full', items: [] };
+  mock.turns.get('thread-existing')!.push(turn);
+  mock.emit('turn/started', { threadId: 'thread-existing', turn });
+  const shortcut = page.getByRole('button', { name: '新建侧边聊天', exact: true });
+  await expect(shortcut).toBeEnabled();
+  await shortcut.click();
+  mock.holdFinalMessage = true;
+  await page.getByRole('textbox', { name: '基于当前对话提问', exact: true }).fill('补充一个问题');
+  await page.getByRole('button', { name: '发送侧边问题', exact: true }).click();
+  await expect(page.getByRole('button', { name: '停止侧边回答', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '切换工作区', exact: true }).click();
+  await shortcut.click();
+  await expect(page.getByRole('button', { name: '停止侧边回答', exact: true })).toBeVisible();
+  expect(mock.requests.filter(request => request.method === 'thread/fork')).toHaveLength(1);
+  expect(mock.requests.filter(request => ['turn/steer', 'turn/interrupt', 'thread/unsubscribe'].includes(request.method!))).toHaveLength(0);
+  expect(mock.request('turn/start')?.params.threadId).toBe(wire.sideThreadId);
+  expect(mock.request('thread/fork')?.params.beforeTurnId).toBeUndefined();
+  expect(mock.turns.get('thread-existing')!.at(-1)!.status).toBe('inProgress');
 });

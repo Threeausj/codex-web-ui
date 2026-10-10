@@ -19,6 +19,7 @@ import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
 import { registerThreadGoals } from './thread-goals.js'
 import { registerAsyncQuestionAnswers } from './async-question-answers.js'
+import { registerAsyncQuestionNotices } from './async-question-notices.js'
 import { registerThreadTakeover } from './thread-takeover.js'
 import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
@@ -141,6 +142,7 @@ export async function createApp(options: AppOptions = {}) {
   registerNavigation(app, getBridge)
   registerThreadGoals(app, { getBridge })
   registerAsyncQuestionAnswers(app, getBridge)
+  const questionNotices = await registerAsyncQuestionNotices(app, dataDir, id => !!storage.host(id))
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
   registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)
@@ -149,7 +151,7 @@ export async function createApp(options: AppOptions = {}) {
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
-    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
+    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
   }))
   app.get('/api/hosts', (_req, res) => res.json({ hosts: storage.hosts }))
   registerHostConnection(app, bridgeOptions)

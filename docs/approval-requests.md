@@ -15,3 +15,5 @@
 本次问题对应的 NAS 运行记录确认使用了 `danger-full-access + never`，但截图中的旧请求已被清除，无法恢复其具体方法名。已复现并修复“非审批请求被显示为空审批卡片、推送端却不通知”的分类错误，不据此推断某个未知请求应自动允许。
 
 参考：[Codex app-server 的审批与客户端工具协议](https://learn.chatgpt.com/docs/app-server)、[用户提问与自动结束间隔](https://learn.chatgpt.com/docs/app-server#toolrequestuserinput)、[Codex 沙箱与审批设置](https://learn.chatgpt.com/docs/sandboxing)。当前时间回调字段参见仓库生成的 `shared/protocol/v2/CurrentTimeReadResponse.ts`。
+
+页面顶部“问题等待你的选择”提醒提供关闭按钮。关闭只隐藏这批提醒，不回答、不取消原生问题，消息中的题目和填写草稿仍保留。新版异步问题按主机、会话、轮次、消息和题目内容精确记录到私人 `DATA_DIR/async-question-notices.json`，重载页面和服务重启后保留；新题目或修改后的题目继续提醒。已在其他客户端回答的问题会只读核对原生状态后清除提醒。此按钮不撤销已投递的系统通知，也不自动批准审批请求。

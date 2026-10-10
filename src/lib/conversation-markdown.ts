@@ -1,6 +1,15 @@
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { isImagePath, previewFilePath } from './file-preview';
+import { safeConversationImageSource } from './conversation-image-viewer';
+
+function markImage(image: HTMLImageElement) {
+  image.dataset.conversationImage = 'true';
+  image.dataset.selectionIgnore = 'true';
+  image.setAttribute('role', 'button');
+  image.tabIndex = 0;
+  image.setAttribute('aria-label', `放大图片 ${image.alt || image.dataset.filePath?.split('/').pop() || '图片'}`);
+}
 
 function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
   const fragment = DOMPurify.sanitize(html, {
@@ -10,7 +19,10 @@ function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
     const source = image.getAttribute('src') || '';
     // Host-local assets use the authenticated image endpoint. Relative paths are
     // resolved inside the conversation's workspace, never the website's origin.
-    if (/^(?:https?:|data:|blob:)/i.test(source)) continue;
+    if (/^(?:https?:|data:|blob:)/i.test(source)) {
+      if (safeConversationImageSource(source, hostId)) markImage(image);
+      continue;
+    }
     const path = previewFilePath(source, `${cwd || '/'}/.conversation.md`, source.startsWith('/') ? '/' : cwd);
     image.removeAttribute('src');
     if (path && isImagePath(path)) {
@@ -18,6 +30,7 @@ function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
       image.dataset.filePath = path;
       image.loading = 'lazy';
       image.decoding = 'async';
+      markImage(image);
     }
   }
   const container = document.createElement('div');

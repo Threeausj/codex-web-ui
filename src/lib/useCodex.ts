@@ -21,6 +21,8 @@ import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './
 import { isInteractiveServerRequest } from '../../shared/server-requests';
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionAnswered, asyncQuestionAnswerDisplayText, asyncQuestionFingerprint, asyncQuestionReplyText } from '../../shared/async-question-reply';
+import type { AsyncQuestionNotice } from '../../shared/async-question-notices';
+import { AsyncQuestionCheckQueue, useAsyncQuestionNoticeDismissals } from './async-question-notices';
 import type { ConversationBookmarkSource } from '../../shared/bookmarks';
 import { mergeBookmarkMessages, retainBookmarkTargets } from './conversation-bookmarks';
 import {
@@ -302,7 +304,15 @@ const recencyKey = (hostId: string, threadId: string) =>
   JSON.stringify([hostId, threadId]);
 const asyncQuestionKey = (hostId: string, threadId: string, itemId: string) => JSON.stringify([hostId, threadId, itemId]);
 const asyncQuestionReceiptReads = new Map<string, Promise<void>>();
-const asyncQuestionChecks = new Map<string, Promise<void>>();
+const asyncQuestionChecks = new AsyncQuestionCheckQueue();
+const asyncQuestionNotices = useAsyncQuestionNoticeDismissals({ requestHttp: http, runtimeIdentity });
+function questionNotice(record: AsyncQuestionRecord): AsyncQuestionNotice | null {
+  const fingerprint = asyncQuestionFingerprint(record.item);
+  const turnId = record.item.turnId || (record.hostId === state.hostId && record.threadId === state.activeThread?.id
+    ? state.turns.find(turn => turn.items?.some((item: DisplayItem) => item.id === record.item.id))?.id : undefined);
+  return fingerprint && turnId ? { hostId: record.hostId, threadId: record.threadId,
+    turnId, itemId: record.item.id, fingerprint } : null;
+}
 function clearAsyncQuestionReads(key: string) {
   for (const readKey of asyncQuestionReceiptReads.keys()) if (JSON.parse(readKey)[0] === key) asyncQuestionReceiptReads.delete(readKey);
 }
@@ -313,25 +323,28 @@ function checkAsyncQuestionAnswers(threadId: string) {
     state.connected && state.threadReady && !state.selectingThread;
   if (!current()) return;
   for (const record of Object.values(state.asyncQuestions)) {
-    if (record.hostId !== hostId || record.threadId !== threadId || !record.item.turnId ||
-        asyncQuestionStatus(record.item, threadId, hostId) !== 'uncertain') continue;
+    if (record.hostId !== hostId || record.threadId !== threadId || !record.item.turnId) continue;
+    const status = asyncQuestionStatus(record.item, threadId, hostId);
+    if (status === 'answered' || status === 'sending') continue;
     const key = asyncQuestionKey(hostId, threadId, record.item.id);
     const fingerprint = asyncQuestionFingerprint(record.item)!;
-    const checkKey = JSON.stringify([authentication, generation, key, fingerprint]);
-    if (asyncQuestionChecks.has(checkKey)) continue;
-    const operation = (async () => {
+    const checkKey = JSON.stringify([authentication, key, fingerprint]);
+    void asyncQuestionChecks.check(checkKey, async () => {
+      if (!current() || asyncQuestionFingerprint(state.asyncQuestions[key]?.item) !== fingerprint ||
+          ['answered', 'sending'].includes(asyncQuestionStatus(record.item, threadId, hostId))) return false;
       try {
         const result = await http(`/threads/${encodeURIComponent(hostId)}/${encodeURIComponent(threadId)}/async-questions/${encodeURIComponent(record.item.id)}/status?turnId=${encodeURIComponent(record.item.turnId!)}`, { signal: AbortSignal.timeout(45000) }, false);
         if (current() && result.answered === true && asyncQuestionFingerprint(state.asyncQuestions[key]?.item) === fingerprint) {
           state.asyncQuestionOperations[key] = { fingerprint, status: 'answered' };
           void privateState.remove('async-question-answer', key).catch(() => {});
         }
-      } catch { /* Synchronization can retry; a read never resends an answer. */ }
-    })();
-    asyncQuestionChecks.set(checkKey, operation);
-    // Only the active synchronization needs deduplication; old generations
-    // must not accumulate indefinitely on long-lived PWA renderers.
-    if (asyncQuestionChecks.size > 256) asyncQuestionChecks.delete(asyncQuestionChecks.keys().next().value!);
+        return current();
+      } catch (error: any) {
+        // A known historical limit/missing item does not change on every delta.
+        // Cool it down while leaving network failures retryable on reconnect.
+        return current() && error?.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 429;
+      }
+    });
   }
 }
 function questionItems(threadId: string, hostId: string) {
@@ -403,11 +416,24 @@ function rememberAsyncQuestions(threadId: string, items: DisplayItem[], hostId =
     clearAsyncQuestionReads(key);
     delete state.asyncQuestions[key]; delete state.asyncQuestionOperations[key]; excess--;
   }
+  if (state.authenticated) void asyncQuestionNotices.refresh().catch(() => {});
+  if (hostId === state.hostId) checkAsyncQuestionAnswers(threadId);
 }
 function pendingAsyncQuestions() {
   return Object.values(state.asyncQuestions).filter(record =>
     state.hosts.some(host => host.id === record.hostId) &&
     asyncQuestionStatus(record.item, record.threadId, record.hostId) !== 'answered');
+}
+function pendingAsyncQuestionNotices() {
+  return pendingAsyncQuestions().filter(record => {
+    const notice = questionNotice(record);
+    return !notice || !asyncQuestionNotices.dismissed(notice);
+  });
+}
+async function dismissAsyncQuestionNotices(records = pendingAsyncQuestionNotices()) {
+  const notices = records.map(questionNotice);
+  if (notices.some(notice => !notice)) throw new Error('无法定位此问题所属轮次，请同步对话后再关闭提醒');
+  await asyncQuestionNotices.dismiss(notices as AsyncQuestionNotice[]);
 }
 function forgetAsyncQuestions(threadId: string, hostId = state.hostId) {
   for (const [key, record] of Object.entries(state.asyncQuestions)) if (record.hostId === hostId && record.threadId === threadId) {
@@ -497,6 +523,7 @@ function clearConversationCaches() {
   state.asyncQuestionOperations = {};
   asyncQuestionReceiptReads.clear();
   asyncQuestionChecks.clear();
+  asyncQuestionNotices.clear();
   historyRestoration = null;
   historyWindowTruncated = false;
   tokenUsages.clear();
@@ -1797,6 +1824,9 @@ async function bootstrap() {
   state.hosts = data.hosts;
   state.projects = data.projects;
   state.connectionMode = data.connectionMode;
+  // Bootstrap carries this small journal to avoid an extra navigation round trip.
+  if (Array.isArray(data.asyncQuestionNoticeDismissals)) asyncQuestionNotices.hydrate(data.asyncQuestionNoticeDismissals);
+  else void asyncQuestionNotices.refresh(true).catch(() => {});
   pausedHosts.clear();
   releasedThreads.clear();
   for (const entry of data.runtimeReleasedThreads || []) {
@@ -4904,6 +4934,9 @@ export function useCodex() {
     asyncQuestionStatus,
     answerAsyncQuestion,
     pendingAsyncQuestions,
+    pendingAsyncQuestionNotices,
+    dismissAsyncQuestionNotices,
+    asyncQuestionNoticesState: asyncQuestionNotices.state,
     canEditMessage,
     resendEditedMessage,
     cancelMessageEdit,

@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import Icon from './Icon.vue';
-const props = defineProps<{ path: string; hostId: string }>();
-const emit = defineEmits<{ openFile: [path: string] }>();
+import { conversationImageUrl, conversationImageViewer } from '../lib/conversation-image-viewer';
+const props = defineProps<{ path: string; hostId: string; threadId?: string }>();
+const viewer = conversationImageViewer();
 const failed = ref(false);
 const name = computed(() => props.path.split('/').pop() || '图片');
-const src = computed(() => `/api/hosts/${encodeURIComponent(props.hostId)}/images?${new URLSearchParams({ path: props.path })}`);
+const src = computed(() => conversationImageUrl(props.path, props.hostId));
+function open() { viewer?.open({ src: src.value, name: name.value, hostId: props.hostId, threadId: props.threadId }); }
 watch(src, () => { failed.value = false; });
 </script>
 <template>
-  <button class="conversation-image" :class="{ 'image-unavailable': failed }" :aria-label="`查看图片 ${name}`" :title="failed ? '图片无法加载，点击在工作区查看' : name" @click="emit('openFile', path)">
+  <button type="button" class="conversation-image" :class="{ 'image-unavailable': failed }" :aria-label="`查看图片 ${name}`" :title="failed ? '图片无法加载，点击重新预览' : '放大查看 ' + name" @click="open">
     <img v-if="!failed" :key="src" :src="src" :alt="name" loading="lazy" decoding="async" @error="failed = true" />
     <span v-else><Icon name="Image" :size="16" />{{ name }} · 图片无法加载<Icon name="Eye" :size="14" /></span>
   </button>
