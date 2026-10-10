@@ -102,6 +102,7 @@ test('SSH preview forwarding is loopback-only and rejects argument injection', (
   const args = sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Test', hostname: 'example.invalid', username: 'user', port: 2222, identityFile: '/tmp/key with spaces' }, 43210, 5173)
   assert.ok(args.includes('127.0.0.1:43210:127.0.0.1:5173'))
   assert.ok(args.includes('ExitOnForwardFailure=yes'))
+  assert.ok(args.includes('ServerAliveInterval=30'))
   assert.deepEqual(args.slice(-2), ['--', 'user@example.invalid'])
   assert.ok(args.includes('/tmp/key with spaces'))
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: '-oProxyCommand=touch /tmp/bad' }, 43210, 5173))
@@ -115,6 +116,7 @@ test('SSH preview forwarding pins managed keys with the same strict trust option
   assert.deepEqual(unmanaged, [
     '-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
     '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR',
+    '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes',
     '-L', '127.0.0.1:43210:127.0.0.1:5173', '-p', '2222', '-i', '/fixture/key with spaces',
     '--', 'test@host.example.test',
   ])
@@ -122,7 +124,8 @@ test('SSH preview forwarding pins managed keys with the same strict trust option
     const pin = { file, hostKeyAlias: '[host.example.test]:2222' }
     const managed = sshForwardArgs(host, 43210, 5173, pin)
     const trust = sshKnownHostsArgs(pin)
-    assert.deepEqual(managed, [...unmanaged.slice(0, 14), ...trust, ...unmanaged.slice(14)])
+    const trustPosition = unmanaged.indexOf('-p')
+    assert.deepEqual(managed, [...unmanaged.slice(0, trustPosition), ...trust, ...unmanaged.slice(trustPosition)])
     assert.equal(managed.filter(value => value === 'StrictHostKeyChecking=yes').length, 1)
     assert.ok(managed.includes('GlobalKnownHostsFile=/dev/null'))
     assert.ok(managed.includes('KnownHostsCommand=none'))

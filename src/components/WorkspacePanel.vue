@@ -78,6 +78,12 @@ const previewUrl = ref("");
 const previewMode = ref("desktop");
 const previewKey = ref(0);
 const previewDocument = ref(false);
+const previewMounted = ref(tab.value === "preview");
+const developmentMounted = ref(false);
+const developmentTarget = ref<{ port: number; path: string; requestId: number }>();
+let developmentRequestId = 0;
+watch(tab, value => { if (value === "preview") previewMounted.value = true; });
+watch(previewSource, value => { if (value === "service") developmentMounted.value = true; });
 const fileView = computed({ get: () => activeEditor.value?.view || "preview", set: value => { if (activeEditor.value) activeEditor.value.view = value; } });
 const draftWarning = ref("");
 let activeScope = "", draftTimer: ReturnType<typeof setTimeout> | undefined, workspaceReady: Promise<void> = Promise.resolve();
@@ -306,9 +312,32 @@ function codeSelection(value: { text: string; startLine: number; endLine: number
   if (action === 'add') emit('add', source); else emit('ask', source);
 }
 async function preview(path?: string) {
-  previewSource.value = "file";
   const input = (path || previewInput.value).trim();
   if (!input) return;
+  // A browser's localhost points to the user's device. Treat loopback URLs
+  // and bare ports as services on the selected host, through its SSH forward.
+  const portInput = input.match(/^:?(\d{1,5})(?=\/|\?|#|$)(.*)$/);
+  const loopbackInput = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\]):\d+(?:[/?#]|$)/i.test(input);
+  if (portInput || loopbackInput) {
+    let target: URL;
+    try {
+      target = portInput
+        ? new URL(`http://127.0.0.1:${portInput[1]}${portInput[2] || "/"}`)
+        : new URL(/^https?:\/\//i.test(input) ? input : `http://${input}`);
+    } catch { error.value = "请输入有效的开发服务地址和端口（1024–65535）"; return; }
+    if (target.protocol !== "http:") { error.value = "开发服务目前支持 HTTP 转发，请使用 http://localhost:端口"; return; }
+    const port = Number(target.port || 80);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) { error.value = "请输入 1024–65535 之间的开发服务端口"; return; }
+    error.value = "";
+    previewInput.value = input;
+    previewSource.value = "service";
+    developmentMounted.value = true;
+    developmentTarget.value = { port, path: target.pathname + target.search + target.hash, requestId: ++developmentRequestId };
+    tab.value = "preview";
+    return;
+  }
+  previewSource.value = "file";
+  error.value = "";
   if (/^https?:\/\//i.test(input)) {
     ++fileGeneration;
     loading.value = false;
@@ -501,7 +530,7 @@ defineExpose({
         </div>
         <form class="preview-toolbar" @submit.prevent="preview()">
           <Icon name="FileText" :size="15" />
-          <input v-model="previewInput" placeholder="输入 URL、Markdown、图片或 HTML 路径" aria-label="预览地址" />
+          <input v-model="previewInput" placeholder="输入端口（5173）、URL 或文件路径" aria-label="预览地址" />
           <button class="icon-button" type="submit" title="打开预览" aria-label="打开预览"><Icon name="ArrowRight" :size="15" /></button>
         </form>
       </template>
@@ -700,95 +729,6 @@ defineExpose({
         @error="emit('error', $event)"
       />
     </div>
-    <div v-else-if="tab === 'preview'" class="workspace-body preview-view">
-      <div class="preview-source-toolbar segmented-control">
-        <button
-          :class="{ active: previewSource === 'file' }"
-          @click="previewSource = 'file'"
-        >
-          文件 / URL</button
-        ><button
-          :class="{ active: previewSource === 'service' }"
-          @click="previewSource = 'service'"
-        >
-          开发服务
-        </button>
-      </div>
-      <DevelopmentPreview
-        v-if="previewSource === 'service'"
-        :api="api"
-        :state="state"
-      />
-      <template v-else>
-        <form class="preview-toolbar" @submit.prevent="preview()">
-          <Icon name="Globe" :size="15" /><input
-            v-model="previewInput"
-            placeholder="输入 URL、Markdown、图片或 HTML 路径"
-            aria-label="预览地址"
-          /><button
-            class="icon-button"
-            type="submit"
-            title="打开预览"
-            aria-label="打开预览"
-          >
-            <Icon name="ArrowRight" :size="15" />
-          </button>
-        </form>
-        <div v-if="previewUrl" class="preview-options">
-          <div class="segmented-control">
-            <button
-              :class="{ active: previewMode === 'desktop' }"
-              @click="previewMode = 'desktop'"
-              title="桌面预览"
-              aria-label="桌面预览"
-            >
-              <Icon name="Monitor" :size="15" /></button
-            ><button
-              :class="{ active: previewMode === 'mobile' }"
-              @click="previewMode = 'mobile'"
-              title="手机预览"
-              aria-label="手机预览"
-            >
-              <Icon name="Smartphone" :size="15" />
-            </button>
-          </div>
-          <button
-            class="icon-button"
-            @click="previewKey++"
-            title="刷新预览"
-            aria-label="刷新预览"
-          >
-            <Icon name="RefreshCw" :size="15" /></button
-          ><a
-            :href="previewUrl"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="icon-button"
-            title="在新标签页打开"
-            aria-label="在新标签页打开"
-            ><Icon name="ExternalLink" :size="15"
-          /></a>
-        </div>
-        <div
-          v-if="previewUrl"
-          class="preview-frame-container"
-          :class="{ mobile: previewMode === 'mobile' }"
-        >
-          <iframe
-            :key="previewKey"
-            :src="previewUrl"
-            title="项目预览"
-            sandbox="allow-scripts allow-forms allow-popups allow-downloads"
-            referrerpolicy="no-referrer"
-          ></iframe>
-        </div>
-        <div v-else class="panel-empty">
-          <Icon name="Eye" :size="32" />
-          <p>把你的作品放在眼前</p>
-          <span>输入运行地址，或打开项目里的 Markdown、图片和 HTML 文件。</span>
-        </div>
-      </template>
-    </div>
     <div v-else-if="tab === 'terminal'" class="workspace-body terminal-view">
       <div class="terminal-mode-toolbar">
         <div class="segmented-control">
@@ -884,7 +824,7 @@ defineExpose({
         </div>
       </template>
     </div>
-    <div v-else class="workspace-body changes-view">
+    <div v-else-if="tab === 'changes'" class="workspace-body changes-view">
       <div class="changes-heading">
         <span>{{ changeScope === 'latest' ? '上一轮操作' : '已加载操作记录' }} · {{ changes.length }} 个文件</span><span class="diff-stats"><span class="diff-count-add">+{{ changeTotals.added }}</span><span class="diff-count-remove">−{{ changeTotals.removed }}</span></span>
       </div>
@@ -912,6 +852,97 @@ defineExpose({
         <p>暂无文件变更</p>
         <span>Codex 对项目的修改将显示在这里。</span>
       </div>
+    </div>
+    <div v-if="previewMounted" v-show="tab === 'preview' && !(previewSource === 'file' && previewDocument)" class="workspace-body preview-view">
+      <div class="preview-source-toolbar segmented-control">
+        <button
+          :class="{ active: previewSource === 'file' }"
+          @click="previewSource = 'file'"
+        >
+          文件 / URL</button
+        ><button
+          :class="{ active: previewSource === 'service' }"
+          @click="previewSource = 'service'"
+        >
+          开发服务
+        </button>
+      </div>
+      <DevelopmentPreview
+        v-if="developmentMounted"
+        v-show="previewSource === 'service'"
+        :api="api"
+        :state="state"
+        :target="developmentTarget"
+      />
+      <template v-if="previewSource === 'file'">
+        <form class="preview-toolbar" @submit.prevent="preview()">
+          <Icon name="Globe" :size="15" /><input
+            v-model="previewInput"
+            placeholder="输入端口（5173）、URL 或文件路径"
+            aria-label="预览地址"
+          /><button
+            class="icon-button"
+            type="submit"
+            title="打开预览"
+            aria-label="打开预览"
+          >
+            <Icon name="ArrowRight" :size="15" />
+          </button>
+        </form>
+        <div v-if="previewUrl" class="preview-options">
+          <div class="segmented-control">
+            <button
+              :class="{ active: previewMode === 'desktop' }"
+              @click="previewMode = 'desktop'"
+              title="桌面预览"
+              aria-label="桌面预览"
+            >
+              <Icon name="Monitor" :size="15" /></button
+            ><button
+              :class="{ active: previewMode === 'mobile' }"
+              @click="previewMode = 'mobile'"
+              title="手机预览"
+              aria-label="手机预览"
+            >
+              <Icon name="Smartphone" :size="15" />
+            </button>
+          </div>
+          <button
+            class="icon-button"
+            @click="previewKey++"
+            title="刷新预览"
+            aria-label="刷新预览"
+          >
+            <Icon name="RefreshCw" :size="15" /></button
+          ><a
+            :href="previewUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="icon-button"
+            title="在新标签页打开"
+            aria-label="在新标签页打开"
+            ><Icon name="ExternalLink" :size="15"
+          /></a>
+        </div>
+        <div
+          v-if="previewUrl"
+          class="preview-frame-container"
+          :class="{ mobile: previewMode === 'mobile' }"
+        >
+          <iframe
+            :key="previewKey"
+            :src="previewUrl"
+            title="项目预览"
+            sandbox="allow-scripts allow-forms allow-popups allow-downloads"
+            referrerpolicy="no-referrer"
+          ></iframe>
+        </div>
+        <div v-else class="panel-empty">
+          <Icon name="Eye" :size="32" />
+          <p>把你的作品放在眼前</p>
+          <span>输入运行地址，或打开项目里的 Markdown、图片和 HTML 文件。</span>
+        </div>
+      </template>
     </div>
   </aside>
 </template>
