@@ -106,7 +106,10 @@ export async function createApp(options: AppOptions = {}) {
   if (options.trustProxy ?? process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
   app.use((_req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'SAMEORIGIN' }); next() })
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next() })
-  app.use(express.json({ limit: '64kb' }))
+  const parseJson = express.json({ limit: '64kb' })
+  // Development services own their request bodies and limits. Parsing here
+  // would consume or reserialize uploads and signed JSON before forwarding.
+  app.use((req, res, next) => req.path.startsWith('/api/dev-preview/') ? next() : parseJson(req, res, next))
   app.get('/api/health', (_req, res) => res.json({ ok: true }))
   app.get('/api/auth/session', auth.session)
   app.post('/api/auth/login', auth.login)

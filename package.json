@@ -20,6 +20,7 @@
     "doctor:preview": "tsx scripts/preview-smoke.ts"
   },
   "dependencies": {
+    "@babel/parser": "^7.29.9",
     "@codemirror/language": "^6.13.1",
     "@codemirror/language-data": "^6.5.2",
     "@codemirror/state": "^6.7.6",

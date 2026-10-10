@@ -10,6 +10,9 @@ import { hostInput } from './storage.js'
 import { sshKnownHostsArgs } from './ssh.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import type { AuthenticatedRequest, Host } from './types.js'
+import { rewriteDevelopmentAssets } from './dev-preview-rewrite.js'
+import { developmentBootstrap } from './dev-preview-runtime.js'
+import { PreviewCookies } from './dev-preview-cookies.js'
 
 type Dependencies = {
   getHost: (id: string) => Host | undefined
@@ -22,10 +25,11 @@ type Dependencies = {
 type Ticket = {
   id: string; sessionId: string; hostId: string; port: number; localPort: number
   origin: string; expiresAt: number; tunnel?: ChildProcess; sockets: Set<WebSocket>; requests: Set<http.ClientRequest>
+  cookies: PreviewCookies
 }
 const input = z.object({
   hostId: z.string().default('local'), port: z.number().int().min(1024).max(65535),
-  path: z.string().max(4096).default('/').refine(value => value.startsWith('/') && !value.startsWith('//') && !/[\x00-\x1f\\]/.test(value), 'Use a relative server path'),
+  path: z.string().max(4096).default('/').refine(value => value.startsWith('/') && !value.startsWith('//') && !/[\x00-\x20\x7f\\]/.test(value), 'Use a relative server path'),
 }).strict()
 const PREFIX = '/api/dev-preview/'
 const TTL = 60 * 60 * 1000
@@ -33,7 +37,7 @@ const TTL = 60 * 60 * 1000
 export function sshForwardArgs(host: Host, localPort: number, targetPort: number, knownHostsFile?: SSHHostKeyPin) {
   const fields = hostInput.parse(Object.fromEntries(Object.entries(host).filter(([key]) => key !== 'id' && key !== 'kind')))
   for (const port of [localPort, targetPort]) if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid forward port')
-  const args = ['-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-L', `127.0.0.1:${localPort}:127.0.0.1:${targetPort}`]
+  const args = ['-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-L', `127.0.0.1:${localPort}:127.0.0.1:${targetPort}`]
   args.push(...sshKnownHostsArgs(knownHostsFile))
   if (fields.port) args.push('-p', String(fields.port))
   if (fields.identityFile) args.push('-i', fields.identityFile)
@@ -41,21 +45,33 @@ export function sshForwardArgs(host: Host, localPort: number, targetPort: number
   return args
 }
 
-function bootstrap(base: string, port: number) {
-  // Runs in an opaque iframe origin. Every relative network request stays under
-  // the ticket; credentials from the Codex app are never forwarded upstream.
-  return `<script>(()=>{const base=${JSON.stringify(base)},port=${port},origin=new URL(location.href).origin;const map=value=>{try{const u=new URL(value,location.href);if(u.origin===origin){if(u.pathname.startsWith(base+'/'))return u.href;return origin+base+u.pathname+u.search+u.hash}if(['localhost','127.0.0.1','[::1]'].includes(u.hostname)&&Number(u.port)===port)return origin+base+u.pathname+u.search+u.hash;return value}catch{return value}};const fetchOriginal=window.fetch;window.fetch=(value,init)=>fetchOriginal(typeof value==='string'||value instanceof URL?map(String(value)):new Request(map(value.url),value),{...init,credentials:'omit'});const open=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url,...rest){return open.call(this,method,map(String(url)),...rest)};const OriginalSocket=window.WebSocket;window.WebSocket=class extends OriginalSocket{constructor(value,protocols){const u=new URL(String(value),location.href);const mapped=map(u.href.replace(/^ws:/,'http:').replace(/^wss:/,'https:'));super(String(mapped).replace(/^http:/,'ws:').replace(/^https:/,'wss:'),protocols)}};const OriginalEvents=window.EventSource;if(OriginalEvents)window.EventSource=class extends OriginalEvents{constructor(value,options){super(map(String(value)),{...options,withCredentials:false})}}})()</script>`
-}
-
 export function rewriteDevelopmentResponse(source: string, contentType: string, base: string, port: number) {
-  // HTML attributes, CSS URL references, and Vite/ES-module root imports.
-  let output = source.replace(/(["'`])\/(?!\/)([^"'`\s<>]*)/g, (_all, quote: string, target: string) => `${quote}${base}/${target}`)
-  output = output.replace(/(url\(\s*)\/(?!\/)/gi, `$1${base}/`)
+  let output = rewriteDevelopmentAssets(source, contentType, base, port)
   if (/text\/html/i.test(contentType)) {
-    const script = bootstrap(base, port)
+    const script = developmentBootstrap(base, port)
     output = /<head(?:\s[^>]*)?>/i.test(output) ? output.replace(/(<head(?:\s[^>]*)?>)/i, `$1${script}`) : `${script}${output}`
   }
   return output
+}
+
+function probeDevelopmentServer(ticket: Ticket, target: string) {
+  return new Promise<void>((resolve, reject) => {
+    const request = http.get({ host: '127.0.0.1', port: ticket.localPort, path: target, agent: false, headers: { host: `localhost:${ticket.port}`, 'accept-encoding': 'identity' } }, response => {
+      // Headers prove that the remote HTTP server answered, including login or
+      // redirect responses. Never buffer or follow a potentially private page.
+      response.destroy(); resolve()
+    })
+    request.setTimeout(10000, () => request.destroy(new Error('Development service timed out')))
+    request.once('error', reject)
+    ticket.requests.add(request)
+    request.once('close', () => ticket.requests.delete(request))
+  })
+}
+
+const blockedHeaders = /^(?:host|cookie|origin|referer|connection|upgrade|content-length|transfer-encoding|keep-alive|te|trailer|proxy-.*|sec-.*)$/i
+function corsHeaders(requested: string | undefined) {
+  return (requested || 'content-type, authorization').split(',').map(value => value.trim().toLowerCase())
+    .filter(value => /^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(value) && !blockedHeaders.test(value)).slice(0, 64).join(', ')
 }
 
 async function freePort() {
@@ -104,27 +120,37 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
   cleanup.unref()
   app.post('/api/dev-previews', deps.requireAuth, deps.requireCsrf, async (req: AuthenticatedRequest, res) => {
     const parsed = input.parse(req.body)
+    const normalizedPath = new URL(parsed.path, 'http://localhost')
+    parsed.path = normalizedPath.pathname + normalizedPath.search + normalizedPath.hash
     const host = deps.getHost(parsed.hostId)
     if (!host) { res.status(404).json({ error: 'Host not found' }); return }
     if (host.kind === 'local' && parsed.port === req.socket.localPort) { res.status(400).json({ error: 'Cannot preview the Codex API server itself' }); return }
     if (tickets.size >= 64) { res.status(429).json({ error: 'Close an existing development preview first' }); return }
     const id = randomBytes(24).toString('base64url')
     const origin = req.get('origin') && req.get('origin') !== 'null' ? req.get('origin')! : `${req.protocol}://${req.get('host')}`
-    const ticket: Ticket = { id, sessionId: req.session!.id, hostId: host.id, port: parsed.port, localPort: parsed.port, origin, expiresAt: Date.now() + TTL, sockets: new Set(), requests: new Set() }
-    if (host.kind === 'ssh') {
-      const knownHostsFile = await deps.resolveSshHostKeyPin?.(host)
-      ticket.localPort = await freePort()
-      if (!deps.isSessionActive(ticket.sessionId)) { res.status(401).json({ error: 'Session expired' }); return }
-      if (deps.getHost(host.id) !== host) { res.status(409).json({ error: 'Host settings changed; open the preview again' }); return }
-      ticket.tunnel = spawn('ssh', sshForwardArgs(host, ticket.localPort, parsed.port, knownHostsFile), { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
-      ticket.tunnel.stderr?.on('data', () => {})
-      try { await waitForTunnel(ticket.tunnel, ticket.localPort) }
-      catch (error) { ticket.tunnel.kill('SIGTERM'); throw error }
-      ticket.tunnel.once('exit', () => dispose(id))
-    }
-    if (!deps.isSessionActive(ticket.sessionId)) { ticket.tunnel?.kill('SIGTERM'); res.status(401).json({ error: 'Session expired' }); return }
+    const ticket: Ticket = { id, sessionId: req.session!.id, hostId: host.id, port: parsed.port, localPort: parsed.port, origin, expiresAt: Date.now() + TTL, sockets: new Set(), requests: new Set(), cookies: new PreviewCookies() }
     tickets.set(id, ticket)
-    res.status(201).json({ id, hostId: ticket.hostId, port: ticket.port, expiresAt: ticket.expiresAt, url: `${PREFIX}${id}${parsed.path}` })
+    res.once('close', () => { if (!res.writableFinished) dispose(id) })
+    try {
+      if (host.kind === 'ssh') {
+        const knownHostsFile = await deps.resolveSshHostKeyPin?.(host)
+        ticket.localPort = await freePort()
+        if (!get(id)) { dispose(id); res.status(401).json({ error: 'Session expired' }); return }
+        if (deps.getHost(host.id) !== host) { dispose(id); res.status(409).json({ error: 'Host settings changed; open the preview again' }); return }
+        ticket.tunnel = spawn('ssh', sshForwardArgs(host, ticket.localPort, parsed.port, knownHostsFile), { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
+        ticket.tunnel.stderr?.on('data', () => {})
+        try { await waitForTunnel(ticket.tunnel, ticket.localPort) }
+        catch (error) { ticket.tunnel.kill('SIGTERM'); throw error }
+        ticket.tunnel.once('exit', () => dispose(id))
+      }
+      await probeDevelopmentServer(ticket, parsed.path.split('#')[0]!)
+      if (!get(id) || deps.getHost(host.id) !== host || res.destroyed) { dispose(id); if (!res.destroyed) res.status(409).json({ error: '连接状态已变化，请重新打开预览' }); return }
+      res.status(201).json({ id, hostId: ticket.hostId, port: ticket.port, expiresAt: ticket.expiresAt, url: `${PREFIX}${id}${parsed.path}` })
+    } catch (cause: any) {
+      dispose(id)
+      if (cause?.name === 'SSHHostKeyError') throw cause
+      if (!res.headersSent && !res.destroyed) res.status(502).json({ error: `无法读取所选主机的 ${parsed.port} 端口。请确认 HTTP 服务已启动${host.kind === 'ssh' ? '，且 SSH 允许 TCP 端口转发（AllowTcpForwarding local 或 yes）' : ''}。` })
+    }
   })
   app.delete('/api/dev-previews/:id', deps.requireAuth, deps.requireCsrf, (req: AuthenticatedRequest, res) => {
     const ticket = tickets.get(String(req.params.id))
@@ -138,16 +164,23 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
     if (!ticket) { res.status(403).send('开发预览已关闭或登录已过期'); return }
     if (req.headers.origin && req.headers.origin !== 'null' && req.headers.origin !== ticket.origin) { res.status(403).send('开发预览来源不匹配'); return }
     if (req.method === 'OPTIONS') {
-      res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }).status(204).end()
+      res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': corsHeaders(req.get('access-control-request-headers')), 'Access-Control-Max-Age': '600' }).status(204).end()
       return
     }
     const target = `${match![2] || '/'}${url.search}`
     if (target.startsWith('//') || /[\x00-\x1f\\]/.test(target)) { res.status(400).end(); return }
     const base = `${PREFIX}${ticket.id}`
-    const headers: http.OutgoingHttpHeaders = { host: `127.0.0.1:${ticket.port}`, 'accept-encoding': 'identity' }
+    const headers: http.OutgoingHttpHeaders = { host: `localhost:${ticket.port}`, 'accept-encoding': 'identity' }
     for (const header of ['accept', 'accept-language', 'content-type', 'range', 'if-none-match', 'if-modified-since']) if (req.headers[header]) headers[header] = req.headers[header]
-    headers.origin = `http://127.0.0.1:${ticket.port}`
-    const upstream = http.request({ host: '127.0.0.1', port: ticket.localPort, method: req.method, path: target, headers }, response => {
+    // Only the sandbox's own app headers may pass. The surrounding Codex page's
+    // Cookie, Authorization and CSRF headers must never reach a dev server.
+    if (req.headers.origin === 'null') for (const [name, value] of Object.entries(req.headers)) {
+      if (!blockedHeaders.test(name) && !['accept-encoding', 'accept', 'accept-language', 'range', 'if-none-match', 'if-modified-since'].includes(name) && value !== undefined) headers[name] = value
+    }
+    const cookies = ticket.cookies.header(target)
+    if (cookies) headers.cookie = cookies
+    headers.origin = `http://localhost:${ticket.port}`
+    const upstream = http.request({ host: '127.0.0.1', port: ticket.localPort, method: req.method, path: target, headers, agent: false }, response => {
       if (!get(ticket.id)) { response.destroy(); res.status(403).end(); return }
       const type = String(response.headers['content-type'] || 'application/octet-stream')
       const text = /text\/html|text\/css|(?:javascript|ecmascript)/i.test(type)
@@ -155,13 +188,17 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
       res.status(response.statusCode || 502)
       res.set({
         'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type',
-        'Content-Security-Policy': `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' ${ticket.origin}; style-src 'unsafe-inline' ${ticket.origin}; img-src data: blob: ${ticket.origin}; font-src data: ${ticket.origin}; media-src data: blob: ${ticket.origin}; connect-src ${ticket.origin} ${ticket.origin.replace(/^http/, 'ws')}; frame-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'`,
+        'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Expose-Headers': 'Content-Disposition, Content-Range, Accept-Ranges',
+        'Content-Security-Policy': `sandbox allow-scripts allow-forms; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' ${ticket.origin}; style-src 'unsafe-inline' ${ticket.origin}; img-src data: blob: ${ticket.origin}; font-src data: ${ticket.origin}; media-src data: blob: ${ticket.origin}; connect-src ${ticket.origin} ${ticket.origin.replace(/^http/, 'ws')}; frame-src 'none'; form-action ${ticket.origin}${base}/; base-uri 'none'; frame-ancestors 'self'`,
       })
+      ticket.cookies.receive(response.headers['set-cookie'], target)
+      for (const name of ['content-disposition', 'content-range', 'accept-ranges']) if (response.headers[name]) res.set(name, String(response.headers[name]))
       const location = response.headers.location
       if (location) {
-        const redirect = new URL(location, `http://127.0.0.1:${ticket.port}${target}`)
-        if (redirect.hostname !== '127.0.0.1' || Number(redirect.port) !== ticket.port || redirect.protocol !== 'http:') { response.destroy(); res.status(502).send('开发服务重定向超出目标端口'); return }
+        let redirect: URL
+        try { redirect = new URL(location, `http://localhost:${ticket.port}${target}`) }
+        catch { response.destroy(); res.status(502).send('开发服务返回了无效的重定向地址'); return }
+        if (!['127.0.0.1', 'localhost', '[::1]'].includes(redirect.hostname) || Number(redirect.port) !== ticket.port || redirect.protocol !== 'http:') { response.destroy(); res.status(502).send('开发服务重定向超出目标端口'); return }
         res.set('Location', `${base}${redirect.pathname}${redirect.search}${redirect.hash}`)
       }
       if (req.method === 'HEAD') { response.resume(); res.end(); return }
@@ -172,6 +209,7 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
         response.on('error', () => { if (!res.headersSent) res.status(502).end('开发资源读取失败'); else res.destroy() })
       } else {
         if (response.headers['content-encoding']) res.set('Content-Encoding', response.headers['content-encoding'])
+        response.on('error', () => { if (!res.headersSent) res.status(502).end('开发资源读取失败'); else res.destroy() })
         response.pipe(res)
       }
     })
@@ -181,8 +219,7 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
     upstream.on('error', () => { if (!res.headersSent) res.status(502).send('无法连接开发服务，请先在所选主机启动该端口'); else res.destroy() })
     req.on('aborted', () => upstream.destroy())
     res.on('close', () => { if (!res.writableEnded) upstream.destroy() })
-    if (req.body !== undefined) upstream.end(JSON.stringify(req.body))
-    else req.pipe(upstream)
+    req.pipe(upstream)
   })
   const handleUpgrade = (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(req.url || '/', 'http://localhost')
@@ -196,7 +233,8 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
     wss.handleUpgrade(req, socket, head, client => {
       ticket.sockets.add(client)
       const protocols = req.headers['sec-websocket-protocol']?.split(',').map(value => value.trim()).filter(Boolean)
-      const upstream = new WebSocket(`ws://127.0.0.1:${ticket.localPort}${target}`, protocols, { origin: `http://127.0.0.1:${ticket.port}`, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false, handshakeTimeout: 15000 })
+      const cookie = ticket.cookies.header(target)
+      const upstream = new WebSocket(`ws://127.0.0.1:${ticket.localPort}${target}`, protocols, { origin: `http://localhost:${ticket.port}`, headers: cookie ? { cookie } : undefined, agent: false, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false, handshakeTimeout: 15000 })
       let ready = false; const queued: { data: Buffer; binary: boolean }[] = []; let queuedBytes = 0
       client.on('message', (data, binary) => {
         const bytes = Buffer.from(data as Buffer)

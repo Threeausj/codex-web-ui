@@ -1,0 +1,18 @@
+/** Run before app scripts in the opaque sandbox; URLs and storage stay scoped. */
+export function developmentBootstrap(base: string, port: number) {
+  return `<script>(()=>{
+const base=${JSON.stringify(base)},port=${port},origin=new URL(location.href).origin;
+const map=value=>{try{const u=new URL(value,location.href);if(!['http:','https:'].includes(u.protocol))return value;if(u.origin===origin){if(u.pathname===base||u.pathname.startsWith(base+'/'))return u.href;return origin+base+u.pathname+u.search+u.hash}if(['localhost','127.0.0.1','[::1]'].includes(u.hostname)&&Number(u.port)===port)return origin+base+u.pathname+u.search+u.hash;return value}catch{return value}};
+const fetchOriginal=window.fetch;window.fetch=(value,init)=>fetchOriginal(typeof value==='string'||value instanceof URL?map(String(value)):new Request(map(value.url),value),{...init,credentials:'omit'});
+const open=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url,...rest){return open.call(this,method,map(String(url)),...rest)};
+const send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(...args){this.withCredentials=false;return send.apply(this,args)};
+const OriginalSocket=window.WebSocket;window.WebSocket=class extends OriginalSocket{constructor(value,protocols){const u=new URL(String(value),location.href);const mapped=map(u.href.replace(/^ws:/,'http:').replace(/^wss:/,'https:'));super(String(mapped).replace(/^http:/,'ws:').replace(/^https:/,'wss:'),protocols)}};
+const OriginalEvents=window.EventSource;if(OriginalEvents)window.EventSource=class extends OriginalEvents{constructor(value,options){super(map(String(value)),{...options,withCredentials:false})}};
+for(const name of ['localStorage','sessionStorage']){try{window[name].getItem('__preview_probe__')}catch{const data=new Map();let size=0;const put=(key,value)=>{key=String(key);value=String(value);const next=size-(data.has(key)?key.length+data.get(key).length:0)+key.length+value.length;if(next>1048576)throw new DOMException('Preview storage limit exceeded','QuotaExceededError');data.set(key,value);size=next};const remove=key=>{key=String(key);if(data.has(key)){size-=key.length+data.get(key).length;data.delete(key)}};const storage={get length(){return data.size},key:index=>Array.from(data.keys())[index]??null,getItem:key=>data.get(String(key))??null,setItem:put,removeItem:remove,clear:()=>{data.clear();size=0}};Object.defineProperty(window,name,{value:new Proxy(storage,{get:(target,key)=>key in target?Reflect.get(target,key):data.get(String(key)),set:(target,key,value)=>{put(key,value);return true},deleteProperty:(target,key)=>{remove(key);return true}})})}}
+// Service workers cannot register under this opaque origin. Hide their feature
+// flag so applications can use their normal online path without a failed boot.
+try{delete Object.getPrototypeOf(navigator).serviceWorker}catch{}
+const attributes=new Set(['src','href','poster','action','formaction']);const setAttribute=Element.prototype.setAttribute;Element.prototype.setAttribute=function(name,value){return setAttribute.call(this,name,attributes.has(String(name).toLowerCase())?map(String(value)):value)};
+for(const [klass,key] of [[HTMLImageElement,'src'],[HTMLScriptElement,'src'],[HTMLLinkElement,'href'],[HTMLAnchorElement,'href'],[HTMLMediaElement,'src'],[HTMLSourceElement,'src'],[HTMLVideoElement,'poster'],[HTMLFormElement,'action']]){const descriptor=Object.getOwnPropertyDescriptor(klass.prototype,key);if(descriptor?.set)Object.defineProperty(klass.prototype,key,{...descriptor,set(value){descriptor.set.call(this,map(String(value)))}})}
+})()</script>`
+}
