@@ -226,6 +226,144 @@ test('accepted next-turn settings sync to other browsers without broadcasting pr
   } finally { value.bridge.close(); }
 });
 
+test('temporary title model activity reaches observers without appearing in browsers, replay or runtime sessions', async () => {
+  const observed: RpcMessage[] = [];
+  const value = fixture({ onProtocolMessage: (_host, message) => { observed.push(message); } });
+  const browser = new Browser(); value.bridge.attach('session:reader', browser.ws(), 'reader');
+  try {
+    await value.bridge.connect();
+    const engineId = (browser.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as any).engineId;
+    const start = value.bridge.request('thread/start', { ephemeral: true, threadSource: 'thread_title', cwd: '/project' });
+    await tick();
+    const request = value.sent.find(message => message.method === 'thread/start')!;
+    const thread = { id: 'internal-title-thread', ephemeral: true, threadSource: 'thread_title', source: 'appServer', status: { type: 'active' } };
+    // Native notifications can precede the thread/start acknowledgement.
+    value.receive({ method: 'thread/started', params: { thread } });
+    value.receive({ id: request.id, result: { thread } }); await start;
+    const generated = value.bridge.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'private-title-generation-prompt' }] });
+    await tick();
+    const generation = value.sent.find(message => message.method === 'turn/start')!;
+    const turn = { id: 'internal-title-turn', status: 'inProgress', items: [] };
+    value.receive({ method: 'turn/started', params: { threadId: thread.id, turn } });
+    value.receive({ id: generation.id, result: { turn } }); await generated;
+    value.receive({ method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId: 'title-answer', delta: '简短标题' } });
+    value.receive({ method: 'turn/completed', params: { threadId: thread.id, turn: { ...turn, status: 'completed' } } });
+    assert.ok(observed.some(message => message.method === 'thread/started' && (message.params as any).thread.id === thread.id));
+    assert.ok(observed.some(message => message.method === 'item/agentMessage/delta' && (message.params as any).delta === '简短标题'));
+    assert.ok(observed.some(message => message.method === 'turn/completed' && (message.params as any).threadId === thread.id));
+    assert.doesNotMatch(JSON.stringify(browser.sent), /internal-title|private-title-generation-prompt|简短标题/);
+    assert.equal(value.bridge.runtime.loadedThreadCount, 0);
+    assert.equal(value.bridge.runtime.activeThreadCount, 0);
+    assert.deepEqual(value.bridge.runtime.threads, []);
+    browser.request({ id: 'title-ping', method: 'bridge/ping', params: {} }); await tick();
+    assert.deepEqual((browser.sent.find(message => message.id === 'title-ping')!.result as any).loadedThreadIds, []);
+    assert.equal(value.bridge.diagnostics().cachedEvents.count, 0);
+    // Only the generated name on the real conversation is public and replayed.
+    const renamed = value.bridge.request('thread/name/set', { threadId: 'real-conversation', name: '邮件系统开发' });
+    await tick();
+    value.receive({ id: value.sent.find(message => message.method === 'thread/name/set')!.id, result: {} }); await renamed;
+    assert.equal((browser.sent.find(message => message.method === 'bridge/thread/changed')!.params as any).request.name, '邮件系统开发');
+    const recovered = new Browser();
+    value.bridge.attach('session:recovered', recovered.ws(), 'recovered', () => true, { engineId, afterSequence: 0 });
+    assert.equal(recovered.sent.filter(message => message.method === 'bridge/thread/changed').length, 1);
+    assert.equal((recovered.sent.find(message => message.method === 'bridge/status')!.params as any).replayComplete, true);
+    assert.doesNotMatch(JSON.stringify(recovered.sent), /internal-title|private-title-generation-prompt|简短标题/);
+  } finally { value.bridge.close(); }
+});
+
+test('title threads identified by their start response reject unexpected tools and approvals before observers can notify', async () => {
+  const observed: RpcMessage[] = [];
+  const value = fixture({ onProtocolMessage: (_host, message) => { observed.push(message); } });
+  const browser = new Browser(); value.bridge.attach('session:reader', browser.ws(), 'reader');
+  try {
+    await value.bridge.connect();
+    const start = value.bridge.request('thread/start', { ephemeral: true, threadSource: 'thread_title' });
+    await tick();
+    // Older peers may omit the feature marker from the returned Thread.
+    value.receive({ id: value.sent.find(message => message.method === 'thread/start')!.id, result: { thread: { id: 'response-title-thread', ephemeral: true } } }); await start;
+    const methods = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'item/tool/requestUserInput', 'tool/requestUserInput', 'mcpServer/elicitation/request', 'item/tool/call', 'execCommandApproval'];
+    for (const [index, method] of methods.entries()) {
+      value.receive({ id: `title-unexpected-${index}`, method, params: { threadId: 'response-title-thread', turnId: 'title-turn', mode: 'form', arguments: { secret: 'must-not-notify' } } });
+    }
+    await tick();
+    for (const [index] of methods.entries()) {
+      const id = `title-unexpected-${index}`;
+      const replies = value.sent.filter(message => message.id === id);
+      assert.equal(replies.length, 1);
+      assert.equal(replies[0].error?.code, -32601);
+      assert.equal(observed.some(message => message.id === id), false, 'A rejected title request must not reach the push observer');
+      assert.equal(browser.sent.some(message => message.id === id), false);
+    }
+    const recovered = new Browser(); value.bridge.attach('session:recovered', recovered.ws(), 'recovered');
+    assert.deepEqual((recovered.sent.find(message => message.method === 'bridge/status')!.params as any).pendingRequests, []);
+    assert.equal(value.bridge.diagnostics().cachedEvents.count, 0);
+    assert.doesNotMatch(JSON.stringify(recovered.sent), /response-title-thread|title-unexpected|must-not-notify/);
+  } finally { value.bridge.close(); }
+});
+
+test('ordinary ephemeral side conversations remain visible and retain real approval prompts', async () => {
+  const value = fixture(); const browser = new Browser(); value.bridge.attach('session:reader', browser.ws(), 'reader');
+  try {
+    await value.bridge.connect();
+    const start = value.bridge.request('thread/start', { ephemeral: true, threadSource: 'feature:side_chat' });
+    await tick();
+    const thread = { id: 'ordinary-side-thread', ephemeral: true, threadSource: 'feature:side_chat' };
+    value.receive({ id: value.sent.find(message => message.method === 'thread/start')!.id, result: { thread } }); await start;
+    value.receive({ method: 'item/agentMessage/delta', params: { threadId: thread.id, itemId: 'side-answer', delta: '侧边答复' } });
+    value.receive({ id: 'side-real-approval', method: 'item/commandExecution/requestApproval', params: { threadId: thread.id, turnId: 'side-turn' } });
+    assert.equal(browser.sent.some(message => message.method === 'item/agentMessage/delta'), true);
+    assert.equal(browser.sent.some(message => message.id === 'side-real-approval'), true);
+    assert.equal(value.sent.some(message => message.id === 'side-real-approval'), false);
+    assert.equal(value.bridge.runtime.loadedThreadCount, 1);
+    assert.equal(value.bridge.runtime.threads[0].id, thread.id);
+  } finally { value.bridge.close(); }
+});
+
+test('rename, archive, delete and revert intent reaches observers before acknowledgement without leaking to browsers', async () => {
+  const observed: RpcMessage[] = [];
+  const value = fixture({ onProtocolMessage: (_host, message) => { observed.push(message); } });
+  const origin = new Browser(), peer = new Browser();
+  value.bridge.attach('session:origin', origin.ws(), 'origin'); value.bridge.attach('session:peer', peer.ws(), 'peer');
+  try {
+    await value.bridge.connect();
+    const methods = ['thread/name/set', 'thread/archive', 'thread/delete', 'thread/revert', 'thread/rollback'];
+    for (const [index, method] of methods.entries()) {
+      origin.request({ id: `manual-intent-${index}`, method, params: { threadId: 'real-thread', name: 'manual-name', beforeTurnId: 'old-turn', config: { secret: 'never-share' } } });
+      await tick();
+      assert.deepEqual(observed.filter(message => message.method === 'bridge/thread/requested').at(-1)?.params, { threadId: 'real-thread', method, ...(method === 'thread/name/set' ? { name: 'manual-name' } : {}) });
+      assert.equal(origin.sent.some(message => message.method === 'bridge/thread/requested'), false);
+      assert.equal(peer.sent.some(message => message.method === 'bridge/thread/requested'), false);
+      // Even a rejected manual edit cancels pending automatic naming intent.
+      value.receive({ id: value.sent.findLast(message => message.method === method)!.id, error: { code: -32000, message: 'Rejected fixture mutation' } });
+      await tick();
+    }
+    assert.equal(observed.filter(message => message.method === 'bridge/thread/requested').length, methods.length);
+    assert.doesNotMatch(JSON.stringify(observed.filter(message => message.method === 'bridge/thread/requested')), /old-turn|config|secret|never-share/);
+    assert.equal(value.bridge.diagnostics().cachedEvents.count, 0);
+    assert.equal(peer.sent.some(message => message.bridgeEventSequence), false);
+  } finally { value.bridge.close(); }
+});
+
+test('accepted thread and turn metadata shares title model overrides while excluding configuration and developer instructions', async () => {
+  const value = fixture(); const origin = new Browser(), peer = new Browser();
+  value.bridge.attach('session:origin', origin.ws(), 'origin'); value.bridge.attach('session:peer', peer.ws(), 'peer');
+  try {
+    await value.bridge.connect();
+    origin.request({ id: 'metadata-start', method: 'thread/start', params: { cwd: '/project', config: { secret: 'private-thread-config' } } }); await tick();
+    const threadResult = { thread: { id: 'metadata-thread', cwd: '/project' }, model: 'thread-model', modelProvider: 'provider', cwd: '/project', activePermissionProfile: 'Read Only', approvalPolicy: 'never', config: { secret: 'private-result-config' }, developerInstructions: 'private-result-instructions' };
+    value.receive({ id: value.sent.find(message => message.method === 'thread/start')!.id, result: threadResult }); await tick();
+    const started = (peer.sent.find(message => message.method === 'bridge/thread/changed')!.params as any).result;
+    assert.deepEqual(started, { thread: threadResult.thread, model: 'thread-model', modelProvider: 'provider', cwd: '/project', activePermissionProfile: 'Read Only', approvalPolicy: 'never' });
+    const input = [{ type: 'text', text: 'Original conversation input' }];
+    origin.request({ id: 'metadata-turn', method: 'turn/start', params: { threadId: 'metadata-thread', input, clientUserMessageId: 'metadata-client', cwd: '/other-project', model: 'selected-model', effort: 'high', collaborationMode: { mode: 'default', settings: { model: 'collaboration-model', reasoning_effort: 'medium', developer_instructions: 'private-collaboration-instructions' } }, config: { secret: 'private-turn-config' } } }); await tick();
+    const turn = { id: 'metadata-turn', status: 'inProgress', items: [] };
+    value.receive({ id: value.sent.find(message => message.method === 'turn/start')!.id, result: { turn, config: { secret: 'private-turn-result' } } }); await tick();
+    const accepted = (peer.sent.filter(message => message.method === 'bridge/thread/changed').at(-1)!.params as any).request;
+    assert.deepEqual(accepted, { input, clientUserMessageId: 'metadata-client', cwd: '/other-project', model: 'collaboration-model', effort: 'high' });
+    assert.doesNotMatch(JSON.stringify(peer.sent), /private-|developer_instructions|developerInstructions|config|secret/);
+  } finally { value.bridge.close(); }
+});
+
 test('a second compaction rejection cannot clear running progress; a timed out request cannot leave sticky progress', async () => {
   const value = fixture()
   try {

@@ -249,3 +249,86 @@ test('a named conversation keeps its canonical title when new input is accepted'
   await expect(titleRow(page)).toHaveText('已有测试历史');
   expect(mock.request('thread/name/set')).toBeUndefined();
 });
+
+test('a generated concise name replaces the long input preview in every Web client, survives an old list response and persists for a new browser', async ({ page, context, browser, mock }) => {
+  unnamedStart(mock);
+  mock.holdFinalMessage = true;
+  const longPrompt = '请帮我设计一个部署在 NAS 的邮件管理系统，支持多个邮箱接入、附件检索、消息分类和移动端使用，并检查现有项目的认证、存储与部署方案，给出具体的实现步骤。';
+  const generatedName = 'NAS 邮件管理系统';
+  await login(page);
+  await send(page, longPrompt);
+  await expect(heading(page)).toHaveText(longPrompt.slice(0, 70));
+  await expect(titleRow(page)).toHaveText(longPrompt);
+  // Native preview and generated name are different persisted metadata fields.
+  const thread = mock.threads.find(thread => thread.id === newId)!;
+  thread.preview = longPrompt;
+  const other = await context.newPage();
+  await mock.install(other);
+  await other.goto('/');
+  await expect(heading(other)).toHaveText(longPrompt.slice(0, 70));
+  const firstDraft = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  const otherDraft = other.getByRole('textbox', { name: '消息输入框', exact: true });
+  await firstDraft.fill('主窗口还未发送的补充');
+  await otherDraft.fill('观察窗口还未发送的补充');
+  const starts = mock.requests.filter(request => request.method === 'turn/start').length;
+  const resumes = mock.requests.filter(request => request.method === 'thread/resume').length;
+  const receive = (mock as any).receive.bind(mock);
+  const held: (() => void)[] = [];
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method !== 'thread/list') return receive(socket, request);
+    mock.requests.push(request);
+    const snapshot = structuredClone(mock.threads);
+    held.push(() => socket.send(JSON.stringify({ id: request.id, result: { data: snapshot, nextCursor: null } })));
+  };
+  for (const target of [page, other]) await target.getByRole('button', { name: '刷新对话', exact: true }).click();
+  await expect.poll(() => held.length).toBeGreaterThanOrEqual(2);
+  thread.name = generatedName;
+  mock.emit('thread/name/updated', { threadId: newId, threadName: generatedName });
+  for (const target of [page, other]) {
+    await expect(heading(target)).toHaveText(generatedName);
+    await expect(titleRow(target)).toHaveText(generatedName);
+    await expect.poll(() => target.title()).toBe(`${generatedName} · Codex Web`);
+  }
+  for (const release of held.splice(0)) release();
+  for (const target of [page, other]) {
+    await expect(heading(target)).toHaveText(generatedName);
+    await expect(titleRow(target)).toHaveText(generatedName);
+    await expect(target.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+  }
+  await expect(firstDraft).toHaveValue('主窗口还未发送的补充');
+  await expect(otherDraft).toHaveValue('观察窗口还未发送的补充');
+  expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(starts);
+  expect(mock.requests.filter(request => request.method === 'thread/resume')).toHaveLength(resumes);
+  expect(mock.request('thread/name/set')).toBeUndefined();
+  (mock as any).receive = receive;
+  // This browser has no local/session storage or private conversation cache.
+  const cleanContext = await browser.newContext({ baseURL: new URL(page.url()).origin });
+  try {
+    const cleanPage = await cleanContext.newPage();
+    await mock.install(cleanPage);
+    await cleanPage.goto('/');
+    await expect(titleRow(cleanPage)).toHaveText(generatedName);
+    await cleanPage.locator('[data-section="recent"] .thread-row').filter({ hasText: generatedName }).click();
+    await expect(heading(cleanPage)).toHaveText(generatedName);
+    await cleanPage.reload();
+    await expect(heading(cleanPage)).toHaveText(generatedName);
+    await expect(titleRow(cleanPage)).toHaveText(generatedName);
+  } finally {
+    await cleanContext.close();
+    await other.close();
+  }
+});
+
+test('blank canonical metadata falls back to a readable preview or placeholder instead of an empty title', async ({ page, mock }) => {
+  mock.threads[0]!.name = ' \n\t ';
+  mock.threads[0]!.preview = '  已有的有效预览  ';
+  await login(page);
+  await expect(titleRow(page)).toHaveText('已有的有效预览');
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(heading(page)).toHaveText('已有的有效预览');
+  await expect.poll(() => page.title()).toBe('已有的有效预览 · Codex Web');
+  mock.threads[0]!.preview = '\t\n';
+  await page.getByRole('button', { name: '刷新对话', exact: true }).click();
+  await expect(heading(page)).toHaveText('新对话');
+  await expect(titleRow(page)).toHaveText('未命名对话');
+});

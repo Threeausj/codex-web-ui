@@ -7,7 +7,16 @@ import {
   sortedThreads,
   threadActivityAt,
   historyActivityAt,
+  threadLabel,
 } from "../src/lib/navigation";
+
+test("conversation labels ignore blank names and preserve canonical titles over bounded previews", () => {
+  assert.equal(threadLabel({ id: "a", name: " \n\t ", preview: "  首条消息预览  " }), "首条消息预览");
+  assert.equal(threadLabel({ id: "a", name: "  概括后的会话标题  ", preview: "较长的首条消息预览" }, "新对话", 2), "概括后的会话标题");
+  assert.equal(threadLabel({ id: "a", preview: "  较长的首条消息预览  " }, "新对话", 2), "较长");
+  assert.equal(threadLabel({ id: "a", name: "  ", preview: "\t\n" }), "未命名对话");
+  assert.equal(threadLabel(undefined, "新对话", 70), "新对话");
+});
 
 test("project groups match exact roots without swallowing similarly named repositories", () => {
   const project = {

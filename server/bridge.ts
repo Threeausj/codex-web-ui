@@ -96,6 +96,8 @@ export class Bridge {
   private pausing?: Promise<void>
   private subscribedThreads = new Set<string>()
   private activeThreads = new Set<string>()
+  // Metadata generation shares the native connection, never the visible chat.
+  private internalThreads = new Set<string>()
   private threadNames = new Map<string, string>()
   private releasing = new Set<string>()
   private hiddenArchiveEvents = new Set<string>()
@@ -159,8 +161,8 @@ export class Bridge {
   get runtime() {
     return { engineId: this.engineId, connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
       ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
-      loadedThreadCount: this.subscribedThreads.size, activeThreadCount: this.activeThreads.size,
-      threads: [...new Set([...this.subscribedThreads, ...this.releasedThreads.keys()])].map(id => ({ id,
+      loadedThreadCount: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)).length, activeThreadCount: [...this.activeThreads].filter(id => !this.internalThreads.has(id)).length,
+      threads: [...new Set([...this.subscribedThreads, ...this.releasedThreads.keys()])].filter(id => !this.internalThreads.has(id)).map(id => ({ id,
         name: this.threadNames.get(id) || this.releasedThreads.get(id)?.name || '未命名对话',
         loaded: this.subscribedThreads.has(id), active: this.activeThreads.has(id), released: this.releasedThreads.has(id),
         restoring: !!this.releasedThreads.get(id)?.restoreThreadIds.length,
@@ -237,6 +239,10 @@ export class Bridge {
 
   private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket, respond?: (message: RpcMessage) => void) {
     const id = `web:${++this.counter}`
+    const targetThread = (params as { threadId?: string })?.threadId
+    if (typeof targetThread === 'string' && ['thread/name/set', 'thread/archive', 'thread/delete', 'thread/revert', 'thread/rollback'].includes(method))
+      this.observeProtocol({ method: 'bridge/thread/requested', params: { threadId: targetThread, method,
+        ...(method === 'thread/name/set' && typeof (params as any)?.name === 'string' ? { name: (params as any).name } : {}) } })
     const compactThread = method === 'thread/compact/start' ? (params as { threadId?: string })?.threadId : undefined
     if (typeof compactThread === 'string') { this.compaction(compactThread).requests.add(id); this.updateCompaction(compactThread) }
     const command = params as { processId?: string; tty?: boolean; cwd?: string } | undefined
@@ -329,6 +335,12 @@ export class Bridge {
   private observeProtocol(message: RpcMessage, responseMethod?: string) {
     // Push providers and other observers cannot stall the native protocol.
     try { void Promise.resolve(this.options.onProtocolMessage?.(this.host, message, responseMethod)).catch(() => {}) } catch {}
+  }
+
+  private rememberInternalThread(id: string) {
+    this.internalThreads.add(id)
+    // Keep recent tombstones so late events stay hidden after unsubscribe.
+    if (this.internalThreads.size > 512) this.internalThreads.delete(this.internalThreads.values().next().value!)
   }
 
   private removeApproval(key: string) {
@@ -424,7 +436,7 @@ export class Bridge {
    * reads remain private to the requesting socket. */
   private broadcastThreadChange(pending: Pending, result: unknown, changeId: string) {
     const params = pending.params as Record<string, unknown> | undefined
-    const response = result as { thread?: { id?: unknown }; turn?: unknown; turnId?: unknown } | null
+    const response = result as { thread?: { id?: unknown }; turn?: unknown; turnId?: unknown; [key: string]: unknown } | null
     let threadId = params?.threadId
     let changed: Record<string, unknown>
     const request: Record<string, unknown> = {}
@@ -433,7 +445,10 @@ export class Bridge {
       case 'thread/fork':
         threadId = response?.thread?.id
         if (!response?.thread) return
+        if (typeof threadId === 'string' && this.internalThreads.has(threadId)) return
         changed = { thread: response.thread }
+        for (const field of ['model', 'modelProvider', 'cwd', 'activePermissionProfile', 'approvalPolicy'])
+          if (response[field] !== undefined) changed[field] = response[field]
         break
       case 'thread/revert':
       case 'thread/rollback':
@@ -469,9 +484,13 @@ export class Bridge {
       default: return
     }
     if (typeof threadId !== 'string' || !threadId) return
+    if (this.internalThreads.has(threadId)) return
     if (['turn/start', 'turn/steer'].includes(pending.method)) {
       if (Array.isArray(params?.input)) request.input = params.input
       if (typeof params?.clientUserMessageId === 'string') request.clientUserMessageId = params.clientUserMessageId
+      for (const field of ['model', 'cwd', 'effort']) if (params?.[field] !== undefined) request[field] = params[field]
+      const collaboration = params?.collaborationMode as { settings?: { model?: unknown } } | undefined
+      if (typeof collaboration?.settings?.model === 'string') request.model = collaboration.settings.model
     }
     const originClientId = pending.clientKey?.slice(pending.clientKey.indexOf(':') + 1)
     const message = { method: 'bridge/thread/changed', params: {
@@ -518,7 +537,7 @@ export class Bridge {
     if (!validId || typeof message.method !== 'string' || !/^[a-zA-Z][a-zA-Z0-9_/.]*$/.test(message.method)) throw new Error('A request requires a valid id and method')
     if (['initialize', 'initialized'].includes(message.method)) { reply(rpcError(message.id!, 'The bridge owns initialization', -32600)); return }
     if (message.method === 'bridge/ping') {
-      reply({ id: message.id, result: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, loadedThreadIds: [...this.subscribedThreads] } })
+      reply({ id: message.id, result: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, loadedThreadIds: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)) } })
       return
     }
     try {
@@ -600,6 +619,18 @@ export class Bridge {
       if (id) this.hiddenArchiveEvents.add(id)
     }
     const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
+    const startedThread = message.method === 'thread/started' ? (message.params as any)?.thread : undefined
+    const returnedThread = pending?.method === 'thread/start' ? (message.result as any)?.thread : undefined
+    if (typeof startedThread?.id === 'string' && startedThread.ephemeral === true && startedThread.threadSource === 'thread_title') this.rememberInternalThread(startedThread.id)
+    if (typeof returnedThread?.id === 'string' && (pending?.params as any)?.ephemeral === true && (pending?.params as any)?.threadSource === 'thread_title') this.rememberInternalThread(returnedThread.id)
+    if (message.id !== undefined && message.method) {
+      const threadId = (message.params as { threadId?: string; conversationId?: string })?.threadId || (message.params as { conversationId?: string })?.conversationId
+      if (threadId && this.internalThreads.has(threadId)) {
+        // Reject before push observers: hidden metadata work never asks the user.
+        this.send(rpcError(message.id, 'Temporary title generation does not support interactive requests', -32601))
+        return
+      }
+    }
     this.observeProtocol(message, pending?.method)
     if (message.id !== undefined && !message.method) {
       if (!pending) return
@@ -661,6 +692,7 @@ export class Bridge {
     }
     if (message.method) {
       const p = message.params as any
+      if (this.internalThreads.has(p?.threadId || p?.thread?.id)) return
       if (message.method === 'thread/deleted' && typeof p?.threadId === 'string') this.forgetDeletedThread(p.threadId)
       if (message.method === 'thread/name/updated' && p?.threadId) this.threadNames.set(p.threadId, String(p.threadName || p.name || '').slice(0, 160))
       if (['thread/archived', 'thread/unarchived'].includes(message.method) && this.hiddenArchiveEvents.has(p?.threadId)) return
@@ -724,8 +756,10 @@ export class Bridge {
     this.approvalItems.clear(); this.approvalItemBytes = 0
     this.subscribedThreads.clear()
     this.activeThreads.clear()
+    this.internalThreads.clear()
     this.contexts.clear()
     this.compactions.clear()
+    this.observeProtocol({ method: 'bridge/disconnected', params: {} })
     for (const key of this.clients.keys()) this.status(key)
   }
 
