@@ -1,5 +1,6 @@
 import { nativeWorktreeWriters } from './worktree-writers.js';
 import { AutomationService, registerAutomations } from './automations.js';
+import { ThreadTitleService } from './thread-titles.js'
 import express, { type ErrorRequestHandler, type RequestHandler } from 'express'
 import multer from 'multer'
 import http from 'node:http'
@@ -82,10 +83,12 @@ export async function createApp(options: AppOptions = {}) {
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
   bridgeOptions.resolveSshHostKeyPin ??= async host => (await sshHostKeys.connectionKnownHosts(host)) ?? bridgeOptions.sshHostKeyPin
   let automations: AutomationService | undefined;
+  let threadTitles: ThreadTitleService | undefined
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
     push.observe(host, message, responseMethod)
     automations?.observe(host, message)
+    threadTitles?.observe(host, message, responseMethod)
     return externalProtocolObserver?.(host, message, responseMethod)
   }
   const bridges = new Map<string, Bridge>()
@@ -102,6 +105,7 @@ export async function createApp(options: AppOptions = {}) {
     return bridge
   }
   const app = express()
+  const titleService = threadTitles = new ThreadTitleService({ getBridge })
   app.disable('x-powered-by')
   if (options.trustProxy ?? process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
   app.use((_req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'SAMEORIGIN' }); next() })
@@ -176,6 +180,7 @@ export async function createApp(options: AppOptions = {}) {
     const previousIdentityFile = storage.host(id)?.identityFile
     const result = await storage.updateHost(id, req.body)
     if (result.connectionReset) {
+      titleService.cancelHost(id)
       developmentPreview.deleteHost(id)
       bridges.get(id)?.close('Host settings changed', 4001)
       bridges.delete(id)
@@ -187,6 +192,7 @@ export async function createApp(options: AppOptions = {}) {
     const id = String(req.params.id)
     const previousIdentityFile = storage.host(id)?.identityFile
     await storage.deleteHost(id)
+    titleService.cancelHost(id)
     await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
     developmentPreview.deleteHost(id)
     bridges.get(id)?.close(); bridges.delete(id)
@@ -274,7 +280,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -325,6 +331,7 @@ export async function createServer(options: AppOptions = {}) {
     context.stopPushPasswordListener()
     let automationFailure: unknown
     try { await context.automations.close() } catch (cause) { automationFailure = cause }
+    await context.threadTitles.close()
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
     for (const ws of wss.clients) ws.terminate()

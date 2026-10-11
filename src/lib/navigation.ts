@@ -59,9 +59,11 @@ export function sortedThreads<T extends ThreadActivity>(threads: T[]): T[] {
 export function threadLabel(thread: {
   name?: string;
   preview?: string;
-  id: string;
-}) {
-  return thread.name || thread.preview || "未命名对话";
+  id?: string;
+} | null | undefined, fallback = "未命名对话", previewLimit?: number) {
+  const name = thread?.name?.trim();
+  const preview = thread?.preview?.trim();
+  return name || preview?.slice(0, previewLimit) || fallback;
 }
 export function isPinned(
   pins: Pin[],

@@ -35,7 +35,7 @@ import ConversationNav from "./components/ConversationNav.vue";
 import ProjectDialog from "./components/ProjectDialog.vue";
 import BookmarksPanel from './components/BookmarksPanel.vue';
 import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
-import { isPinned } from "./lib/navigation";
+import { isPinned, threadLabel } from "./lib/navigation";
 import { initializeDevicePush, onPushNavigate, pwaState, updatePwa } from "./lib/pwa";
 import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navigation";
 
@@ -142,12 +142,7 @@ const projectName = computed(
     state.projectPath.split("/").filter(Boolean).pop() ||
     "选择项目",
 );
-const threadTitle = computed(
-  () =>
-    state.activeThread?.name ||
-    state.activeThread?.preview?.slice(0, 70) ||
-    "新对话",
-);
+const threadTitle = computed(() => threadLabel(state.activeThread, "新对话", 70));
 const visibleThreads = computed(() =>
   state.threads.filter(
     (thread: any) =>
