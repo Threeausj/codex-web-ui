@@ -59,7 +59,11 @@ function onPointerDown(event: PointerEvent) {
   dismiss();
 }
 function onKeyDown(event: KeyboardEvent) {
-  if (event.key === 'Escape') dismiss();
+  if (event.key !== 'Escape') return;
+  if (scheduled) window.cancelAnimationFrame(scheduled);
+  scheduled = 0;
+  dismiss();
+  window.getSelection()?.removeAllRanges();
 }
 function action(kind: 'add' | 'ask' | 'bookmark') {
   const captured = source.value;

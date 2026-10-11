@@ -40,8 +40,9 @@ test('sidebar retains its first history anchor, can explicitly restart, and save
 });
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(value => { resolve = value; });
-  return { promise, resolve };
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((value, failure) => { resolve = value; reject = failure; });
+  return { promise, resolve, reject };
 }
 function fixture() {
   const main = reactive<any>({
@@ -330,16 +331,37 @@ test('a late fork after close is unsubscribed and never starts a model turn', as
   } finally { value.controller.dispose(); }
 });
 
-test('host switching submits side cleanup on the old shared socket without interrupting the parent', async () => {
+test('host switching retains side content and drafts, pauses its RPCs, and recovers on the original host', async () => {
   const value = fixture();
   try {
     value.controller.prepare(selected);
     await value.controller.send('解释');
-    value.controller.state.open = false;
+    value.controller.state.draft = '尚未发送的问题';
+    value.emit('item/agentMessage/delta', { threadId: 'side', itemId: 'partial', turnId: 'side-turn', delta: '已收到的回答' });
+    const count = value.calls.length;
     value.main.switchingHost = true;
-    assert.equal(value.controller.state.source, null);
-    assert.deepEqual(value.calls.slice(-2).map(call => [call.method, call.params.threadId]), [['turn/interrupt', 'side'], ['thread/unsubscribe', 'side']]);
-    assert.equal(value.main.activeThread.id, 'parent');
+    value.emit('bridge/disconnecting', { permanent: true });
+    value.main.hostId = 'remote'; value.main.activeThread = { id: 'other-parent', cwd: '/wrong' };
+    value.main.switchingHost = false;
+    await nextTick();
+    assert.equal(value.controller.state.open, false);
+    assert.equal(value.controller.state.connected, false);
+    assert.equal(value.controller.state.source?.threadId, 'parent');
+    assert.equal(value.controller.state.threadId, 'side');
+    assert.equal(value.controller.state.draft, '尚未发送的问题');
+    assert.equal(value.controller.state.items.find(item => item.id === 'partial')?.text, '已收到的回答');
+    assert.equal(value.calls.length, count, 'Navigation must neither interrupt nor unsubscribe the original side branch');
+    await assert.rejects(value.controller.send('不能误发'), /尚未连接/);
+    assert.equal(value.calls.length, count);
+    value.overrides.set('thread/turns/list', () => { throw Object.assign(new Error('ephemeral threads do not support thread/turns/list'), { code: -32600 }); });
+    value.overrides.set('thread/read', () => ({ thread: { id: 'side', ephemeral: true, status: { type: 'idle' } } }));
+    value.main.switchingHost = true; value.main.hostId = 'local'; value.main.activeThread = { id: 'parent', cwd: '/workspace' };
+    value.main.switchingHost = false;
+    await nextTick(); await value.controller.recover();
+    assert.equal(value.controller.state.connected, true);
+    assert.equal(value.controller.state.items.find(item => item.id === 'partial')?.text, '已收到的回答');
+    assert.equal(value.controller.state.draft, '尚未发送的问题');
+    assert.match(value.controller.state.notice, /不支持补读/);
   } finally { value.controller.dispose(); }
 });
 
@@ -635,7 +657,7 @@ for (const method of ['thread/deleted', 'thread/closed']) {
       assert.equal(f.controller.state.threadId, 'fresh-side');
       assert.equal(f.controller.state.busy, true);
       assert.deepEqual(f.controller.state.turns.map(turn => turn.id), ['fresh-turn']);
-      assert.equal(f.controller.state.items.filter(item => item.type === 'userMessage').length, 1);
+      assert.equal(f.controller.state.items.filter(item => item.type === 'userMessage').length, 2, 'Ended-branch questions stay visible until explicitly discarded');
       assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 2);
       assert.equal(f.calls.some(call => call.method === 'turn/interrupt' && call.params.threadId === 'parent'), false);
     } finally { held.resolve({ turn: { id: 'late-old-turn', status: 'inProgress' } }); f.controller.dispose(); }
@@ -690,4 +712,264 @@ test('ending the temporary side branch does not lose or duplicate an in-flight f
     assert.equal(f.calls.filter(call => call.method === 'thread/fork' && !call.params.ephemeral).length, 1);
     assert.equal(f.calls.find(call => call.method === 'thread/inject_items')?.params.threadId, 'formal-kept');
   } finally { held.resolve({ thread: { id: 'formal-kept', ephemeral: false } }); reloaded?.dispose(); f.controller.dispose(); }
+});
+
+test('hide and main-conversation navigation retain draft and live answer ownership until explicit close', async () => {
+  const f = fixture();
+  try {
+    f.controller.prepare(selected); await f.controller.send('原来的问题');
+    f.controller.state.draft = '保留的草稿';
+    const count = f.calls.length;
+    f.controller.hide();
+    assert.equal(f.controller.state.open, false);
+    f.main.activeThread = { id: 'another-parent', name: '另一个父对话', cwd: '/other-project' };
+    f.main.turns = [{ id: 'other-turn', status: 'completed' }]; f.main.busy = false;
+    f.main.model = 'wrong-model'; f.main.effort = 'low';
+    assert.equal(f.controller.state.source?.threadId, 'parent');
+    assert.equal(f.controller.state.draft, '保留的草稿');
+    assert.equal(f.calls.length, count);
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', text: '隐藏时仍实时加载' }] } });
+    f.controller.prepareConversation();
+    assert.equal(f.controller.state.open, true);
+    assert.equal(f.controller.state.items.at(-1)?.text, '隐藏时仍实时加载');
+    await f.controller.send('继续原来的分支');
+    const sent = f.calls.filter(call => call.method === 'turn/start').at(-1)!.params;
+    assert.equal(sent.threadId, 'side'); assert.equal(sent.cwd, '/workspace');
+    assert.equal(sent.model, 'test-model'); assert.equal(sent.effort, 'high');
+    assert.equal(f.controller.state.sourceCwd, '/workspace');
+    await f.controller.close();
+    assert.equal(f.controller.state.source, null); assert.equal(f.controller.state.draft, '');
+    assert.equal(f.controller.state.items.length, 0);
+    assert.deepEqual(f.calls.slice(-2).map(call => [call.method, call.params.threadId]), [['turn/interrupt', 'side'], ['thread/unsubscribe', 'side']]);
+  } finally { f.controller.dispose(); }
+});
+
+test('a prepared selection forks its original parent and boundary when first sent after main navigation', async () => {
+  const f = fixture();
+  try {
+    f.controller.prepare(selected); f.controller.state.draft = '还未发送';
+    f.main.activeThread = { id: 'another-parent', cwd: '/wrong-project' };
+    f.main.turns = [{ id: 'wrong-turn', status: 'completed' }];
+    f.main.model = 'wrong-model'; f.main.effort = 'low'; f.main.modeCapabilities = { plan: false };
+    f.controller.prepare({ ...selected, threadId: 'another-parent', turnId: 'wrong-turn', text: '新父对话选段' });
+    assert.equal(f.controller.state.source?.threadId, 'parent');
+    assert.equal(f.controller.state.draft, '还未发送');
+    assert.match(f.controller.state.notice, /保留原会话/);
+    await f.controller.send('原问题');
+    const fork = f.calls.find(call => call.method === 'thread/fork')!.params;
+    assert.equal(fork.threadId, 'parent'); assert.equal(fork.lastTurnId, 'parent-turn');
+    assert.equal(fork.cwd, '/workspace'); assert.equal(fork.model, 'test-model');
+    const sent = f.calls.find(call => call.method === 'turn/start')!.params;
+    assert.equal(sent.cwd, '/workspace'); assert.equal(sent.model, 'test-model'); assert.equal(sent.effort, 'high');
+    assert.equal(sent.collaborationMode.mode, 'default');
+  } finally { f.controller.dispose(); }
+});
+
+test('a full-context fork sent from another parent never claims its stale metadata is a reproducible save anchor', async () => {
+  const f = fixture();
+  try {
+    f.main.busy = false; f.controller.prepareConversation();
+    f.main.activeThread = { id: 'another-parent', cwd: '/wrong-project' };
+    f.main.turns = [{ id: 'wrong-turn', status: 'completed' }];
+    await f.controller.send('原父对话的完整上下文');
+    assert.equal(f.calls[0].params.threadId, 'parent');
+    assert.deepEqual(f.controller.state.boundary, {});
+    f.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed' } });
+    await assert.rejects(f.controller.saveBranch(), /无法准确复刻/);
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 1);
+  } finally { f.controller.dispose(); }
+});
+
+test('an accepted delayed side fork survives main selection and starts only its original isolated branch', async () => {
+  const f = fixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); f.overrides.set('thread/fork', () => held.promise);
+    const send = f.controller.send('尚在创建'); await new Promise(resolve => setImmediate(resolve));
+    f.main.activeThread = { id: 'another-parent', cwd: '/wrong' }; f.main.model = 'wrong-model';
+    held.resolve({ thread: { id: 'side', ephemeral: true } }); await send;
+    assert.equal(f.controller.state.source?.threadId, 'parent'); assert.equal(f.controller.state.threadId, 'side');
+    assert.equal(f.controller.state.loading, false); assert.equal(f.controller.state.busy, true);
+    assert.equal(f.calls.find(call => call.method === 'turn/start')?.params.cwd, '/workspace');
+    assert.equal(f.calls.some(call => call.method === 'thread/unsubscribe'), false);
+  } finally { held.resolve({ thread: { id: 'side', ephemeral: true } }); f.controller.dispose(); }
+});
+
+test('a fork acknowledged after host switch is retained, verified on return, and never sends to the other host', async () => {
+  const f = fixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); f.controller.state.draft = '未发送的问题';
+    f.overrides.set('thread/fork', () => held.promise);
+    const send = f.controller.send(f.controller.state.draft); await new Promise(resolve => setImmediate(resolve));
+    f.main.switchingHost = true; f.emit('bridge/disconnecting', { permanent: true });
+    f.main.hostId = 'remote'; f.main.switchingHost = false;
+    held.resolve({ thread: { id: 'side', ephemeral: true } });
+    await assert.rejects(send, /返回原主机/);
+    assert.equal(f.controller.state.threadId, 'side'); assert.equal(f.controller.state.loading, false);
+    assert.equal(f.controller.state.draft, '未发送的问题');
+    assert.deepEqual(f.calls.map(call => call.method), ['thread/fork']);
+    f.main.switchingHost = true; f.main.hostId = 'local'; f.main.switchingHost = false;
+    await nextTick();
+    await f.controller.send('返回后发送');
+    assert.equal(f.calls.filter(call => call.method === 'thread/fork').length, 1);
+    assert.equal(f.calls.filter(call => call.method === 'thread/goal/get').length, 1);
+    assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+    assert.equal(f.calls.every(call => call.hostId === 'local'), true);
+  } finally { held.resolve({ thread: { id: 'side', ephemeral: true } }); f.controller.dispose(); }
+});
+
+test('explicitly starting another side branch after navigation refreshes the current parent context', async () => {
+  const f = savedSidebarFixture();
+  try {
+    f.controller.prepare(selected); await f.controller.send('旧问题'); f.controller.state.draft = '旧草稿';
+    f.main.activeThread = { id: 'another-parent', name: '新父对话', cwd: '/new-project' };
+    f.main.turns = [{ id: 'new-parent-turn', status: 'completed' }]; f.main.busy = false;
+    f.main.model = 'new-model';
+    await f.controller.newBranch();
+    assert.equal(f.controller.state.source?.threadId, 'another-parent');
+    assert.equal(f.controller.state.draft, ''); assert.equal(f.controller.state.items.length, 0);
+    await f.controller.send('新问题');
+    const fork = f.calls.filter(call => call.method === 'thread/fork').at(-1)!.params;
+    assert.equal(fork.threadId, 'another-parent'); assert.equal(fork.cwd, '/new-project'); assert.equal(fork.model, 'new-model');
+  } finally { f.controller.dispose(); }
+});
+
+test('logout clears retained side state even while a formal save is settling and preserves its durable receipt', async () => {
+  const f = savedSidebarFixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('保存中的问答'); f.controller.state.draft = '私有草稿';
+    f.overrides.set('thread/fork', () => held.promise);
+    const saving = f.controller.saveBranch(); await new Promise(resolve => setImmediate(resolve));
+    f.main.authenticated = false;
+    assert.equal(f.controller.state.source, null); assert.equal(f.controller.state.items.length, 0);
+    assert.equal(f.controller.state.draft, ''); assert.equal(f.controller.state.saving, false);
+    held.resolve({ thread: { id: 'formal-after-logout', ephemeral: false, path: '/sessions/formal-after-logout.jsonl' } });
+    assert.equal(await saving, 'formal-after-logout');
+    const receipt = await f.journal.read('side-branch-save', JSON.stringify(['local', 'parent']));
+    assert.equal(receipt.saved, 'formal-after-logout');
+    assert.equal(f.calls.some(call => call.method === 'thread/inject_items'), false);
+  } finally { held.resolve({ thread: { id: 'formal-after-logout', ephemeral: false } }); f.controller.dispose(); }
+});
+
+test('a formal save continues against its pinned parent and cwd after main-conversation navigation', async () => {
+  const f = savedSidebarFixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('应保存的原侧边问答');
+    f.controller.state.draft = '同时保留草稿';
+    f.overrides.set('thread/fork', () => held.promise);
+    const saving = f.controller.saveBranch('原父分支'); await new Promise(resolve => setImmediate(resolve));
+    f.main.activeThread = { id: 'another-parent', cwd: '/wrong-save-project' };
+    f.main.turns = [{ id: 'wrong-save-tail', status: 'completed' }];
+    held.resolve({ thread: { id: 'formal-pinned', ephemeral: false, path: '/sessions/formal-pinned.jsonl' } });
+    assert.equal(await saving, 'formal-pinned');
+    assert.equal(f.controller.state.savedThreadId, 'formal-pinned');
+    assert.equal(f.controller.state.draft, '同时保留草稿');
+    const formalFork = f.calls.filter(call => call.method === 'thread/fork').at(-1)!.params;
+    assert.equal(formalFork.threadId, 'parent'); assert.equal(formalFork.cwd, '/workspace');
+    assert.equal(formalFork.lastTurnId, 'parent-turn');
+    assert.equal(f.calls.find(call => call.method === 'thread/inject_items')?.params.threadId, 'formal-pinned');
+  } finally { held.resolve({ thread: { id: 'formal-pinned', ephemeral: false } }); f.controller.dispose(); }
+});
+
+test('a start acknowledgment lost during host navigation retains its uncertain message and draft without repeating it', async () => {
+  const f = fixture();
+  try {
+    f.controller.prepare(selected); f.controller.state.draft = '不可重复发送的问题';
+    f.overrides.set('turn/start', () => {
+      f.main.switchingHost = true; f.emit('bridge/disconnecting', { permanent: true });
+      f.main.hostId = 'remote'; f.main.switchingHost = false;
+      throw Object.assign(new Error('connection closed; server may have accepted'), { uncertain: true });
+    });
+    await assert.rejects(f.controller.send(f.controller.state.draft), /server may have accepted/);
+    assert.equal(f.controller.state.threadId, 'side'); assert.equal(f.controller.state.loading, false);
+    assert.equal(f.controller.state.draft, '不可重复发送的问题');
+    assert.equal(f.controller.state.items.find(item => item.type === 'userMessage')?.status, 'unconfirmed');
+    assert.match(f.controller.state.error, /勿重复发送/);
+    assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+    assert.equal(f.calls.some(call => call.method === 'turn/interrupt' || call.method === 'thread/unsubscribe'), false);
+  } finally { f.controller.dispose(); }
+});
+
+test('a native engine restart retains visible answers and drafts, while later fresh questions disclose the new context', async () => {
+  const f = savedSidebarFixture();
+  try {
+    f.controller.prepare(selected); await f.controller.send('已有的提问'); f.controller.state.draft = '还在编写';
+    const displayed = JSON.stringify(f.controller.state.items);
+    f.emit('bridge/status', { engineId: 'engine-b', connected: true });
+    assert.equal(JSON.stringify(f.controller.state.items), displayed);
+    assert.equal(f.controller.state.draft, '还在编写'); assert.equal(f.controller.state.threadId, '');
+    await f.controller.send('新进程下的问题');
+    assert.equal(f.controller.state.items.filter(item => item.type === 'userMessage').length, 2);
+    assert.match(f.controller.state.notice, /之前显示的侧边问答仍保留/);
+  } finally { f.controller.dispose(); }
+});
+
+test('ending a retained side branch requires its own connected host and cannot silently lose background ownership', async () => {
+  const f = fixture();
+  try {
+    f.controller.prepare(selected); await f.controller.send('仍运行的问题'); f.controller.state.draft = '保留草稿';
+    f.main.switchingHost = true; f.main.hostId = 'remote'; f.main.switchingHost = false;
+    const count = f.calls.length;
+    await assert.rejects(f.controller.close(), /返回侧边聊天所在的主机/);
+    assert.equal(f.controller.state.threadId, 'side'); assert.equal(f.controller.state.draft, '保留草稿');
+    assert.equal(f.calls.length, count);
+    f.main.hostId = 'local'; f.main.connected = false; await nextTick();
+    await assert.rejects(f.controller.close(), /恢复连接/);
+    assert.equal(f.controller.state.threadId, 'side'); assert.equal(f.controller.state.draft, '保留草稿');
+    f.main.connected = true;
+    await f.controller.close(); assert.equal(f.controller.state.source, null);
+  } finally { f.controller.dispose(); }
+});
+
+for (const nativeEnding of ['restart', 'thread/closed']) {
+  for (const acknowledgment of ['accepted', 'uncertain']) {
+    test(`a pending side start invalidated by ${nativeEnding} cannot falsely confirm a draft after ${acknowledgment} acknowledgment`, async () => {
+      const f = fixture(), held = deferred<any>();
+      try {
+        f.controller.prepare(selected); f.controller.state.draft = '必须保留的待确认问题';
+        f.overrides.set('turn/start', () => held.promise);
+        const sending = f.controller.send(f.controller.state.draft); await new Promise(resolve => setImmediate(resolve));
+        if (nativeEnding === 'restart') f.emit('bridge/status', { engineId: 'engine-b', connected: true });
+        else f.emit('thread/closed', { threadId: 'side' });
+        if (acknowledgment === 'uncertain') held.reject(Object.assign(new Error('ACK outcome uncertain'), { uncertain: true }));
+        else held.resolve({ turn: { id: 'late-side-turn', status: 'inProgress', items: [] } });
+        assert.equal(await sending, false, 'The panel must only clear a draft on a positively accepted current start');
+        assert.equal(f.controller.state.draft, '必须保留的待确认问题');
+        assert.equal(f.controller.state.items.find(item => item.type === 'userMessage')?.status, 'unconfirmed');
+        assert.equal(f.controller.state.threadId, ''); assert.equal(f.controller.state.loading, false);
+        assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+      } finally { held.resolve({ turn: { id: 'late-side-turn', status: 'inProgress' } }); f.controller.dispose(); }
+    });
+  }
+}
+
+test('an older new-branch cleanup cannot replace or clear a newly prepared sidebar draft', async () => {
+  const f = savedSidebarFixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('旧侧边问答');
+    f.overrides.set('thread/unsubscribe', () => held.promise);
+    const restarting = f.controller.newBranch(); await new Promise(resolve => setImmediate(resolve));
+    f.main.activeThread = { id: 'another-parent', cwd: '/new-project', name: '新父对话' };
+    f.controller.prepareConversation(); f.controller.state.draft = '新侧边草稿';
+    held.resolve({});
+    await assert.rejects(restarting, /已打开其他侧边聊天/);
+    assert.equal(f.controller.state.source?.threadId, 'another-parent');
+    assert.equal(f.controller.state.draft, '新侧边草稿');
+    assert.equal(f.controller.state.sourceCwd, '/new-project');
+  } finally { held.resolve({}); f.controller.dispose(); }
+});
+
+test('changing only the main parent while a new branch awaits cleanup cannot create a branch with empty settings', async () => {
+  const f = savedSidebarFixture(), held = deferred<any>();
+  try {
+    f.controller.prepare(selected); await f.controller.send('旧问题');
+    f.overrides.set('thread/unsubscribe', () => held.promise);
+    const restarting = f.controller.newBranch(); await new Promise(resolve => setImmediate(resolve));
+    f.main.activeThread = { id: 'another-parent', cwd: '/new-project', name: '新父对话' };
+    held.resolve({});
+    await assert.rejects(restarting, /主会话已变化/);
+    assert.equal(f.controller.state.source, null);
+    f.controller.prepareConversation(); await f.controller.send('当前会话问题');
+    const fork = f.calls.filter(call => call.method === 'thread/fork').at(-1)!.params;
+    assert.equal(fork.threadId, 'another-parent'); assert.equal(fork.cwd, '/new-project');
+  } finally { held.resolve({}); f.controller.dispose(); }
 });

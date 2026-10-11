@@ -130,7 +130,7 @@ test('rapid repeated sidebar Stop clicks share one pending operation and one con
   assertOnlySideStopped(mock);
 });
 
-test('switching the parent while sidebar Stop confirms a conflict prevents its retry', async ({ page, mock }) => {
+test('switching the parent while sidebar Stop confirms a conflict still stops its retained side branch', async ({ page, mock }) => {
   const control = sidebarWire(mock); control.holdProbe = true;
   mock.threads.push({ ...mock.threads[0], id: 'another-parent', name: '另一个父对话', preview: '另一个父对话' });
   mock.turns.set('another-parent', []);
@@ -140,17 +140,18 @@ test('switching the parent while sidebar Stop confirms a conflict prevents its r
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '另一个父对话' }).first().click();
   await expect(page.locator('.main-header')).toContainText('另一个父对话');
   control.releaseProbe!();
-  await expect(page.locator('.side-chat-panel')).toHaveCount(0);
-  expect(stops(mock).some(request => request.params.turnId === newId)).toBe(false);
+  await expect(page.locator('.side-chat-panel')).toBeHidden();
+  await expect.poll(() => stops(mock).some(request => request.params.turnId === newId)).toBe(true);
   assertOnlySideStopped(mock);
 });
 
-test('closing the sidebar during confirmation prevents a retry on the released branch', async ({ page, mock }) => {
+test('explicitly ending the sidebar during Stop confirmation prevents a retry on the released branch', async ({ page, mock }) => {
   const control = sidebarWire(mock); control.holdProbe = true;
   await openRunningSidebar(page); control.advance();
   await stop(page).click();
   await expect.poll(() => probes(mock).length).toBe(1);
-  await page.getByRole('button', { name: '关闭侧边聊天', exact: true }).click();
+  await page.getByRole('button', { name: '结束侧边聊天', exact: true }).click();
+  await page.getByRole('dialog', { name: '结束侧边聊天？', exact: true }).getByRole('button', { name: '确认结束', exact: true }).click();
   control.releaseProbe!();
   await expect(page.locator('.side-chat-panel')).toHaveCount(0);
   expect(stops(mock).some(request => request.params.turnId === newId)).toBe(false);
