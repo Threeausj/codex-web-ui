@@ -480,6 +480,7 @@ watch(tab, async (value) => {
   }
 });
 defineExpose({
+  working: computed(() => editorTabs.value.some(entry => entry.saving)),
   openFile,
   revealPath,
   setTab: (value: string) => {

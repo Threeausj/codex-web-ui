@@ -617,7 +617,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);
 });
-defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext });
+defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext,
+  working: computed(() => uploading.value || submitting.value) });
 </script>
 
 <template>

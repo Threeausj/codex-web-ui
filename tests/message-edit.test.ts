@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { editableMessage, editedMessageInput } from '../src/lib/message-edit'
+import { editableMessage, editedMessageInput, messageEditDraft, uploadedEditAttachments } from '../src/lib/message-edit'
 import type { DisplayItem } from '../src/lib/events'
 
 const thread = { id: 'thread', historyMode: 'paginated', ephemeral: false, canAcceptDirectInput: true }
@@ -91,4 +91,58 @@ test('empty text is rejected before revert unless an existing image remains as m
     assert.deepEqual(editedMessageInput({ ...message, content: [image] }, ''), [
       { type: 'text', text: '', text_elements: [] }, image,
     ])
+})
+
+test('an edit draft exposes only exact application upload references and retains ordinary attachment-like prose', () => {
+  const filePath = '/workspace/demo/.codex-web-uploads/12345678-abcd-4321-9876-123456789abc/0-notes.txt'
+  const localPath = '/app/data/uploads/12345678-abcd-4321-9876-123456789abc/1-report.pdf'
+  const text = `Correct this\n\n附件文件：${filePath}（notes.txt）\n\n附件文件：${localPath}（report.pdf）`
+  const item = { ...user('user', 'turn'), content: [{ type: 'text', text }, { type: 'localImage', path: '/old/image.png' }] }
+  const draft = messageEditDraft(item)
+  assert.equal(draft.text, 'Correct this')
+  assert.deepEqual(draft.attachments.map(attachment => attachment.name), ['image.png', 'notes.txt', 'report.pdf'])
+  assert.equal(draft.attachments[0]!.input.path, '/old/image.png')
+  const prose = '附件文件：/workspace/notes.txt（notes.txt）\n附件文件：/workspace/uploads/not-a-uuid/0-notes.txt（notes.txt）'
+  assert.equal(messageEditDraft(item, prose).text, prose)
+  for (const folder of ['.codex-web-uploads', 'uploads']) {
+    const rootPath = `/${folder}/12345678-abcd-4321-9876-123456789abc/0-notes.txt`
+    assert.equal(messageEditDraft(item, `附件文件：${rootPath}（notes.txt）`).attachments.at(-1)!.path, rootPath)
+  }
+})
+
+test('editing can replace or remove original images, upload normal files, and preserve structured skill and app context', () => {
+  const item = { ...user('user', 'turn'), content: [
+    { type: 'text', text: 'Old' },
+    { type: 'localImage', path: '/old/image.png' },
+    { type: 'image', fileId: 'original' },
+    { type: 'skill', name: 'review', path: '/review/SKILL.md' },
+    { type: 'mention', name: 'GitHub', path: 'app://github' },
+  ] }
+  const attachments = uploadedEditAttachments([
+    { path: '/new/image.png', name: 'image.png', mime: 'image/png' },
+    { path: '/new/notes.txt', name: 'notes.txt', mime: 'text/plain' },
+  ])
+  assert.deepEqual(editedMessageInput(item, 'New', attachments), [
+    { type: 'text', text: 'New\n\n附件文件：/new/notes.txt（notes.txt）', text_elements: [] },
+    { type: 'skill', name: 'review', path: '/review/SKILL.md' },
+    { type: 'mention', name: 'GitHub', path: 'app://github' },
+    { type: 'localImage', path: '/new/image.png' },
+  ])
+  assert.deepEqual(editedMessageInput(item, 'Text only', []), [
+    { type: 'text', text: 'Text only', text_elements: [] },
+    { type: 'skill', name: 'review', path: '/review/SKILL.md' },
+    { type: 'mention', name: 'GitHub', path: 'app://github' },
+  ])
+  assert.equal(item.content[1]!.path, '/old/image.png')
+})
+
+test('attachment-only edited images and ordinary files are valid while removing the final content is rejected', () => {
+  const item = user('user', 'turn')
+  const images = uploadedEditAttachments([{ path: '/new/image.png', name: 'image.png', mime: 'image/png' }])
+  assert.deepEqual(editedMessageInput(item, '', images), [
+    { type: 'text', text: '', text_elements: [] }, { type: 'localImage', path: '/new/image.png' },
+  ])
+  const files = uploadedEditAttachments([{ path: '/new/notes.txt', name: 'notes.txt', mime: 'text/plain' }])
+  assert.deepEqual(editedMessageInput(item, '', files), [{ type: 'text', text: '附件文件：/new/notes.txt（notes.txt）', text_elements: [] }])
+  assert.throws(() => editedMessageInput(item, '', []), /不能为空/)
 })

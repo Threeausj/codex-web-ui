@@ -36,7 +36,7 @@ import ProjectDialog from "./components/ProjectDialog.vue";
 import BookmarksPanel from './components/BookmarksPanel.vue';
 import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
 import { isPinned, threadLabel } from "./lib/navigation";
-import { initializeDevicePush, onPushNavigate, pwaState, updatePwa } from "./lib/pwa";
+import { initializeDevicePush, onPushNavigate, pwaState, updatePwa, setPwaUpdateGuard, resumeDeferredPwaUpdate, cancelDeferredPwaUpdate } from "./lib/pwa";
 import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navigation";
 
 const api = useCodex();
@@ -111,6 +111,15 @@ const loginPassword = ref("");
 const loginBusy = ref(false);
 const actionPending = ref(false);
 const actionBusy = computed(() => actionPending.value || state.editingMessage);
+const messageEditOpen = ref(false);
+const updateCanReload = computed(() => !(
+  state.busy || state.compacting || actionBusy.value || state.loading ||
+  state.selectingThread || state.switchingHost || state.changingContext ||
+  state.modeBusy || messageEditOpen.value || composer.value?.working || workspace.value?.working ||
+  sideChat.state.busy || sideChat.state.loading || sideChat.state.saving
+));
+setPwaUpdateGuard(() => updateCanReload.value);
+watch(updateCanReload, ready => { if (ready) void resumeDeferredPwaUpdate(); });
 let navigationSelection = 0;
 let activeActionCount = 0;
 const theme = ref(browserStorage.local.getItem("codex.theme") || "system");
@@ -851,6 +860,8 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  cancelDeferredPwaUpdate();
+  setPwaUpdateGuard(() => true);
   conversationImages.close();
   clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
   onBackground();
@@ -1157,9 +1168,10 @@ watch(() => [state.authenticated, state.loading], () => {
             : "App Server 已断开，正在尝试重连…"
         }}
       </div>
-      <div v-if="pwaState.updateAvailable || pwaState.updateError" class="connection-banner" role="status">
-        <Icon :name="pwaState.updateBusy ? 'LoaderCircle' : 'Download'" :size="15" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateError || (pwaState.updateBusy ? '正在更新应用…' : '应用有新版本') }}
-        <button class="button button-small button-secondary" :disabled="state.busy || actionBusy || pwaState.updateBusy" @click="updatePwa()">{{ state.busy ? '任务完成后更新' : pwaState.updateBusy ? '正在更新…' : '更新应用' }}</button>
+      <div v-if="pwaState.updateAvailable || pwaState.updateError || pwaState.updateDeferred" class="connection-banner" role="status">
+        <Icon :name="pwaState.updateBusy ? 'LoaderCircle' : 'Download'" :size="15" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateError || (pwaState.updateDeferred ? '已安排更新，等待当前操作完成' : pwaState.updateBusy ? '正在更新应用…' : '应用有新版本') }}
+        <button class="button button-small button-secondary" :disabled="pwaState.updateBusy || pwaState.updateDeferred" @click="updatePwa()">{{ pwaState.updateDeferred ? '等待更新' : pwaState.updateBusy ? '正在更新…' : !updateCanReload ? '完成后更新' : '更新应用' }}</button>
+        <button v-if="pwaState.updateDeferred" class="button button-small button-secondary" @click="cancelDeferredPwaUpdate()">取消更新</button>
       </div>
       <button
         v-if="otherRequestCount"
@@ -1259,6 +1271,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :editing="state.editingMessage"
               :edit-disabled="editDisabled"
               :edit-message="api.resendEditedMessage"
+              :upload-edit-files="api.uploadEditFiles"
               :cancel-message-edit="api.cancelMessageEdit"
               :load-turn-details="api.loadTurnDetails"
               :async-question-status="api.asyncQuestionStatus"
@@ -1267,6 +1280,7 @@ watch(() => [state.authenticated, state.loading], () => {
               @fork="fork"
               @open-file="(path, line) => openWorkspace('files', path, line)"
               @error="showError"
+              @edit-session-active="messageEditOpen = $event"
             />
             <ApprovalCard
               v-for="request in activeRequests"

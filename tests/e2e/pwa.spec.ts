@@ -107,6 +107,143 @@ async function openPushSettings(page: Page) {
   await page.getByRole("button", { name: "应用与通知", exact: true }).click();
 }
 
+test('settings can manually check the deployed app, display a failed check and retry without losing the session', async ({ page }) => {
+  await loginBuilt(page);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('手动检查更新保留草稿');
+  await openPushSettings(page);
+  const updateSettings = page.locator('section[aria-labelledby="pwa-update-heading"]');
+  await updateSettings.getByRole('button', { name: '检查更新', exact: true }).click();
+  await expect(updateSettings.getByRole('status')).toHaveText('当前已是服务器上的最新版本');
+  const checkRequest = '**/index.html?codex-update=*';
+  await page.route(checkRequest, route => route.fulfill({ status: 503, contentType: 'text/plain', body: 'Unavailable' }));
+  await updateSettings.getByRole('button', { name: '检查更新', exact: true }).click();
+  await expect(updateSettings.getByRole('alert')).toContainText('无法检查服务器版本');
+  await page.unroute(checkRequest);
+  await updateSettings.getByRole('button', { name: '重试检查', exact: true }).click();
+  await expect(updateSettings.getByRole('status')).toHaveText('当前已是服务器上的最新版本');
+  await expect(updateSettings.getByRole('alert')).toHaveCount(0);
+  await page.getByRole('button', { name: '关闭设置', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('手动检查更新保留草稿');
+  await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+});
+
+test('settings manually download and activate a newly deployed worker without requiring PWA installation', async ({ page }) => {
+  await loginBuilt(page);
+  await openPushSettings(page);
+  const updateSettings = page.locator('section[aria-labelledby="pwa-update-heading"]');
+  workerRevision = '\n// manually-checked-update-fixture\n';
+  try {
+    await updateSettings.getByRole('button', { name: '检查更新', exact: true }).click();
+    await expect(updateSettings.getByRole('status')).toHaveText('有新版本可用');
+    await Promise.all([page.waitForEvent('domcontentloaded'), updateSettings.getByRole('button', { name: '更新应用', exact: true }).click()]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+    await expect(page.locator('.connection-banner').filter({ hasText: '应用有新版本' })).toHaveCount(0);
+  } finally { workerRevision = ''; }
+});
+
+test('opening the lazy source editor does not produce a false update when the deployed app is unchanged', async ({ page, mock }) => {
+  mock.turns.get('thread-existing')![0].items[1].text = '[打开源码](/workspace/demo/README.md)';
+  await loginBuilt(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await page.getByRole('link', { name: '打开源码', exact: true }).click();
+  await page.locator('.file-view-switch').getByRole('button', { name: '源码', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'README.md 文件内容', exact: true })).toBeVisible();
+  await expect(page.locator('link[rel="stylesheet"][href*="CodeEditor-"]')).toHaveCount(1);
+  await openPushSettings(page);
+  const updateSettings = page.locator('section[aria-labelledby="pwa-update-heading"]');
+  await updateSettings.getByRole('button', { name: '检查更新', exact: true }).click();
+  await expect(updateSettings.getByRole('status')).toHaveText('当前已是服务器上的最新版本');
+  await expect(updateSettings.getByRole('button', { name: '更新应用', exact: true })).toHaveCount(0);
+});
+
+test('manual updates detect a stylesheet-only deployment and work in an ordinary browser without service workers', async ({ page }) => {
+  await page.addInitScript(() => { delete (Navigator.prototype as any).serviceWorker; });
+  await page.goto(origin);
+  await page.getByRole('textbox', { name: '访问密码' }).fill('test-password-123');
+  await page.getByRole('button', { name: '进入工作区', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await openPushSettings(page);
+  await page.route('**/index.html?codex-update=*', async route => {
+    const response = await route.fetch();
+    const html = await response.text();
+    const updated = html.replace(/\/assets\/index-[a-zA-Z0-9_-]+\.css/, '/assets/index-style-only-update.css');
+    expect(updated).not.toEqual(html);
+    await route.fulfill({ response, body: updated });
+  });
+  const updateSettings = page.locator('section[aria-labelledby="pwa-update-heading"]');
+  await updateSettings.getByRole('button', { name: '检查更新', exact: true }).click();
+  await expect(updateSettings.getByRole('status')).toHaveText('有新版本可用');
+  await Promise.all([page.waitForEvent('domcontentloaded'), updateSettings.getByRole('button', { name: '更新应用', exact: true }).click()]);
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+});
+
+test('a queued worker update preserves an open message editor and its uploaded attachments until editing finishes', async ({ page, mock }) => {
+  mock.turns.get('thread-existing')!.push({ id: 'pwa-editable-turn', status: 'completed', items: [
+    { id: 'pwa-editable-user', type: 'userMessage', content: [{ type: 'text', text: '更新前可编辑的问题', text_elements: [] }] },
+    { id: 'pwa-editable-answer', type: 'agentMessage', text: '更新前的回复' },
+  ] });
+  await loginBuilt(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await page.getByRole('button', { name: '编辑消息', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '编辑消息内容', exact: true });
+  await editor.fill('更新等待期间保留的编辑草稿');
+  await page.getByLabel('上传编辑附件', { exact: true }).setInputFiles({ name: 'edit-notes.txt', mimeType: 'text/plain', buffer: Buffer.from('keep edit attachment') });
+  await expect(page.locator('.message-editor')).toContainText('notes.txt');
+  let navigations = 0;
+  page.on('domcontentloaded', () => { navigations++; });
+  workerRevision = '\n// editing-deferred-update-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await page.getByRole('button', { name: '完成后更新', exact: true }).click();
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();
+    await expect(editor).toHaveValue('更新等待期间保留的编辑草稿');
+    await expect(page.locator('.message-editor')).toContainText('notes.txt');
+    expect(navigations).toBe(0);
+    await page.getByRole('button', { name: '取消更新', exact: true }).click();
+    await expect(editor).toHaveValue('更新等待期间保留的编辑草稿');
+    await page.getByRole('button', { name: '完成后更新', exact: true }).click();
+    await Promise.all([page.waitForEvent('domcontentloaded'), page.locator('.message-editor').getByRole('button', { name: '取消', exact: true }).click()]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+    expect(mock.request('thread/revert')).toBeUndefined();
+    expect(mock.request('turn/start')).toBeUndefined();
+  } finally { workerRevision = ''; }
+});
+
+test('a pending workspace file save postpones a worker update until its write is acknowledged', async ({ page, mock }) => {
+  mock.turns.get('thread-existing')![0].items[1].text = '[打开文件](/workspace/demo/README.md)';
+  const receive = (mock as any).receive.bind(mock);
+  let pending: { socket: any; request: any } | undefined;
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method === 'fs/writeFile') { pending = { socket, request }; return; }
+    return receive(socket, request);
+  };
+  await loginBuilt(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await page.getByRole('link', { name: '打开文件', exact: true }).click();
+  await page.locator('.file-view-switch').getByRole('button', { name: '源码', exact: true }).click();
+  const file = page.getByRole('textbox', { name: 'README.md 文件内容', exact: true });
+  await file.click(); await file.press('ControlOrMeta+A');
+  await page.keyboard.insertText('# Updating while saving');
+  await page.locator('.workspace-panel').getByRole('button', { name: '保存', exact: true }).click();
+  await expect.poll(() => !!pending).toBe(true);
+  let navigations = 0;
+  page.on('domcontentloaded', () => { navigations++; });
+  workerRevision = '\n// file-save-deferred-update-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await page.getByRole('button', { name: '完成后更新', exact: true }).click();
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();
+    await expect(file).toContainText('Updating while saving');
+    expect(navigations).toBe(0);
+    await Promise.all([page.waitForEvent('domcontentloaded'), Promise.resolve().then(() => receive(pending!.socket, pending!.request))]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+  } finally { workerRevision = ''; }
+});
+
 test("built PWA installs its real worker, caches public resources only and starts offline without private history", async ({ page, context }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await loginBuilt(page);
@@ -343,16 +480,15 @@ test("a waiting production worker prompts for update and cannot reload an active
   workerRevision = "\n// lifecycle-update-fixture\n";
   try {
     await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
-    const update = page.getByRole("button", { name: "任务完成后更新", exact: true });
+    const update = page.getByRole("button", { name: "完成后更新", exact: true });
     await expect(update).toBeVisible();
-    await expect(update).toBeDisabled();
+    await expect(update).toBeEnabled();
+    await update.click();
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();
     expect(await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())!.waiting)).toBe(true);
-    mock.finishStream();
-    const ready = page.getByRole("button", { name: "更新应用", exact: true });
-    await expect(ready).toBeEnabled();
-    await Promise.all([page.waitForEvent("domcontentloaded"), ready.click()]);
+    await Promise.all([page.waitForEvent('domcontentloaded'), Promise.resolve().then(() => mock.finishStream())]);
     await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toBeEnabled();
-    await expect(ready).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toHaveCount(0);
     expect(mock.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
   } finally { workerRevision = ""; }
 });

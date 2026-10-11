@@ -877,13 +877,26 @@ hr {
   border-radius: 8px;
 }
 .message-images {
+  --conversation-image-max-width: 230px;
+  --conversation-image-max-height: 190px;
   display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
   gap: 8px;
   flex-wrap: wrap;
+  max-width: 100%;
+  min-width: 0;
   margin-bottom: 8px;
 }
+.message-images > button {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+}
 .message-images img {
-  max-width: 230px;
+  display: block;
+  max-width: min(230px, 100%);
   max-height: 190px;
   object-fit: contain;
   border-radius: 10px;

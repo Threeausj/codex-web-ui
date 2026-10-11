@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import VirtualHistoryBlock from "./VirtualHistoryBlock.vue";
 import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
@@ -12,6 +12,8 @@ import {
 } from "../lib/presentation";
 import type { DisplayItem } from "../lib/events";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
+import { messageEditDraft, releaseEditAttachments, uploadedEditAttachments, type MessageEditAttachment, type MessageEditSession } from '../lib/message-edit';
+import { uniqueClipboardFiles } from '../lib/clipboard';
 
 const props = defineProps<{
   items: DisplayItem[];
@@ -24,7 +26,8 @@ const props = defineProps<{
   editableItemId?: string;
   editing?: boolean;
   editDisabled?: boolean;
-  editMessage?: (itemId: string, text: string) => Promise<void>;
+  editMessage?: (itemId: string, text: string, attachments?: MessageEditAttachment[]) => Promise<void>;
+  uploadEditFiles?: (itemId: string, files: File[]) => Promise<any[]>;
   cancelMessageEdit?: (itemId: string) => void;
   loadTurnDetails?: (turnId: string) => Promise<void>;
   asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain';
@@ -35,41 +38,59 @@ const emit = defineEmits<{
   fork: [turnId?: string];
   openFile: [path: string, line?: number];
   error: [message: string];
+  editSessionActive: [active: boolean];
 }>();
-const editSession = ref<{
-  itemId: string;
-  draft: string;
-  error: string;
-  saving: boolean;
-} | null>(null);
+const editSession = ref<MessageEditSession | null>(null);
 const editingItem = ref<DisplayItem | null>(null);
+watch(() => !!editSession.value, active => emit('editSessionActive', active), { flush: 'sync' });
+function clearEdit() {
+  if (editSession.value) releaseEditAttachments(editSession.value.attachments);
+  editSession.value = null;
+  editingItem.value = null;
+}
+onBeforeUnmount(() => { clearEdit(); emit('editSessionActive', false); });
 function beginEdit(item: DisplayItem, text: string) {
   if (props.editDisabled || props.editing || !props.editMessage ||
       item.id !== props.editableItemId || editSession.value) return;
   editingItem.value = { ...item };
-  editSession.value = { itemId: item.id, draft: text, error: '', saving: false };
+  const draft = messageEditDraft(item, text);
+  editSession.value = { itemId: item.id, draft: draft.text, attachments: draft.attachments, error: '', saving: false, uploading: 0 };
 }
 function cancelEdit() {
   const session = editSession.value;
   if (!session || session.saving || props.editing) return;
   props.cancelMessageEdit?.(session.itemId);
-  editSession.value = null;
-  editingItem.value = null;
+  clearEdit();
+}
+async function uploadEdit(files: File[], clipboard = false) {
+  const session = editSession.value;
+  if (!session || session.saving || props.editing || props.editDisabled || !props.uploadEditFiles) return;
+  session.uploading++;
+  session.error = '';
+  try {
+    const selected = clipboard ? await uniqueClipboardFiles(files) : files;
+    if (session !== editSession.value || session.saving || props.editing || props.editDisabled || !selected.length) return;
+    const uploaded = uploadedEditAttachments(await props.uploadEditFiles(session.itemId, selected));
+    if (session !== editSession.value) { releaseEditAttachments(uploaded); return; }
+    session.attachments.push(...uploaded);
+  } catch (cause: any) {
+    if (session === editSession.value) session.error = cause?.message || '附件上传失败，请重试。';
+  } finally { session.uploading--; }
+}
+function removeEditAttachment(index: number) {
+  const session = editSession.value;
+  if (!session || session.saving || session.uploading || props.editing || props.editDisabled) return;
+  releaseEditAttachments(session.attachments.splice(index, 1));
 }
 async function saveEdit() {
   const session = editSession.value;
-  const hasImage = editingItem.value?.content?.some((input: any) =>
-    ['image', 'localImage'].includes(input.type));
-  if (!session || session.saving || props.editing || props.editDisabled ||
-      (!session.draft.trim() && !hasImage) || !props.editMessage) return;
+  if (!session || session.saving || session.uploading || props.editing || props.editDisabled ||
+      (!session.draft.trim() && !session.attachments.length) || !props.editMessage) return;
   session.saving = true;
   session.error = '';
   try {
-    await props.editMessage(session.itemId, session.draft);
-    if (editSession.value === session) {
-      editSession.value = null;
-      editingItem.value = null;
-    }
+    await props.editMessage(session.itemId, session.draft, session.attachments);
+    if (editSession.value === session) clearEdit();
   } catch (cause: any) {
     session.error = cause?.message || '重新发送失败，请重试。';
   } finally {
@@ -171,6 +192,8 @@ function hasPendingQuestion(block: any) {
       :begin-edit="beginEdit"
       :cancel-edit="cancelEdit"
       :save-edit="saveEdit"
+      :upload-edit="uploadEdit"
+      :remove-edit-attachment="removeEditAttachment"
       @fork="emit('fork', $event)"
       @open-file="(path, line) => emit('openFile', path, line)"
       @error="emit('error', $event)"
@@ -192,6 +215,8 @@ function hasPendingQuestion(block: any) {
         :begin-edit="beginEdit"
         :cancel-edit="cancelEdit"
         :save-edit="saveEdit"
+        :upload-edit="uploadEdit"
+        :remove-edit-attachment="removeEditAttachment"
         @fork="emit('fork', $event)"
         @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"
@@ -285,6 +310,8 @@ function hasPendingQuestion(block: any) {
     :edit-session="editSession"
     :cancel-edit="cancelEdit"
     :save-edit="saveEdit"
+    :upload-edit="uploadEdit"
+    :remove-edit-attachment="removeEditAttachment"
     @open-file="(path, line) => emit('openFile', path, line)"
     @error="emit('error', $event)"
   />
