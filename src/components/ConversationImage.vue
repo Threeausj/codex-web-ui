@@ -18,7 +18,7 @@ watch(src, () => { failed.value = false; });
 </template>
 <style scoped>
 .conversation-image { display: block; max-width: 100%; border-radius: 10px; overflow: hidden; }
-.conversation-image img { display: block; max-width: min(360px, 100%); max-height: 260px; object-fit: contain; border: 1px solid var(--border); border-radius: 10px; }
+.conversation-image img { display: block; max-width: min(var(--conversation-image-max-width, 360px), 100%); max-height: var(--conversation-image-max-height, 260px); object-fit: contain; border: 1px solid var(--border); border-radius: 10px; }
 .image-unavailable { padding: 8px 10px; background: var(--soft); color: var(--muted); font-size: 12px; }
 .image-unavailable span { display: flex; align-items: center; gap: 6px; }
 </style>

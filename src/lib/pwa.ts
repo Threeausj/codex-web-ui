@@ -31,7 +31,10 @@ export const pwaState = reactive({
   installing: false,
   updateAvailable: false,
   updateBusy: false,
+  updateDeferred: false,
   updateError: '',
+  updateCheckStatus: 'idle' as 'idle' | 'checking' | 'latest' | 'available' | 'error',
+  updateCheckError: '',
   registrationStatus: 'idle' as 'idle' | 'development' | 'registering' | 'ready' | 'unavailable' | 'error',
   error: '',
   pushSupported: inBrowser && window.isSecureContext === true && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window,
@@ -51,6 +54,9 @@ let deviceInitialization: Promise<void> | null = null;
 let deviceOperation: Promise<void> | null = null;
 let wantsReload = false;
 let pageNeedsReload = false;
+let serverBuildChanged = false;
+let updateCheck: Promise<boolean> | null = null;
+let canReloadUpdatedApp: () => boolean = () => true;
 let lastController = inBrowser && 'serviceWorker' in navigator ? navigator.serviceWorker.controller : null;
 let updateTimer: ReturnType<typeof setTimeout> | undefined;
 const observedRegistrations = new WeakSet<ServiceWorkerRegistration>();
@@ -65,9 +71,9 @@ let retiredEndpoint = '';
 try { retiredEndpoint = localStorage.getItem(retiredEndpointKey) || ''; } catch { /* Device storage may be unavailable. */ }
 
 /** Browser APIs can hang without rejecting when Android suspends networking. */
-function deadline<T>(promise: Promise<T>, milliseconds = 15000): Promise<T> {
+function deadline<T>(promise: Promise<T>, milliseconds = 15000, message = '通知操作超时，请检查网络后重试'): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('通知操作超时，请检查网络后重试')), milliseconds);
+    const timer = setTimeout(() => reject(new Error(message)), milliseconds);
     promise.then(value => { clearTimeout(timer); resolve(value); }, cause => { clearTimeout(timer); reject(cause); });
   });
 }
@@ -78,15 +84,104 @@ function pushHttp(api: HttpApi, path: string, init: RequestInit = {}, reportErro
 }
 
 function refreshUpdateAvailability() {
-  pwaState.updateAvailable = pageNeedsReload || !!(registration?.waiting && registration.waiting.state !== 'redundant');
+  pwaState.updateAvailable = serverBuildChanged || pageNeedsReload || !!(registration?.waiting && registration.waiting.state !== 'redundant');
 }
 function reloadUpdatedApp() {
   clearTimeout(updateTimer);
   updateTimer = undefined;
   wantsReload = false;
   pwaState.updateBusy = false;
+  // Work may have started while an update was activating in the background.
+  if (!canReloadUpdatedApp()) { pwaState.updateDeferred = true; return; }
+  pwaState.updateDeferred = false;
   pwaState.updateError = '';
   location.reload();
+}
+
+/** Return true only when a reload will not interrupt work or an open editor. */
+export function setPwaUpdateGuard(canReload: () => boolean): void { canReloadUpdatedApp = canReload; }
+export function cancelDeferredPwaUpdate(): void { pwaState.updateDeferred = false; }
+export async function resumeDeferredPwaUpdate(): Promise<void> {
+  if (pwaState.updateDeferred && canReloadUpdatedApp()) await updatePwa();
+}
+
+function ownAppEntries(value: Document): string[] {
+  return Array.from(value.querySelectorAll('script[type="module"][src],link[rel="stylesheet"][href]')).flatMap(element => {
+    const source = element.getAttribute('src') || element.getAttribute('href');
+    if (!source) return [];
+    const url = new URL(source, location.href);
+    return url.origin === location.origin ? [url.pathname + url.search] : [];
+  }).sort();
+}
+// Vite injects stylesheets when editors and terminal panels load. Capture the
+// HTML entry resources before Vue mounts so lazy assets cannot mimic a new build.
+const initialAppEntries = inBrowser && typeof document !== 'undefined' ? ownAppEntries(document) : [];
+async function checkServerBuild(): Promise<boolean> {
+  const controller = new AbortController();
+  try {
+    const target = new URL('/index.html', location.href);
+    // Public HTML bypasses worker caches and intermediary caches without
+    // sending session credentials or changing this tab's current destination.
+    target.searchParams.set('codex-update', Date.now().toString(36));
+    const html = await deadline((async () => {
+      const response = await fetch(target, { cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal });
+      if (!response.ok || !response.headers.get('content-type')?.includes('text/html')) throw new Error('无法检查服务器版本，请稍后重试。');
+      return response.text();
+    })(), 15000, '检查更新超时，请检查网络后重试。');
+    const current = initialAppEntries;
+    const next = ownAppEntries(new DOMParser().parseFromString(html, 'text/html'));
+    if (!current.length || !next.length) throw new Error('无法识别服务器版本，请稍后重试。');
+    return JSON.stringify(current) !== JSON.stringify(next);
+  } finally { controller.abort(); }
+}
+async function checkWorkerBuild(): Promise<void> {
+  if (!registration) await initPwa();
+  if (!registration) return;
+  await deadline(registration.update(), 15000, '应用资源检查超时，请检查网络后重试。');
+  const worker = registration.installing;
+  if (!worker || ['installed', 'activated'].includes(worker.state)) return;
+  await new Promise<void>((resolve, reject) => {
+    const finish = () => {
+      if (['installed', 'activated'].includes(worker.state)) { clearTimeout(timer); worker.removeEventListener('statechange', changed); resolve(); }
+      else if (worker.state === 'redundant') { clearTimeout(timer); worker.removeEventListener('statechange', changed); reject(new Error('应用资源下载失败，请重试检查更新。')); }
+    };
+    const changed = () => finish();
+    const timer = setTimeout(() => { worker.removeEventListener('statechange', changed); reject(new Error('应用资源下载超时，请检查网络后重试。')); }, 15000);
+    worker.addEventListener('statechange', changed);
+    finish();
+  });
+}
+
+/** Check the deployed frontend; this never starts a server or Docker update. */
+export function checkPwaUpdate(): Promise<boolean> {
+  if (updateCheck) return updateCheck;
+  if (pwaState.updateBusy) return Promise.resolve(pwaState.updateAvailable);
+  pwaState.updateCheckStatus = 'checking';
+  pwaState.updateCheckError = '';
+  const operation = (async () => {
+    try {
+      if (!navigator.onLine) throw new Error('连接网络后再检查更新。');
+      const [server, worker] = await Promise.allSettled([checkServerBuild(), checkWorkerBuild()]);
+      if (server.status === 'fulfilled') serverBuildChanged = server.value;
+      refreshUpdateAvailability();
+      if (pwaState.updateAvailable) {
+        pwaState.updateCheckStatus = 'available';
+        return true;
+      }
+      if (server.status === 'rejected') throw server.reason;
+      if (worker.status === 'rejected') throw worker.reason;
+      pwaState.updateCheckStatus = 'latest';
+      pwaState.updateError = '';
+      return false;
+    } catch (cause: any) {
+      pwaState.updateCheckStatus = 'error';
+      pwaState.updateCheckError = cause.message || '检查更新失败，请重试。';
+      return false;
+    }
+  })();
+  updateCheck = operation;
+  void operation.finally(() => { if (updateCheck === operation) updateCheck = null; });
+  return operation;
 }
 function observeRegistration(result: ServiceWorkerRegistration) {
   const observeWorker = (worker: ServiceWorker | null) => {
@@ -213,15 +308,18 @@ export async function updatePwa() {
   if (pwaState.updateBusy) return;
   pwaState.updateError = '';
   if (!navigator.onLine) { pwaState.updateError = '连接网络后再更新应用。'; return; }
+  if (!canReloadUpdatedApp()) { pwaState.updateDeferred = true; return; }
+  pwaState.updateDeferred = false;
   pwaState.updateBusy = true;
   try {
     if (!registration) await initPwa();
-    if (!registration) throw new Error(pwaState.error || '应用更新尚未准备好，请刷新页面后重试。');
     refreshUpdateAvailability();
-    const worker = registration.waiting;
+    const worker = registration?.waiting;
     if (!worker || worker.state === 'redundant') {
-      if (pageNeedsReload) { reloadUpdatedApp(); return; }
+      if (pageNeedsReload || serverBuildChanged) { reloadUpdatedApp(); return; }
+      if (!registration) throw new Error(pwaState.error || '请先检查更新，再重新加载应用。');
       pwaState.updateBusy = false;
+      pwaState.updateCheckStatus = 'latest';
       return;
     }
     wantsReload = true;

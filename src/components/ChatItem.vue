@@ -11,6 +11,8 @@ import { diffStats } from '../lib/diff-stats'
 import { publicReasoningSummary } from '../lib/activity-presentation'
 import { asyncUserInputQuestions } from '../../shared/async-user-input'
 import AsyncQuestionCard from './AsyncQuestionCard.vue'
+import EditMessageAttachments from './EditMessageAttachments.vue'
+import type { MessageEditSession } from '../lib/message-edit'
 import { asyncQuestionAnswerDisplayText } from '../../shared/async-question-reply'
 
 const props = defineProps<{
@@ -24,10 +26,12 @@ const props = defineProps<{
   canEdit?: boolean
   editing?: boolean
   editDisabled?: boolean
-  editSession?: { itemId: string; draft: string; error: string; saving: boolean } | null
+  editSession?: MessageEditSession | null
   beginEdit?: (item: any, text: string) => void
   cancelEdit?: () => void
   saveEdit?: () => Promise<void>
+  uploadEdit?: (files: File[], clipboard?: boolean) => Promise<void>
+  removeEditAttachment?: (index: number) => void
   asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain'
   answerAsyncQuestion?: (item: any, answers: string[], threadId?: string, hostId?: string) => Promise<void>
   asyncQuestionsDisabled?: boolean
@@ -42,8 +46,7 @@ const editDraft = computed({
 })
 const editInput = ref<HTMLTextAreaElement>()
 const editPending = computed(() => props.editSession?.saving || props.editing)
-const hasEditInput = computed(() => !!editDraft.value.trim() ||
-  (props.item.content || []).some((input: any) => ['image', 'localImage'].includes(input.type)))
+const hasEditInput = computed(() => !!editDraft.value.trim() || !!props.editSession?.attachments.length)
 const text = computed(() => {
   const raw = props.item.text || (props.item.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
   return props.item.type === 'userMessage' ? asyncQuestionAnswerDisplayText(raw) ?? raw : raw
@@ -77,8 +80,8 @@ function toggleFile(event: Event, path: string) {
   else expandedFiles.value.delete(path)
 }
 
-const userImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')))
-const localImages = computed(() => (props.item.content || []).filter((c: any) => c.type === 'localImage' && c.path))
+const userImages = computed(() => (props.item.content || []).filter((c: any) =>
+  (c.type === 'image' && /^data:image\/|^https?:\/\//.test(c.url || '')) || (c.type === 'localImage' && c.path)))
 const reasoningSummary = computed(() => publicReasoningSummary(props.item))
 const readActions = computed(() => (props.item.commandActions || []).filter((action: any) => action.type === 'read'))
 const toolTitle = computed(() => {
@@ -117,7 +120,7 @@ function cancelEdit() {
   props.cancelEdit?.()
 }
 async function saveEdit() {
-  if (props.editDisabled || editPending.value || !hasEditInput.value) return
+  if (props.editDisabled || editPending.value || props.editSession?.uploading || !hasEditInput.value) return
   await props.saveEdit?.()
 }
 function onEditKeydown(event: KeyboardEvent) {
@@ -155,15 +158,21 @@ function onLink(event: MouseEvent) {
 
 <template>
   <article v-if="item.type === 'userMessage'" class="message user-message">
-    <div v-if="userImages.length" class="message-images"><button v-for="(img, index) in userImages" :key="index" type="button" class="message-image-preview" aria-label="放大上传的图片" @click="previewImage(img.url, '上传的图片')"><img :src="img.url" alt="上传的图片" loading="lazy" decoding="async" /></button></div>
-    <div v-if="localImages.length" class="message-images"><ConversationImage v-for="(img, index) in localImages" :key="img.path + index" :path="img.path" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
+    <div v-if="userImages.length && !editorOpen" class="message-images">
+      <template v-for="(img, index) in userImages" :key="`${img.type}:${index}`">
+        <ConversationImage v-if="img.type === 'localImage'" :path="img.path" :host-id="hostId || 'local'" :thread-id="threadId" />
+        <button v-else type="button" class="message-image-preview" aria-label="放大上传的图片" @click="previewImage(img.url, '上传的图片')"><img :src="img.url" alt="上传的图片" loading="lazy" decoding="async" /></button>
+      </template>
+    </div>
     <form v-if="editorOpen" class="message-editor" @submit.prevent="saveEdit">
+      <EditMessageAttachments :attachments="editSession?.attachments || []" :disabled="editPending || editDisabled" :uploading="!!editSession?.uploading" @upload="(files, clipboard) => uploadEdit?.(files, clipboard)" @remove="removeEditAttachment?.($event)">
       <textarea ref="editInput" v-model="editDraft" aria-label="编辑消息内容" rows="3" :disabled="editPending" @input="resizeEditor" @keydown="onEditKeydown"></textarea>
+      </EditMessageAttachments>
       <p class="message-edit-note">重新发送会替换本轮回复，已执行的文件修改不会撤销。</p>
       <p v-if="editSession?.error" class="message-edit-error" role="alert">{{ editSession.error }}</p>
       <div class="message-edit-buttons">
         <button type="button" class="button button-small button-secondary" :disabled="editPending" @click="cancelEdit">取消</button>
-        <button type="submit" class="button button-small button-primary" :disabled="editPending || editDisabled || !hasEditInput"><Icon v-if="editPending" name="LoaderCircle" :size="15" class="spin" />{{ editPending ? '正在重新发送…' : '保存并重新发送' }}</button>
+        <button type="submit" class="button button-small button-primary" :disabled="editPending || editDisabled || !!editSession?.uploading || !hasEditInput"><Icon v-if="editPending" name="LoaderCircle" :size="15" class="spin" />{{ editPending ? '正在重新发送…' : '保存并重新发送' }}</button>
       </div>
     </form>
     <div v-else class="user-bubble" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId">{{ text }}</div>

@@ -5,6 +5,8 @@ import {
   pwaState,
   installPwa,
   updatePwa,
+  checkPwaUpdate,
+  cancelDeferredPwaUpdate,
   initializeDevicePush,
   enableDevicePush,
   disableDevicePush,
@@ -57,6 +59,15 @@ const pushReason = computed(() => {
   return '';
 });
 const canEnable = computed(() => !pwaState.pushBusy && !pwaState.offline && pwaState.pushReady && pwaState.pushPermission !== 'denied' && (!pwaState.appleMobile || pwaState.installed));
+const updateStatus = computed(() => {
+  if (pwaState.updateCheckStatus === 'checking') return '正在检查更新…';
+  if (pwaState.updateBusy) return '正在更新应用…';
+  if (pwaState.updateDeferred) return '已安排在当前任务结束后更新';
+  if (pwaState.updateAvailable) return '有新版本可用';
+  if (pwaState.updateCheckStatus === 'latest') return '当前已是服务器上的最新版本';
+  if (pwaState.updateCheckStatus === 'error') return '检查更新失败，请重试';
+  return '更新准备好后会提示，也可以手动检查';
+});
 async function operate(action: () => Promise<any>, message: string, progress = '') {
   notice.value = progress;
   localError.value = '';
@@ -108,12 +119,22 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
         <div v-else-if="pwaState.appleMobile" class="pwa-instructions"><Icon name="Smartphone" :size="17" /><span>在 Safari 中点击<strong>分享</strong>，选择<strong>添加到主屏幕</strong>，然后从主屏幕打开。iOS / iPadOS 16.4 或更新版本支持后台通知。</span></div>
         <div v-else class="pwa-instructions"><Icon name="Monitor" :size="17" /><span>在支持安装的浏览器中，通过地址栏安装图标或菜单中的<strong>安装应用</strong>添加到设备。</span></div>
       </template>
-      <div class="pwa-update-row">
-        <span>{{ pwaState.updateBusy ? '正在更新应用…' : pwaState.updateAvailable ? '有新版本可用' : '更新会在准备好后提示，不会打断对话' }}</span>
-        <button v-if="pwaState.updateAvailable || pwaState.updateError" class="button button-small button-secondary" :disabled="state.busy || pwaState.updateBusy" @click="updatePwa"><Icon name="RefreshCw" :size="14" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateBusy ? '正在更新…' : '更新应用' }}</button>
+    </section>
+
+    <section class="pwa-section" aria-labelledby="pwa-update-heading">
+      <div class="pwa-section-title">
+        <div class="pwa-title"><Icon name="RefreshCw" :size="18" /><h4 id="pwa-update-heading">应用更新</h4></div>
       </div>
-      <p v-if="pwaState.updateError" class="pwa-subtle" role="alert">{{ pwaState.updateError }}</p>
-      <p v-if="pwaState.updateAvailable && state.busy" class="pwa-subtle">等待当前任务完成后再更新。</p>
+      <p>获取服务器已部署的最新版，更新当前网页或已安装应用。运行中的任务和正在编辑的消息会在结束后再更新。</p>
+      <div class="pwa-update-row">
+        <span role="status" aria-live="polite">{{ updateStatus }}</span>
+        <div class="pwa-update-actions">
+          <button class="button button-small button-secondary" :disabled="pwaState.updateCheckStatus === 'checking' || pwaState.updateBusy" @click="checkPwaUpdate"><Icon name="RefreshCw" :size="14" :class="{ spin: pwaState.updateCheckStatus === 'checking' }" />{{ pwaState.updateCheckStatus === 'checking' ? '正在检查…' : pwaState.updateCheckStatus === 'error' ? '重试检查' : '检查更新' }}</button>
+          <button v-if="pwaState.updateDeferred" class="button button-small button-secondary" @click="cancelDeferredPwaUpdate">取消等待</button>
+          <button v-else-if="pwaState.updateAvailable || pwaState.updateError" class="button button-small button-secondary" :disabled="pwaState.updateBusy || pwaState.updateCheckStatus === 'checking'" @click="updatePwa"><Icon name="Download" :size="14" :class="{ spin: pwaState.updateBusy }" />{{ pwaState.updateBusy ? '正在更新…' : state.busy ? '任务完成后更新' : '更新应用' }}</button>
+        </div>
+      </div>
+      <p v-if="pwaState.updateCheckError || pwaState.updateError" class="pwa-subtle pwa-update-error" role="alert">{{ pwaState.updateCheckError || pwaState.updateError }}</p>
     </section>
 
     <section class="pwa-section" aria-labelledby="pwa-push-heading">
@@ -176,6 +197,8 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
 .pwa-button-row .icon-button { margin-left:auto; }
 .pwa-update-row { justify-content:space-between;margin:16px 0 0;font-size:11px;line-height:1.6;color:var(--muted); }
 .pwa-update-row .button { flex-shrink:0; }
+.pwa-update-actions { display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px; }
+.pwa-update-error { color:var(--danger, #b94d45); }
 .pwa-preferences { margin-top:6px; }
 .pwa-preference { display:flex;justify-content:space-between;align-items:center;gap:15px;padding:13px 0;border-top:1px solid var(--border);cursor:pointer; }
 .pwa-preference > div { display:flex;flex-direction:column;gap:5px;min-width:0; }

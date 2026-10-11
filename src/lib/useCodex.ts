@@ -9,7 +9,7 @@ import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import type { ReviewTarget } from "../../shared/protocol/v2/ReviewTarget";
 import { subagentStatus } from "./subagents";
 import { mergeContextUsage } from "./context-usage";
-import { editableMessage, editedMessageInput } from "./message-edit";
+import { editableMessage, editedMessageInput, type MessageEditAttachment } from "./message-edit";
 import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
 import { interruptConflictCandidate } from './turn-interrupt';
 import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
@@ -3167,14 +3167,14 @@ function refreshRevertedThread(threadId: string) {
   state.selectingThread = false;
   if (state.connected) void selectThread(threadId, { preserveWriter: true });
 }
-async function resendEditedMessage(itemId: string, text: string) {
+async function resendEditedMessage(itemId: string, text: string, attachments?: MessageEditAttachment[]) {
   if (!canEditMessage(itemId)) throw fail(new Error("当前消息不能编辑，请等待任务结束并确认会话状态"));
   const hostId = state.hostId;
   const threadId = state.activeThread.id;
   const generation = selectionGeneration;
   const original = pendingMessageEdit?.reverted && pendingMessageEdit.item.id === itemId
     ? pendingMessageEdit.item : state.items.find(item => item.id === itemId)!;
-  const input = editedMessageInput(original, text);
+  const input = editedMessageInput(original, text, attachments);
   const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === state.activePermissionProfileId);
   resolvePermissionProfile(profile || { id: 'edit', name: '消息权限', sandboxMode: state.permission as any, approvalPolicy: approvalPolicy(), networkAccess: state.permission === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
   const selectedModel = state.models.find(model => model.model === state.model);
@@ -3998,6 +3998,31 @@ async function uploadFiles(files: FileList | File[], reportError = true) {
       return attachment;
     }),
   );
+}
+/** Edit uploads belong to the inline draft, never the next-message composer. */
+async function uploadEditFiles(itemId: string, files: FileList | File[]) {
+  if (!canEditMessage(itemId) || sendInFlight || state.editingMessage)
+    throw new Error('当前无法上传编辑附件，请等待发送或同步完成');
+  const hostId = state.hostId;
+  const threadId = state.activeThread?.id;
+  const authentication = authenticationGeneration;
+  const cwd = state.projectPath;
+  const originals = Array.from(files);
+  if (!originals.length) return [];
+  const form = new FormData();
+  form.set('hostId', hostId);
+  form.set('cwd', cwd);
+  for (const file of originals) form.append('files', file);
+  const result = await http('/uploads', { method: 'POST', body: form }, false);
+  // A history refresh on the same destination must not discard a completed
+  // upload. The component also checks the captured editor session identity.
+  if (authentication !== authenticationGeneration ||
+      hostId !== state.hostId || threadId !== state.activeThread?.id || cwd !== state.projectPath)
+    throw new Error('会话已切换，附件未加入其他会话；请返回原会话重新上传');
+  return result.files.map((file: any, index: number) => ({ ...file,
+    previewUrl: file.mime?.startsWith('image/') && originals[index]?.type.startsWith('image/')
+      ? URL.createObjectURL(originals[index]) : undefined,
+  }));
 }
 function removeAttachment(index: number) {
   releaseAttachments(state.attachments.slice(index, index + 1));
@@ -5067,6 +5092,7 @@ export function useCodex() {
     updateHost,
     removeHost,
     uploadFiles,
+    uploadEditFiles,
     removeAttachment,
     searchFiles,
     readDirectory,
