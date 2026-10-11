@@ -125,6 +125,21 @@ test('selection actions remain usable by keyboard and dismiss after Escape or a 
   expect(mock.request('turn/start')).toBeUndefined();
 });
 
+test('Escape cancels a pending selection capture instead of allowing its toolbar to reopen', async ({ page, mock }) => {
+  selectionWire(mock);
+  await selectHistory(page);
+  await selectMessage(page);
+  await page.evaluate(() => {
+    // A native selection update may be queued immediately before Escape.
+    document.dispatchEvent(new Event('selectionchange'));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  });
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.getByRole('toolbar', { name: '所选对话内容' })).toHaveCount(0);
+  expect(await page.evaluate(() => window.getSelection()?.rangeCount)).toBe(0);
+  expect(mock.request('turn/start')).toBeUndefined();
+});
+
 test('mobile selection actions fit the viewport and open a keyboard-sized sidebar without sending', async ({ page, mock }) => {
   selectionWire(mock);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -165,7 +180,8 @@ test('side questions start an independent read-only ephemeral branch and preserv
   expect(mock.turns.get('thread-existing')).toHaveLength(1);
   await expect(page.locator('.side-chat-transcript').getByRole('button', { name: '从此处创建分支', exact: true })).toHaveCount(0);
   await page.screenshot({ path: '/tmp/codex-selected-side-chat.png', fullPage: true });
-  await page.getByRole('button', { name: '关闭侧边聊天', exact: true }).click();
+  await page.getByRole('button', { name: '结束侧边聊天', exact: true }).click();
+  await page.getByRole('dialog', { name: '结束侧边聊天？', exact: true }).getByRole('button', { name: '确认结束', exact: true }).click();
   await expect(page.locator('.side-chat-panel')).toHaveCount(0);
   await expect.poll(() => wire.releases).toContain(wire.sideThreadId);
   await expect(main).toHaveValue('原对话尚未发送的草稿');
@@ -183,7 +199,7 @@ test('hiding and reopening the sidebar preserves an unsent question and quotes c
   await expect(page.locator('.side-chat-panel')).toBeHidden();
   await page.getByRole('button', { name: '新建侧边聊天', exact: true }).click();
   await expect(side).toHaveValue('尚未发送的侧边问题');
-  await page.getByRole('button', { name: '关闭侧边聊天', exact: true }).click();
+  await page.getByRole('button', { name: '收起侧边聊天', exact: true }).click();
   await selectMessage(page);
   await page.getByRole('button', { name: '添加到对话', exact: true }).click();
   await page.getByRole('button', { name: '发送消息', exact: true }).click();

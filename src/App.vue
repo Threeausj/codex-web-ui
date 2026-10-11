@@ -79,7 +79,8 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
   // Back hides the side chat so its question and running answer remain intact.
-  { id: 'side-chat', visible: () => sideChat.state.open, close: () => { sideChat.state.open = false; } },
+  { id: 'side-chat', visible: () => sideChat.state.open, close: () => sideChat.hide() },
+  { id: 'side-chat-close', visible: () => !!sideChatPanel.value?.confirmingClose, close: () => sideChatPanel.value?.closeConfirmation() },
   { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
   { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
   { id: 'image-preview', visible: () => !!conversationImages.image.value, close: () => conversationImages.close() },
@@ -390,7 +391,7 @@ async function newThread() {
   threadMenu.value = false;
   await action(() => api.newThread());
   await nextTick();
-  composer.value?.focus();
+  if (!sideChat.state.open) composer.value?.focus();
 }
 async function forceEnterThread() {
   await api.takeoverThread(owner => window.confirm(
@@ -432,13 +433,13 @@ async function chooseNewContext(hostId: string, path?: string) {
       }
     }
   });
-  if (generation === navigationSelection && !state.activeThread) {
+  if (generation === navigationSelection && !state.activeThread && !sideChat.state.open) {
     await nextTick();
     composer.value?.focus();
   }
 }
 function openWorkspace(tab = "files", path = "", line?: number) {
-  sideChat.state.open = false;
+  sideChat.hide();
   const samePath = workspaceOpen.value && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceOpen.value = true;
@@ -449,7 +450,7 @@ function openWorkspace(tab = "files", path = "", line?: number) {
 }
 function toggleWorkspace() {
   if (sideChat.state.open) {
-    sideChat.state.open = false;
+    sideChat.hide();
     workspaceOpen.value = true;
   } else workspaceOpen.value = !workspaceOpen.value;
 }
@@ -475,6 +476,24 @@ function askInSideChat(value: ConversationSelectionSource) {
     sideChat.prepare(source);
     void nextTick(() => sideChatPanel.value?.focusQuestion());
   } catch (error: any) { showError(error.message || '无法打开侧边聊天'); }
+}
+async function returnSideChatParent(hostId: string, id: string) {
+  const source = sideChat.state.source;
+  if (!source || source.hostId !== hostId || source.threadId !== id) return;
+  const generation = navigationSelection + 1;
+  await selectThread({ hostId, id });
+  if (generation !== navigationSelection || sideChat.state.source !== source ||
+      !state.authenticated || state.hostId !== hostId || state.activeThread?.id !== id) return;
+  openSideChat();
+}
+async function openSideChatFile(path: string, line?: number) {
+  const source = sideChat.state.source;
+  if (!source) return;
+  if (source.hostId !== state.hostId) {
+    await selectThread({ hostId: source.hostId, id: source.threadId });
+    if (state.hostId !== source.hostId || state.activeThread?.id !== source.threadId) return;
+  }
+  openWorkspace('files', path, line);
 }
 function bookmarkSelection(value: ConversationSelectionSource) {
   const source = selectedSource(value);
@@ -1379,7 +1398,7 @@ watch(() => [state.authenticated, state.loading], () => {
       />
     </ResizableWorkspace>
     <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" panel-id="side-chat-panel">
-      <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @quote="addToConversation" @open-file="(path, line) => openWorkspace('files', path, line)" />
+      <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @quote="addToConversation" @open-parent="returnSideChatParent" @open-file="openSideChatFile" />
     </ResizableWorkspace>
     <ProjectDialog
       v-if="editingProject"

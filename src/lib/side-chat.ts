@@ -22,7 +22,9 @@ export type ConversationSideChatSource = {
 export type SideChatSource = SelectedConversationText | ConversationSideChatSource;
 export type SideChatState = {
   open: boolean;
+  draft: string;
   source: SideChatSource | null;
+  sourceCwd: string;
   threadId: string;
   anchor: SideChatSource | null;
   boundary: { lastTurnId?: string; beforeTurnId?: string };
@@ -41,7 +43,7 @@ export type SideChatState = {
 
 /** A sidebar answer is a separate ephemeral branch, never a steer of the parent. */
 export function useSideChat(api: any, mainState: any) {
-  const state = reactive<SideChatState>({ open: false, source: null, threadId: '', anchor: null, boundary: {}, savedThreadId: '', saving: false, saveTargetThreadId: '', saveUncertain: '', items: [], turns: [], busy: false, loading: false, connected: false, error: '', notice: '' });
+  const state = reactive<SideChatState>({ open: false, draft: '', source: null, sourceCwd: '', threadId: '', anchor: null, boundary: {}, savedThreadId: '', saving: false, saveTargetThreadId: '', saveUncertain: '', items: [], turns: [], busy: false, loading: false, connected: false, error: '', notice: '' });
   let generation = 0;
   let activeTurnId = '';
   let requestPending = false;
@@ -66,6 +68,10 @@ export function useSideChat(api: any, mainState: any) {
   let savedBranchPath = '';
   let inheritedGoalCleared = false;
   let emptyAnchorTail: string | null = null;
+  let sideGoalCleared = false;
+  // Main conversation selection is independent of the retained side branch.
+  // Keep only the parent's settings and turn metadata, never copy its transcript.
+  let sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, turns: [] as { id: string; status?: string }[] };
   const visibleMessages = () => state.items.filter(item => item.type === 'userMessage' || item.type === 'agentMessage').map(item => ({
     key: `${item.type}:${item.clientId || item.id}`,
     text: `${item.type === 'userMessage' ? '用户' : '助手'}：${item.text || (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n')}`,
@@ -78,8 +84,20 @@ export function useSideChat(api: any, mainState: any) {
   }
   const ownedKey = (hostId: string, threadId: string) => JSON.stringify([hostId, threadId]);
   const runtimeIdentity = () => api.runtimeIdentity?.() || {};
-  const sourceScope = () => state.source && mainState.authenticated && mainState.hostId === state.source.hostId && mainState.activeThread?.id === state.source.threadId;
-  const canConnect = () => !!sourceScope() && !!mainState.connected && !mainState.runtimePaused && !mainState.switchingHost;
+  const sourceScope = () => state.source && mainState.authenticated && identity?.authenticationGeneration === runtimeIdentity().authenticationGeneration;
+  const sourceSelected = () => state.source && mainState.hostId === state.source.hostId && mainState.activeThread?.id === state.source.threadId;
+  const canConnect = () => !!sourceScope() && mainState.hostId === state.source?.hostId && !!mainState.connected && !mainState.runtimePaused && !mainState.switchingHost;
+  function captureContext() {
+    if (!sourceSelected()) return;
+    sourceContext = {
+      cwd: mainState.activeThread?.cwd || mainState.projectPath || '',
+      model: mainState.model || mainState.activeThread?.model || '',
+      effort: mainState.effort || 'medium', plan: !!mainState.modeCapabilities?.plan,
+      busy: !!mainState.busy,
+      turns: (mainState.turns || []).map((turn: any) => ({ id: turn.id, status: turn.status })),
+    };
+    state.sourceCwd = sourceContext.cwd;
+  }
   function remember(hostId: string, id: string) {
     ownedThreads.add(ownedKey(hostId, id));
     if (ownedThreads.size > 64) ownedThreads.delete(ownedThreads.values().next().value!);
@@ -108,12 +126,16 @@ export function useSideChat(api: any, mainState: any) {
     ++interruptGeneration;
     interruptRequest = null;
     state.open = false;
+    state.draft = '';
     state.source = null;
+    state.sourceCwd = '';
+    sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, turns: [] };
     state.threadId = '';
     state.anchor = null;
     state.boundary = {};
     resetSavedBranch();
     emptyAnchorTail = null;
+    sideGoalCleared = false;
     state.saving = false;
     state.items = [];
     state.turns = [];
@@ -130,8 +152,11 @@ export function useSideChat(api: any, mainState: any) {
     revisions.clear();
     turnRevisions.clear();
   }
-  async function close() {
-    if (state.saving) { state.open = false; return; }
+  function hide() { state.open = false; }
+  async function close(force = false) {
+    if (state.saving && !force) { hide(); return; }
+    if (!force && state.threadId && !canConnect())
+      throw new Error('请先返回侧边聊天所在的主机并恢复连接，再结束侧边聊天');
     const hostId = state.source?.hostId;
     const threadId = state.threadId;
     const turnId = activeTurnId;
@@ -152,8 +177,6 @@ export function useSideChat(api: any, mainState: any) {
   }
   function prepareConversation() {
     const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
-    if (!mainState.authenticated || !validId(mainState.hostId) || !validId(mainState.activeThread?.id) || mainState.switchingHost)
-      throw new Error('请先打开当前主机的对话');
     if (state.source && sourceScope()) {
       // Reopening the shortcut must retain the draft, selection and active turn.
       state.open = true;
@@ -161,6 +184,8 @@ export function useSideChat(api: any, mainState: any) {
       state.notice = '已打开现有侧边聊天，保留当前问答和草稿。需要新的上下文时，请等待任务完成后另开侧边分支。';
       return;
     }
+    if (!mainState.authenticated || !validId(mainState.hostId) || !validId(mainState.activeThread?.id) || mainState.switchingHost)
+      throw new Error('请先打开当前主机的对话');
     const title = mainState.activeThread.name || mainState.activeThread.preview || '';
     prepareSource({ kind: 'conversation', hostId: mainState.hostId, threadId: mainState.activeThread.id,
       ...(typeof title === 'string' && title.trim() ? { threadName: title.replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 160) } : {}) });
@@ -168,13 +193,19 @@ export function useSideChat(api: any, mainState: any) {
   function prepareSource(source: SideChatSource) {
     if (state.saving && state.source && (state.source.hostId !== source.hostId || state.source.threadId !== source.threadId))
       throw new Error('侧边分支正在保存，请等待保存回执后再打开新的侧边聊天');
-    if (state.source && (state.source.hostId !== source.hostId || state.source.threadId !== source.threadId)) void close();
+    if (state.source && (state.source.hostId !== source.hostId || state.source.threadId !== source.threadId)) {
+      state.open = true;
+      state.connected = canConnect();
+      state.notice = '已保留原会话的侧边聊天和草稿；如需当前会话的上下文，请显式另开侧边分支或结束现有侧边聊天。';
+      return;
+    }
     if (!state.source) {
       ++generation;
       identity = runtimeIdentity();
       if (unknownForks.has(saveScope(source))) state.saveUncertain = 'fork';
     }
     state.source = source;
+    if (!state.threadId) captureContext();
     if (!state.threadId && !restoringSave) {
       const version = generation;
       restoringSave = (async () => {
@@ -199,9 +230,25 @@ export function useSideChat(api: any, mainState: any) {
     state.notice = state.threadId ? '后续提问沿用首次创建的侧边上下文；如需按新选段重新继承历史，请另开侧边分支。' : '';
   }
   async function newBranch() {
-    const source = state.source && { ...state.source };
+    let source = state.source && { ...state.source };
     if (!source || state.busy || state.loading || state.saving) throw new Error('请等待侧边任务完成');
-    await close();
+    if (!canConnect()) throw new Error('请先返回侧边聊天所在的主机，再结束或另开分支');
+    if (!sourceSelected()) {
+      const current = mainState.activeThread;
+      if (!current?.id || mainState.switchingHost) throw new Error('请先打开当前主机的对话');
+      const title = current.name || current.preview || '';
+      source = { kind: 'conversation', hostId: mainState.hostId, threadId: current.id,
+        ...(typeof title === 'string' && title.trim() ? { threadName: title.replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 160) } : {}) };
+    }
+    const closing = close();
+    const closedGeneration = generation;
+    await closing;
+    if (generation !== closedGeneration || state.source)
+      throw new Error('已打开其他侧边聊天，原另开分支操作已取消');
+    if (!mainState.authenticated || mainState.hostId !== source.hostId || mainState.switchingHost)
+      throw new Error('主机或登录状态已变化，请重新打开侧边聊天');
+    if (mainState.activeThread?.id !== source.threadId)
+      throw new Error('主会话已变化，请重新打开侧边聊天以继承当前上下文');
     prepareSource(source);
   }
   function noteTurn(turn: any) {
@@ -221,9 +268,9 @@ export function useSideChat(api: any, mainState: any) {
     // The official /side behavior forks all native history, including the
     // current partial turn. A lastTurnId cannot name an in-progress turn.
     if ('kind' in source && source.kind === 'conversation') return {};
-    const turns = mainState.turns || [];
+    const turns = sourceContext.turns;
     const selected = source.turnId && turns.find((turn: any) => turn.id === source.turnId);
-    if (selected && ['completed', 'failed', 'interrupted'].includes(selected.status)) return { lastTurnId: selected.id };
+    if (selected && ['completed', 'failed', 'interrupted'].includes(selected.status || '')) return { lastTurnId: selected.id };
     const active = [...turns].reverse().find((turn: any) => !turn.status || turn.status === 'inProgress');
     // The protocol forbids forking through a running turn. Its selected text is
     // supplied explicitly even when only the preceding history can be forked.
@@ -239,7 +286,7 @@ export function useSideChat(api: any, mainState: any) {
     return resolvePermissionProfile({
       id: 'web-side-chat', name: '侧边聊天', sandboxMode: 'read-only',
       approvalPolicy: approvalPolicy as any, networkAccess: false,
-    }, { cwd: mainState.activeThread?.cwd || mainState.projectPath, requirements });
+    }, { cwd: sourceContext.cwd, requirements });
   }
   async function clearInheritedGoal(hostId: string, threadId: string) {
     try {
@@ -253,21 +300,21 @@ export function useSideChat(api: any, mainState: any) {
       throw new Error(`无法确认侧边聊天的目标状态：${cause?.message || String(cause)}`);
     }
   }
-  async function send(question: string) {
+  async function send(question: string): Promise<boolean> {
     const preparedGeneration = generation;
     if (restoringSave) await restoringSave;
-    if (preparedGeneration !== generation || disposed) return;
+    if (preparedGeneration !== generation || disposed) return false;
     const source = state.source && { ...state.source };
-    if (!source || !sourceScope()) throw new Error('当前对话已变化，请重新打开侧边聊天');
-    if (!question.trim()) return;
+    if (!source || !sourceScope()) throw new Error('侧边聊天的登录状态已变化，请重新打开');
+    if (!question.trim()) return false;
     if (question.trim().length > 16_000) throw new Error('侧边问题过长，请缩短后发送');
     if (!canConnect()) throw new Error('工作站尚未连接，请等待连接恢复');
     if (requestPending || state.busy || state.loading) throw new Error('请等待侧边聊天当前任务完成');
+    if (!state.threadId) captureContext();
     const policy = readOnlyPolicy();
     const version = generation;
-    const model = mainState.model || mainState.activeThread?.model || '';
-    const effort = mainState.effort || 'medium';
-    const cwd = mainState.activeThread?.cwd || mainState.projectPath;
+    const context = sourceContext;
+    const { model, effort, cwd } = context;
     requestPending = true;
     state.loading = true;
     state.error = '';
@@ -276,10 +323,14 @@ export function useSideChat(api: any, mainState: any) {
     let optimisticId = '';
     try {
       if (!id) {
-        if (threadEnded) { state.items = []; state.turns = []; threadEnded = false; }
+        if (threadEnded) {
+          threadEnded = false;
+          state.turns = state.turns.map(turn => turn.status === 'inProgress' ? { ...turn, status: 'interrupted' } : turn);
+          state.notice = '已建立新的临时分支；之前显示的侧边问答仍保留，新的上下文重新继承原父对话。';
+        }
         const boundary = forkBoundary(source);
-        const parentTail = mainState.turns?.at(-1);
-        const stableTailId = !mainState.busy && ['completed', 'failed', 'interrupted'].includes(parentTail?.status) ? parentTail.id : '';
+        const parentTail = context.turns.at(-1);
+        const stableTailId = !context.busy && ['completed', 'failed', 'interrupted'].includes(parentTail?.status || '') ? parentTail!.id : '';
         const result = await call(source.hostId, 'thread/fork', {
           threadId: source.threadId, ...boundary, excludeTurns: true, ephemeral: true,
           sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy,
@@ -288,26 +339,41 @@ export function useSideChat(api: any, mainState: any) {
         id = result?.thread?.id;
         if (typeof id !== 'string' || id === source.threadId) throw new Error('服务器未创建独立的侧边聊天');
         remember(source.hostId, id);
-        if (!stillCurrent(version, source)) { await release(source.hostId, id); return; }
+        if (!stillCurrent(version, source)) { await release(source.hostId, id); return false; }
         if (result.thread.ephemeral !== true) {
           await release(source.hostId, id);
           throw new Error('当前 Codex 不支持临时侧边聊天，请更新服务器上的 Codex');
         }
-        // Ephemeral forks cannot use deferGoalContinuation. Confirm the new
-        // branch's independent goal state before its first explicit turn.
-        try { await clearInheritedGoal(source.hostId, id); }
-        catch (cause) { await release(source.hostId, id).catch(() => {}); throw cause; }
-        if (!stillCurrent(version, source)) { await release(source.hostId, id); return; }
+        // Retain the accepted fork even if the transport switches hosts before
+        // its acknowledgment. Never issue its next mutation on another host.
         state.threadId = id;
         state.anchor = { ...source };
+        state.boundary = boundary;
+        emptyAnchorTail = parentTail?.id || null;
+        if (!canConnect()) throw new Error('侧边分支已创建，请返回原主机连接后再发送问题');
         // A later formal save can reproduce a completed parent anchor. A fork
         // containing an active partial turn cannot be recreated by truncating
         // the subsequently changed parent, so keep that case explicitly guarded.
         state.boundary = 'kind' in source && source.kind === 'conversation' && stableTailId &&
-          !mainState.busy && mainState.turns?.at(-1)?.id === stableTailId ? { lastTurnId: stableTailId } : boundary;
-        emptyAnchorTail = mainState.turns?.at(-1)?.id || null;
+          sourceSelected() && !mainState.busy && mainState.turns?.at(-1)?.id === stableTailId ? { lastTurnId: stableTailId } : boundary;
       }
-      if (!stillCurrent(version, source)) return;
+      if (!stillCurrent(version, source)) return false;
+      if (!canConnect()) throw new Error('请返回侧边聊天所在的主机后再发送问题');
+      // An accepted fork may have been retained across a host switch before
+      // verification completed. Always verify its independent goal before use.
+      if (!sideGoalCleared) {
+        try { await clearInheritedGoal(source.hostId, id); }
+        catch (cause) {
+          if (canConnect()) {
+            await release(source.hostId, id).catch(() => {});
+            if (stillCurrent(version, source) && state.threadId === id) state.threadId = '';
+          }
+          throw cause;
+        }
+        if (!stillCurrent(version, source)) { await release(source.hostId, id); return false; }
+        sideGoalCleared = true;
+      }
+      if (!canConnect()) throw new Error('请返回侧边聊天所在的主机后再发送问题');
       optimisticId = randomUUID();
       const input = [
         { type: 'text', text: question.trim(), text_elements: [] },
@@ -320,11 +386,11 @@ export function useSideChat(api: any, mainState: any) {
       const result = await call(source.hostId, 'turn/start', {
         threadId: id, clientUserMessageId: optimisticId, input, cwd,
         model: model || undefined, effort, approvalPolicy: policy.approvalPolicy, sandboxPolicy: policy.sandboxPolicy,
-        ...(mainState.modeCapabilities?.plan && model ? { collaborationMode: nativeCollaborationMode('default', model, effort) } : {}),
+        ...(context.plan && model ? { collaborationMode: nativeCollaborationMode('default', model, effort) } : {}),
       });
       if (!stillCurrent(version, source)) {
         await release(source.hostId, id, result?.turn?.status === 'inProgress' ? result.turn.id : undefined);
-        return;
+        return false;
       }
       // A streamed completion can precede the private start acknowledgement.
       if (eventRevision === revision) {
@@ -340,8 +406,9 @@ export function useSideChat(api: any, mainState: any) {
         if (['sending', 'unconfirmed'].includes(item.status)) delete item.status;
         if (result?.turn?.id) item.turnId = result.turn.id;
       }
+      return true;
     } catch (cause: any) {
-      if (!stillCurrent(version, source)) return;
+      if (!stillCurrent(version, source)) return false;
       state.error = cause?.message || String(cause);
       if (cause?.uncertain) {
         state.error += '；请同步侧边聊天后确认，勿重复发送';
@@ -392,8 +459,11 @@ export function useSideChat(api: any, mainState: any) {
     if (state.savedThreadId && !hasUnsavedMessages()) return state.savedThreadId;
     if ('kind' in source && source.kind === 'conversation' && !state.boundary.lastTurnId)
       throw new Error('此侧边聊天继承了运行中的部分上下文，无法准确复刻为正式分支；请使用“引用回答到主对话”保留回答');
-    if (!state.boundary.lastTurnId && !state.boundary.beforeTurnId && (mainState.turns?.at(-1)?.id || null) !== emptyAnchorTail)
-      throw new Error('首次侧边提问没有可固定的轮次，而父对话历史已变化；请引用回答到主对话，或另开侧边分支');
+    if (!state.boundary.lastTurnId && !state.boundary.beforeTurnId) {
+      if (!sourceSelected()) throw new Error('首次侧边提问没有可固定的轮次，请返回原父对话核对历史后再保存');
+      if ((mainState.turns?.at(-1)?.id || null) !== emptyAnchorTail)
+        throw new Error('首次侧边提问没有可固定的轮次，而父对话历史已变化；请引用回答到主对话，或另开侧边分支');
+    }
     const policy = readOnlyPolicy();
     const version = generation;
     const current = () => stillCurrent(version, source);
@@ -419,7 +489,7 @@ export function useSideChat(api: any, mainState: any) {
         forkDispatched = true;
         const result = await call(source.hostId, 'thread/fork', {
           threadId: source.threadId, ...state.boundary, ephemeral: false, excludeTurns: true, deferGoalContinuation: true,
-          sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy, cwd: mainState.activeThread?.cwd || mainState.projectPath,
+          sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy, cwd: sourceContext.cwd,
         });
         saved = result?.thread?.id;
         if (!saved || saved === source.threadId || result.thread.ephemeral) { saved = ''; throw Object.assign(new Error('服务器未返回可核对的正式分支 ID'), { uncertain: true }); }
@@ -546,7 +616,7 @@ export function useSideChat(api: any, mainState: any) {
     if (!canConnect() || !state.connected) return Promise.reject(new Error('工作站尚未连接，请等待连接恢复'));
     if (requestPending || state.loading || state.saving) return Promise.reject(new Error('侧边任务正在准备，请等待轮次确认后再停止'));
     if (!activeTurnId) {
-      return state.busy ? Promise.reject(new Error('无法确定侧边任务的轮次，请等待状态更新或关闭侧边聊天')) : Promise.resolve();
+      return state.busy ? Promise.reject(new Error('无法确定侧边任务的轮次，请等待状态更新或确认结束侧边聊天')) : Promise.resolve();
     }
     const version = generation;
     const requestIdentity = runtimeIdentity();
@@ -622,7 +692,7 @@ export function useSideChat(api: any, mainState: any) {
             if (!state.busy) activeTurnId = '';
           }
           state.notice = state.busy && !activeTurnId
-            ? '侧边连接已恢复，但临时对话无法补读断线消息；正在等待回答状态，关闭侧边聊天可释放此分支'
+            ? '侧边连接已恢复，但临时对话无法补读断线消息；正在等待回答状态，确认结束侧边聊天可释放此分支'
             : '侧边连接已恢复；临时对话不支持补读断线期间的消息';
           return;
         }
@@ -650,22 +720,22 @@ export function useSideChat(api: any, mainState: any) {
   }
   const unsubscribe = api.subscribeProtocol?.((hostId: string, message: any) => {
     const { method, params: params = {} } = message;
-    if (method === 'bridge/disconnecting' && state.source) {
+    if (method === 'bridge/disconnecting' && state.source && hostId === state.source.hostId) {
       ++interruptGeneration;
       interruptRequest = null;
       const nextIdentity = runtimeIdentity();
-      if (params.permanent || identity?.authenticationGeneration !== nextIdentity.authenticationGeneration) void close();
+      if (!mainState.authenticated || identity?.authenticationGeneration !== nextIdentity.authenticationGeneration) void close(true);
       else state.connected = false;
       return;
     }
     if (method === 'bridge/status' && state.source && hostId === state.source?.hostId) {
       if (identity?.engineId && params.engineId && identity.engineId !== params.engineId) {
         state.threadId = '';
+        sideGoalCleared = false;
         if (!state.saveTargetThreadId) resetSavedBranch();
         if (state.source && unknownForks.has(saveScope(state.source))) state.saveUncertain = 'fork';
-        state.items = [];
-        state.turns = [];
         state.busy = false;
+        for (const item of state.items) if (item.type === 'userMessage' && item.status === 'sending') item.status = 'unconfirmed';
         activeTurnId = '';
         threadEnded = true;
         state.error = 'Codex 进程已重启，临时侧边聊天已结束；重新发送会创建新分支';
@@ -712,7 +782,9 @@ export function useSideChat(api: any, mainState: any) {
       requestPending = false;
       recovering = null;
       state.threadId = '';
+      sideGoalCleared = false;
       state.busy = false;
+      for (const item of state.items) if (item.type === 'userMessage' && item.status === 'sending') item.status = 'unconfirmed';
       state.loading = false;
       activeTurnId = '';
       threadEnded = true;
@@ -721,9 +793,14 @@ export function useSideChat(api: any, mainState: any) {
     return true;
   }) || (() => {});
   const stopScope = watch(() => [mainState.hostId, mainState.activeThread?.id, mainState.authenticated, mainState.switchingHost], () => {
-    if (state.source && (!sourceScope() || mainState.switchingHost)) void close();
+    if (!state.source) return;
+    if (!sourceScope()) { void close(true); return; }
+    if (!canConnect()) state.connected = false;
+    // Hiding or selecting a different main conversation must never end the
+    // auxiliary task. Its single retained session remains pinned to its source.
+    if (!sourceSelected() || mainState.switchingHost) hide();
   }, { flush: 'sync' });
-  const stopConnection = watch(() => [mainState.connected, mainState.runtimePaused], () => {
+  const stopConnection = watch(() => [mainState.hostId, mainState.connected, mainState.runtimePaused, mainState.switchingHost], () => {
     if (!state.source) return;
     const previous = state.connected;
     state.connected = canConnect();
@@ -731,10 +808,10 @@ export function useSideChat(api: any, mainState: any) {
   });
   function dispose() {
     if (disposed) return;
-    void close();
+    void close(true);
     disposed = true;
     stopScope(); stopConnection(); unsubscribe();
   }
   if (getCurrentScope()) onScopeDispose(dispose);
-  return { state, prepare, prepareConversation, send, interrupt, close, recover, newBranch, saveBranch, resumeSavedBranch, answerQuote, dispose };
+  return { state, prepare, prepareConversation, send, interrupt, hide, close, recover, newBranch, saveBranch, resumeSavedBranch, answerQuote, dispose };
 }
