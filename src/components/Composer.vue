@@ -314,8 +314,7 @@ function inspectInput() {
     }, 180);
   } else searchPending.value = false;
 }
-function removePickerToken(token: "/" | "@") {
-  const position = input.value?.selectionStart ?? draft.value.length;
+function removePickerToken(token: "/" | "@", position = input.value?.selectionStart ?? draft.value.length) {
   const before = draft.value.slice(0, position);
   const expression = token === "/" ? /\/[^\s]*$/ : /@[^\s]*$/;
   const replaced = before.replace(expression, "");
@@ -332,13 +331,14 @@ async function pick(result: any) {
   if (result.kind === "skill" || result.kind === "mode") {
     const key = draftKey.value;
     const chosenDraft = draft.value;
+    const chosenPosition = input.value?.selectionStart ?? draft.value.length;
     choosing.value = true;
     pickerError.value = "";
     try {
       if (result.kind === "skill") await props.api.attachSkill(result.skill);
       else await props.api.setConversationMode(result.id);
       if (draftKey.value === key && draft.value === chosenDraft)
-        removePickerToken(result.kind === "skill" ? "/" : "@");
+        removePickerToken(result.kind === "skill" ? "/" : "@", chosenPosition);
     } catch (cause: any) {
       pickerError.value = cause.message || "切换失败";
     } finally { choosing.value = false; }
@@ -489,6 +489,13 @@ function insertAt() {
     input.value?.setSelectionRange(draft.value.length, draft.value.length);
     inspectInput();
   });
+}
+function closePicker() {
+  picker.value = "";
+  pickerGeneration++;
+  searchPending.value = false;
+  if (searchTimer) clearTimeout(searchTimer);
+  input.value?.focus();
 }
 const draftKey = computed(
   () =>
@@ -642,8 +649,9 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
       :aria-label="picker === 'commands' ? '对话指令' : '模式与项目文件'"
     >
       <div class="picker-label">
-        {{ picker === "commands" ? "指令与技能" : "对话模式与文件"
-        }}<span>↑ ↓ 选择 · ↵ 确认</span>
+        <span class="picker-heading">{{ picker === "commands" ? "指令与技能" : "对话模式与文件" }}</span>
+        <span class="picker-input-hint"><span class="picker-keyboard-hint">↑ ↓ 选择 · ↵ 确认</span><span class="picker-touch-hint">点击选择</span></span>
+        <button type="button" class="icon-button picker-close" aria-label="关闭选择菜单" @pointerdown.prevent @click="closePicker"><Icon name="X" :size="14" /></button>
       </div>
       <button
         v-for="(result, index) in results"
@@ -654,6 +662,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         :disabled="result.disabled || choosing || pickerDisabled"
         role="option"
         :aria-selected="index === selected"
+        @pointerdown.prevent
         @mousedown.prevent
         @click="pick(result)"
       >
@@ -832,6 +841,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           ><button
             class="icon-button mention-button"
             :disabled="!state.connected || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
+            @pointerdown.prevent
             @click="insertAt"
             title="选择模式或引用项目文件"
             aria-label="选择模式或引用项目文件"
@@ -1031,6 +1041,17 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 }
 .composer-picker > button:disabled { opacity: .55; cursor: default; }
 .composer-picker > button:disabled:hover { background: transparent; }
+.picker-label { align-items: center; padding: 3px 6px 5px 10px; }
+.picker-label .picker-heading { flex: 1; }
+.picker-input-hint { flex: 0 0 auto; }
+.picker-touch-hint { display: none; }
+.picker-close { flex: 0 0 auto; width: 28px; height: 28px; }
+@media (pointer: coarse) {
+  .picker-keyboard-hint { display: none; }
+  .picker-touch-hint { display: inline; }
+  .composer-picker > button { min-height: 44px; touch-action: manipulation; }
+  .picker-close { width: 36px; height: 36px; }
+}
 .picker-kind { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
 .picker-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; font-size: 11px; color: var(--muted); }
 .picker-error, .composer-mode-error { color: var(--danger); }

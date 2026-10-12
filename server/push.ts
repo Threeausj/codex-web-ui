@@ -18,7 +18,7 @@ const DELIVERY_TTL = 60 * 60 * 1000
 const MAX_OUTBOX = 1024
 const MAX_ATTEMPTS = 8
 type DeliveryFailure = 'provider_unavailable' | 'rate_limited' | 'timeout' | 'rejected' | 'metadata_pending' | 'expired' | 'queue_full'
-type DeliveryHealth = { delivered: number; failed: number; expired: number; overflow?: number; lastDeliveredAt?: number; lastFailureAt?: number; lastFailure?: DeliveryFailure }
+type DeliveryHealth = { delivered: number; failed: number; expired: number; overflow?: number; lastDeliveredAt?: number; lastCompletedAcceptedAt?: number; lastFailureAt?: number; lastFailure?: DeliveryFailure }
 const preferencesSchema = z.object({ completed: z.boolean(), approval: z.boolean(), errors: z.boolean() }).strict()
 export type PushPreferences = z.infer<typeof preferencesSchema>
 const defaultPreferences: PushPreferences = { completed: true, approval: true, errors: true }
@@ -27,7 +27,8 @@ const subscriptionSchema = z.object({
   expirationTime: z.number().nonnegative().nullable().optional(),
   keys: z.object({ p256dh: z.string().max(128), auth: z.string().max(64) }).strict(),
 }).strict()
-type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string; grantId: string; delivery: DeliveryHealth }
+export type PushTestReceipt = { id: string; state: 'queued' | 'sending' | 'retrying' | 'accepted' | 'failed' | 'expired'; attempts: number; createdAt: number; updatedAt: number; nextRetryAt: number | null; failure: DeliveryFailure | null }
+type Device = { subscription: PushSubscription; preferences: PushPreferences; sessionHash: string; expiresAt: number; credentialVersion?: string; grantId: string; delivery: DeliveryHealth; lastTest?: PushTestReceipt }
 type PushNotice = { title: string; body: string; tag: string; data: { hostId?: string; threadId?: string; url: string; kind: 'completed' | 'approval' | 'errors' | 'test' } }
 type PendingNotice = { requestId?: RpcId; questionItemId?: string; questionCount?: number; deadline?: number }
 type OutboxDelivery = { id: string; endpoint: string; grantId: string; sessionHash: string; credentialVersion?: string; notice: PushNotice; createdAt: number; expiresAt: number; attempts: number; nextAttemptAt: number; metadataHost?: Host; failure?: DeliveryFailure; requestId?: RpcId; questionItemId?: string; questionCount?: number; answeredQuestionIndices?: number[] }
@@ -86,7 +87,8 @@ function titleText(value: unknown) {
 }
 type ThreadTitle = { name?: string; preview?: string; subagent?: boolean; ephemeral?: boolean; sourceKnown?: boolean; sourceChecked?: boolean }
 const failureSchema = z.enum(['provider_unavailable', 'rate_limited', 'timeout', 'rejected', 'metadata_pending', 'expired', 'queue_full'])
-const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), overflow: z.number().int().nonnegative().optional(), lastDeliveredAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
+const testReceiptSchema = z.object({ id: z.string().uuid(), state: z.enum(['queued', 'sending', 'retrying', 'accepted', 'failed', 'expired']), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), createdAt: z.number().nonnegative(), updatedAt: z.number().nonnegative(), nextRetryAt: z.number().nonnegative().nullable(), failure: failureSchema.nullable() }).strict()
+const healthSchema = z.object({ delivered: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), expired: z.number().int().nonnegative(), overflow: z.number().int().nonnegative().optional(), lastDeliveredAt: z.number().nonnegative().optional(), lastCompletedAcceptedAt: z.number().nonnegative().optional(), lastFailureAt: z.number().nonnegative().optional(), lastFailure: failureSchema.optional() }).strict()
 const noticeSchema = z.object({ title: z.string().max(100), body: z.string().max(100), tag: z.string().max(100), data: z.object({ hostId: z.string().max(256).optional(), threadId: z.string().max(256).optional(), url: z.string().max(4096), kind: z.enum(['completed', 'approval', 'errors', 'test']) }).strict() }).strict()
 const outboxSchema = z.object({ id: z.string().uuid(), endpoint: z.string().max(4096), grantId: z.string().uuid(), sessionHash: z.string().regex(/^[a-zA-Z0-9_-]{43}$/), credentialVersion: z.string().optional(), notice: noticeSchema, createdAt: z.number().nonnegative(), expiresAt: z.number().nonnegative(), attempts: z.number().int().min(0).max(MAX_ATTEMPTS), nextAttemptAt: z.number().nonnegative(), metadataHost: z.object({ id: z.string().min(1).max(256), name: z.string().max(256), kind: z.enum(['local', 'ssh']) }).strict().optional(), failure: failureSchema.optional(), requestId: z.union([z.string().max(256), z.number().int().safe()]).optional(), questionItemId: z.string().min(1).max(256).optional(), questionCount: z.number().int().min(1).max(1000).optional(), answeredQuestionIndices: z.array(z.number().int().min(0).max(999)).max(1000).optional() }).strict()
 function emptyHealth(): DeliveryHealth { return { delivered: 0, failed: 0, expired: 0 } }
@@ -179,7 +181,8 @@ export class PushService {
           if (subscription.expirationTime && subscription.expirationTime <= this.now()) continue
           const grantId = z.string().uuid().safeParse(device.grantId)
           const health = healthSchema.safeParse(device.delivery)
-          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt, grantId: grantId.success ? grantId.data : randomUUID(), delivery: health.success ? health.data : emptyHealth(), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : typeof device.credentialVersion === 'string' ? { credentialVersion: device.credentialVersion } : {}) })
+          const lastTest = testReceiptSchema.safeParse(device.lastTest)
+          this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(device.preferences), sessionHash: device.sessionHash, expiresAt: device.expiresAt, grantId: grantId.success ? grantId.data : randomUUID(), delivery: health.success ? health.data : emptyHealth(), ...(lastTest.success ? { lastTest: lastTest.data } : {}), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : typeof device.credentialVersion === 'string' ? { credentialVersion: device.credentialVersion } : {}) })
         } catch { /* Invalid or unsupported saved device data is never sent to the network. */ }
       }
       if (Array.isArray(saved.events)) for (const raw of saved.events.slice(-MAX_EVENTS)) {
@@ -191,7 +194,10 @@ export class PushService {
         if (!parsed.success) continue
         const job = parsed.data
         if (!job.notice.data.url.startsWith('/?') && job.notice.data.url !== '/') continue
-        if (job.expiresAt <= this.now() || job.attempts >= MAX_ATTEMPTS || !this.liveDevice(job)) continue
+        const device = this.liveDevice(job)
+        if (!device) continue
+        if (job.expiresAt <= this.now()) { this.updateTestReceipt(job, device, 'expired', null, 'expired'); continue }
+        if (job.attempts >= MAX_ATTEMPTS) { this.updateTestReceipt(job, device, 'failed', null, job.failure || 'provider_unavailable'); continue }
         this.outbox.set(job.id, job)
       }
       await this.save()
@@ -231,7 +237,10 @@ export class PushService {
     const expiresAt = Math.min(this.now() + GRANT_TTL, subscription.expirationTime || Infinity)
     const previous = this.devices.get(subscription.endpoint)
     const sameGrant = previous?.sessionHash === sessionHash && previous.credentialVersion === this.credentialVersion && previous.subscription.keys.auth === subscription.keys.auth && previous.subscription.keys.p256dh === subscription.keys.p256dh
-    this.devices.set(subscription.endpoint, { subscription, preferences: preferencesSchema.parse(preferences), sessionHash, expiresAt, grantId: sameGrant ? previous.grantId : randomUUID(), delivery: sameGrant ? previous.delivery : emptyHealth(), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : {}) })
+    const device: Device = { subscription, preferences: preferencesSchema.parse(preferences), sessionHash, expiresAt, grantId: sameGrant ? previous.grantId : randomUUID(), delivery: sameGrant ? previous.delivery : emptyHealth(), ...(sameGrant && previous.lastTest ? { lastTest: previous.lastTest } : {}), ...(this.credentialVersion ? { credentialVersion: this.credentialVersion } : {}) }
+    // Foreground renewal of the same grant must preserve the object observed by
+    // an in-flight provider call; its acknowledgement still belongs to this device.
+    this.devices.set(subscription.endpoint, sameGrant ? Object.assign(previous, device) : device)
     this.prune()
     await this.save()
     this.runDeliveries()
@@ -286,12 +295,35 @@ export class PushService {
     this.prune()
     if (this.closed || this.outbox.size >= this.maxOutbox) throw Object.assign(new Error('Push delivery queue is full; try again shortly'), { status: 503 })
     const job = this.newDelivery(device, { title: 'Codex', body: '后台通知已开启。', tag: `codex-push-test-${randomUUID()}`, data: { url: '/', kind: 'test' } })
+    const previousTest = device.lastTest
+    device.lastTest = { id: job.id, state: 'queued', attempts: 0, createdAt: job.createdAt, updatedAt: this.now(), nextRetryAt: null, failure: null }
     this.outbox.set(job.id, job)
     this.uncommitted.add(job.id)
-    try { await this.save() } catch (error) { this.outbox.delete(job.id); this.outcomes.delete(job.id); throw error }
+    try { await this.save() } catch (error) {
+      this.outbox.delete(job.id); this.outcomes.delete(job.id)
+      if (device.lastTest?.id === job.id) device.lastTest = previousTest
+      throw error
+    }
     finally { this.uncommitted.delete(job.id) }
     this.runDeliveries()
-    return { ok: true as const, queued: true as const }
+    return { ok: true as const, queued: true as const, deliveryId: job.id }
+  }
+
+  /** One current test per device, visible only to the grant's current login.
+   * Acceptance is a provider acknowledgement, never a handset display receipt. */
+  testStatus(sessionId: string, deliveryId: string): PushTestReceipt {
+    const sessionHash = hash(sessionId)
+    const device = [...this.devices.values()].find(device => device.sessionHash === sessionHash && this.authorized(device) && device.lastTest?.id === deliveryId)
+    if (!device?.lastTest) throw Object.assign(new Error('This test notification is unavailable; refresh notification status and try again'), { status: 404 })
+    return structuredClone(device.lastTest)
+  }
+
+  private updateTestReceipt(job: OutboxDelivery, device: Device, state: PushTestReceipt['state'], nextRetryAt: number | null = null, failure: DeliveryFailure | null = null) {
+    if (job.notice.data.kind !== 'test' || device.lastTest?.id !== job.id) return
+    // An older in-flight delivery must never overwrite a later test or undo an
+    // expiry recorded while its provider connection was still in flight.
+    if (['accepted', 'failed', 'expired'].includes(device.lastTest.state)) return
+    device.lastTest = { ...device.lastTest, state, attempts: job.attempts, updatedAt: this.now(), nextRetryAt, failure }
   }
 
   /** Own-device aggregate health only: no endpoint, keys, conversation text or credential hashes. */
@@ -305,6 +337,7 @@ export class PushService {
       delivered: own.reduce((sum, device) => sum + device.delivery.delivered, 0), failed: own.reduce((sum, device) => sum + device.delivery.failed, 0), expired: own.reduce((sum, device) => sum + device.delivery.expired, 0),
       nextRetryAt: queued.length ? Math.min(...queued.map(job => job.nextAttemptAt)) : null,
       lastDeliveredAt: Math.max(0, ...own.map(device => device.delivery.lastDeliveredAt || 0)) || null,
+      lastCompletedAcceptedAt: Math.max(0, ...own.map(device => device.delivery.lastCompletedAcceptedAt || 0)) || null,
       lastFailureAt: recent[0]?.lastFailureAt || null, lastFailure: recent[0]?.lastFailure || null }
   }
 
@@ -323,7 +356,7 @@ export class PushService {
     for (const [key, job] of this.outbox) {
       const device = this.liveDevice(job)
       if (device && job.expiresAt > this.now()) continue
-      if (device) { device.delivery.expired++; device.delivery.lastFailure = 'expired'; device.delivery.lastFailureAt = this.now() }
+      if (device) { device.delivery.expired++; device.delivery.lastFailure = 'expired'; device.delivery.lastFailureAt = this.now(); this.updateTestReceipt(job, device, 'expired', null, 'expired') }
       this.outbox.delete(key); this.finish(job, { error: providerError() }); changed = true
     }
     return changed
@@ -567,6 +600,7 @@ export class PushService {
     if (job.attempts >= MAX_ATTEMPTS || job.expiresAt <= this.now()) {
       this.outbox.delete(job.id); device.delivery.failed++
     }
+    this.updateTestReceipt(job, device, job.expiresAt <= this.now() ? 'expired' : this.outbox.has(job.id) ? 'retrying' : 'failed', this.outbox.has(job.id) ? job.nextAttemptAt : null, job.expiresAt <= this.now() ? 'expired' : failure)
     await this.save()
     this.finish(job, this.outbox.has(job.id) ? { ok: true, queued: true, retryAt: job.nextAttemptAt } : { error: providerError() })
   }
@@ -574,8 +608,9 @@ export class PushService {
   private async deliver(job: OutboxDelivery) {
     let device = this.liveDevice(job)
     if (!device || !this.outbox.has(job.id)) return
-    if (job.attempts >= MAX_ATTEMPTS) { this.outbox.delete(job.id); device.delivery.failed++; await this.save(); this.finish(job, { error: providerError() }); return }
+    if (job.attempts >= MAX_ATTEMPTS) { this.outbox.delete(job.id); device.delivery.failed++; this.updateTestReceipt(job, device, 'failed', null, job.failure || 'provider_unavailable'); await this.save(); this.finish(job, { error: providerError() }); return }
     job.attempts++
+    this.updateTestReceipt(job, device, 'sending')
     // Record attempts before dispatch, including metadata failures, so crashes and
     // permanent upstream failures cannot cause unlimited restart retries.
     await this.save()
@@ -597,7 +632,11 @@ export class PushService {
         this.send(device.subscription, JSON.stringify(job.notice), { vapidDetails: this.keys, TTL: Math.max(1, Math.ceil((job.expiresAt - this.now()) / 1000)), timeout: 10000, contentEncoding: 'aes128gcm', urgency: 'high', topic: hash(job.notice.tag).slice(0, 32) }),
         new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(Object.assign(new Error('Push delivery timed out'), { code: 'ETIMEDOUT' })), 12000); deadline.unref() }),
       ])
-      if (this.liveDevice(job) === device) { device.delivery.delivered++; device.delivery.lastDeliveredAt = this.now() }
+      if (this.liveDevice(job) === device) {
+        device.delivery.delivered++; device.delivery.lastDeliveredAt = this.now()
+        if (job.notice.data.kind === 'completed') device.delivery.lastCompletedAcceptedAt = this.now()
+        this.updateTestReceipt(job, device, 'accepted')
+      }
     } catch (error) {
       const status = (error as { statusCode?: number })?.statusCode
       if (!this.outbox.has(job.id) || this.liveDevice(job) !== device) return
@@ -608,7 +647,7 @@ export class PushService {
         const retryAfter = typeof rawRetry === 'string' ? /^\d+$/.test(rawRetry) ? Number(rawRetry) * 1000 : Math.max(0, Date.parse(rawRetry) - this.now()) : undefined
         await this.retry(job, device, status === 429 ? 'rate_limited' : (error as { code?: string })?.code === 'ETIMEDOUT' ? 'timeout' : 'provider_unavailable', retryAfter)
       } else {
-        this.outbox.delete(job.id); device.delivery.failed++; device.delivery.lastFailureAt = this.now(); device.delivery.lastFailure = 'rejected'; await this.save(); this.finish(job, { error: providerError() })
+        this.outbox.delete(job.id); device.delivery.failed++; device.delivery.lastFailureAt = this.now(); device.delivery.lastFailure = 'rejected'; this.updateTestReceipt(job, device, 'failed', null, 'rejected'); await this.save(); this.finish(job, { error: providerError() })
       }
       return
     } finally { clearTimeout(deadline) }
@@ -644,5 +683,9 @@ export function registerPush(app: Express, push: PushService) {
   app.post('/api/push/test', route(async (req: AuthenticatedRequest, res) => {
     const result = await push.test(req.session!.id, endpointBody.parse(req.body).endpoint)
     res.status(result.queued ? 202 : 200).json(result)
+  }))
+  app.get('/api/push/test/:id', route((req: AuthenticatedRequest, res) => {
+    const deliveryId = z.string().uuid().parse(req.params.id)
+    res.json(push.testStatus(req.session!.id, deliveryId))
   }))
 }

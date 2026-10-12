@@ -3,6 +3,15 @@ import { pushTargetFromUrl } from './push-navigation';
 
 export type PushPreferences = { completed: boolean; approval: boolean; errors: boolean };
 export type PushDestination = { hostId: string; threadId: string };
+export type PushTestReceipt = {
+  id: string;
+  state: 'queued' | 'sending' | 'retrying' | 'accepted' | 'failed' | 'expired';
+  attempts: number;
+  createdAt: number;
+  updatedAt: number;
+  nextRetryAt: number | null;
+  failure: string | null;
+};
 type PushConfig = { enabled: boolean; publicKey: string; reason?: string };
 type HttpApi = { requestHttp(path: string, init?: RequestInit, reportError?: boolean): Promise<any>; runtimeIdentity?(): { authenticationGeneration?: number } };
 type InstallPrompt = Event & { prompt(): Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }> };
@@ -572,7 +581,8 @@ export async function saveDevicePushPreferences(api: HttpApi, preferences: PushP
 
 export async function testDevicePush(api: HttpApi) {
   const generation = deviceAuthGeneration;
-  const current = () => generation === deviceAuthGeneration;
+  const authentication = api.runtimeIdentity?.().authenticationGeneration;
+  const current = () => generation === deviceAuthGeneration && authentication === api.runtimeIdentity?.().authenticationGeneration;
   if (deviceInitialization) await deviceInitialization;
   if (!current()) return;
   if (pwaState.pushBusy) throw new Error('请等待当前通知操作完成');
@@ -584,7 +594,8 @@ export async function testDevicePush(api: HttpApi) {
     subscription = await deadline(registration ? registration.pushManager.getSubscription() : Promise.resolve(null));
     if (!current()) return;
     if (!subscription) throw new Error('先在这台设备启用通知');
-    return await pushHttp(api, '/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
+    const result = await pushHttp(api, '/push/test', { method: 'POST', body: JSON.stringify({ endpoint: subscription.endpoint }), signal: AbortSignal.timeout(20000) }, false);
+    if (current()) return result;
   } catch (cause: any) {
     if (!current()) return;
     if (cause.status === 410 && subscription) {
@@ -594,7 +605,15 @@ export async function testDevicePush(api: HttpApi) {
     }
     pwaState.pushError = cause.message || '无法发送测试通知';
     throw cause;
-  } finally { if (current()) pwaState.pushBusy = false; finishDeviceOperation(); }
+  } finally { if (generation === deviceAuthGeneration) pwaState.pushBusy = false; finishDeviceOperation(); }
+}
+
+/** Read an existing test only; retrying this request never sends another notification. */
+export async function readDevicePushTest(api: HttpApi, id: string, signal?: AbortSignal): Promise<PushTestReceipt> {
+  const result = await pushHttp(api, `/push/test/${encodeURIComponent(id)}`, { signal }, false);
+  if (result?.id !== id || !['queued', 'sending', 'retrying', 'accepted', 'failed', 'expired'].includes(result.state))
+    throw new Error('无法识别测试通知状态，请刷新通知状态后重试。');
+  return result;
 }
 
 export async function testSystemNotification() {
@@ -611,13 +630,13 @@ export async function testSystemNotification() {
     const worker = await initPwa();
     if (!current()) return;
     if (!worker) throw new Error('通知服务尚未就绪，请刷新后重试');
-    await worker.showNotification('Codex 系统通知检查', {
+    await deadline(worker.showNotification('Codex 系统通知检查', {
       body: '收到这条通知表示应用的系统通知可以正常显示。',
       icon: '/icons/icon-command-192.png',
       badge: '/icons/icon-command-192.png',
       tag: `codex-system-test-${Date.now()}`,
       data: {},
-    });
+    }), 15000, '系统通知检查超时，请刷新通知状态后重试。');
   } catch (cause: any) {
     if (!current()) return;
     pwaState.pushError = cause.message || '无法显示系统通知';
