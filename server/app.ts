@@ -1,6 +1,7 @@
 import { nativeWorktreeWriters } from './worktree-writers.js';
 import { AutomationService, registerAutomations } from './automations.js';
 import { ThreadTitleService } from './thread-titles.js'
+import { NativeProjects } from './native-projects.js'
 import express, { type ErrorRequestHandler, type RequestHandler } from 'express'
 import multer from 'multer'
 import http from 'node:http'
@@ -106,6 +107,7 @@ export async function createApp(options: AppOptions = {}) {
   }
   const app = express()
   const titleService = threadTitles = new ThreadTitleService({ getBridge })
+  const nativeProjects = new NativeProjects({ storage, getBridge })
   app.disable('x-powered-by')
   if (options.trustProxy ?? process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
   app.use((_req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'SAMEORIGIN' }); next() })
@@ -124,7 +126,9 @@ export async function createApp(options: AppOptions = {}) {
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
   app.use('/api', auth.requireAuth, auth.requireCsrf)
   registerPush(app, push)
-  automations = new AutomationService(dataDir, { getBridge, getHost: id => storage.host(id) })
+  automations = new AutomationService(dataDir, { getBridge, getHost: id => storage.host(id),
+    resolveProject: async (hostId, directory) => (await nativeProjects.resolveForCwd(hostId, directory))?.projectId ?? null,
+  })
   await automations.initialize()
   registerAutomations(app, automations)
   registerTmux(app, { getBridge })
@@ -199,6 +203,10 @@ export async function createApp(options: AppOptions = {}) {
     res.json({ ok: true })
   })))
   app.get('/api/projects', asyncRoute(async (_req, res) => res.json({ projects: await storage.projects() })))
+  app.post('/api/projects/resolve-native', asyncRoute(async (req, res) => {
+    const fields = z.object({ hostId: z.string().min(1).max(256), path: absolutePath }).strict().parse(req.body)
+    res.json(await nativeProjects.resolve(fields.hostId, fields.path))
+  }))
   app.post('/api/projects', asyncRoute(async (req, res) => {
     const { path: projectPath, name, hostId, rootPaths } = z.object({ path: absolutePath, rootPaths: z.array(absolutePath).max(12).optional(), name: z.string().min(1).max(256).optional(), hostId: z.string().default('local') }).parse(req.body)
     const bridge = await getBridge(hostId)

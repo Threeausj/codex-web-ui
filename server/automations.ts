@@ -48,7 +48,7 @@ export function nextAutomationAt(spec: Pick<AutomationInput, 'cadence' | 'timezo
   throw new Error('无法计算下一次执行时间');
 }
 
-type Dependencies = { getBridge(hostId: string): Promise<Bridge>; getHost(hostId: string): Host | undefined; now?: () => number };
+type Dependencies = { getBridge(hostId: string): Promise<Bridge>; getHost(hostId: string): Host | undefined; resolveProject?(hostId: string, cwd: string): Promise<string | null>; now?: () => number };
 export class AutomationService {
   private tasks: Automation[] = [];
   private runs: AutomationRun[] = [];
@@ -204,9 +204,11 @@ export class AutomationService {
       await bridge.connect();
       if (this.closed) return;
       run.engineId = bridge.runtime.engineId;
+      const projectId = await this.dependencies.resolveProject?.(run.spec.hostId, run.spec.cwd);
+      if (this.closed) return;
       this.note(run, 'creating', '正在创建独立执行会话'); await this.save();
       if (this.closed) return;
-      const result = await bridge.request('thread/start', { cwd: run.spec.cwd, model: run.spec.model || undefined, sandbox: run.spec.permission, approvalPolicy: 'never', historyMode: 'paginated' }, 30000) as any;
+      const result = await bridge.request('thread/start', { cwd: run.spec.cwd, model: run.spec.model || undefined, sandbox: run.spec.permission, approvalPolicy: 'never', historyMode: 'paginated', ...(projectId ? { projectId } : {}) }, 30000) as any;
       if (!result?.thread?.id || result.thread.ephemeral) throw new Error('Codex 未返回正式会话 ID');
       run.threadId = result.thread.id; await this.save();
       if (this.closed) return;
