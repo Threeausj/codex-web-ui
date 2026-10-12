@@ -352,6 +352,8 @@ for (const target of [
   { scope: 'custom', value: '检查登录重启和注销竞态', expected: { type: 'custom', instructions: '检查登录重启和注销竞态' } },
 ]) {
   test(`native review chooses ${target.scope} on a native thread without a synthetic user prompt`, async ({ page, mock }) => {
+    mock.nativeProjectSupported = true;
+    mock.nativeProjectIds.set(JSON.stringify(['local', root]), 'native-review-project');
     await installGit(page, mock);
     await login(page);
     await slash(page, 'review');
@@ -363,7 +365,8 @@ for (const target of [
     await dialog.getByRole('button', { name: '开始审阅', exact: true }).click();
     await expect(dialog).toHaveCount(0);
     expect(mock.request('review/start')?.params).toMatchObject({ delivery: 'inline', target: target.expected });
-    expect(mock.request('thread/start')?.params).toMatchObject({ cwd: root, sandbox: 'workspace-write', approvalPolicy: 'on-request' });
+    expect(mock.request('thread/start')?.params).toMatchObject({ cwd: root, projectId: 'native-review-project', sandbox: 'workspace-write', approvalPolicy: 'on-request' });
+    expect(mock.nativeProjectResolutions).toEqual([{ hostId: 'local', path: root }]);
     expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(0);
     await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
   });
@@ -385,6 +388,29 @@ test('review validates commit and custom scopes and preserves the existing compo
   await dialog.getByRole('button', { name: '关闭代码审阅', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('未发送的审阅前草稿');
   expect(mock.request('review/start')).toBeUndefined();
+});
+
+test('a welcome review waits for native project confirmation and retries without creating an unassigned review thread', async ({ page, mock }) => {
+  await installGit(page, mock);
+  let attempts = 0;
+  await page.route('**/api/projects/resolve-native', route => {
+    attempts++;
+    return attempts === 1
+      ? route.fulfill({ status: 503, json: { error: '审阅项目连接暂时失败' } })
+      : route.fulfill({ json: { supported: true, projectId: 'native-retried-review-project' } });
+  });
+  await login(page);
+  await slash(page, 'review');
+  const dialog = page.getByRole('dialog', { name: '代码审阅', exact: true });
+  await dialog.getByRole('button', { name: '开始审阅', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('审阅项目连接暂时失败');
+  expect(mock.request('thread/start')).toBeUndefined();
+  expect(mock.request('review/start')).toBeUndefined();
+  await dialog.getByRole('button', { name: '开始审阅', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(mock.requests.filter(request => request.method === 'thread/start')).toHaveLength(1);
+  expect(mock.request('thread/start')?.params.projectId).toBe('native-retried-review-project');
+  expect(mock.request('review/start')).toBeDefined();
 });
 
 test('an existing review applies the current full-access policy before starting the review turn', async ({ page, mock }) => {
@@ -436,11 +462,13 @@ test('welcome review stays locked after creating its thread and shows a settings
 });
 
 test('creating from a starting branch prepares a worktree conversation and binds the first real message to its cwd', async ({ page, mock }) => {
+  mock.nativeProjectSupported = true;
   const git = await installGit(page);
   await login(page);
   const panel = await openGit(page);
   await panel.getByText('创建独立工作树', { exact: true }).click();
   const destination = '/workspace/new-worktree-thread';
+  mock.nativeProjectIds.set(JSON.stringify(['local', destination]), 'native-worktree-project');
   await panel.getByRole('textbox', { name: '工作树绝对路径' }).fill(destination);
   await panel.getByRole('textbox', { name: '工作树新分支名称' }).fill('feature/new-thread');
   await panel.getByRole('combobox', { name: '工作树起始分支' }).selectOption('feature/existing');
@@ -453,6 +481,8 @@ test('creating from a starting branch prepares a worktree conversation and binds
   await send(page, '在此工作树开始实现');
   await expect(page.locator('.agent-message').last()).toContainText('流式回复完成');
   expect(mock.request('thread/start')?.params.cwd).toBe(destination);
+  expect(mock.request('thread/start')?.params.projectId).toBe('native-worktree-project');
+  expect(mock.nativeProjectResolutions).toEqual([{ hostId: 'local', path: destination }]);
   expect(mock.request('turn/start')?.params.threadId).toBe(mock.request('thread/start')?.params ? mock.threads[0]!.id : '');
 });
 

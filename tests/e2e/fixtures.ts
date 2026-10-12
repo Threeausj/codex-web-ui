@@ -74,6 +74,9 @@ export class MockCodex {
   asyncStatusRequests: { hostId: string; threadId: string; itemId: string; turnId: string | null }[] = [];
   asyncStatusOverride: boolean | null = null;
   uploads: { body: Buffer; contentType: string }[] = [];
+  nativeProjectResolutions: { hostId: string; path: string }[] = [];
+  nativeProjectSupported = false;
+  nativeProjectIds = new Map<string, string>();
   sockets: WebSocketRoute[] = [];
   authenticated = false;
   requireApprovalNext = false;
@@ -323,6 +326,12 @@ export class MockCodex {
             };
           }
           return respond({ preferences: this.preferences });
+        case "/api/projects/resolve-native": {
+          const fields = request.postDataJSON();
+          this.nativeProjectResolutions.push(fields);
+          const projectId = this.nativeProjectIds.get(JSON.stringify([fields.hostId, fields.path]));
+          return respond({ projectId: this.nativeProjectSupported ? projectId ?? null : null, supported: this.nativeProjectSupported });
+        }
         case "/api/projects": {
           if (request.method() === "POST") {
             const fields = request.postDataJSON();
@@ -510,6 +519,7 @@ export class MockCodex {
         const thread = {
           ...makeThread(`thread-${++this.count}`, "新的测试对话"),
           cwd: p.cwd || workspace,
+          projectId: p.projectId ?? null,
         };
         this.threads.unshift(thread);
         this.turns.set(thread.id, []);

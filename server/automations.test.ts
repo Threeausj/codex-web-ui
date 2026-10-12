@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { AutomationService, nextAutomationAt, type AutomationInput, type AutomationRun } from './automations.js';
 const host = { id: 'local', name: 'Fixture', kind: 'local' as const };
 const spec: AutomationInput = { name: 'Review', hostId: 'local', cwd: '/fixture', prompt: 'Review the project', model: 'fixture', effort: 'high', permission: 'read-only', timezone: 'Asia/Shanghai', cadence: { kind: 'interval', minutes: 5 }, enabled: true, maxRetries: 1 };
-async function fixture() {
+async function fixture(resolveProject?: (hostId: string, cwd: string) => Promise<string | null>) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-automation-'));
   let clock = Date.parse('2026-10-08T00:00:00Z'); const calls: any[] = []; let count = 0; let failure: any;
   const bridge: any = { paused: false, runtime: { engineId: 'fixture-engine' }, connect: async () => { if (failure?.connecting) throw new Error('offline'); }, request: async (method: string, params: any) => {
@@ -18,7 +18,7 @@ async function fixture() {
     if (method === 'thread/turns/list') return { data: [{ id: `turn-${count}`, status: 'completed' }], nextCursor: null };
     return {};
   } };
-  const dependencies = { getBridge: async () => bridge, getHost: (id: string) => id === 'local' ? host : undefined, now: () => clock };
+  const dependencies = { getBridge: async () => bridge, getHost: (id: string) => id === 'local' ? host : undefined, resolveProject, now: () => clock };
   let service = new AutomationService(directory, dependencies); await service.initialize(false);
   const settle = async () => {
     const deadline = Date.now() + 10000;
@@ -111,6 +111,39 @@ test('pre-dispatch connection failures recover using bounded retries; paused sch
     const task = await f.service.put({ ...spec, enabled: false }); f.advance(30 * 60000); await f.service.tick(); assert.equal(f.calls.length, 0);
     f.setFailure({ connecting: true }); await f.service.runNow(task.id); await f.settle(); assert.equal(f.service.list().runs[0]!.phase, 'failed');
     f.setFailure(null); f.advance(30000); await f.service.tick(); await f.settle(); assert.equal(f.service.list().runs[0]!.phase, 'running'); assert.equal(f.service.list().runs[0]!.attempt, 2); assert.equal(f.service.list().runs[0]!.error, undefined);
+  } finally { await f.close(); }
+});
+
+test('automation resolves its saved native project before creating the durable execution thread', async () => {
+  const resolved: { hostId: string; cwd: string }[] = [];
+  const f = await fixture(async (hostId, cwd) => { resolved.push({ hostId, cwd }); return 'native-project'; });
+  try {
+    const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+    assert.deepEqual(resolved, [{ hostId: 'local', cwd: '/fixture' }]);
+    assert.equal(f.calls.find(call => call.method === 'thread/start').params.projectId, 'native-project');
+    assert.equal(f.service.list().runs[0]!.phase, 'running');
+  } finally { await f.close(); }
+});
+
+test('automation without a native project preserves cwd-only creation', async () => {
+  const f = await fixture(async () => null);
+  try {
+    const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+    assert.equal(Object.hasOwn(f.calls.find(call => call.method === 'thread/start').params, 'projectId'), false);
+  } finally { await f.close(); }
+});
+
+test('failed project resolution retries before dispatch without creating an uncertain thread', async () => {
+  let fail = true;
+  const f = await fixture(async () => { if (fail) throw new Error('Project lookup timed out'); return 'native-recovered'; });
+  try {
+    const task = await f.service.put(spec); await f.service.runNow(task.id); await f.settle();
+    assert.equal(f.calls.filter(call => call.method === 'thread/start').length, 0);
+    assert.equal(f.service.list().runs[0]!.phase, 'failed');
+    assert.equal(f.service.list().runs[0]!.retryAt, f.clock() + 30000);
+    fail = false; f.advance(30000); await f.service.tick(); await f.settle();
+    assert.equal(f.calls.find(call => call.method === 'thread/start').params.projectId, 'native-recovered');
+    assert.equal(f.service.list().runs[0]!.phase, 'running');
   } finally { await f.close(); }
 });
 

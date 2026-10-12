@@ -1493,6 +1493,16 @@ function receive(message: any) {
     return;
   }
   if (method === "thread/started") updateThread(p.thread);
+  if (method === "thread/project/updated" &&
+      (p.projectId === null || typeof p.projectId === 'string')) {
+    const thread = state.threads.find(entry => entry.id === p.threadId)
+      ?? (state.activeThread?.id === p.threadId ? state.activeThread : undefined);
+    if (thread) {
+      updateThread({ ...thread, projectId: p.projectId });
+      scheduleConversationSnapshot(p.threadId);
+    }
+    return;
+  }
   if (method === "thread/reverted") {
     const key = recencyKey(state.hostId, p.threadId);
     if (localReverts.delete(key)) return;
@@ -2842,6 +2852,24 @@ function sandboxPolicy(
 function approvalPolicy(permission = state.permission): any {
   return permission === "danger-full-access" ? "never" : "on-request";
 }
+/** Native project membership is separate from a thread's tool working directory. */
+async function resolveNativeProjectIdentity(hostId: string, cwd: string): Promise<string | undefined> {
+  const projects = state.projects.filter(entry => (entry.hostId || 'local') === hostId);
+  let project = projects.find(entry => entry.path === cwd);
+  if (!project) {
+    const secondary = projects.filter(entry => (entry.rootPaths || []).includes(cwd));
+    if (secondary.length > 1) throw new Error('当前目录属于多个项目，请明确选择项目后发送');
+    project = secondary[0];
+  }
+  if (!project) return undefined;
+  const result = await http('/projects/resolve-native', {
+    method: 'POST', body: JSON.stringify({ hostId, path: project.path }),
+  }, false);
+  if (result.supported === false && result.projectId === null) return undefined;
+  if (result.supported !== true || typeof result.projectId !== 'string' || !result.projectId.trim())
+    throw new Error('无法确认项目归属，请重试后发送');
+  return result.projectId;
+}
 async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = [], delivery: "immediate" | "queue" = "immediate") {
   if (messageQueue?.state.uncertain) throw fail(new Error('上一项队列操作尚未确认，请先核对队列和对话后恢复发送。'));
   if (state.compacting) throw fail(new Error('正在压缩上下文，请等待压缩完成后发送。'));
@@ -2873,6 +2901,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     throw fail(new Error("Goal 目标需要 1–4000 个字符，请填写目标后发送"));
   const hostId = state.hostId;
   const generation = selectionGeneration;
+  const authentication = authenticationGeneration;
   const cwd = state.projectPath;
   const model = state.model;
   const serviceTier = serviceTierParams(state);
@@ -2964,9 +2993,14 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   }
   try {
     if (!id) {
+      const projectId = await resolveNativeProjectIdentity(hostId, cwd);
+      if (hostId !== state.hostId || generation !== selectionGeneration ||
+          authentication !== authenticationGeneration || !state.authenticated || state.activeThread || cwd !== state.projectPath)
+        throw new Error('新对话位置已变化，消息尚未发送，请在目标项目重新确认');
       const result = await rpc("thread/start", {
         ...serviceTier,
         cwd,
+        ...(projectId ? { projectId } : {}),
         runtimeWorkspaceRoots: workspaceRoots,
         model: model || undefined,
         sandbox: permission as any,
@@ -3535,8 +3569,14 @@ async function startWorkflowThread() {
   const hostId = state.hostId;
   const generation = selectionGeneration;
   const authentication = authenticationGeneration;
+  const options = workflowThreadOptions();
+  const projectId = await resolveNativeProjectIdentity(hostId, options.cwd);
+  if (hostId !== state.hostId || generation !== selectionGeneration ||
+      authentication !== authenticationGeneration || !state.authenticated || state.activeThread || options.cwd !== state.projectPath)
+    throw new Error('工作区已切换，新会话尚未创建；请在目标项目重新确认。');
   const result = await rpc('thread/start', {
-    ...workflowThreadOptions(),
+    ...options,
+    ...(projectId ? { projectId } : {}),
     historyMode: 'paginated',
   });
   if (hostId !== state.hostId || generation !== selectionGeneration || authentication !== authenticationGeneration)
