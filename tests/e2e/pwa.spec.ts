@@ -94,6 +94,7 @@ async function capturePushApi(page: Page, calls: PushCall[], options: { tab?: st
     if (pathname.endsWith("/config")) return route.fulfill({ json: { enabled: true, publicKey: options.key ?? publicKey } });
     if (pathname.endsWith('/status')) return route.fulfill({ json: { devices: 1, queued: 0, retrying: 0, delivered: 0, failed: 0, expired: 0, nextRetryAt: null, lastDeliveredAt: null, lastFailureAt: null, lastFailure: null } });
     calls.push({ method: request.method(), pathname, body: request.postDataJSON(), csrf: request.headers()["x-csrf-token"], tab: options.tab });
+    if (pathname.includes('/test/')) return route.fulfill({ status: 404, json: { error: 'Unknown test receipt' } });
     if (pathname.endsWith("/test") && options.testStatus) return route.fulfill({ status: options.testStatus, json: { error: "Notification subscription has expired" } });
     return route.fulfill({ json: { ok: true, expiresAt: Date.now() + 2_592_000_000 } });
   });
@@ -375,11 +376,11 @@ test('push tests show pending, acceptance and failure; a separate local test che
   await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
   await expect.poll(() => testRequests).toBe(1);
   await expect(page.getByRole('button', { name: '正在发送…', exact: true })).toBeDisabled();
-  await expect(page.getByRole('status')).toContainText('正在发送测试通知…');
+  await expect(page.getByLabel('通知操作结果').getByRole('status')).toContainText('正在发送测试通知…');
   release();
-  await expect(page.getByRole('status')).toContainText('推送服务已接收测试通知，请查看系统通知。');
+  await expect(page.getByLabel('通知操作结果').getByRole('status')).toContainText('服务器已接收测试通知请求，请查看系统通知。');
   await page.getByRole('button', { name: '检查系统通知', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('系统通知已发出，请查看通知栏。');
+  await expect(page.getByLabel('通知操作结果').getByRole('status')).toContainText('系统通知已发出，请查看通知栏。');
   expect(await page.evaluate(() => (window as any).systemNotifications)).toEqual([
     { title: 'Codex 系统通知检查', options: expect.objectContaining({ data: {}, tag: expect.stringContaining('codex-system-test-') }) },
   ]);
@@ -463,7 +464,7 @@ test('backgrounding a pending push test bypasses a cached anonymous session and 
     expect(sessionRequests.length).toBeGreaterThan(before);
     expect(sessionRequests.slice(before).every(url => !!url.searchParams.get('_request'))).toBe(true);
     release();
-    await expect(page.getByRole('status')).toContainText('推送服务已接收测试通知');
+    await expect(page.getByLabel('通知操作结果').getByRole('status')).toContainText('服务器已接收测试通知请求');
     await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
     expect(testRequests).toBe(1);
     expect(mock.request('turn/start')).toBeUndefined();
@@ -700,7 +701,7 @@ test('a late push test from a signed-out login cannot change a fresh login or it
   await expect(page.getByText('Old device endpoint expired', { exact: true })).toHaveCount(0);
 });
 
-test('queued test notifications show retry acceptance instead of claiming provider delivery and recover the status', async ({ page }) => {
+test('legacy queued test notifications show neutral queue acceptance and do not claim provider delivery from aggregate health', async ({ page }) => {
   await installPushFixture(page, { active: true, permission: 'granted' });
   const calls: PushCall[] = [];
   await capturePushApi(page, calls);
@@ -717,8 +718,10 @@ test('queued test notifications show retry acceptance instead of claiming provid
   await loginBuilt(page);
   await openPushSettings(page);
   await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('测试通知已保存，服务器会自动重试');
-  await expect(page.getByRole('status')).not.toContainText('推送服务已接收测试通知');
+  const feedback = page.getByLabel('通知操作结果');
+  await expect(feedback).toContainText('服务器已接收测试通知，正在等待发送');
+  await expect(feedback).not.toContainText('推送服务暂时不可用');
+  await expect(feedback).not.toContainText('推送服务已接收本次测试通知');
   const health = page.getByLabel('推送投递状态');
   await expect(health).toContainText('待发送 1 条');
   await expect(health).toContainText('自动重试 1 条');
@@ -729,6 +732,229 @@ test('queued test notifications show retry acceptance instead of claiming provid
   await expect(health).toContainText('推送服务已接收 1 条');
   await expect(health).not.toContainText('待发送');
   await expect(health).not.toContainText('推送服务限流');
+  await expect(feedback).not.toContainText('推送服务已接收本次测试通知');
+});
+
+const receiptId = 'ace11bf3-36d4-43b8-8efb-11f97792980e';
+function pushReceipt(state: 'queued' | 'sending' | 'retrying' | 'accepted' | 'failed' | 'expired', fields: Record<string, any> = {}) {
+  return { id: receiptId, state, attempts: state === 'queued' ? 0 : 1, createdAt: Date.now(), updatedAt: Date.now(), nextRetryAt: null, failure: null, ...fields };
+}
+
+test('mobile test feedback stays beside the button and follows only its own receipt, without duplicate sends', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  await page.route('**/api/push/status*', route => route.fulfill({ json: { devices: 4, queued: 0, retrying: 0, delivered: 999, failed: 0, expired: 0 } }));
+  let sendRoute: import('@playwright/test').Route | undefined;
+  let sends = 0; let receipt = pushReceipt('queued');
+  await page.route('**/api/push/test', route => { sends++; sendRoute = route; });
+  await page.route('**/api/push/test/*', route => route.fulfill({ json: receipt }));
+  await page.addInitScript(() => { ServiceWorkerRegistration.prototype.showNotification = async () => {}; });
+  await loginBuilt(page);
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  const feedback = page.getByLabel('通知操作结果');
+  await expect(feedback).toContainText('正在发送测试通知');
+  await expect(feedback).toBeInViewport();
+  await expect(feedback.locator('span')).toBeInViewport();
+  await expect.poll(() => !!sendRoute).toBe(true);
+  await sendRoute!.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } });
+  await expect(feedback).toContainText('正在等待发送');
+  await expect(feedback).not.toContainText('推送服务已接收本次测试通知');
+  await expect(page.getByRole('button', { name: '等待测试状态…', exact: true })).toBeDisabled();
+  // A local display check keeps the remote receipt, and cannot unlock a duplicate send.
+  await page.getByRole('button', { name: '检查系统通知', exact: true }).click();
+  await expect(feedback).toContainText('系统通知已发出');
+  await expect(page.getByRole('button', { name: '等待测试状态…', exact: true })).toBeDisabled();
+  receipt = pushReceipt('accepted');
+  await page.getByRole('button', { name: '刷新本次测试', exact: true }).click();
+  await expect(feedback).toContainText('推送服务已接收本次测试通知，不代表手机已显示');
+  await expect(feedback).toBeInViewport();
+  await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+  expect(sends).toBe(1);
+});
+
+test('test receipt polling shows a retry reason and time, then provider acceptance without sending again', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let receipt = pushReceipt('retrying', { failure: 'rate_limited', nextRetryAt: Date.now() + 60000 });
+  let sends = 0; let reads = 0;
+  await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+  await page.route('**/api/push/test/*', route => { reads++; return route.fulfill({ json: receipt }); });
+  await loginBuilt(page); await openPushSettings(page); await page.clock.install();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  const feedback = page.getByLabel('通知操作结果');
+  await expect(feedback).toContainText('本次测试正在自动重试：推送服务限流；下次');
+  await expect(feedback).not.toContainText('推送服务已接收本次测试通知');
+  receipt = pushReceipt('accepted');
+  await page.clock.runFor(3001);
+  await expect(feedback).toContainText('推送服务已接收本次测试通知，不代表手机已显示');
+  expect(reads).toBe(2); expect(sends).toBe(1);
+  await page.clock.fastForward(10000);
+  expect(reads).toBe(2);
+});
+
+test('a test finishing during an old aggregate status read queues a fresh read instead of losing its refresh', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let held: import('@playwright/test').Route | undefined;
+  let reads = 0;
+  await page.route('**/api/push/status*', route => {
+    reads++;
+    if (reads === 1) { held = route; return; }
+    return route.fulfill({ json: { devices: 1, queued: 0, retrying: 0, delivered: 7, failed: 0, expired: 0 } });
+  });
+  await page.route('**/api/push/test', route => route.fulfill({ status: 202, json: { ok: true, queued: true } }));
+  await loginBuilt(page); await openPushSettings(page);
+  await expect.poll(() => !!held).toBe(true);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect(page.getByLabel('通知操作结果')).toContainText('服务器已接收测试通知');
+  await held!.fulfill({ json: { devices: 1, queued: 0, retrying: 0, delivered: 0, failed: 0, expired: 0 } });
+  await expect.poll(() => reads).toBe(2);
+  await expect(page.getByLabel('推送投递状态')).toContainText('推送服务已接收 7 条');
+  await expect(page.getByLabel('通知操作结果')).not.toContainText('推送服务已接收本次测试通知');
+});
+
+for (const outcome of ['failed', 'expired', 'missing'] as const) {
+  test(`a ${outcome} test receipt reports recovery without signing out, discarding a draft or replaying actions`, async ({ page, mock }) => {
+    await installPushFixture(page, { active: true, permission: 'granted' });
+    await capturePushApi(page, []);
+    let sends = 0;
+    await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+    await page.route('**/api/push/test/*', route => outcome === 'missing'
+      ? route.fulfill({ status: 404, json: { error: 'Test record no longer exists' } })
+      : route.fulfill({ json: pushReceipt(outcome, { failure: outcome === 'failed' ? 'rejected' : 'expired' }) }));
+    await loginBuilt(page);
+    await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('通知失败保留的草稿');
+    await openPushSettings(page);
+    await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+    await expect(page.getByLabel('通知操作结果').getByRole('alert')).toContainText(outcome === 'failed' ? '本次测试发送失败' : outcome === 'expired' ? '本次测试通知已过期' : '本次测试记录已失效或无法访问');
+    await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+    await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+    await page.getByRole('button', { name: '关闭设置', exact: true }).click();
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('通知失败保留的草稿');
+    expect(sends).toBe(1); expect(mock.request('turn/start')).toBeUndefined();
+  });
+}
+
+test('offline test receipt queries resume without repeating the push or logging out', async ({ page, context }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let receipt = pushReceipt('queued'); let sends = 0; let reads = 0;
+  await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+  await page.route('**/api/push/test/*', route => { reads++; return route.fulfill({ json: receipt }); });
+  await loginBuilt(page); await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => reads).toBe(1);
+  await context.setOffline(true);
+  await expect(page.getByLabel('通知操作结果')).toContainText('网络恢复后继续查询');
+  receipt = pushReceipt('accepted');
+  await context.setOffline(false);
+  await expect(page.getByLabel('通知操作结果')).toContainText('推送服务已接收本次测试通知');
+  expect(sends).toBe(1);
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+});
+
+test('receipt queries stop after two minutes and a manual refresh reads the same test without sending again', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let receipt = pushReceipt('queued'); let sends = 0; let reads = 0;
+  await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+  await page.route('**/api/push/test/*', route => { reads++; return route.fulfill({ json: receipt }); });
+  await loginBuilt(page); await openPushSettings(page); await page.clock.install();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => reads).toBe(1);
+  await page.clock.fastForward(120001);
+  await expect(page.getByLabel('通知操作结果').getByRole('alert')).toContainText('本次测试状态查询已暂停');
+  const stopped = reads;
+  await page.clock.fastForward(30000);
+  expect(reads).toBe(stopped);
+  receipt = pushReceipt('accepted');
+  await page.getByRole('button', { name: '刷新本次测试', exact: true }).click();
+  await expect(page.getByLabel('通知操作结果')).toContainText('推送服务已接收本次测试通知');
+  expect(sends).toBe(1);
+});
+
+test('a hung receipt read times out with recovery feedback and a successful GET clears it without sending twice', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let sends = 0; let reads = 0; let held: import('@playwright/test').Route | undefined;
+  await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+  await page.route('**/api/push/test/*', route => {
+    reads++;
+    if (reads === 1) { held = route; return; }
+    return route.fulfill({ json: pushReceipt('accepted') });
+  });
+  await loginBuilt(page); await openPushSettings(page); await page.clock.install();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => !!held).toBe(true);
+  await page.clock.fastForward(15001);
+  await expect(page.getByLabel('通知操作结果').getByRole('alert')).toContainText('读取本次测试状态超时');
+  await page.getByRole('button', { name: '刷新本次测试', exact: true }).click();
+  await expect(page.getByLabel('通知操作结果')).toContainText('推送服务已接收本次测试通知');
+  await expect(page.getByLabel('通知操作结果').getByRole('alert')).toHaveCount(0);
+  expect(sends).toBe(1);
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+});
+
+test('closing settings cancels receipt polling and ignores a late read when reopened', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let held: import('@playwright/test').Route | undefined; let reads = 0;
+  await page.route('**/api/push/test', route => route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }));
+  await page.route('**/api/push/test/*', route => { reads++; held = route; });
+  await loginBuilt(page); await openPushSettings(page); await page.clock.install();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => !!held).toBe(true);
+  await page.getByRole('button', { name: '关闭设置', exact: true }).click();
+  await held!.fulfill({ json: pushReceipt('accepted') }).catch(() => {});
+  await page.clock.fastForward(10000);
+  expect(reads).toBe(1);
+  await openPushSettings(page);
+  await expect(page.getByLabel('通知操作结果')).not.toContainText('推送服务已接收本次测试通知');
+  await expect(page.getByRole('button', { name: '刷新本次测试', exact: true })).toHaveCount(0);
+});
+
+test('session credential rotation while still logged in discards a stale test receipt and permits a new test', async ({ page, mock }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  let credential = 'mock-csrf'; let rotations = 0; let sends = 0;
+  await page.route('**/api/auth/session*', route => route.fulfill({ json: { authenticated: mock.authenticated, authRequired: true, csrfToken: credential } }));
+  await page.route('**/api/push/test', route => { sends++; return route.fulfill({ status: 202, json: { ok: true, queued: true, deliveryId: receiptId } }); });
+  await page.route('**/api/push/test/*', route => {
+    if (!rotations) {
+      rotations++; credential = 'rotated-csrf';
+      return route.fulfill({ status: 401, json: { error: 'Previous test credentials changed' } });
+    }
+    return route.fulfill({ json: pushReceipt('accepted') });
+  });
+  await loginBuilt(page);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('登录令牌轮换保留的草稿');
+  await openPushSettings(page);
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect.poll(() => rotations).toBe(1);
+  await expect(page.getByRole('button', { name: '刷新本次测试', exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('通知操作结果')).not.toContainText('Previous test credentials');
+  await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
+  await expect(page.getByLabel('通知操作结果')).toContainText('推送服务已接收本次测试通知');
+  expect(sends).toBe(2);
+  await expect(page.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
+  await page.getByRole('button', { name: '关闭设置', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('登录令牌轮换保留的草稿');
+});
+
+test('a hung system notification check releases the controls after a bounded timeout', async ({ page }) => {
+  await installPushFixture(page, { active: true, permission: 'granted' });
+  await capturePushApi(page, []);
+  await page.addInitScript(() => { ServiceWorkerRegistration.prototype.showNotification = () => new Promise(() => {}); });
+  await loginBuilt(page); await openPushSettings(page); await page.clock.install();
+  await page.getByRole('button', { name: '检查系统通知', exact: true }).click();
+  await expect(page.getByLabel('通知操作结果')).toContainText('正在检查系统通知');
+  await page.clock.fastForward(15001);
+  await expect(page.getByLabel('通知操作结果').getByRole('alert')).toContainText('系统通知检查超时');
+  await expect(page.getByRole('button', { name: '发送测试通知', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: '检查系统通知', exact: true })).toBeEnabled();
 });
 
 test('notification diagnostics show bounded failure and expiration without exposing provider credentials', async ({ page }) => {
@@ -736,12 +962,14 @@ test('notification diagnostics show bounded failure and expiration without expos
   await capturePushApi(page, []);
   await page.route('**/api/push/status*', route => route.fulfill({ json: {
     devices: 1, queued: 0, retrying: 0, delivered: 2, failed: 1, expired: 3, nextRetryAt: null,
-    lastDeliveredAt: Date.now() - 2000, lastFailureAt: Date.now(), lastFailure: 'expired',
+    lastDeliveredAt: Date.now() - 2000, lastCompletedAcceptedAt: Date.now() - 3000, lastFailureAt: Date.now(), lastFailure: 'expired',
   } }));
   await loginBuilt(page);
   await openPushSettings(page);
   const health = page.getByLabel('推送投递状态');
   await expect(health).toContainText('推送服务已接收 2 条');
+  await expect(health).toContainText('最近完成提醒已由推送服务接收');
+  await expect(health).toContainText('不代表手机已显示');
   await expect(health).toContainText('发送失败 1 条 · 已过期 3 条');
   await expect(health).toContainText('通知已超过有效期');
   await expect(health).not.toContainText('fcm.googleapis.com');

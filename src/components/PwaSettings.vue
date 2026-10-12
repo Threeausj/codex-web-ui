@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import Icon from './Icon.vue';
 import {
   pwaState,
@@ -11,35 +11,138 @@ import {
   enableDevicePush,
   disableDevicePush,
   testDevicePush,
+  readDevicePushTest,
   testSystemNotification,
   saveDevicePushPreferences,
   type PushPreferences,
+  type PushTestReceipt,
 } from '../lib/pwa';
 const props = defineProps<{ api: any; state: any }>();
 const notice = ref('');
 const localError = ref('');
 const testing = ref<'push' | 'system' | ''>('');
-type DeliveryStatus = { devices: number; queued: number; overflow?: number; backlog?: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastFailureAt: number | null; lastFailure: string | null };
+const systemNotice = ref('');
+type DeliveryStatus = { devices: number; queued: number; overflow?: number; backlog?: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastCompletedAcceptedAt?: number | null; lastFailureAt: number | null; lastFailure: string | null };
 const deliveryStatus = ref<DeliveryStatus | null>(null);
 const deliveryError = ref('');
 let statusTimer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
 let statusReading = false;
-const failures: Record<string, string> = { provider_unavailable: '推送服务暂时不可用', rate_limited: '推送服务限流', timeout: '推送连接超时', rejected: '推送服务拒绝请求', metadata_pending: '正在确认对话类型', expired: '通知已超过有效期' };
+let statusRefreshPending = false;
+let statusController: AbortController | undefined;
+const failures: Record<string, string> = { provider_unavailable: '推送服务暂时不可用', rate_limited: '推送服务限流', timeout: '推送连接超时', rejected: '推送服务拒绝请求', metadata_pending: '正在确认对话类型', expired: '通知已超过有效期', queue_full: '推送队列已满' };
 const retryTime = computed(() => deliveryStatus.value?.nextRetryAt ? new Date(deliveryStatus.value.nextRetryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
+const authentication = () => props.state.authenticationGeneration ?? props.api.runtimeIdentity?.().authenticationGeneration;
+const authenticated = () => props.state.authenticated !== false;
 async function refreshDeliveryStatus() {
   clearTimeout(statusTimer);
-  if (disposed || statusReading || pwaState.offline) return;
+  if (disposed || !authenticated() || pwaState.offline) return;
+  // A POST may finish while an older read is still in flight. Read again after
+  // that response instead of silently dropping the requested refresh.
+  if (statusReading) { statusRefreshPending = true; return; }
+  const identity = authentication();
+  const current = () => !disposed && authenticated() && identity === authentication();
   statusReading = true;
+  const controller = statusController = new AbortController();
   try {
-    const result = await props.api.requestHttp('/push/status', { signal: AbortSignal.timeout(10000) }, false);
-    if (!disposed) { deliveryStatus.value = result; deliveryError.value = ''; }
-  } catch (cause: any) { if (!disposed) deliveryError.value = cause.message || '无法读取推送状态'; }
+    const result = await props.api.requestHttp('/push/status', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]) }, false);
+    if (current()) { deliveryStatus.value = result; deliveryError.value = ''; }
+  } catch (cause: any) { if (current()) deliveryError.value = cause.message || '无法读取推送状态'; }
   finally {
     statusReading = false;
-    if (!disposed && deliveryStatus.value?.queued) statusTimer = setTimeout(() => { void refreshDeliveryStatus(); }, 5000);
+    if (statusController === controller) statusController = undefined;
+    if (!disposed && authenticated() && statusRefreshPending) { statusRefreshPending = false; void refreshDeliveryStatus(); }
+    else if (current() && deliveryStatus.value?.queued) statusTimer = setTimeout(() => { void refreshDeliveryStatus(); }, 5000);
   }
 }
+const testId = ref('');
+const testReceipt = ref<PushTestReceipt | null>(null);
+const testReading = ref(false);
+const testReadError = ref('');
+const testQueryPaused = ref(false);
+let testGeneration = 0;
+let testIdentity: number | undefined;
+let testTimer: ReturnType<typeof setTimeout> | undefined;
+let testLimitTimer: ReturnType<typeof setTimeout> | undefined;
+let testController: AbortController | undefined;
+const terminalTest = () => !!testReceipt.value && ['accepted', 'failed', 'expired'].includes(testReceipt.value.state);
+const waitingForTest = computed(() => !!testId.value && !terminalTest() && !testQueryPaused.value);
+const currentTest = (generation: number) => !disposed && authenticated() && generation === testGeneration && testIdentity === authentication();
+function stopTestPolling() {
+  clearTimeout(testTimer); clearTimeout(testLimitTimer);
+  testTimer = testLimitTimer = undefined;
+  testController?.abort(); testController = undefined;
+}
+function resetTest() {
+  ++testGeneration; stopTestPolling();
+  testId.value = ''; testReceipt.value = null; testReading.value = false;
+  testReadError.value = ''; testQueryPaused.value = false; systemNotice.value = '';
+}
+function beginTestQueryWindow(generation: number) {
+  clearTimeout(testLimitTimer);
+  testQueryPaused.value = false;
+  testLimitTimer = setTimeout(() => {
+    if (!currentTest(generation) || terminalTest()) return;
+    testQueryPaused.value = true;
+    stopTestPolling(); testReading.value = false;
+    testReadError.value = '本次测试状态查询已暂停。服务器仍会按原计划发送；点击“刷新本次测试”继续查询，不会重复发送。';
+  }, 120000);
+}
+async function refreshTestReceipt(manual = false) {
+  const generation = testGeneration;
+  if (!testId.value || !currentTest(generation) || testReading.value) return;
+  if (manual) beginTestQueryWindow(generation);
+  clearTimeout(testTimer);
+  if (pwaState.offline || testQueryPaused.value) return;
+  const controller = testController = new AbortController();
+  testReading.value = true;
+  try {
+    const result = await readDevicePushTest(props.api, testId.value, AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]));
+    if (!currentTest(generation) || testController !== controller) return;
+    testReceipt.value = result;
+    testReadError.value = '';
+    if (terminalTest()) stopTestPolling();
+  } catch (cause: any) {
+    if (!currentTest(generation) || testController !== controller) return;
+    if (cause.status === 403 || cause.status === 404 || cause.status === 410) {
+      testQueryPaused.value = true;
+      testReadError.value = '本次测试记录已失效或无法访问。请刷新通知状态；若仍失败，请关闭并重新启用通知。';
+      stopTestPolling();
+    } else testReadError.value = cause.name === 'TimeoutError' || cause.name === 'AbortError' || /超时/.test(cause.message || '')
+      ? '读取本次测试状态超时，连接恢复后会继续查询，不会重复发送。'
+      : '无法读取本次测试状态，请检查网络。连接恢复后会继续查询，不会重复发送。';
+  } finally {
+    if (currentTest(generation)) {
+      // An aborted read can settle after a manual refresh has already begun.
+      // Only its own controller may release that newer read's busy state.
+      if (!testController || testController === controller) {
+        testReading.value = false;
+        if (testController === controller) testController = undefined;
+        if (!terminalTest() && !testQueryPaused.value && !pwaState.offline)
+          testTimer = setTimeout(() => { void refreshTestReceipt(); }, 3000);
+      }
+    } else if (!disposed && generation === testGeneration) { resetTest(); testing.value = ''; notice.value = ''; localError.value = ''; }
+  }
+}
+const testMessage = computed(() => {
+  const receipt = testReceipt.value;
+  if (!receipt) return '';
+  if (receipt.state === 'accepted') return '推送服务已接收本次测试通知，不代表手机已显示。未收到时可点击“检查系统通知”。';
+  if (receipt.state === 'failed') return `本次测试发送失败：${failures[receipt.failure || ''] || '推送服务拒绝请求'}。请刷新通知状态后检查连接。`;
+  if (receipt.state === 'expired') return '本次测试通知已过期，未能送达推送服务。请检查连接后再测试。';
+  if (receipt.state === 'retrying') {
+    const at = receipt.nextRetryAt ? new Date(receipt.nextRetryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+    return `本次测试正在自动重试：${failures[receipt.failure || ''] || '发送暂时受阻'}${at ? `；下次 ${at}` : ''}。无需再次发送。`;
+  }
+  if (receipt.state === 'sending') return '正在向推送服务发送本次测试通知…';
+  return '服务器已接收本次测试通知，正在等待发送…';
+});
+const feedbackError = computed(() => {
+  if (testing.value === 'system') return '';
+  const error = localError.value || pwaState.pushError || testReadError.value || (['failed', 'expired'].includes(testReceipt.value?.state || '') ? testMessage.value : '');
+  return error ? [systemNotice.value, error].filter(Boolean).join(' ') : '';
+});
+const feedbackNotice = computed(() => [systemNotice.value, testMessage.value || (systemNotice.value ? '' : notice.value)].filter(Boolean).join(' '));
 const android = /Android/i.test(navigator.userAgent);
 const categories: { key: keyof PushPreferences; label: string; description: string }[] = [
   { key: 'completed', label: '回复已完成', description: 'Codex 完成本次任务时提醒' },
@@ -69,28 +172,50 @@ const updateStatus = computed(() => {
   return '更新准备好后会提示，也可以手动检查';
 });
 async function operate(action: () => Promise<any>, message: string, progress = '') {
+  const identity = authentication();
+  const current = () => !disposed && authenticated() && identity === authentication();
   notice.value = progress;
+  systemNotice.value = '';
   localError.value = '';
-  try { await action(); notice.value = message; }
-  catch (cause: any) { localError.value = cause.message || '操作失败，请重试'; }
-  finally { void refreshDeliveryStatus(); }
+  try { await action(); if (current()) notice.value = message; }
+  catch (cause: any) { if (current()) localError.value = cause.message || '操作失败，请重试'; }
+  finally { if (current()) void refreshDeliveryStatus(); }
 }
 async function sendTest(kind: 'push' | 'system') {
+  // Checking local display must not forget an already queued remote test or
+  // unlock a second send while the first test is waiting for its receipt.
+  if (kind === 'push') { resetTest(); systemNotice.value = ''; }
+  const generation = testGeneration;
+  testIdentity = authentication();
   testing.value = kind;
-  let queued = false;
+  if (kind === 'push') notice.value = '正在发送测试通知…';
+  else systemNotice.value = '正在检查系统通知…';
+  localError.value = '';
   try {
-    await operate(
-      async () => {
-        const result = kind === 'push' ? await testDevicePush(props.api) : await testSystemNotification();
-        // Queue acceptance is different from push-provider acceptance.
-        queued = kind === 'push' && result?.queued === true;
-        return result;
-      },
-      kind === 'push' ? '推送服务已接收测试通知，请查看系统通知。' : '系统通知已发出，请查看通知栏。',
-      kind === 'push' ? '正在发送测试通知…' : '正在检查系统通知…',
-    );
-    if (queued) notice.value = '推送服务暂时不可用，测试通知已保存，服务器会自动重试。';
-  } finally { testing.value = ''; }
+    const result = kind === 'push' ? await testDevicePush(props.api) : await testSystemNotification();
+    if (!currentTest(generation)) return;
+    if (kind === 'system') { systemNotice.value = '系统通知已发出，请查看通知栏。'; return; }
+    notice.value = result?.queued
+      ? '服务器已接收测试通知，正在等待发送。当前服务器不提供本次投递状态，请勿重复点击。'
+      : '服务器已接收测试通知请求，请查看系统通知。';
+    if (kind === 'push' && typeof result?.deliveryId === 'string' && /^[0-9a-f-]{36}$/i.test(result.deliveryId)) {
+      testId.value = result.deliveryId;
+      notice.value = '服务器已接收本次测试通知，正在等待发送…';
+      beginTestQueryWindow(generation);
+      void refreshTestReceipt();
+    }
+  } catch (cause: any) {
+    if (currentTest(generation)) localError.value = cause.status === 403 || cause.status === 404
+      ? '这台设备的通知授权已失效，请刷新通知状态；若仍失败，请关闭并重新启用通知。'
+      : cause.message || '无法发送测试通知，请重试。';
+  } finally {
+    if (currentTest(generation)) { testing.value = ''; void refreshDeliveryStatus(); }
+    else if (!disposed && generation === testGeneration) { resetTest(); testing.value = ''; notice.value = ''; localError.value = ''; }
+  }
+}
+async function refreshNotificationStatus() {
+  await operate(() => initializeDevicePush(props.api), '通知状态已刷新');
+  if (testId.value) await refreshTestReceipt(true);
 }
 async function preferenceChanged(key: keyof PushPreferences, event: Event) {
   const input = event.target as HTMLInputElement;
@@ -99,7 +224,21 @@ async function preferenceChanged(key: keyof PushPreferences, event: Event) {
   input.checked = pwaState.pushPreferences[key];
 }
 onMounted(() => { void initializeDevicePush(props.api); void refreshDeliveryStatus(); });
-onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
+watch(() => pwaState.offline, offline => {
+  if (offline) { clearTimeout(testTimer); testController?.abort(); }
+  else { void refreshDeliveryStatus(); if (testId.value && !testQueryPaused.value) void refreshTestReceipt(); }
+});
+watch(authentication, () => {
+  resetTest(); testing.value = ''; notice.value = ''; localError.value = '';
+  deliveryStatus.value = null; deliveryError.value = '';
+  clearTimeout(statusTimer); statusController?.abort();
+  void refreshDeliveryStatus();
+});
+watch(() => [props.state.authenticated, pwaState.pushSubscribed], ([signedIn, subscribed]) => {
+  if (signedIn === false || !subscribed) { resetTest(); testing.value = ''; }
+  if (signedIn === false) { clearTimeout(statusTimer); statusController?.abort(); statusRefreshPending = false; notice.value = ''; systemNotice.value = ''; localError.value = ''; }
+});
+onBeforeUnmount(() => { disposed = true; ++testGeneration; stopTestPolling(); clearTimeout(statusTimer); statusController?.abort(); });
 </script>
 
 <template>
@@ -145,14 +284,19 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
       <p>关闭页面或切换应用后，服务器通过系统通知提醒你。服务器需保持运行；通知显示对话名和事件，不包含回复正文、命令和文件路径。</p>
       <div v-if="pwaState.offline" class="pwa-instructions"><Icon name="WifiOff" :size="17" /><span>当前离线，连接网络后可修改通知设置。</span></div>
       <div v-else-if="pushReason" class="pwa-instructions"><Icon name="CircleHelp" :size="17" /><span>{{ pushReason }}</span></div>
+      <div class="pwa-feedback-area" aria-label="通知操作结果">
+        <div v-if="feedbackError" class="pwa-feedback error" role="alert"><Icon name="AlertCircle" :size="16" /><span>{{ feedbackError }}</span></div>
+        <div v-else-if="feedbackNotice" class="pwa-feedback" role="status"><Icon :name="testing || waitingForTest ? 'LoaderCircle' : 'CheckCircle2'" :class="{ spin: !!testing || waitingForTest }" :size="16" /><span>{{ feedbackNotice }}<template v-if="pwaState.offline && waitingForTest"> 当前离线，网络恢复后继续查询。</template></span></div>
+      </div>
       <div class="pwa-button-row">
         <button v-if="!pwaState.pushSubscribed" class="button" :disabled="!canEnable" @click="operate(() => enableDevicePush(api), '已启用这台设备的后台通知')"><Icon :name="pwaState.pushBusy ? 'LoaderCircle' : 'CheckCircle2'" :size="16" />启用通知</button>
         <template v-else>
           <button class="button button-secondary" :disabled="pwaState.pushBusy || pwaState.offline" @click="operate(() => disableDevicePush(api), '已关闭这台设备的后台通知')">关闭通知</button>
-          <button class="button button-secondary" :disabled="pwaState.pushBusy || !!testing || pwaState.offline || !pwaState.pushReady" @click="sendTest('push')"><Icon :name="testing === 'push' ? 'LoaderCircle' : 'Send'" :class="{ spin: testing === 'push' }" :size="15" />{{ testing === 'push' ? '正在发送…' : '发送测试通知' }}</button>
+          <button class="button button-secondary" :disabled="pwaState.pushBusy || !!testing || waitingForTest || pwaState.offline || !pwaState.pushReady" @click="sendTest('push')"><Icon :name="testing === 'push' || waitingForTest ? 'LoaderCircle' : 'Send'" :class="{ spin: testing === 'push' || waitingForTest }" :size="15" />{{ testing === 'push' ? '正在发送…' : waitingForTest ? '等待测试状态…' : '发送测试通知' }}</button>
         </template>
         <button v-if="pwaState.pushPermission === 'granted'" class="button button-secondary" :disabled="pwaState.pushBusy || !!testing" @click="sendTest('system')"><Icon :name="testing === 'system' ? 'LoaderCircle' : 'Bell'" :class="{ spin: testing === 'system' }" :size="15" />检查系统通知</button>
-        <button class="icon-button" aria-label="刷新通知状态" title="刷新通知状态" :disabled="pwaState.pushBusy || pwaState.offline" @click="operate(() => initializeDevicePush(api), '')"><Icon name="RefreshCw" :size="16" /></button>
+        <button v-if="testId" class="button button-small button-secondary" :disabled="testReading || pwaState.offline || !!testing" @click="refreshTestReceipt(true)"><Icon name="RefreshCw" :size="14" :class="{ spin: testReading }" />刷新本次测试</button>
+        <button class="icon-button" aria-label="刷新通知状态" title="刷新通知状态" :disabled="pwaState.pushBusy || pwaState.offline" @click="refreshNotificationStatus"><Icon name="RefreshCw" :size="16" /></button>
       </div>
       <div class="pwa-preferences" aria-label="通知类别">
         <label v-for="category in categories" :key="category.key" class="pwa-preference">
@@ -162,6 +306,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
       </div>
       <div v-if="deliveryStatus && pwaState.pushSubscribed" class="pwa-delivery-status" aria-live="polite" aria-label="推送投递状态">
         <span>推送服务已接收 {{ deliveryStatus.delivered }} 条</span>
+        <span v-if="deliveryStatus.lastCompletedAcceptedAt">最近完成提醒已由推送服务接收：{{ new Date(deliveryStatus.lastCompletedAcceptedAt).toLocaleString() }}（不代表手机已显示）</span>
         <span v-if="deliveryStatus.queued">待发送 {{ deliveryStatus.queued }} 条<span v-if="deliveryStatus.retrying"> · 自动重试 {{ deliveryStatus.retrying }} 条</span><span v-if="retryTime"> · 下次 {{ retryTime }}</span></span>
         <span v-if="deliveryStatus.overflow">积压已达上限，{{ deliveryStatus.overflow }} 条未能入队</span>
         <span v-if="deliveryStatus.failed || deliveryStatus.expired">发送失败 {{ deliveryStatus.failed }} 条 · 已过期 {{ deliveryStatus.expired }} 条</span>
@@ -172,8 +317,6 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
       <p class="pwa-subtle">网络或推送服务暂时出错时，服务器会保存通知并自动重试；最多尝试 8 次，有效期 1 小时。服务接收成功不代表手机已显示通知。</p>
       <p v-if="android" class="pwa-subtle">Android Chrome 的后台通知需要手机能连接 Google 推送服务。若测试已接收却未收到，先点击“检查系统通知”；能收到系统检查通知时，请检查手机的 Google 服务连接和省电设置。</p>
     </section>
-    <div v-if="localError || pwaState.pushError" class="pwa-feedback error" role="alert"><Icon name="AlertCircle" :size="16" /><span>{{ localError || pwaState.pushError }}</span></div>
-    <div v-else-if="notice" class="pwa-feedback" role="status"><Icon :name="testing ? 'LoaderCircle' : 'CheckCircle2'" :class="{ spin: !!testing }" :size="16" /><span>{{ notice }}</span></div>
   </div>
 </template>
 
@@ -206,6 +349,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
 .pwa-preference span { color:var(--muted);font-size:11px;line-height:1.6; }
 .pwa-preference input { flex-shrink:0;width:17px;height:17px;accent-color:var(--text);cursor:pointer; }
 .pwa-section p.pwa-subtle { font-size:11px;margin-top:14px; }
+.pwa-feedback-area { min-height:84px;display:flex;align-items:center;margin-top:12px; }
 .pwa-feedback { display:flex;align-items:flex-start;gap:8px;line-height:1.7;font-size:12px;color:var(--muted); }
 .pwa-feedback > svg { flex-shrink:0;margin-top:2px; }
 .pwa-feedback.error { color:var(--danger, #b94d45); }
@@ -219,5 +363,6 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(statusTimer); });
   .pwa-preference { min-height:44px; }
   .pwa-preference input { width:20px;height:20px; }
   .pwa-update-row { flex-wrap:wrap;font-size:12px; }
+  .pwa-feedback-area { min-height:96px; }
 }
 </style>

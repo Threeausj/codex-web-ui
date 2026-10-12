@@ -77,6 +77,7 @@ const saved = <T>(key: string, fallback: T): T => {
 };
 const state = reactive({
   authenticated: false,
+  authenticationGeneration: 0,
   online: navigator.onLine !== false,
   authRequired: true,
   loading: true,
@@ -167,6 +168,9 @@ const state = reactive({
 let socket: WebSocket | null = null;
 let csrfToken = "";
 let authenticationGeneration = 0;
+function advanceAuthentication() {
+  state.authenticationGeneration = ++authenticationGeneration;
+}
 type SessionStatus = { authenticated: boolean; authRequired?: boolean; csrfToken?: string };
 let sessionValidation: { generation: number; promise: Promise<SessionStatus | null> } | null = null;
 let counter = 0;
@@ -784,7 +788,7 @@ function validateSession(): Promise<SessionStatus | null> {
     state.authRequired = session.authRequired ?? state.authRequired;
     if (session.authenticated) {
       if (csrfToken && session.csrfToken && csrfToken !== session.csrfToken) {
-        authenticationGeneration++;
+        advanceAuthentication();
         clearConversationCaches();
       }
       csrfToken = session.csrfToken ?? csrfToken;
@@ -792,7 +796,7 @@ function validateSession(): Promise<SessionStatus | null> {
       void activateConversationCache();
     } else {
       const wasAuthenticated = state.authenticated;
-      authenticationGeneration++;
+      advanceAuthentication();
       csrfToken = "";
       state.authenticated = false;
       clearConversationCaches();
@@ -1966,7 +1970,7 @@ async function initialize() {
   }
 }
 async function login(password: string) {
-  authenticationGeneration++;
+  advanceAuthentication();
   clearConversationCaches();
   state.selectingThread = false;
   state.threadConflict = null;
@@ -1988,7 +1992,7 @@ async function login(password: string) {
       method: "POST",
       body: JSON.stringify({ password }),
     });
-    authenticationGeneration++;
+    advanceAuthentication();
     csrfToken = session.csrfToken;
     state.authenticated = true;
     await activateConversationCache();
@@ -1998,13 +2002,13 @@ async function login(password: string) {
   }
 }
 async function logout() {
-  authenticationGeneration++;
+  advanceAuthentication();
   if (typeof window !== "undefined" && "serviceWorker" in navigator) {
     // Server logout is authoritative; an unavailable browser unsubscribe cannot block it.
     void revokeDevicePush({ requestHttp: http, runtimeIdentity }, { logout: true });
   }
   await http("/auth/logout", { method: "POST" });
-  authenticationGeneration++;
+  advanceAuthentication();
   csrfToken = "";
   state.authenticated = false;
   clearConversationCaches();

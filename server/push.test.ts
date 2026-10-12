@@ -122,7 +122,7 @@ test('the default production sender generates encrypted VAPID requests and handl
   try {
     const device = subscription('default-sender-device')
     await push.subscribe('test-session', device)
-    assert.deepEqual(await push.test('test-session', device.endpoint), { ok: true, queued: true }); await push.flush()
+    assert.match((await push.test('test-session', device.endpoint)).deliveryId, /^[0-9a-f-]{36}$/); await push.flush()
     assert.equal(requests.length, 1)
     const sent = requests[0]!
     assert.equal(sent.options.hostname, 'fcm.googleapis.com')
@@ -137,7 +137,7 @@ test('the default production sender generates encrypted VAPID requests and handl
     const ciphertext = Buffer.concat(sent.chunks)
     assert.ok(ciphertext.length > 100 && !ciphertext.includes(Buffer.from('后台通知已开启')))
     statusCode = 410
-    assert.deepEqual(await push.test('test-session', device.endpoint), { ok: true, queued: true }); await push.flush()
+    assert.match((await push.test('test-session', device.endpoint)).deliveryId, /^[0-9a-f-]{36}$/); await push.flush()
     assert.equal(requests.length, 2)
     assert.equal(push.hasActiveSubscriptions, false)
   } finally { await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
@@ -533,6 +533,8 @@ test('expired upstream subscriptions are removed and provider errors never expos
     const response = await fetch(app.base + '/api/push/test', { method: 'POST', headers: session.headers, body: JSON.stringify({ endpoint: device.endpoint }) })
     assert.equal(response.status, 202); await app.push.flush()
     const body = await response.text()
+    const result = JSON.parse(body) as { deliveryId: string }
+    assert.equal((await fetch(app.base + '/api/push/test/' + result.deliveryId, { headers: { cookie: session.cookie } })).status, 404)
     assert.ok(!body.includes('private-token') && !body.includes('secret-body') && !body.includes('fcm.googleapis.com'))
     assert.equal(app.push.hasActiveSubscriptions, false)
     assert.equal(JSON.parse(await fs.readFile(path.join(app.directory, 'push-subscriptions.json'), 'utf8')).subscriptions.length, 0)
@@ -564,6 +566,45 @@ test('delivery concurrency is bounded and slow or failed push delivery does not 
     assert.equal(peak, 4)
     assert.equal(push.hasActiveSubscriptions, true)
   } finally { await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('only accepted main completion deliveries record a durable completion timestamp', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-completed-accepted-'))
+  let clock = Date.now(), failing = false
+  const payloads: string[] = []
+  const options = { now: () => clock, sendNotification: async (_device: PushSubscription, payload: string) => {
+    if (failing) throw Object.assign(new Error('Private provider error'), { statusCode: 503 })
+    payloads.push(JSON.parse(payload).data.kind)
+  } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    const device = subscription('completed-accepted'); await service.subscribe('session', device)
+    assert.equal(service.status('session').lastCompletedAcceptedAt, null)
+    await service.test('session', device.endpoint); await service.flush()
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'main', source: 'cli', ephemeral: false } } })
+    service.observe(host, { id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'main', turnId: 'running', command: 'private command' } })
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'child', source: { subAgent: { thread_spawn: { parent_thread_id: 'main' } } } } } })
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'child', turn: { id: 'child-turn', status: 'completed' } } })
+    service.observe(host, { method: 'thread/started', params: { thread: { id: 'ephemeral', source: 'cli', ephemeral: true } } })
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'ephemeral', turn: { id: 'ephemeral-turn', status: 'completed' } } })
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'main', turn: { id: 'failed-turn', status: 'failed' } } })
+    await service.flush()
+    assert.deepEqual(payloads.sort(), ['approval', 'errors', 'test'])
+    assert.equal(service.status('session').lastCompletedAcceptedAt, null)
+    failing = true; clock += 1000
+    service.observe(host, { method: 'turn/completed', params: { threadId: 'main', turn: { id: 'finished-turn', status: 'completed' } } })
+    await service.flush(); assert.equal(service.status('session').lastCompletedAcceptedAt, null)
+    failing = false; clock += 5000; await service.flush()
+    const acceptedAt = clock
+    assert.equal(service.status('session').lastCompletedAcceptedAt, acceptedAt)
+    assert.equal(service.status('different-login').lastCompletedAcceptedAt, null)
+    clock += 1000; await service.test('session', device.endpoint); await service.flush()
+    assert.equal(service.status('session').lastCompletedAcceptedAt, acceptedAt)
+    await service.close(); service = await PushService.create(directory, new Set([origin]), options)
+    assert.equal(service.status('session').lastCompletedAcceptedAt, acceptedAt)
+    const persisted = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.equal(persisted.subscriptions[0].delivery.lastCompletedAcceptedAt, acceptedAt)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
 
 test('the durable outbox retries a 503 per device without duplicating successful devices or replayed events', async () => {
@@ -661,6 +702,179 @@ test('test notification failure returns a persisted 202 retry with sanitized own
     assert.equal((await other.json() as { devices: number }).devices, 0)
     assert.equal((await fetch(app.base + '/api/push/status')).status, 401)
   } finally { await app.cleanup() }
+})
+
+test('test receipts report the specific provider acknowledgement with authentication and login isolation', async () => {
+  const app = await application()
+  try {
+    const session = await app.login(), stranger = await app.login()
+    const device = subscription('private-receipt-token')
+    await app.push.subscribe(app.auth.getSession(session.cookie)!.id, device)
+    const response = await fetch(app.base + '/api/push/test', { method: 'POST', headers: session.headers, body: JSON.stringify({ endpoint: device.endpoint }) })
+    assert.equal(response.status, 202)
+    const result = await response.json() as { ok: boolean; queued: boolean; deliveryId: string }
+    assert.deepEqual(result, { ok: true, queued: true, deliveryId: result.deliveryId })
+    assert.match(result.deliveryId, /^[0-9a-f-]{36}$/)
+    await app.push.flush()
+    const url = app.base + '/api/push/test/' + result.deliveryId
+    assert.equal((await fetch(url)).status, 401)
+    assert.equal((await fetch(url, { headers: { cookie: stranger.cookie } })).status, 404)
+    assert.equal((await fetch(app.base + '/api/push/test/not-a-uuid', { headers: { cookie: session.cookie } })).status, 400)
+    const receiptResponse = await fetch(url, { headers: { cookie: session.cookie } })
+    assert.equal(receiptResponse.status, 200)
+    assert.equal(receiptResponse.headers.get('cache-control'), 'no-store')
+    const receipt = await receiptResponse.json() as Record<string, unknown>
+    assert.deepEqual(Object.keys(receipt).sort(), ['attempts', 'createdAt', 'failure', 'id', 'nextRetryAt', 'state', 'updatedAt'])
+    assert.equal(receipt.state, 'accepted'); assert.equal(receipt.attempts, 1)
+    assert.equal(receipt.failure, null); assert.equal(receipt.nextRetryAt, null)
+    const plain = JSON.stringify(receipt)
+    for (const secret of ['private-receipt-token', 'fcm.googleapis.com', 'keys', 'sessionHash', '后台通知']) assert.ok(!plain.includes(secret))
+    const stored = JSON.parse(await fs.readFile(path.join(app.directory, 'push-subscriptions.json'), 'utf8'))
+    assert.deepEqual(stored.subscriptions[0].lastTest, receipt)
+    await app.push.unsubscribe(app.auth.getSession(session.cookie)!.id, device.endpoint)
+    assert.equal((await fetch(url, { headers: { cookie: session.cookie } })).status, 404)
+  } finally { await app.cleanup() }
+})
+
+test('test receipts distinguish durable enqueue from an in-flight send and provider acceptance', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-progress-'))
+  let release!: () => void, started!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const sending = new Promise<void>(resolve => { started = resolve })
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async () => { started(); await waiting } })
+  try {
+    const device = subscription('receipt-progress'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint)
+    await sending
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'sending')
+    const snapshot = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.equal(snapshot.subscriptions[0].lastTest.state, 'sending')
+    assert.equal(snapshot.outbox[0].id, result.deliveryId)
+    release(); await service.flush()
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'accepted')
+  } finally { release(); await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('one test receipt retries durably across restart and clears its old failure after acceptance', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-restart-'))
+  let clock = Date.now(), failed = true
+  const options = { now: () => clock, sendNotification: async () => { if (failed) throw Object.assign(new Error('Private provider error'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    const device = subscription('receipt-retry'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint); await service.flush()
+    const receipt = service.testStatus('session', result.deliveryId)
+    assert.equal(receipt.state, 'retrying'); assert.equal(receipt.failure, 'provider_unavailable')
+    assert.equal(receipt.attempts, 1); assert.equal(receipt.nextRetryAt, clock + 5000)
+    await service.close(); failed = false
+    service = await PushService.create(directory, new Set([origin]), options)
+    assert.deepEqual(service.testStatus('session', result.deliveryId), receipt)
+    clock += 5000; await service.flush()
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'accepted')
+    assert.equal(service.testStatus('session', result.deliveryId).failure, null)
+    assert.equal(service.testStatus('session', result.deliveryId).attempts, 2)
+    assert.equal(service.testStatus('session', result.deliveryId).nextRetryAt, null)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('an older in-flight test never overwrites the newest test failure or exposes its superseded receipt', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-race-'))
+  const pending: { resolve(): void; reject(error: Error): void }[] = []
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: () => new Promise<void>((resolve, reject) => { pending.push({ resolve, reject }) }) })
+  try {
+    const device = subscription('receipt-race'); await service.subscribe('session', device)
+    const old = await service.test('session', device.endpoint)
+    while (pending.length < 1) await tick()
+    const latest = await service.test('session', device.endpoint)
+    while (pending.length < 2) await tick()
+    pending[1]!.reject(Object.assign(new Error(`Private ${device.endpoint}`), { statusCode: 403 }))
+    while (service.testStatus('session', latest.deliveryId).state !== 'failed') await tick()
+    const receipt = service.testStatus('session', latest.deliveryId)
+    assert.equal(receipt.failure, 'rejected'); assert.equal(receipt.nextRetryAt, null)
+    assert.throws(() => service.testStatus('session', old.deliveryId), (cause: any) => cause.status === 404)
+    pending[0]!.resolve(); await service.flush()
+    assert.deepEqual(service.testStatus('session', latest.deliveryId), receipt)
+    assert.ok(!JSON.stringify(receipt).includes(device.endpoint))
+    const snapshot = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.deepEqual(snapshot.subscriptions[0].lastTest, receipt)
+  } finally { for (const job of pending) job.resolve(); await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('foreground renewal preserves an in-flight test acknowledgement but a new login cannot read it', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-renewal-'))
+  let release!: () => void, started!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const sending = new Promise<void>(resolve => { started = resolve })
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async () => { started(); await waiting } })
+  try {
+    const device = subscription('receipt-renewal'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint); await sending
+    await service.subscribe('session', device)
+    release(); await service.flush()
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'accepted')
+    assert.equal(service.status('session').queued, 0)
+    await service.subscribe('different-login', device)
+    assert.throws(() => service.testStatus('session', result.deliveryId), (cause: any) => cause.status === 404)
+    assert.throws(() => service.testStatus('different-login', result.deliveryId), (cause: any) => cause.status === 404)
+  } finally { release(); await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('test expiration during a cold restart becomes a durable expired receipt rather than a stale pending state', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-expiry-'))
+  let clock = Date.now(), sent = 0
+  const options = { now: () => clock, deliveryTtlMs: 1000, sendNotification: async () => { sent++; throw Object.assign(new Error('Private failure'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    const device = subscription('receipt-expiry'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint); await service.flush()
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'retrying')
+    await service.close(); clock += 1000
+    service = await PushService.create(directory, new Set([origin]), options)
+    const receipt = service.testStatus('session', result.deliveryId)
+    assert.equal(receipt.state, 'expired'); assert.equal(receipt.failure, 'expired'); assert.equal(receipt.nextRetryAt, null)
+    assert.equal(sent, 1)
+    const snapshot = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'))
+    assert.equal(snapshot.outbox.length, 0); assert.deepEqual(snapshot.subscriptions[0].lastTest, receipt)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('test retry exhaustion reports a bounded failure and preserves it after restart', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-exhaustion-'))
+  let clock = Date.now(), sent = 0
+  const options = { now: () => clock, retryBaseMs: 1, sendNotification: async () => { sent++; throw Object.assign(new Error('Private rejection'), { statusCode: 503 }) } }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    const device = subscription('receipt-exhaustion'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint); await service.flush()
+    for (let attempt = 1; attempt < 8; attempt++) { clock = service.testStatus('session', result.deliveryId).nextRetryAt!; await service.flush() }
+    const receipt = service.testStatus('session', result.deliveryId)
+    assert.equal(receipt.state, 'failed'); assert.equal(receipt.attempts, 8); assert.equal(receipt.failure, 'provider_unavailable')
+    assert.equal(receipt.nextRetryAt, null); assert.equal(sent, 8)
+    await service.close(); service = await PushService.create(directory, new Set([origin]), options); await service.flush()
+    assert.deepEqual(service.testStatus('session', result.deliveryId), receipt); assert.equal(sent, 8)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('version-three device storage without a test receipt remains compatible and invalid receipts disclose no extra fields', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-test-receipt-compatibility-'))
+  const options = { sendNotification: async () => {} }
+  let service = await PushService.create(directory, new Set([origin]), options)
+  try {
+    const device = subscription('receipt-compatibility'); await service.subscribe('session', device)
+    const result = await service.test('session', device.endpoint); await service.flush(); await service.close()
+    const filename = path.join(directory, 'push-subscriptions.json')
+    const snapshot = JSON.parse(await fs.readFile(filename, 'utf8'))
+    delete snapshot.subscriptions[0].lastTest; await fs.writeFile(filename, JSON.stringify(snapshot))
+    service = await PushService.create(directory, new Set([origin]), options)
+    assert.equal(service.status('session').devices, 1)
+    assert.throws(() => service.testStatus('session', result.deliveryId), (cause: any) => cause.status === 404)
+    const latest = await service.test('session', device.endpoint); await service.flush(); await service.close()
+    const malformed = JSON.parse(await fs.readFile(filename, 'utf8'))
+    malformed.subscriptions[0].lastTest.endpoint = device.endpoint; await fs.writeFile(filename, JSON.stringify(malformed))
+    service = await PushService.create(directory, new Set([origin]), options)
+    assert.equal(service.status('session').devices, 1)
+    assert.throws(() => service.testStatus('session', latest.deliveryId), (cause: any) => cause.status === 404)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
 
 test('unknown source is retained for retry and a recovered child source suppresses its completion', async () => {
@@ -975,7 +1189,7 @@ test('test notification receipt returns after durable enqueue while all delivery
     service.observe(host, { method: 'turn/completed', params: { threadId: 'busy', turn: { id: 't', status: 'completed' } } });
     while (started < 4) await tick();
     const result = await service.test('session', subscription('test-accepted-4').endpoint);
-    assert.deepEqual(result, { ok: true, queued: true }); assert.equal(started, 4);
+    assert.deepEqual(result, { ok: true, queued: true, deliveryId: result.deliveryId }); assert.match(result.deliveryId, /^[0-9a-f-]{36}$/); assert.equal(started, 4);
     const stored = JSON.parse(await fs.readFile(path.join(directory, 'push-subscriptions.json'), 'utf8'));
     assert.equal(stored.outbox.length, 6); assert.equal(service.status('session').queued, 6);
   } finally { release(); await service.close(); await fs.rm(directory, { recursive: true, force: true }); }
@@ -1047,9 +1261,13 @@ test('hard delivery timeout schedules a durable retry instead of hanging or disc
     t.mock.timers.enable({ apis: ['setTimeout'] })
     const response = service.test('session', device.endpoint)
     await started; clock += 12000; t.mock.timers.tick(12000)
-    assert.equal((await response).queued, true); await service.flush(); assert.equal(service.status('session').lastFailure, 'timeout')
+    const result = await response
+    assert.equal(result.queued, true); await service.flush(); assert.equal(service.status('session').lastFailure, 'timeout')
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'retrying')
+    assert.equal(service.testStatus('session', result.deliveryId).failure, 'timeout')
     clock += 5000; await service.flush()
     assert.equal(calls, 2); assert.equal(service.status('session').queued, 0); assert.equal(service.status('session').delivered, 1)
+    assert.equal(service.testStatus('session', result.deliveryId).state, 'accepted')
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })
 
