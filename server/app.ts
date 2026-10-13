@@ -32,6 +32,7 @@ import { registerFiles } from './files.js'
 import { registerDiagnostics } from './diagnostics.js'
 import { registerThreadContext } from './thread-context.js'
 import { registerHostConnection } from './host-connection.js'
+import { registerHostSettings } from './host-settings.js'
 import { readRuntimePausedHosts, readRuntimeReleasedThreads, registerHostResources } from './host-resources.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
@@ -159,7 +160,12 @@ export async function createApp(options: AppOptions = {}) {
   registerConversationImages(app, getBridge)
   registerFiles(app, getBridge)
   registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
-  registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions })
+  registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions,
+    withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),
+  })
+  registerHostSettings(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions,
+    withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),
+  })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
     res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })

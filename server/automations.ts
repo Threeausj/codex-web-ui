@@ -58,6 +58,7 @@ export class AutomationService {
   private ticking = false;
   private closed = false;
   private operations = new Map<string, Promise<void>>();
+  private runtimeMaintenance = new Set<string>();
   private capacityError = '';
   private readonly file: string;
   private readonly now: () => number;
@@ -87,6 +88,17 @@ export class AutomationService {
     if (start) { this.timer = setInterval(() => { void this.tick().catch(cause => { this.error = (cause as Error).message; }); }, 10000); this.timer.unref(); }
   }
   list() { return { tasks: structuredClone(this.tasks), runs: structuredClone(this.runs.slice(-300).reverse()), error: this.error || this.capacityError }; }
+  /** Reserve one host across runtime replacement without blocking unrelated
+   * hosts. Enqueue and dispatch check the same reservation inside mutations. */
+  async withHostRuntimeMaintenance<T>(hostId: string, work: () => Promise<T>): Promise<T> {
+    await this.mutate(async () => {
+      if (this.runtimeMaintenance.has(hostId) || this.runs.some(run => run.spec.hostId === hostId && (active(run) || run.phase === 'needs_review')))
+        throw Object.assign(new Error('此主机仍有自动化正在执行、排队或等待结果核对，请处理后重新连接'), { status: 409, code: 'runtime_busy' });
+      this.runtimeMaintenance.add(hostId);
+    });
+    try { return await work(); }
+    finally { this.runtimeMaintenance.delete(hostId); }
+  }
   private mutate<T>(work: () => Promise<T>): Promise<T> {
     const operation = this.mutations.then(() => {
       if (this.closed) throw Object.assign(new Error('自动化服务正在停止'), { status: 503 });
@@ -143,6 +155,7 @@ export class AutomationService {
     else delete run.finishedAt;
   }
   private async enqueue(task: Automation, occurrence: number) {
+    if (this.runtimeMaintenance.has(task.hostId)) throw Object.assign(new Error('此主机正在重新连接 Codex，请稍后运行自动化'), { status: 409, code: 'runtime_reconnecting' });
     if (this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) throw Object.assign(new Error('此自动化仍在执行或等待结果核对'), { status: 409 });
     if (this.runs.filter(run => !terminal(run)).length >= 20) throw Object.assign(new Error('自动化等待队列已满'), { status: 409 });
     const { id, createdAt, updatedAt, nextAt, ...spec } = task;
@@ -171,6 +184,7 @@ export class AutomationService {
     try { await this.mutate(async () => {
       this.capacityError = '';
       for (const task of this.tasks) if (task.enabled && task.nextAt != null && task.nextAt <= this.now()) {
+        if (this.runtimeMaintenance.has(task.hostId)) continue;
         const occurrence = task.nextAt;
         if (!this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) {
           try { await this.enqueue(task, occurrence); }
@@ -185,6 +199,7 @@ export class AutomationService {
       }
       for (const run of this.runs) {
         if (this.closed) return;
+        if (this.runtimeMaintenance.has(run.spec.hostId)) continue;
         if (run.phase === 'failed' && run.retryAt && run.retryAt <= this.now()) { run.retryAt = undefined; delete run.error; this.note(run, 'queued', '执行前的连接失败，按配置重试'); await this.save(); }
         if (run.phase !== 'queued' || this.operations.size >= 2) continue;
         if (this.runs.some(other => other !== run && other.spec.hostId === run.spec.hostId && ['connecting','creating','dispatching','running','waiting'].includes(other.phase))) continue;

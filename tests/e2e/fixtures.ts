@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionReplyText } from '../../shared/async-question-reply';
 import { asyncQuestionAnswered } from '../../shared/async-question-reply';
@@ -79,6 +80,8 @@ export class MockCodex {
   nativeProjectIds = new Map<string, string>();
   sockets: WebSocketRoute[] = [];
   authenticated = false;
+  runtimeConnected = true;
+  runtimePaused = false;
   requireApprovalNext = false;
   holdFinalMessage = false;
   holdTurnStartResponse = false;
@@ -133,11 +136,15 @@ export class MockCodex {
     ],
   ]);
   private activeApproval?: { id: string; threadId: string; turn: any };
-  private activeProcess?: {
+  private activeProcesses = new Map<string, {
     request: Rpc;
     socket: WebSocketRoute;
     processId: string;
-  };
+    tty: boolean;
+    cwd: string;
+    lastOutput: string;
+  }>();
+  private terminalDecoders = new Map<string, StringDecoder>();
   private finishMessage?: () => void;
   private count = 0;
 
@@ -147,6 +154,34 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      const hostSettingsRoute = /^\/api\/hosts\/([^/]+)\/(runtime\/(?:information|reconnect)|settings\/rpc|codex-settings(?:\/(?:provider|login(?:\/cancel)?|logout))?)$/.exec(url.pathname);
+      if (hostSettingsRoute) {
+        const hostId = decodeURIComponent(hostSettingsRoute[1]!);
+        const target = hostId === "local" ? this : this.hostMocks.get(hostId);
+        if (!target) return respond({ error: "Host not found" }, 404);
+        const operation = hostSettingsRoute[2];
+        const native = (method: string, params?: any) => new Promise<any>((resolve, reject) => {
+          const sink = { send(raw: string) {
+            const message = JSON.parse(raw);
+            if (message.error) reject(Object.assign(new Error(message.error.message), message.error)); else resolve(message.result);
+          } } as unknown as WebSocketRoute;
+          target.receive(sink, { id: `settings-${this.count++}`, method, params });
+        });
+        if (operation === "runtime/information") return respond({
+          checkedAt: Date.now(), runtime: { connected: target.runtimeConnected, paused: target.runtimePaused, managed: true, mode: hostId === "local" ? "spawn" : "ssh", userAgent: "codex_cli_rs/fixture", activeThreadCount: [...target.turns.values()].filter(turns => turns.some(turn => turn.status === "inProgress")).length, activeProcesses: [...target.activeProcesses.values()].map(process => ({ processId: process.processId })) },
+          config: { model: target.config.model || null, model_context_window: target.config.model_context_window || null, model_auto_compact_token_limit: target.config.model_auto_compact_token_limit || null },
+          models: target.runtimeConnected && !target.runtimePaused ? models : [], canReconnect: !target.runtimePaused, reconnectDisabledReason: target.runtimePaused ? "Web Codex 已释放" : null,
+        });
+        if (operation === "runtime/reconnect") return respond({ ok: true });
+        if (operation === "settings/rpc") {
+          try {
+            const input = request.postDataJSON();
+            return respond(await native(input.method, input.params));
+          } catch (cause: any) { return respond({ error: cause.message, code: cause.code }, 400); }
+        }
+        if (operation === "codex-settings") return respond({ provider: "official", baseUrl: "", hasApiKey: false, model: target.config.model, connected: target.runtimeConnected, canChange: target.runtimeConnected && !target.runtimePaused, disabledReason: !target.runtimeConnected ? "请先连接此主机" : null, account: { type: "chatgpt", email: "test@example.invalid", planType: "plus" } });
+        return respond({ error: `Unimplemented settings fixture mutation: ${operation}` }, 404);
+      }
       if (url.pathname === '/api/async-question-notices') return respond({ dismissals: this.asyncQuestionNoticeDismissals });
       if (url.pathname === '/api/async-question-notices/dismiss') {
         const questions: AsyncQuestionNotice[] = request.postDataJSON().questions;
@@ -402,6 +437,7 @@ export class MockCodex {
           method: "bridge/status",
           params: {
             connected: true,
+            activeProcesses: [...target.activeProcesses.values()].map(({ request: _request, socket: _socket, ...process }) => process),
             releasedThreadIds: this.runtimeReleasedThreads.map(entry => entry.threadId),
             hostId,
             mode: "spawn",
@@ -414,6 +450,20 @@ export class MockCodex {
   }
 
   emit(method: string, params: unknown) {
+    if (method === "bridge/status") {
+      const status = params as { connected?: boolean; paused?: boolean };
+      if (typeof status.connected === "boolean") this.runtimeConnected = status.connected;
+      if (typeof status.paused === "boolean") this.runtimePaused = status.paused;
+    }
+    if (method === 'command/exec/outputDelta') {
+      const delta = params as any, process = this.activeProcesses.get(delta.processId);
+      if (process && delta.deltaBase64) {
+        const key = `${delta.processId}:${delta.stream || 'stdout'}`;
+        let decoder = this.terminalDecoders.get(key);
+        if (!decoder) { decoder = new StringDecoder('utf8'); this.terminalDecoders.set(key, decoder); }
+        process.lastOutput += decoder.write(Buffer.from(delta.deltaBase64, 'base64'));
+      }
+    }
     for (const socket of this.sockets)
       socket.send(JSON.stringify({ method, params }));
   }
@@ -718,7 +768,8 @@ export class MockCodex {
       case "fs/writeFile":
         return this.reply(socket, request, {});
       case "command/exec": {
-        this.activeProcess = { request, socket, processId: p.processId };
+        this.activeProcesses.set(p.processId, { request, socket, processId: p.processId, tty: !!p.tty, cwd: p.cwd, lastOutput: "" });
+        this.emit("bridge/status", { connected: true, activeProcesses: [...this.activeProcesses.values()].map(({ request: _request, socket: _socket, ...process }) => process) });
         // A UTF-8 codepoint can cross app-server byte-chunk boundaries.
         const bytes = Buffer.from("终端输出正常\n");
         this.emit("command/exec/outputDelta", {
@@ -740,13 +791,16 @@ export class MockCodex {
       case "command/exec/resize":
         return this.reply(socket, request, {});
       case "command/exec/terminate": {
-        if (this.activeProcess) {
-          this.reply(this.activeProcess.socket, this.activeProcess.request, {
+        const process = this.activeProcesses.get(p.processId);
+        if (process) {
+          this.reply(process.socket, process.request, {
             stdout: "",
             stderr: "",
             exitCode: 0,
           });
-          this.activeProcess = undefined;
+          this.activeProcesses.delete(p.processId);
+          this.emit("bridge/terminal/completed", { processId: p.processId, result: { stdout: "", stderr: "", exitCode: 0 } });
+          this.emit("bridge/status", { connected: true, activeProcesses: [...this.activeProcesses.values()].map(({ request: _request, socket: _socket, ...process }) => process) });
         }
         return this.reply(socket, request, {});
       }

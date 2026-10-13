@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { randomUUID } from "../lib/uuid";
 import Icon from "./Icon.vue";
 import ConnectionDialog from "./ConnectionDialog.vue";
@@ -8,6 +8,8 @@ import PwaSettings from "./PwaSettings.vue";
 import PasswordSettings from "./PasswordSettings.vue";
 import HostDiagnostics from "./HostDiagnostics.vue";
 import IntegrationsSettings from "./IntegrationsSettings.vue";
+import PerformanceSettings from "./PerformanceSettings.vue";
+import CodexSettings from "./CodexSettings.vue";
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -27,13 +29,17 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{ close: []; theme: [value: string] }>();
 const section = ref(props.initialTab || "general");
+const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "local");
+const codexSettingsBusy = ref(false);
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
+  { id: "performance", label: "性能", icon: "Zap" },
   { id: "pwa", label: "应用与通知", icon: "Smartphone" },
   { id: "projects", label: "项目", icon: "Folder" },
   { id: "hosts", label: "连接", icon: "Globe" },
   { id: "permissions", label: "权限预设", icon: "Shield" },
-  { id: "account", label: "账户", icon: "Bot" },
+  { id: "codex", label: "Codex", icon: "Bot" },
+  { id: "account", label: "账户", icon: "Lock" },
   { id: "integrations", label: "技能与集成", icon: "Package" },
   { id: "config", label: "配置", icon: "Code2" },
   { id: "shortcuts", label: "快捷键", icon: "Keyboard" },
@@ -41,19 +47,18 @@ const sections = [
 const projectPath = ref("");
 const projectName = ref("");
 const projectRootPaths = ref("");
-const projectHostId = ref(props.state.hostId || "local");
+const projectHostId = ref(settingsHostId.value);
 const folderPickerTarget = ref<"project" | "root" | null>(null);
 const hostForm = ref(false);
 const editingHost = ref<any>(null);
 const saving = ref(false);
+const settingsReading = ref(false);
+let settingsReadGeneration = 0;
 const error = ref("");
 const success = ref("");
 const configEdits = ref(
   '[\n  { "keyPath": "model", "value": "", "mergeStrategy": "replace" }\n]',
 );
-const loginUrl = ref("");
-const apiKey = ref("");
-const useApiKey = ref(false);
 const profileForm = ref(false);
 const editingProfileId = ref("");
 const profileDraft = reactive<WebPermissionProfile>({
@@ -66,7 +71,10 @@ const profileDraft = reactive<WebPermissionProfile>({
 const permissionProfiles = computed(() =>
   availablePermissionProfiles(props.state.preferences?.permissionProfiles),
 );
-const requirements = computed(() => props.state.requirements || null);
+const hostSettings = computed(() => props.api.hostSettings(settingsHostId.value));
+const settingsState = computed(() => hostSettings.value.state);
+const settingsApi = computed(() => hostSettings.value.api);
+const requirements = computed(() => settingsState.value.requirements || null);
 const defaultPermission = computed(
   () => props.state.preferences?.defaultPermission || "workspace-write",
 );
@@ -90,9 +98,9 @@ async function chooseDefaultPermission(event: Event) {
   );
   select.value = defaultPermission.value;
 }
-const configLayers = computed(() => props.state.config?.layers || []);
+const configLayers = computed(() => settingsState.value.config?.layers || []);
 const configOrigins = computed(() =>
-  Object.entries(props.state.config?.origins || {}).map(([key, value]) => ({
+  Object.entries(settingsState.value.config?.origins || {}).map(([key, value]) => ({
     key,
     ...(value as any),
   })),
@@ -106,15 +114,14 @@ const providerCapabilities = ref<any>(null);
 const providerNotice = ref("");
 let providerGeneration = 0;
 const selectedModel = computed(() =>
-  props.state.models?.find((model: any) => model.model === props.state.model),
-);
-const account = computed(
-  () => props.state.account?.account || props.state.account,
+  settingsState.value.models?.find((model: any) => model.model === settingsState.value.model),
 );
 const config = computed(
-  () => props.state.config?.config || props.state.config || {},
+  () => settingsState.value.config?.config || settingsState.value.config || {},
 );
 const currentHosts = computed(() => props.state.hosts || []);
+const settingsHost = computed(() => currentHosts.value.find((host: any) => host.id === settingsHostId.value));
+const globalSection = computed(() => ["general", "pwa", "account", "shortcuts"].includes(section.value));
 const projectHost = computed(() =>
   currentHosts.value.find((host: any) => host.id === projectHostId.value),
 );
@@ -126,10 +133,18 @@ watch(projectHostId, () => {
   success.value = "";
 });
 watch(currentHosts, (hosts) => {
+  if (!hosts.some((host: any) => host.id === settingsHostId.value)) settingsHostId.value = hosts[0]?.id || "local";
   if (!hosts.some((host: any) => host.id === projectHostId.value))
     projectHostId.value = hosts.some((host: any) => host.id === props.state.hostId)
       ? props.state.hostId
       : hosts[0]?.id || "local";
+});
+watch(settingsHostId, (value) => {
+  projectHostId.value = value;
+  error.value = "";
+  success.value = "";
+  profileForm.value = false;
+  configEdits.value = '[\n  { "keyPath": "model", "value": "", "mergeStrategy": "replace" }\n]';
 });
 function selectedFolder(path: string) {
   if (folderPickerTarget.value === "project") projectPath.value = path;
@@ -214,18 +229,18 @@ async function saveEdits() {
       const restriction = configEditRestriction(
         edit.keyPath,
         edit.value,
-        props.state.config,
+        settingsState.value.config,
         requirements.value,
       );
       if (restriction) throw new Error(restriction);
     }
-    await props.api.rpc("config/batchWrite", {
+    await settingsApi.value.rpc("config/batchWrite", {
       edits,
       filePath: userLayer.value?.name.file,
       expectedVersion: userLayer.value?.version,
       reloadUserConfig: true,
     });
-    await props.api.readConfig();
+    await settingsApi.value.readConfig();
   }, "配置已保存并重新读取");
 }
 function editProfile(profile?: WebPermissionProfile) {
@@ -260,7 +275,7 @@ async function saveProfile() {
     profiles.push(profile);
     await props.api.updatePreferences({ permissionProfiles: profiles });
     // Saving is allowed even if this host forbids selection, so the preset remains usable on another host.
-    if (!permissionProfileProblems(profile, requirements.value).length)
+    if (settingsHostId.value === props.state.hostId && !permissionProfileProblems(profile, requirements.value).length)
       await props.api.selectPermissionProfile(profile.id);
     profileForm.value = false;
   }, "权限预设已保存到 Web 服务");
@@ -278,66 +293,45 @@ async function deleteProfile(profile: WebPermissionProfile) {
 }
 async function loadProviderCapabilities() {
   const generation = ++providerGeneration;
-  const selectedHost = props.state.hostId;
+  const selectedHost = settingsHostId.value;
   providerCapabilities.value = null;
   providerNotice.value = "";
   try {
-    const result = await props.api.rpc(
+    const result = await settingsApi.value.rpc(
       "modelProvider/capabilities/read",
       {},
       45000,
       { silentError: true },
     );
     if (
-      selectedHost === props.state.hostId &&
+      selectedHost === settingsHostId.value &&
       generation === providerGeneration
     )
       providerCapabilities.value = result;
   } catch (cause: any) {
     if (
-      selectedHost === props.state.hostId &&
+      selectedHost === settingsHostId.value &&
       generation === providerGeneration
     )
       providerNotice.value = cause.message || "此主机未报告提供方能力";
   }
 }
-async function loginAccount() {
-  const result = await action(async () =>
-    props.api.rpc(
-      "account/login/start",
-      useApiKey.value
-        ? { type: "apiKey", apiKey: apiKey.value }
-        : { type: "chatgpt" },
-    ),
-  );
-  if (result?.authUrl) loginUrl.value = result.authUrl;
-  if (result?.type === "apiKey") {
-    apiKey.value = "";
-    success.value = "API 密钥已保存到当前主机";
-    await props.api.readConfig();
-  }
-}
-async function logoutAccount() {
-  await action(async () => {
-    await props.api.rpc("account/logout", {});
-    await props.api.readConfig();
-  }, "已退出 Codex 账户");
-}
-onMounted(() => {
-  if (props.state.connected) {
-    void action(async () => {
-      await props.api.readConfig();
-      await props.api.loadIntegrations();
+watch(() => [settingsHostId.value, section.value], () => {
+  const readGeneration = ++settingsReadGeneration;
+  ++providerGeneration;
+  providerCapabilities.value = null;
+  providerNotice.value = "";
+  if (["general", "config", "permissions", "integrations"].includes(section.value)) {
+    settingsReading.value = true;
+    const api = settingsApi.value;
+    void api.readConfig().catch((cause: any) => {
+      if (readGeneration === settingsReadGeneration) error.value = cause.message || "无法读取所选主机的设置";
+    }).finally(() => {
+      if (readGeneration === settingsReadGeneration) settingsReading.value = false;
     });
-    void loadProviderCapabilities();
-  }
-});
-watch(
-  () => props.state.hostId,
-  () => {
-    if (props.state.connected) void loadProviderCapabilities();
-  },
-);
+    if (section.value === "config") void loadProviderCapabilities();
+  } else settingsReading.value = false;
+}, { immediate: true });
 </script>
 
 <template>
@@ -358,6 +352,13 @@ watch(
           <Icon name="X" />
         </button>
       </header>
+      <div class="settings-host-bar">
+        <label for="settings-host-select"><Icon name="Server" :size="16" /><span>设置主机</span></label>
+        <select id="settings-host-select" v-model="settingsHostId" class="text-input" aria-label="设置主机" :disabled="saving || codexSettingsBusy || !!state.runtimeReconnectingHostId">
+          <option v-for="host in currentHosts" :key="host.id" :value="host.id">{{ host.name }}{{ host.kind === 'ssh' ? ' · 远程' : ' · 本机' }}</option>
+        </select>
+        <span v-if="globalSection" class="settings-host-scope">此栏目适用于整个 Web 应用</span>
+      </div>
       <div class="settings-layout">
         <nav class="settings-nav" aria-label="设置类别">
           <button
@@ -404,7 +405,7 @@ watch(
                 class="text-input compact-select"
                 :value="defaultPermission"
                 aria-label="全局默认权限"
-                :disabled="saving || state.selectingThread || state.switchingHost || state.changingContext"
+                :disabled="saving || settingsReading || state.selectingThread || state.switchingHost || state.changingContext"
                 @change="chooseDefaultPermission"
               >
                 <option value="read-only" :disabled="!!defaultPermissionProblems('read-only').length">只读</option>
@@ -470,6 +471,7 @@ watch(
             </div>
           </template>
           <PwaSettings v-else-if="section === 'pwa'" :api="api" :state="state" />
+          <PerformanceSettings v-else-if="section === 'performance'" :api="api" :state="state" :host-id="settingsHostId" />
           <template v-else-if="section === 'projects'">
             <h3>项目</h3>
             <p class="settings-description">
@@ -514,18 +516,6 @@ watch(
             </div>
             <form class="settings-form" @submit.prevent="addProject">
               <h4>添加项目</h4>
-              <label class="form-label">主机
-                <select
-                  v-model="projectHostId"
-                  class="text-input"
-                  aria-label="项目主机"
-                  :disabled="saving"
-                >
-                  <option v-for="host in currentHosts" :key="host.id" :value="host.id">
-                    {{ host.name }}{{ host.kind === 'ssh' ? ' · 远程' : ' · 本机' }}
-                  </option>
-                </select>
-              </label>
               <label class="form-label"
                 >项目路径<div class="project-path-row"><input
                   v-model="projectPath"
@@ -684,7 +674,7 @@ watch(
               <p class="connection-footnote">
                 连接使用此主机的 SSH 配置、已有密钥与 known_hosts。
               </p>
-              <HostDiagnostics :api="api" :host-id="state.hostId" :host-name="currentHosts.find((host: any) => host.id === state.hostId)?.name" />
+              <HostDiagnostics :api="api" :host-id="settingsHostId" :host-name="settingsHost?.name" />
             </div>
           </template>
           <template v-else-if="section === 'permissions'">
@@ -701,6 +691,7 @@ watch(
               给常用沙箱、审批和网络设置命名。Web
               预设跨设备保存，每次发送按官方协议应用，不修改桌面的命名权限配置。
             </p>
+            <p v-if="settingsHostId !== state.hostId" class="form-help">按所选主机检查权限策略；要在当前对话使用预设，请先切换到该主机的对话。</p>
             <div class="settings-list">
               <div
                 v-for="profile in permissionProfiles"
@@ -726,14 +717,14 @@ watch(
                   >
                 </div>
                 <span
-                  v-if="state.activePermissionProfileId === profile.id"
+                  v-if="settingsHostId === state.hostId && state.activePermissionProfileId === profile.id"
                   class="status-pill"
                   >当前</span
                 ><button
                   v-else
                   class="button button-small button-secondary"
                   :disabled="
-                    saving ||
+                    saving || settingsReading || settingsHostId !== state.hostId ||
                     !!permissionProfileProblems(profile, requirements).length
                   "
                   @click="
@@ -854,7 +845,7 @@ watch(
             </p>
             <div class="settings-list">
               <div
-                v-for="profile in state.nativePermissionProfiles || []"
+                v-for="profile in settingsState.nativePermissionProfiles || []"
                 :key="profile.id"
                 class="integration-row"
               >
@@ -868,81 +859,17 @@ watch(
                 }}</span>
               </div>
               <p
-                v-if="!state.nativePermissionProfiles?.length"
+                v-if="!settingsState.nativePermissionProfiles?.length"
                 class="settings-empty"
               >
                 此主机未报告原生权限预设。
               </p>
             </div>
           </template>
+          <CodexSettings v-else-if="section === 'codex'" :api="api" :state="state" :host-id="settingsHostId" @busy="codexSettingsBusy = $event" />
           <template v-else-if="section === 'account'">
-            <h3>Codex 账户</h3>
-            <p class="settings-description">
-              所选主机的模型账户，与网页访问密码独立。
-            </p>
-            <div v-if="account" class="account-card">
-              <div class="account-avatar"><Icon name="Bot" :size="24" /></div>
-              <div>
-                <strong>{{ account.email || account.type || "已登录" }}</strong
-                ><span>{{
-                  account.planType || account.plan || "当前主机账户"
-                }}</span>
-              </div>
-              <button
-                class="button button-small button-secondary"
-                @click="logoutAccount"
-                :disabled="saving"
-              >
-                退出账户
-              </button>
-            </div>
-            <template v-else
-              ><div class="setting-note">
-                <Icon name="Bot" :size="22" />
-                <p>登录 ChatGPT 账户，或使用 OpenAI API 密钥开始工作。</p>
-              </div>
-              <div class="segmented-control account-methods">
-                <button
-                  :class="{ active: !useApiKey }"
-                  @click="useApiKey = false"
-                >
-                  ChatGPT</button
-                ><button
-                  :class="{ active: useApiKey }"
-                  @click="useApiKey = true"
-                >
-                  API 密钥
-                </button>
-              </div>
-              <label v-if="useApiKey" class="form-label"
-                >API 密钥<input
-                  v-model="apiKey"
-                  class="text-input"
-                  type="password"
-                  placeholder="sk-…"
-                  autocomplete="off" /></label
-              ><button
-                class="button button-primary"
-                :disabled="
-                  saving || !state.connected || (useApiKey && !apiKey.trim())
-                "
-                @click="loginAccount"
-              >
-                {{ useApiKey ? "保存 API 密钥" : "登录 ChatGPT"
-                }}<Icon
-                  v-if="saving"
-                  name="LoaderCircle"
-                  :size="15"
-                  class="spin"
-                /></button
-              ><a
-                v-if="loginUrl && /^https?:\/\//.test(loginUrl)"
-                :href="loginUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="account-login-link"
-                >继续在浏览器完成登录<Icon name="ExternalLink" :size="14" /></a
-            ></template>
+            <h3>网页账户</h3>
+            <p class="settings-description">管理此 Web 应用的访问密码与登录。主机的模型账户可在 Codex 中切换。</p>
             <div class="setting-row">
               <div>
                 <strong>网页访问</strong
@@ -964,7 +891,7 @@ watch(
             <PasswordSettings v-if="state.authRequired" :api="api" :state="state" />
           </template>
           <template v-else-if="section === 'integrations'">
-            <IntegrationsSettings :api="api" :state="state" />
+            <IntegrationsSettings :key="settingsHostId" :api="settingsApi" :state="settingsState" />
           </template>
           <template v-else-if="section === 'config'">
             <div class="settings-title-row">
@@ -973,7 +900,7 @@ watch(
                 class="icon-button"
                 @click="
                   action(async () => {
-                    await api.readConfig();
+                    await settingsApi.readConfig();
                     await loadProviderCapabilities();
                   })
                 "
@@ -991,7 +918,7 @@ watch(
             <div class="setting-row">
               <div>
                 <strong>{{
-                  selectedModel?.displayName || state.model || "主机默认模型"
+                  selectedModel?.displayName || settingsState.model || "主机默认模型"
                 }}</strong
                 ><span
                   >{{ config.model_provider || "默认提供方" }} · 输入：{{
@@ -1106,7 +1033,7 @@ watch(
               ><button
                 class="button button-primary"
                 type="submit"
-                :disabled="saving || !state.connected"
+                :disabled="saving || settingsReading || !settingsState.connected || settingsState.runtimePaused || !settingsState.config"
               >
                 <Icon
                   :name="saving ? 'LoaderCircle' : 'Save'"
@@ -1149,6 +1076,11 @@ watch(
 </template>
 
 <style scoped>
+.settings-host-bar { display:flex; align-items:center; gap:12px; padding:12px 22px; border-bottom:1px solid var(--border); flex-shrink:0; }
+.settings-host-bar label { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:11px; flex-shrink:0; }
+.settings-host-bar .text-input { width:210px; min-width:0; min-height:32px; font-size:12px; padding:7px 10px; }
+.settings-host-scope { font-size:10px; color:var(--muted); margin-left:auto; overflow-wrap:anywhere; }
+@media(max-width:760px) { .settings-host-bar { padding:11px 19px; gap:10px; flex-wrap:wrap; } .settings-host-bar label { font-size:12px; } .settings-host-bar .text-input { width:auto; flex:1; font-size:14px; min-height:38px; } .settings-host-scope { flex-basis:100%; margin:0; font-size:11px; } }
 .project-path-row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
 .project-path-row .text-input { min-width: 0; flex: 1; margin-top: 0; }
 .project-path-row .button { flex-shrink: 0; min-height: 38px; }

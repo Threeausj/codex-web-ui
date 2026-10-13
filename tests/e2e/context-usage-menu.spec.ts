@@ -156,7 +156,8 @@ test('a narrow desktop conversation wraps its tools without overlap, keeps conte
   expect(mock.request('turn/interrupt')).toBeUndefined();
   expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
   await expectControlsFit();
-  const current = (await page.getByRole('button', { name: '追加指令', exact: true }).boundingBox())!;
+  await expect(page.locator('.composer-submit .send-button')).toHaveCount(1);
+  const current = (await page.getByRole('button', { name: '停止生成', exact: true }).boundingBox())!;
   expect(current.x + current.width).toBeCloseTo(before.x + before.width, 0);
   expect(current.y + current.height).toBeCloseTo(before.y + before.height, 0);
   await indicator(page).click();

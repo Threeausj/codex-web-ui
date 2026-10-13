@@ -746,7 +746,7 @@ defineExpose({
           </button>
         </div>
         <select
-          v-if="state.terminalProcesses?.length"
+          v-if="terminalMode === 'command' && state.terminalProcesses?.length"
           :value="state.terminalProcessId"
           aria-label="选择运行中的终端"
           @change="

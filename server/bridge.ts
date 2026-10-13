@@ -20,7 +20,7 @@ export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?
 type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
-type DisconnectCategory = 'inputError' | 'nativeJson' | 'nativeFrameLimit' | 'transportError' | 'transportClose' | 'initializeFailure' | 'requestWrite' | 'runtimePaused' | 'serverClosed'
+type DisconnectCategory = 'inputError' | 'nativeJson' | 'nativeFrameLimit' | 'transportError' | 'transportClose' | 'initializeFailure' | 'requestWrite' | 'runtimePaused' | 'runtimeReconnect' | 'serverClosed'
 export type ReleasedThread = { name: string; restoreThreadIds: string[] }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
 
@@ -96,6 +96,11 @@ export class Bridge {
   private compactions = new Map<string, { requests: Set<string>; items: Map<string, string | undefined> }>()
   private disposed = false
   private pausing?: Promise<void>
+  private reconnecting?: Promise<void>
+  private runtimeMaintenance = false
+  // Children created by Codex need not be browser subscriptions. Track their
+  // activity separately so refreshing the engine cannot terminate them.
+  private nativeActiveThreads = new Set<string>()
   private subscribedThreads = new Set<string>()
   private activeThreads = new Set<string>()
   // Metadata generation shares the native connection, never the visible chat.
@@ -176,6 +181,7 @@ export class Bridge {
   }
 
   async connect(): Promise<void> {
+    if (this.runtimeMaintenance) throw Object.assign(new Error('正在重新连接 Codex，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
     if (this.paused) throw Object.assign(new Error('此主机的 Web Codex 已释放，点击“连接 Web Codex”后恢复'), { status: 409, code: 'runtime_paused' })
     if (this.connected) return
     if (this.connecting) return this.connecting
@@ -268,6 +274,9 @@ export class Bridge {
   }
 
   private checkThreadRequest(method: string, params: unknown) {
+    // A caller may have passed connect() immediately before maintenance was
+    // reserved. Check again after that await, before any native write.
+    if (this.runtimeMaintenance) throw Object.assign(new Error('正在重新连接 Codex，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
     if (this.releasing.size && ['thread/archive', 'thread/unarchive', 'thread/delete'].includes(method))
       throw Object.assign(new Error('会话正在关闭，请稍后再归档、恢复或删除'), { status: 409 })
     const id = (params as { threadId?: string } | undefined)?.threadId
@@ -559,7 +568,7 @@ export class Bridge {
       const result = await this.rawRequest(message.method, message.params, key, message.id, timeout, recipient, reply)
       reply({ id: message.id, result })
     } catch (error) {
-      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : ['runtime_paused', 'thread_released'].includes((error as { code?: string }).code || '') ? { data: { code: (error as { code?: string }).code } } : {}) } })
+      reply({ id: message.id, error: error instanceof RpcFailure ? error.rpc : { code: -32000, message: (error as Error).message, ...((error as { uncertain?: boolean; code?: string }).uncertain ? { data: { uncertain: true } } : ['runtime_paused', 'runtime_reconnecting', 'thread_released'].includes((error as { code?: string }).code || '') ? { data: { code: (error as { code?: string }).code } } : {}) } })
     }
   }
 
@@ -617,6 +626,12 @@ export class Bridge {
       } } }
     }
     this.observeContext(message)
+    const activity = message.params as { threadId?: string; thread?: { id?: string; status?: { type?: string } }; turn?: { status?: string }; status?: { type?: string } } | undefined
+    if (message.method === 'thread/started' && activity?.thread?.id && activity.thread.status?.type === 'active') this.nativeActiveThreads.add(activity.thread.id)
+    if (activity?.threadId) {
+      if (message.method === 'turn/started' && (!activity.turn?.status || activity.turn.status === 'inProgress') || message.method === 'thread/status/changed' && activity.status?.type === 'active') this.nativeActiveThreads.add(activity.threadId)
+      if (['turn/completed', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/status/changed' && activity.status?.type !== 'active') this.nativeActiveThreads.delete(activity.threadId)
+    }
     this.rememberApprovalItem(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
       const id = (message.params as { threadId?: string })?.threadId
@@ -765,6 +780,7 @@ export class Bridge {
     this.approvalItems.clear(); this.approvalItemBytes = 0
     this.subscribedThreads.clear()
     this.activeThreads.clear()
+    this.nativeActiveThreads.clear()
     this.internalThreads.clear()
     this.contexts.clear()
     this.compactions.clear()
@@ -873,11 +889,121 @@ export class Bridge {
   }
 
   async resume(): Promise<void> {
+    if (this.runtimeMaintenance) throw Object.assign(new Error('正在重新连接 Codex，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
     await this.pausing
     await this.connecting?.catch(() => {})
     if (this.disposed) throw new Error('Host connection was closed')
     this.paused = false
     await this.connect()
+  }
+
+  private assertRuntimeIdle() {
+    const conflict = (message: string) => Object.assign(new Error(message), { status: 409, code: 'runtime_busy' })
+    if (this.disposed) throw Object.assign(new Error('Host connection was closed'), { status: 409 })
+    if (this.pausing || this.releasing.size) throw conflict('正在释放会话连接，请稍后重试')
+    if (this.activeThreads.size || this.nativeActiveThreads.size) throw conflict('此主机仍有对话或子智能体正在运行，请等待完成后重新连接')
+    if (this.approvals.size) throw conflict('此主机仍有待处理的审批或问题，请先处理后重新连接')
+    if (this.processes.size) throw conflict('此主机仍有终端正在运行，请先关闭终端后重新连接')
+    if (this.pending.size || this.connecting) throw conflict('此主机仍有请求或命令未完成，请稍后重新连接')
+  }
+
+  get reconnectStatus() {
+    try {
+      if (this.runtimeMaintenance) throw new Error('正在重新连接 Codex，请稍后重试')
+      this.assertRuntimeIdle()
+      return { canReconnect: true, reconnectDisabledReason: null }
+    } catch (error) { return { canReconnect: false, reconnectDisabledReason: (error as Error).message } }
+  }
+
+  private async assertNativeRuntimeIdle() {
+    if (this.connected) {
+      // Query native memory rather than assuming all child sessions have
+      // been opened in this browser. Never resume a thread for this check.
+      const cursors = new Set<string>(), ids = new Set<string>()
+      const probe = (method: string, params: unknown) => this.rawRequest(method, params, undefined, undefined, 10000)
+        .catch(() => { throw Object.assign(new Error('无法核对 Codex 的活动会话，请稍后重新连接'), { status: 409 }) })
+      let cursor: string | null = null
+      do {
+        const page = await probe('thread/loaded/list', { limit: 100, cursor }) as { data?: unknown; nextCursor?: unknown }
+        if (!Array.isArray(page?.data) || page.data.some(id => typeof id !== 'string') || page.nextCursor != null && typeof page.nextCursor !== 'string')
+          throw Object.assign(new Error('无法确认 Codex 已加载会话的状态，请稍后重新连接'), { status: 409 })
+        for (const id of page.data as string[]) ids.add(id)
+        cursor = page.nextCursor as string | null || null
+        if (ids.size > 10000 || cursor && cursors.has(cursor)) throw Object.assign(new Error('无法完整核对 Codex 会话，请稍后重新连接'), { status: 409 })
+        if (cursor) cursors.add(cursor)
+        this.assertRuntimeIdle()
+      } while (cursor)
+      for (const threadId of ids) {
+        const metadata = await probe('thread/read', { threadId, includeTurns: false }) as { thread?: { id?: string; status?: { type?: string } } }
+        const status = metadata?.thread?.status?.type
+        if (status === 'active') throw Object.assign(new Error('此主机仍有对话或子智能体正在运行，请等待完成后重新连接'), { status: 409, code: 'runtime_busy' })
+        if (metadata?.thread?.id !== threadId || !['idle', 'notLoaded', 'systemError'].includes(status || ''))
+          throw Object.assign(new Error('无法确认 Codex 会话是否空闲，请稍后重新连接'), { status: 409 })
+        this.assertRuntimeIdle()
+        // Commands started by model tools can outlive their turn and are
+        // not command/exec sessions owned by this Web bridge.
+        const terminals = await probe('thread/backgroundTerminals/list', { threadId, limit: 1 }) as { data?: unknown; nextCursor?: unknown }
+        if (!Array.isArray(terminals?.data) || terminals.nextCursor != null && typeof terminals.nextCursor !== 'string')
+          throw Object.assign(new Error('无法核对 Codex 后台终端，请稍后重新连接'), { status: 409 })
+        if (terminals.data.length || terminals.nextCursor) throw Object.assign(new Error('此主机仍有后台命令或终端正在运行，请先关闭后重新连接'), { status: 409, code: 'runtime_busy' })
+        this.assertRuntimeIdle()
+      }
+    }
+    this.assertRuntimeIdle()
+  }
+
+  /** Idle host maintenance for configuration and native device login. The
+   * transport stays open, so account/login/start is not canceled by a restart. */
+  withRuntimeMaintenance<T>(work: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<T>): Promise<T> {
+    try {
+      if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
+      this.assertRuntimeIdle()
+      if (!this.connected) throw Object.assign(new Error('请先连接 Codex 后再更新配置'), { status: 409 })
+    } catch (error) { return Promise.reject(error) }
+    this.runtimeMaintenance = true
+    return (async () => {
+      await this.assertNativeRuntimeIdle()
+      return work((method, params, timeout = 10000) => this.rawRequest(method, params, undefined, undefined, timeout))
+    })().finally(() => { this.runtimeMaintenance = false })
+  }
+
+  /** Explicitly refresh only this Web client's runtime. The shared proxy daemon
+   * is never terminated: disposing its transport closes only our proxy client. */
+  reconnect(prepare?: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<void>): Promise<void> {
+    if (this.reconnecting) return prepare ? Promise.reject(Object.assign(new Error('另一项 Codex 更新正在进行，请稍后重试'), { status: 409 })) : this.reconnecting
+    try {
+      if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
+      this.assertRuntimeIdle()
+    } catch (error) { return Promise.reject(error) }
+    this.runtimeMaintenance = true
+    const wasPaused = this.paused
+    const operation = (async () => {
+      try {
+        await this.assertNativeRuntimeIdle()
+        this.assertRuntimeIdle()
+        if (prepare) {
+          if (!this.connected) throw Object.assign(new Error('请先连接 Codex 后再更新配置'), { status: 409 })
+          await prepare((method, params, timeout = 10000) => this.rawRequest(method, params, undefined, undefined, timeout))
+          this.assertRuntimeIdle()
+        }
+        const transport = this.transport
+        this.disconnect(new Error('正在重新连接 Codex'), 'runtimeReconnect')
+        if (transport?.closed) {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          try {
+            await Promise.race([transport.closed, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(Object.assign(new Error('旧 Codex 连接尚未关闭，请稍后重试'), { status: 409 })), 4000); timer.unref?.() })])
+          } finally { clearTimeout(timer) }
+        }
+        if (this.disposed) throw new Error('Host connection was closed')
+        this.paused = false
+        await this.initialize()
+      } catch (error) {
+        this.paused = wasPaused
+        throw error
+      }
+    })().finally(() => { this.runtimeMaintenance = false; this.reconnecting = undefined })
+    this.reconnecting = operation
+    return operation
   }
 
   close(reason = 'Server stopping', code = 1001) {

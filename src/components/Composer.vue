@@ -33,11 +33,33 @@ const uploading = computed(() => uploadCount.value > 0);
 let uploadContextGeneration = 0;
 watch(() => [props.state.hostId, props.state.projectPath, props.state.activeThread?.id], () => { ++uploadContextGeneration; }, { flush: "sync" });
 const submitting = ref(false);
+const submittedDuringCompaction = ref(false);
+const stopProtected = ref(false);
+let stopGuardUntil = 0;
+let stopGuardTimer: ReturnType<typeof setTimeout> | undefined;
 const delivery = ref<"immediate" | "queue">("immediate");
 const queue = computed(() => props.api.messageQueue);
 watch(() => [props.state.hostId, props.state.activeThread?.id], () => { delivery.value = "immediate"; });
 watch(() => props.state.busy, (busy, previous) => { if (!busy && previous && !submitting.value) delivery.value = "immediate"; });
 const sendLabel = computed(() => delivery.value === "queue" ? "加入下一轮队列" : props.state.busy ? "追加指令" : "发送消息");
+const hasContent = computed(() => !!(draft.value.trim() || quotedContexts.value.length ||
+  props.state.attachments?.length || props.state.selectedSkills?.length));
+const showStop = computed(() => props.state.busy && !hasContent.value && !submitting.value);
+const primaryLabel = computed(() => showStop.value ? "停止生成" : submitting.value && submittedDuringCompaction.value ? "压缩结束后发送" : sendLabel.value);
+function protectStop() {
+  stopGuardUntil = Date.now() + 600;
+  stopProtected.value = true;
+  clearTimeout(stopGuardTimer);
+  stopGuardTimer = setTimeout(() => { stopProtected.value = false; }, 600);
+}
+async function primaryAction(event: MouseEvent) {
+  if (!showStop.value) { await send(); return; }
+  // A double tap still lands on the same single action. Keyboard activation
+  // is deliberate and does not need the short pointer protection.
+  if (event.detail > 0 && Date.now() < stopGuardUntil) return;
+  try { await props.api.interrupt(); }
+  catch (cause: any) { emit("error", cause.message || "停止失败"); }
+}
 let pendingDraftSubmission: {
   key: string; hostId: string; projectPath: string; threadId?: string; targetKey?: string;
 } | undefined;
@@ -316,10 +338,9 @@ const canSend = computed(
   () =>
     !props.state.threadConflict &&
     !queue.value?.state.uncertain &&
-    (delivery.value !== "queue" || queue.value?.canMutate.value) &&
+    (delivery.value !== "queue" || props.state.compacting && queue.value?.state.status === 'supported' || queue.value?.canMutate.value) &&
     (!props.state.activeThread || props.state.threadReady !== false) &&
     !props.state.runtimePaused &&
-    !props.state.compacting &&
     props.state.connected &&
     !props.state.selectingThread &&
     !props.state.switchingHost &&
@@ -328,7 +349,7 @@ const canSend = computed(
     !props.contextBusy &&
     !submitting.value &&
     !uploading.value &&
-    (draft.value.trim() || quotedContexts.value.length || props.state.attachments?.length || props.state.selectedSkills?.length),
+    hasContent.value,
 );
 function resize() {
   if (input.value) {
@@ -474,16 +495,19 @@ async function send() {
   const submittedContexts = [...quotedContexts.value];
   const command = commands.find((command) => command.name === text);
   if (command) {
+    protectStop();
     emit("command", command.id);
     draft.value = "";
     resize();
     return;
   }
   submitting.value = true;
+  submittedDuringCompaction.value = !!props.state.compacting;
   pendingDraftSubmission = { key: submittedKey, hostId: props.state.hostId,
     projectPath: props.state.projectPath, threadId: props.state.activeThread?.id };
   try {
     await props.api.send(text, undefined, submittedContexts, delivery.value);
+    protectStop();
     clearSubmittedDraft(submittedKey, submittedDraft);
     const sentKeys = new Set(submittedContexts.map(conversationSelectionKey));
     if (draftKey.value === submittedKey)
@@ -509,6 +533,7 @@ async function send() {
     emit("error", cause.message || "发送消息失败");
   } finally {
     submitting.value = false;
+    submittedDuringCompaction.value = false;
     if (!props.state.busy) delivery.value = "immediate";
     pendingDraftSubmission = undefined;
   }
@@ -690,6 +715,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   ++uploadContextGeneration;
+  clearTimeout(stopGuardTimer);
   if (searchTimer) clearTimeout(searchTimer);
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);
@@ -1059,21 +1085,17 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               </optgroup></select
             ><Icon name="ChevronDown" :size="11" /></label
           ><button
-            v-if="state.busy"
-            class="send-button stop-button"
-            @click="api.interrupt()"
-            title="停止生成"
-            aria-label="停止生成"
-          >
-            <span></span></button
-          ><button
             class="send-button"
-            :disabled="!canSend"
-            @click="send"
-            :title="sendLabel"
-            :aria-label="sendLabel"
+            :class="{ 'stop-button': showStop }"
+            :disabled="showStop ? !state.connected : !canSend"
+            :data-stop-protected="showStop && stopProtected || undefined"
+            @click="primaryAction"
+            :title="primaryLabel"
+            :aria-label="primaryLabel"
           >
+            <span v-if="showStop"></span>
             <Icon
+              v-else
               :name="submitting ? 'LoaderCircle' : 'ArrowUp'"
               :size="20"
               :class="{ spin: submitting }"
@@ -1082,6 +1104,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         </div>
       </div>
     </div>
+    <p v-if="submitting && submittedDuringCompaction" class="compaction-send-note" role="status"><Icon name="LoaderCircle" :size="12" class="spin" />压缩结束后发送，草稿暂时保留。</p>
   </div>
   <Teleport to="body">
     <section
@@ -1115,6 +1138,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 </template>
 
 <style scoped>
+.compaction-send-note { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; margin: 7px 4px 0; }
 .composer-area {
   border: 1px solid var(--border);
   border-radius: 16px;

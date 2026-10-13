@@ -37,6 +37,7 @@ async function tapSendTwice(page: Page, buttonName: string, mock: MockCodex) {
 async function explicitlyStop(page: Page, mock: MockCodex) {
   const threadId = mock.request('turn/start')!.params.threadId;
   const turnId = mock.turns.get(threadId)!.at(-1)!.id;
+  await expect(stop(page)).not.toHaveAttribute('data-stop-protected', 'true');
   await stop(page).click();
   await expect.poll(() => interruptions(mock).map(request => request.params)).toEqual([{ threadId, turnId }]);
   await expect(stop(page)).toHaveCount(0);
@@ -45,7 +46,7 @@ async function explicitlyStop(page: Page, mock: MockCodex) {
 
 for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) test.describe(`Stop button stability at ${viewport.width}px`, () => {
   test.use({ hasTouch: viewport.width < 760 });
-  test(`consecutive send taps preserve the new task while an explicit Stop remains immediate at ${viewport.width}px`, async ({ page, mock }) => {
+  test(`consecutive send taps preserve the new task while Stop works after the short pointer guard at ${viewport.width}px`, async ({ page, mock }) => {
     await page.setViewportSize(viewport);
     holdUntilStopped(mock);
     await login(page);
@@ -93,4 +94,14 @@ for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 
     mock.emit('thread/status/changed', { threadId, status: { type: 'idle' } });
     await expect(page.locator('.thread-menu').getByRole('button', { name: '归档对话', exact: true })).toBeEnabled();
   });
+});
+
+test('a deliberate keyboard Stop bypasses pointer double-tap protection', async ({ page, mock }) => {
+  holdUntilStopped(mock);
+  await login(page);
+  await send(page, '开始任务');
+  await expect(stop(page)).toHaveAttribute('data-stop-protected', 'true');
+  await stop(page).focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => interruptions(mock).length).toBe(1);
 });

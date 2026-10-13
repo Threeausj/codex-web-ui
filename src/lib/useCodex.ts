@@ -1,5 +1,8 @@
 import { methodAccepts } from "./integration-capabilities";
 import { copyText } from './copy-text';
+import { useHostSettings } from './host-settings';
+import { interactiveShellCommand } from '../../shared/terminal-shell';
+import { waitForCompaction } from './compaction-send';
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
 import { reactive, ref, toRaw } from "vue";
 import { randomUUID } from "./uuid";
@@ -133,6 +136,8 @@ const state = reactive({
   agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number; turnId?: string; turnStatus?: string }>,
   attachments: [] as any[],
   config: null as any,
+  runtimeInformation: {} as Record<string, any>,
+  runtimeReconnectingHostId: '',
   skills: [] as any[],
   skillsLoading: false,
   skillsError: "",
@@ -172,6 +177,7 @@ let csrfToken = "";
 let authenticationGeneration = 0;
 function advanceAuthentication() {
   state.authenticationGeneration = ++authenticationGeneration;
+  settingsApi.resetHostSettings();
 }
 type SessionStatus = { authenticated: boolean; authRequired?: boolean; csrfToken?: string };
 let sessionValidation: { generation: number; promise: Promise<SessionStatus | null> } | null = null;
@@ -234,6 +240,7 @@ const tokenUsages = new Map<string, any>();
 const tokenUsageRevisions = new Map<string, number>();
 const compactionRevisions = new Map<string, number>();
 const compactions = new Map<string, { turnId?: string; requested?: boolean }>();
+const compactionResults = new Map<string, boolean>();
 const pausedHosts = new Set<string>();
 const releasedThreads = new Map<string, Set<string>>();
 function updateReleasedThreads(hostId: string, ids: string[]) {
@@ -300,6 +307,93 @@ function sideChatRpc(hostId: string, method: Method, params: any) {
   return rpc(method, params, 45000, { silentError: true });
 }
 function runtimeIdentity() { return { authenticationGeneration, engineId }; }
+let metadataReconnectChoices: { authentication: number; hostId: string; hostGeneration: number; threadId: string | null } | null = null;
+function preserveMetadataChoices() {
+  const selection = metadataReconnectChoices;
+  return !!selection && selection.authentication === authenticationGeneration && selection.hostId === state.hostId &&
+    selection.hostGeneration === hostSelectionGeneration && selection.threadId === (state.activeThread?.id || null);
+}
+const settingsApi = useHostSettings(state, http, runtimeIdentity, hostId => {
+  if (hostId !== state.hostId) return;
+  ++configGeneration;
+  verifiedConfiguration = null;
+  configurationRequest = null;
+  invalidateRuntimeCapabilities();
+});
+async function refreshCurrentRuntimeMetadata() {
+  const authentication = authenticationGeneration, hostId = state.hostId, selectedEngine = engineId;
+  const hostGeneration = hostSelectionGeneration;
+  const current = () => authentication === authenticationGeneration && state.authenticated && hostId === state.hostId &&
+    hostGeneration === hostSelectionGeneration && selectedEngine === engineId && state.connected && !state.runtimePaused;
+  if (!state.authenticated || !state.connected || state.runtimePaused) return;
+  try {
+    const information = await settingsApi.refreshRuntimeInformation(hostId);
+    if (!current() || information.runtime?.engineId !== selectedEngine) return;
+    await readConfig(true, true);
+    if (!current()) return;
+    if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+  } catch { /* A later reconnect/read retries metadata; never replay mutations. */ }
+}
+async function reconnectRuntime(hostId = state.hostId) {
+  if (state.runtimeReconnectingHostId) throw new Error('正在重新连接主机，请稍候');
+  const authentication = authenticationGeneration;
+  const selectedHostGeneration = hostSelectionGeneration;
+  const choices = hostId === state.hostId ? { authentication, hostId, hostGeneration: selectedHostGeneration, threadId: state.activeThread?.id || null } : null;
+  if (choices) metadataReconnectChoices = choices;
+  const authenticated = () => authentication === authenticationGeneration && state.authenticated;
+  const currentHost = () => authenticated() && hostId === state.hostId && selectedHostGeneration === hostSelectionGeneration;
+  const assertAuthenticated = () => { if (!authenticated()) throw new Error('登录状态已变化，请重新核对主机连接'); };
+  state.runtimeReconnectingHostId = hostId;
+  settingsApi.invalidateHostSettings(hostId);
+  if (currentHost()) { ++configGeneration; verifiedConfiguration = null; configurationRequest = null; }
+  try {
+    const response = await http(`/hosts/${encodeURIComponent(hostId)}/runtime/reconnect`, { method: 'POST', body: '{}' }, false);
+    assertAuthenticated();
+    const reconnectedEngine = response.runtime?.engineId;
+    const information = await settingsApi.refreshRuntimeInformation(hostId);
+    assertAuthenticated();
+    if (!information.runtime?.connected || information.runtime?.paused || !reconnectedEngine || information.runtime.engineId !== reconnectedEngine)
+      throw new Error('Codex 连接已变化或未恢复，请重新读取运行信息');
+    if (currentHost()) {
+      verifiedConfiguration = null;
+      configurationRequest = null;
+      invalidateRuntimeCapabilities();
+      // Re-handshake notifications retain all browser drafts and synchronise
+      // the selected writer. Wait for the new transport before reading config.
+      await resumeConnection();
+      assertAuthenticated();
+      if (currentHost()) {
+        if (!state.connected || state.runtimePaused || engineId !== reconnectedEngine ||
+          state.activeThread && !state.threadReleased && !state.threadReady)
+          throw new Error(state.threadConflict?.message || state.error || '主机已重启，但当前对话尚未恢复，请同步对话后重试');
+        await readConfig(true, true);
+        assertAuthenticated();
+        if (!currentHost()) return information;
+        if (!state.connected || state.runtimePaused || engineId !== reconnectedEngine)
+          throw new Error('Codex 连接已变化，请重新读取运行信息');
+        if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+        await Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
+        assertAuthenticated();
+        if (!currentHost()) return information;
+        if (!state.connected || state.runtimePaused || engineId !== reconnectedEngine)
+          throw new Error('Codex 连接已变化，请重新读取运行信息');
+        if (state.activeThread?.id) await refreshContextUsage(hostId, state.activeThread.id);
+        assertAuthenticated();
+        if (currentHost() && (!state.connected || state.runtimePaused || engineId !== reconnectedEngine))
+          throw new Error('Codex 连接已变化，请重新读取运行信息');
+      }
+    }
+    return information;
+  } catch (error) {
+    // Refresh read-only availability after a rejected or uncertain restart.
+    // The user's explicit retry remains the only source of another POST.
+    if (authenticated()) await settingsApi.refreshRuntimeInformation(hostId).catch(() => {});
+    throw error;
+  } finally {
+    if (metadataReconnectChoices === choices) metadataReconnectChoices = null;
+    if (authentication === authenticationGeneration && state.runtimeReconnectingHostId === hostId) state.runtimeReconnectingHostId = '';
+  }
+}
 const terminalDecoders = new Map<string, TextDecoder>();
 const completedTerminalProcesses = new Set<string>();
 const recencySortSupport = new Map<string, boolean>();
@@ -627,12 +721,14 @@ function beginCompactionUsage(threadId: string) {
   const key = recencyKey(state.hostId, threadId);
   compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
   if (!compactions.has(key)) compactions.set(key, {});
+  compactionResults.delete(key);
   if (state.activeThread?.id === threadId) state.compacting = true;
 }
 function finishCompaction(threadId: string, turnId?: string, completed = true) {
   const key = recencyKey(state.hostId, threadId);
   const current = compactions.get(key);
   if (current?.turnId && turnId && current.turnId !== turnId) return;
+  if (current) compactionResults.set(key, completed);
   compactions.delete(key);
   compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
   if (current?.requested && !activeTurns.has(threadId)) noteRuntime(threadId, false);
@@ -679,7 +775,10 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
   });
   document.addEventListener('freeze', () => { void flushConversationCache(); });
 }
-function appendTerminal(chunk: string) {
+function appendTerminal(chunk: string, processId = state.terminalProcessId) {
+  const process = state.terminalProcesses.find(process => process.processId === processId);
+  if (process) process.lastOutput = ((process.lastOutput || "") + chunk).slice(-200000);
+  if (processId !== state.terminalProcessId) return;
   state.terminalOutput = (state.terminalOutput + chunk).slice(-500000);
   for (const listener of terminalListeners) listener(chunk);
 }
@@ -719,7 +818,6 @@ function attachTerminal(processId: string) {
   state.terminalSessionName =
     terminalSessionNames.get(`${state.hostId}:${processId}`) || "";
   state.terminalRunning = true;
-  terminalDecoders.clear();
   restoreTerminalOutput(process.lastOutput || "");
 }
 
@@ -1415,7 +1513,12 @@ function receive(message: any) {
     const changedEngine = !!engineId && typeof p.engineId === 'string' && engineId !== p.engineId;
     if (typeof p.engineId === 'string') {
       if (engineId !== p.engineId) {
-        if (changedEngine) invalidateRuntimeCapabilities();
+        if (changedEngine) {
+          invalidateRuntimeCapabilities();
+          verifiedConfiguration = null;
+          configurationRequest = null;
+          settingsApi.invalidateHostSettings(state.hostId);
+        }
         if (changedEngine && state.activeThread) {
           state.threadReady = false;
           ++selectionGeneration;
@@ -1466,7 +1569,16 @@ function receive(message: any) {
     if (p.connected && !state.runtimePaused) {
       state.error = state.threadConflict?.message || "";
       if (p.pendingRequests) state.pendingRequests = p.pendingRequests.filter(isInteractiveServerRequest);
-      if (changedEngine) void Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
+      if (changedEngine) {
+        void Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
+        // initialize broadcasts before releasing its maintenance lock. Read
+        // fresh metadata on all observing browsers once it has settled.
+        const refreshedEngine = engineId, hostId = state.hostId, auth = authenticationGeneration;
+        setTimeout(() => {
+          if (auth === authenticationGeneration && hostId === state.hostId && refreshedEngine === engineId && state.runtimeReconnectingHostId !== hostId)
+            void refreshCurrentRuntimeMetadata();
+        }, 250);
+      }
       if (state.goalReadError) void refreshCurrentGoal();
     }
     if (p.connected && !state.runtimePaused && Array.isArray(p.activeProcesses)) {
@@ -1476,7 +1588,7 @@ function receive(message: any) {
       );
       state.terminalRunning = !!process;
       if (process && (reconnecting || !state.terminalOutput)) {
-        terminalDecoders.clear();
+        for (const key of terminalDecoders.keys()) if (key.startsWith(`${state.hostId}:${process.processId}:`)) terminalDecoders.delete(key);
         restoreTerminalOutput(process.lastOutput || "");
       }
     }
@@ -1488,6 +1600,7 @@ function receive(message: any) {
     return;
   }
   if (method === "bridge/terminal/completed") {
+    for (const key of terminalDecoders.keys()) if (key.startsWith(`${state.hostId}:${p.processId}:`)) terminalDecoders.delete(key);
     terminalSessionNames.delete(`${state.hostId}:${p.processId}`);
     state.terminalProcesses = state.terminalProcesses.filter(
       (process) => process.processId !== p.processId,
@@ -1675,11 +1788,9 @@ function receive(message: any) {
     if (method === "turn/plan/updated") state.plan = p.plan;
     if (method === "error") state.error = p.error?.message ?? "app-server 错误";
   }
-  if (
-    method === "command/exec/outputDelta" &&
-    p.processId === state.terminalProcessId
-  ) {
-    const key = `${p.processId}:${p.stream}`;
+  if (method === "command/exec/outputDelta" &&
+    (p.processId === state.terminalProcessId || state.terminalProcesses.some(process => process.processId === p.processId))) {
+    const key = `${state.hostId}:${p.processId}:${p.stream}`;
     let decoder = terminalDecoders.get(key);
     if (!decoder) {
       decoder = new TextDecoder();
@@ -1690,8 +1801,9 @@ function receive(message: any) {
         Uint8Array.from(atob(p.deltaBase64), (c) => c.charCodeAt(0)),
         { stream: true },
       ),
+      p.processId,
     );
-    if (p.capReached) appendTerminal("\r\n[输出已截断]\r\n");
+    if (p.capReached) appendTerminal("\r\n[输出已截断]\r\n", p.processId);
   }
 }
 function connect(): Promise<void> {
@@ -2069,6 +2181,10 @@ async function logout() {
   state.terminalOutput = "";
   state.terminalProcesses = [];
   browserStorage.session.setItem("codex.terminalProcessIds", "{}");
+  terminalDecoders.clear();
+  terminalSessionNames.clear();
+  completedTerminalProcesses.clear();
+  compactionResults.clear();
 }
 function setOnline(online: boolean) {
   state.online = online;
@@ -2379,6 +2495,9 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   ++takeoverOperation;
   const previousId = state.activeThread?.id;
   if (previousId !== id) {
+    // A user's new selection ends the original thread's temporary metadata
+    // protection; returning later must load that thread's own choices.
+    if (metadataReconnectChoices?.hostId === hostId) metadataReconnectChoices = null;
     pendingMessageEdit = null;
     state.selectedSkills = [];
     ++modeOperation;
@@ -2399,7 +2518,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   saveConversationSnapshot();
   state.selectingThread = true;
   if (!preserveWriter) state.threadReady = false;
-  if (!preserveWriter) state.runtimePolicy = null;
+  if (!preserveWriter && !preserveMetadataChoices()) state.runtimePolicy = null;
   const runtimeRevision = turnRevisions.get(id) ?? 0;
   const itemRevision = itemEventSequence;
   const continuityRevision = eventGapRevision;
@@ -2455,7 +2574,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       await ensureConfiguration();
       if (!current()) return;
     }
-    if (!preserveWriter) applyPermissionDefault();
+    if (!preserveWriter && !preserveMetadataChoices()) applyPermissionDefault();
     const resumeProfile = availablePermissionProfiles(state.preferences.permissionProfiles)
       .find(profile => profile.id === state.activePermissionProfileId);
     const webPermission = !preserveWriter ? resolveWebPermissionSelection(state.permission as any, {
@@ -2506,8 +2625,8 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     // previous first-message preview; an ordinary empty page does not.
     const revertedEmpty = !!candidates && !runtimeChanged && !page.data.length && !page.nextCursor;
     const previousProject = state.projectPath;
-    state.activePermissionProfileId =
-      previousId === id ? previousProfileId : "";
+    const preserveChoices = preserveMetadataChoices() && previousId === id;
+    if (!preserveChoices) state.activePermissionProfileId = previousId === id ? previousProfileId : "";
     const knownRecency = state.threads.find(
       (thread) => thread.id === id,
     )?.recencyAt;
@@ -2541,7 +2660,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       state.collaborationMode = result.collaborationMode.mode;
       if (state.collaborationMode === 'plan') state.goalMode = false;
     }
-    state.model = result.model ?? result.thread.model ?? state.model;
+    if (!preserveChoices) state.model = result.model ?? result.thread.model ?? state.model;
     if ('serviceTier' in result) {
       state.nativeServiceTier = result.serviceTier ?? null;
       state.serviceTier = state.nativeServiceTier;
@@ -2550,9 +2669,9 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       state.nativeServiceTier = null;
       state.serviceTierScope = '';
     }
-    state.effort =
+    if (!preserveChoices) state.effort =
       result.reasoningEffort ?? result.thread.reasoningEffort ?? state.effort;
-    if (result.sandbox?.type) {
+    if (!preserveChoices && result.sandbox?.type) {
       state.permission = sandboxName(result.sandbox.type);
       state.runtimePolicy = {
         sandboxPolicy: { ...sandboxPolicy(), ...result.sandbox },
@@ -2562,7 +2681,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
           "on-request",
       };
     }
-    applyPermissionDefault();
+    if (!preserveChoices) applyPermissionDefault();
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
     if (reuseHistory) page.data = retainHistoryDetails(page.data, loadedHistory!.turns, live);
@@ -2906,7 +3025,7 @@ async function resolveNativeProjectIdentity(hostId: string, cwd: string): Promis
 }
 async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = [], delivery: "immediate" | "queue" = "immediate") {
   if (messageQueue?.state.uncertain) throw fail(new Error('上一项队列操作尚未确认，请先核对队列和对话后恢复发送。'));
-  if (state.compacting) throw fail(new Error('正在压缩上下文，请等待压缩完成后发送。'));
+  const waitingForCompaction = state.compacting;
   if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
   if (state.activeThread && !state.threadReady) throw fail(new Error('正在加载会话，请先同步对话后发送。'));
   if (state.threadConflict) throw fail(new Error('此对话仍被其他 Codex 客户端占用，请先重试或强制进入。'));
@@ -2927,7 +3046,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   if (delivery === 'queue') {
     if (editedInput) throw fail(new Error('编辑重发不能加入队列，请先完成消息编辑'));
     if (!state.activeThread?.id) throw fail(new Error('请先打开一个已有对话再排队'));
-    if (!messageQueue || !messageQueue.canMutate.value) throw fail(new Error(messageQueue?.blockedReason.value || '原生消息队列尚未准备好'));
+    if (!messageQueue || !waitingForCompaction && !messageQueue.canMutate.value) throw fail(new Error(messageQueue?.blockedReason.value || '原生消息队列尚未准备好'));
     if (goalMode && (!state.goal || state.goal.status === 'complete')) throw fail(new Error('请先发送并创建目标，再添加后续排队消息'));
   }
   const createGoal = delivery !== 'queue' && goalMode && (!state.goal || state.goal.status === 'complete');
@@ -3013,6 +3132,31 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   let id = state.activeThread?.id as string | undefined;
   const messageId = randomUUID();
   let activateGoal: ThreadGoal | null = null;
+  if (waitingForCompaction) {
+    const threadId = id!, key = recencyKey(hostId, threadId);
+    const requestSocket = socket, requestEngine = engineId;
+    const requested = !!compactions.get(key)?.requested;
+    let dedicatedTurnId = requested ? compactions.get(key)?.turnId : undefined;
+    const initialError = state.error;
+    try {
+      await waitForCompaction(() => {
+        if (requested && !dedicatedTurnId) dedicatedTurnId = compactions.get(key)?.turnId;
+        const turn = dedicatedTurnId ? state.turns.find(turn => turn.id === dedicatedTurnId) : undefined;
+        return {
+          valid: hostId === state.hostId && threadId === state.activeThread?.id && cwd === state.projectPath &&
+            generation === selectionGeneration && authentication === authenticationGeneration && state.authenticated &&
+            state.connected && state.online !== false && !state.runtimePaused && !state.threadReleased && !state.threadConflict &&
+            !state.selectingThread && !state.switchingHost && !state.changingContext && requestSocket === socket && requestEngine === engineId,
+          compacting: state.compacting,
+          dedicatedTurnActive: !!dedicatedTurnId && activeTurns.get(threadId) === dedicatedTurnId && state.busy,
+          failed: compactionResults.get(key) === false || ['failed', 'interrupted'].includes(turn?.status) ||
+            !!state.error && state.error !== initialError,
+        };
+      });
+      if (delivery === 'queue' && !messageQueue!.canMutate.value)
+        throw new Error(messageQueue!.blockedReason.value || '原生消息队列尚未准备好');
+    } catch (error) { sendInFlight = false; throw fail(error); }
+  }
   if (delivery === 'queue') {
     try {
       await messageQueue!.add(inputs, messageId);
@@ -4256,11 +4400,11 @@ async function setServiceTier(value: string | null) {
 }
 async function runTerminal(command: string) {
   if (state.terminalRunning) throw fail(new Error("已有终端命令正在运行"));
+  const hostId = state.hostId, authentication = authenticationGeneration;
   const processId = `web-${randomUUID()}`;
   rememberTerminal(processId);
   state.terminalRunning = true;
   state.terminalSessionName = "";
-  terminalDecoders.clear();
   appendTerminal(`$ ${command}\r\n`);
   let uncertain = false;
   try {
@@ -4278,6 +4422,7 @@ async function runTerminal(command: string) {
       3610000,
     );
     if (
+      hostId === state.hostId && authentication === authenticationGeneration &&
       state.terminalProcessId === processId &&
       !completedTerminalProcesses.has(processId)
     )
@@ -4289,7 +4434,7 @@ async function runTerminal(command: string) {
     uncertain = !!(error as { uncertain?: boolean }).uncertain;
     throw error;
   } finally {
-    if (state.terminalProcessId === processId && !uncertain)
+    if (hostId === state.hostId && authentication === authenticationGeneration && state.terminalProcessId === processId && !uncertain)
       state.terminalRunning = false;
   }
 }
@@ -4312,6 +4457,10 @@ async function startTerminal(
   rememberTerminal(processId);
   state.terminalRunning = true;
   state.terminalOutput = "";
+  const hostId = state.hostId, authentication = authenticationGeneration;
+  state.terminalProcesses = [...state.terminalProcesses, {
+    processId, tty: true, cwd: state.projectPath, startedAt: Date.now(), lastOutput: "", pending: true,
+  }];
   state.terminalSessionName = options.persistent
     ? options.sessionName || "tmux"
     : "";
@@ -4320,13 +4469,12 @@ async function startTerminal(
       `${state.hostId}:${processId}`,
       state.terminalSessionName,
     );
-  terminalDecoders.clear();
   let uncertain = false;
   try {
     const result = await rpc(
       "command/exec",
       {
-        command: options.command || ["/bin/sh"],
+        command: options.command || [...interactiveShellCommand],
         processId,
         tty: true,
         cwd: state.projectPath,
@@ -4338,6 +4486,7 @@ async function startTerminal(
       7200000,
     );
     if (
+      hostId === state.hostId && authentication === authenticationGeneration &&
       state.terminalProcessId === processId &&
       !completedTerminalProcesses.has(processId)
     )
@@ -4346,8 +4495,10 @@ async function startTerminal(
     uncertain = !!(error as { uncertain?: boolean }).uncertain;
     throw error;
   } finally {
-    if (state.terminalProcessId === processId && !uncertain)
-      state.terminalRunning = false;
+    if (hostId === state.hostId && authentication === authenticationGeneration && !uncertain) {
+      state.terminalProcesses = state.terminalProcesses.filter(process => process.processId !== processId);
+      if (state.terminalProcessId === processId) state.terminalRunning = false;
+    }
   }
 }
 async function switchTmuxTerminal(prepared: any) {
@@ -4372,7 +4523,7 @@ async function switchTmuxTerminal(prepared: any) {
   const terminalVersion = terminalSelectionGeneration;
   const permission = state.permission;
   const policy = JSON.stringify(sandboxPolicy());
-  if (state.terminalRunning && state.terminalSessionName) await stopTerminal();
+  if (state.terminalRunning && state.terminalSessionName) await stopTerminal(state.terminalProcessId, false);
   if (
     hostId !== state.hostId ||
     cwd !== state.projectPath ||
@@ -4391,25 +4542,35 @@ async function switchTmuxTerminal(prepared: any) {
     newConnection: true,
   }).catch((error) => fail(error));
 }
-async function resizeTerminal(cols: number, rows: number) {
-  if (state.terminalRunning && state.terminalProcessId)
+async function resizeTerminal(cols: number, rows: number, processId = state.terminalProcessId) {
+  if (state.terminalRunning && processId && processId === state.terminalProcessId)
     await rpc("command/exec/resize", {
-      processId: state.terminalProcessId,
+      processId,
       size: { cols, rows },
     });
 }
-async function writeTerminal(text: string) {
+async function writeTerminal(text: string, processId = state.terminalProcessId) {
+  if (!state.connected || !state.terminalRunning || !processId || processId !== state.terminalProcessId)
+    throw new Error("终端连接已变化，请重新选择终端后输入");
   const bytes = new TextEncoder().encode(text);
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   await rpc("command/exec/write", {
-    processId: state.terminalProcessId,
+    processId,
     deltaBase64: btoa(binary),
   });
 }
-async function stopTerminal() {
-  if (state.terminalProcessId)
-    await rpc("command/exec/terminate", { processId: state.terminalProcessId });
+async function stopTerminal(processId = state.terminalProcessId, selectNext = true) {
+  if (!processId) return;
+  const hostId = state.hostId, authentication = authenticationGeneration;
+  await rpc("command/exec/terminate", { processId });
+  if (hostId !== state.hostId || authentication !== authenticationGeneration) return;
+  state.terminalProcesses = state.terminalProcesses.filter(process => process.processId !== processId);
+  if (state.terminalProcessId !== processId) return;
+  state.terminalRunning = false;
+  state.terminalSessionName = "";
+  const next = state.terminalProcesses.find(process => process.tty && process.cwd === state.projectPath);
+  if (next && selectNext) attachTerminal(next.processId);
 }
 async function listSubagents(threadId: string, cursor: string | null = null) {
   if (!threadId) return { data: [], nextCursor: null };
@@ -4447,12 +4608,12 @@ function respond(id: string | number, result: any) {
     (request) => request.id !== id,
   );
 }
-function readConfig(force = false): Promise<void> {
+function readConfig(force = false, preserveChoices = false): Promise<void> {
   const requestScope = scope();
   const requestSocket = socket;
   if (!force && configurationRequest?.scope === requestScope && configurationRequest.socket === requestSocket)
     return configurationRequest.promise;
-  const operation = loadConfig().finally(() => {
+  const operation = loadConfig(preserveChoices || preserveMetadataChoices()).finally(() => {
     if (configurationRequest?.promise === operation) configurationRequest = null;
   });
   configurationRequest = { scope: requestScope, socket: requestSocket, promise: operation };
@@ -4466,12 +4627,14 @@ async function ensureConfiguration() {
   if (verifiedConfiguration?.scope !== scope() || verifiedConfiguration.socket !== socket)
     throw new Error('主机配置尚未确认，请同步后重试。');
 }
-async function loadConfig() {
+async function loadConfig(preserveChoices = false) {
   const generation = ++configGeneration;
   const requestScope = scope();
   const requestSocket = socket;
+  const requestAuthentication = authenticationGeneration, requestEngine = engineId;
   verifiedConfiguration = null;
-  const current = () => generation === configGeneration && requestScope === scope() && requestSocket === socket;
+  const current = () => generation === configGeneration && requestScope === scope() && requestSocket === socket &&
+    requestAuthentication === authenticationGeneration && state.authenticated && requestEngine === engineId;
   const optional = (method: Method, params: any, apply: (value: any) => void) =>
     rpc(method, params, 45000, { silentError: true }).then(value => {
       if (current()) apply(value);
@@ -4485,8 +4648,20 @@ async function loadConfig() {
   });
   // Start the model catalogue concurrently, but apply it after configuration
   // so the provider's default cannot override the user's configured model.
-  const modelsRequest = rpc("model/list", { limit: 100, includeHidden: false }, 45000, { silentError: true })
-    .then(value => ({ value }), () => ({ value: null }));
+  const modelsRequest = (async () => {
+    const data: any[] = [], cursors = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const page: any = await rpc('model/list', { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) }, 45000, { silentError: true });
+      if (!current()) return null;
+      if (!Array.isArray(page.data)) throw new Error('Codex 返回了无效的模型列表');
+      data.push(...page.data);
+      cursor = typeof page.nextCursor === 'string' && page.nextCursor ? page.nextCursor : null;
+      if (data.length > 10000 || cursor && cursors.has(cursor)) throw new Error('模型列表分页无法完成');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return { data };
+  })().then(value => ({ value }), () => ({ value: null }));
   const results = await Promise.allSettled([
     rpc("config/read", {
       includeLayers: true,
@@ -4508,10 +4683,10 @@ async function loadConfig() {
     state.config = config.value;
     const settings = config.value.config;
     if (!state.model && settings.model) state.model = settings.model;
-    if (settings.model_reasoning_effort)
+    if (!preserveChoices && settings.model_reasoning_effort)
       state.effort = settings.model_reasoning_effort;
   }
-  if (!state.activeThread) {
+  if (!preserveChoices && !state.activeThread) {
     state.permission = state.preferences.defaultPermission || "workspace-write";
     state.activePermissionProfileId = "";
     const profile = availablePermissionProfiles(
@@ -5168,6 +5343,8 @@ export function useCodex() {
       receiveThreadChange({ threadId, method: 'turn/start', result: { turn }, request }),
   }, state);
   return {
+    ...settingsApi,
+    reconnectRuntime,
     messageQueue,
     state,
     initialize,
