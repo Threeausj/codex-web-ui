@@ -227,3 +227,83 @@ test("workspace drag resizes the existing PTY's columns without starting another
   await expect(page.getByLabel("交互式终端")).toBeVisible();
   await page.getByRole("button", { name: "结束终端", exact: true }).click();
 });
+
+
+test("preview focus changes and unexpected pointer capture loss keep the last dragged width", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await slash(page, "terminal");
+  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await page.getByRole("textbox", { name: "预览地址" }).fill("index.html");
+  await page.getByRole("button", { name: "打开预览", exact: true }).click();
+  const frame = page.locator('iframe[title="项目预览"]');
+  await expect(frame).toBeVisible();
+  await drag(page, -100, false);
+  await expect.poll(() => width(page)).toBe(510);
+  await frame.evaluate((element: HTMLIFrameElement) => element.contentWindow!.focus());
+  await expect(page.locator(".workspace-drag-overlay")).toHaveCount(0);
+  await expect.poll(() => width(page)).toBe(510);
+  expect(await storedWidth(page)).toBe("510");
+  await page.mouse.up();
+  await drag(page, -60, false);
+  await expect.poll(() => width(page)).toBe(570);
+  // A competing pointer surface can release capture without pointerup.
+  await handle(page).evaluate(element => element.releasePointerCapture(1));
+  await page.mouse.move((await handle(page).boundingBox())!.x, 241);
+  await expect(page.locator(".workspace-drag-overlay")).toHaveCount(0);
+  await expect.poll(() => width(page)).toBe(570);
+  expect(await storedWidth(page)).toBe("570");
+  await page.mouse.up();
+  expect(await page.evaluate(() => document.body.style.cursor)).toBe("");
+  expect(await page.evaluate(() => document.body.style.userSelect)).toBe("");
+});
+
+
+test("pointer release commits its final coordinate when the last movement was coalesced", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await page.getByRole("button", { name: "切换工作区", exact: true }).click();
+  const bounds = (await handle(page).boundingBox())!;
+  const startX = bounds.x + bounds.width / 2;
+  const y = bounds.y + 240;
+  await page.mouse.move(startX, y);
+  await page.mouse.down();
+  await page.mouse.move(startX - 70, y);
+  await expect.poll(() => width(page)).toBe(480);
+  await handle(page).dispatchEvent("pointerup", { pointerId: 1, clientX: startX - 130, clientY: y, button: 0 });
+  await expect(page.locator(".workspace-drag-overlay")).toHaveCount(0);
+  await expect.poll(() => width(page)).toBe(540);
+  expect(await storedWidth(page)).toBe("540");
+  await page.mouse.up();
+});
+
+
+test("workspace and retained side chat share the latest width when switching panels", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').filter({ hasText: "已有测试历史" }).first().click();
+  await expect(page.getByText("历史保持可读", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "切换工作区", exact: true }).click();
+  await drag(page, -180);
+  await expect.poll(() => width(page)).toBe(590);
+  await page.getByRole("button", { name: "新建侧边聊天", exact: true }).click();
+  const sideChat = page.locator("#side-chat-panel");
+  const sideWidth = async () => Math.round((await sideChat.boundingBox())!.width);
+  await expect(sideChat).toBeVisible();
+  await expect.poll(sideWidth).toBe(590);
+  await page.getByRole("button", { name: "收起侧边聊天", exact: true }).click();
+  await expect(sideChat).toBeHidden();
+  await drag(page, -70);
+  await expect.poll(() => width(page)).toBe(660);
+  await page.getByRole("button", { name: "新建侧边聊天", exact: true }).click();
+  await expect.poll(sideWidth).toBe(660);
+  await drag(page, 80);
+  await expect.poll(sideWidth).toBe(580);
+  await page.getByRole("button", { name: "收起侧边聊天", exact: true }).click();
+  await expect.poll(() => width(page)).toBe(580);
+  await handle(page).dblclick();
+  await expect.poll(() => width(page)).toBe(410);
+  expect(await storedWidth(page)).toBeNull();
+  await page.getByRole("button", { name: "新建侧边聊天", exact: true }).click();
+  await expect.poll(sideWidth).toBe(410);
+});

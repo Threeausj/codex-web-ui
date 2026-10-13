@@ -293,7 +293,7 @@ hr {
   overflow: hidden;
 }
 .sidebar {
-  width: 246px;
+  width: var(--sidebar-width, 246px);
   flex-shrink: 0;
   background: var(--sidebar);
   display: flex;
@@ -2475,14 +2475,14 @@ hr {
 
 @media (min-width: 761px) and (max-width: 1150px) {
   .sidebar {
-    width: 220px;
+    width: var(--sidebar-width, 220px);
   }
   .workspace-panel {
     width: 360px;
     min-width: 310px;
   }
   .workspace-visible .sidebar {
-    width: 200px;
+    width: var(--sidebar-width, 200px);
   }
   .workspace-visible .composer-container {
     padding-inline: 18px;
