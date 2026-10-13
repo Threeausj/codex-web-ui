@@ -102,10 +102,10 @@ test("remote project browsing and addition preserve the current local chat and d
   await input.fill("保留当前草稿");
   const resumeCount = mock.requests.filter((request) => request.method === "thread/resume").length;
   const settings = await openProjects(page);
-  await expect(settings.getByRole("combobox", { name: "项目主机", exact: true })).toHaveValue("local");
+  await expect(settings.getByRole("combobox", { name: "设置主机", exact: true })).toHaveValue("local");
   await settings.getByRole("textbox", { name: "项目路径", exact: true }).fill("/local/path");
   await settings.getByRole("textbox", { name: "其他工作目录", exact: true }).fill("/local/extra");
-  await settings.getByRole("combobox", { name: "项目主机", exact: true }).selectOption("ssh-folders");
+  await settings.getByRole("combobox", { name: "设置主机", exact: true }).selectOption("ssh-folders");
   await expect(settings.getByRole("textbox", { name: "项目路径", exact: true })).toHaveValue("");
   await expect(settings.getByRole("textbox", { name: "其他工作目录", exact: true })).toHaveValue("");
   await settings.getByRole("button", { name: "浏览项目文件夹", exact: true }).click();

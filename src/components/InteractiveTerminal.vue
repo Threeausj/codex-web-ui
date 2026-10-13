@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import Icon from "./Icon.vue";
+import { copyText } from "../lib/copy-text";
 
 const props = defineProps<{ api: any; state: any }>();
 const element = ref<HTMLDivElement>();
@@ -13,6 +14,11 @@ const persistentNote = ref("");
 const starting = ref(false);
 const mounted = ref(false);
 const ctrl = ref(false);
+const hasSelection = ref(false);
+const closing = ref(new Set<string>());
+const terminals = computed<any[]>(() => (props.state.terminalProcesses || []).filter((process: any) => process.tty));
+const canStart = computed(() => !starting.value && !terminals.value.some((process: any) => process.pending) && props.state.connected && !props.state.switchingHost &&
+  !!props.state.projectPath && props.state.permission !== "read-only");
 const keys = [
   { label: "Ctrl+C", value: "\u0003" },
   { label: "Ctrl+D", value: "\u0004" },
@@ -33,40 +39,41 @@ let startGeneration = 0;
 let automaticScope = "";
 
 function fitTerminal() {
-  if (!element.value?.clientWidth || !terminal || !fit) return;
+  if (!element.value?.clientWidth || !element.value?.clientHeight || !terminal || !fit) return;
   fit.fit();
   clearTimeout(resizeTimer);
+  const hostId = props.state.hostId, processId = props.state.terminalProcessId;
+  const cols = terminal.cols, rows = terminal.rows;
   resizeTimer = setTimeout(() => {
     if (
-      props.state.terminalRunning &&
-      props.state.terminalProcessId?.startsWith("web-pty-")
+      !disposed && hostId === props.state.hostId && processId === props.state.terminalProcessId &&
+      props.state.terminalRunning && processId?.startsWith("web-pty-")
     ) {
       void props.api
-        .resizeTerminal(terminal!.cols, terminal!.rows)
+        .resizeTerminal(cols, rows, processId)
         .catch(() => {});
     }
   }, 120);
 }
-async function start() {
-  if (disposed || starting.value || props.state.terminalRunning ||
-      !props.state.connected || !props.state.projectPath ||
-      props.state.switchingHost || props.state.permission === "read-only") return;
+async function start(newConnection = false) {
+  if (disposed || !canStart.value || (props.state.terminalRunning && !newConnection)) return;
   const generation = ++startGeneration;
   error.value = "";
   persistentNote.value = "";
   starting.value = true;
   let options:
-    | { command?: string[]; persistent?: boolean; sessionName?: string }
+    | { command?: string[]; persistent?: boolean; sessionName?: string; newConnection?: boolean }
     | undefined;
   const hostId = props.state.hostId;
   const projectPath = props.state.projectPath;
   const permission = props.state.permission;
-  const requestedPersistent = persistent.value;
+  const requestedPersistent = !newConnection && persistent.value;
+  options = { newConnection };
   const current = () => !disposed && generation === startGeneration && hostId === props.state.hostId &&
     projectPath === props.state.projectPath && permission === props.state.permission &&
-    requestedPersistent === persistent.value;
+    (newConnection || requestedPersistent === persistent.value);
   try {
-    if (persistent.value) {
+    if (requestedPersistent) {
       const result = await props.api.requestHttp("/terminal-sessions/prepare", {
         method: "POST",
         body: JSON.stringify({ hostId, cwd: projectPath, permission }),
@@ -78,6 +85,7 @@ async function start() {
         command: result.command,
         persistent: true,
         sessionName: result.sessionName,
+        newConnection,
       };
       persistentNote.value = result.note;
     }
@@ -93,12 +101,43 @@ async function start() {
     if (generation === startGeneration) starting.value = false;
   }
 }
-async function stop() {
+async function stop(processId = props.state.terminalProcessId) {
+  if (!processId || closing.value.has(processId)) return;
+  const hostId = props.state.hostId;
+  closing.value = new Set([...closing.value, processId]);
   try {
-    await props.api.stopTerminal();
+    await props.api.stopTerminal(processId);
   } catch (cause: any) {
-    error.value = cause.message;
+    if (hostId === props.state.hostId) error.value = cause.message;
+  } finally {
+    closing.value = new Set([...closing.value].filter(id => id !== processId));
   }
+}
+async function selectTerminal(processId: string) {
+  ++startGeneration;
+  starting.value = false;
+  error.value = "";
+  persistentNote.value = "";
+  ctrl.value = false;
+  try { props.api.attachTerminal(processId); await nextTick(); fitTerminal(); terminal?.focus(); }
+  catch (cause: any) { error.value = cause.message; }
+}
+async function copySelection() {
+  const text = terminal?.getSelection();
+  if (!text) return;
+  try { await copyText(text); props.api.toast("已复制终端选中内容"); }
+  catch (cause: any) { error.value = cause.message; }
+}
+async function pasteClipboard() {
+  if (!props.state.terminalRunning || !props.state.connected) return;
+  const hostId = props.state.hostId, processId = props.state.terminalProcessId;
+  try {
+    if (!navigator.clipboard?.readText) throw new Error("当前浏览器无法读取剪贴板，请在终端中使用系统粘贴");
+    const text = await navigator.clipboard.readText();
+    if (!disposed && hostId === props.state.hostId && processId === props.state.terminalProcessId) {
+      terminal?.focus(); terminal?.paste(text);
+    }
+  } catch (cause: any) { if (hostId === props.state.hostId) error.value = cause.message; }
 }
 async function writeKey(value: string) {
   if (!props.state.terminalRunning || !props.state.connected) return;
@@ -143,6 +182,14 @@ onMounted(async () => {
         .writeTerminal(data)
         .catch((cause: Error) => (error.value = cause.message));
   });
+  terminal.onSelectionChange(() => { hasSelection.value = !!terminal?.hasSelection(); });
+  terminal.attachCustomKeyEventHandler(event => {
+    if (event.type === "keydown" && event.shiftKey && (event.ctrlKey || event.metaKey)) {
+      if (event.code === "KeyC") { event.preventDefault(); void copySelection(); return false; }
+      if (event.code === "KeyV") { event.preventDefault(); void pasteClipboard(); return false; }
+    }
+    return true;
+  });
   observer = new ResizeObserver(fitTerminal);
   observer.observe(element.value!);
   fitTerminal();
@@ -183,7 +230,7 @@ watch(
 );
 watch(
   () => props.state.terminalProcessId,
-  () => terminal?.reset(),
+  () => { terminal?.reset(); ctrl.value = false; hasSelection.value = false; },
   { flush: "sync" },
 );
 onBeforeUnmount(() => {
@@ -198,6 +245,16 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="interactive-terminal">
+    <div v-if="terminals.length" class="pty-tabs" role="tablist" aria-label="终端标签">
+      <div v-for="(process, index) in terminals" :key="process.processId" class="pty-tab" :class="{ active: process.processId === state.terminalProcessId }">
+        <button role="tab" :aria-selected="process.processId === state.terminalProcessId" :aria-label="`终端 ${index + 1}`"
+          :title="`${process.cwd || 'Shell'} · ${process.processId}`" @click="selectTerminal(process.processId)">
+          <Icon name="Terminal" :size="13" /><span>{{ process.cwd?.split('/').pop() || 'Shell' }} {{ index + 1 }}</span>
+        </button>
+        <button class="pty-tab-close" :aria-label="`关闭终端 ${index + 1}`" :title="process.processId === state.terminalProcessId && state.terminalSessionName ? '断开此 tmux 连接' : '结束此终端的 Shell'"
+          :disabled="closing.has(process.processId) || !state.connected" @click="stop(process.processId)"><Icon name="X" :size="12" /></button>
+      </div>
+    </div>
     <div class="pty-toolbar">
       <span
         ><i :class="{ running: state.terminalRunning }"></i
@@ -208,13 +265,17 @@ onBeforeUnmount(() => {
               : "Shell 正在运行"
             : "交互终端"
         }}</span
-      ><button
+      ><div class="pty-actions"><button
+        class="icon-button" aria-label="新建终端" title="新建独立 Shell" :disabled="!canStart" @click="start(true)"><Icon name="Plus" :size="16" /></button><button
+        class="icon-button" aria-label="复制终端选中内容" title="复制选中内容 · Ctrl+Shift+C" :disabled="!hasSelection" @click="copySelection"><Icon name="Copy" :size="14" /></button><button
+        class="icon-button" aria-label="粘贴到终端" title="粘贴 · Ctrl+Shift+V" :disabled="!state.terminalRunning || !state.connected" @click="pasteClipboard"><Icon name="CornerDownLeft" :size="14" /></button><button
+        class="icon-button" aria-label="滚动到终端最新输出" title="最新输出" @click="terminal?.scrollToBottom()"><Icon name="ArrowDown" :size="14" /></button><button
         v-if="!state.terminalRunning"
         class="button button-small button-secondary"
         :disabled="
-          starting || !state.connected || state.permission === 'read-only'
+          !canStart
         "
-        @click="start"
+        @click="start()"
       >
         {{ starting ? "检查中…" : "启动终端" }}</button
       ><button
@@ -222,10 +283,10 @@ onBeforeUnmount(() => {
         class="icon-button"
         :title="state.terminalSessionName ? '断开 tmux 连接' : '结束终端'"
         aria-label="结束终端"
-        @click="stop"
+        @click="stop()"
       >
         <Icon name="StopCircle" :size="15" />
-      </button>
+      </button></div>
     </div>
     <label v-if="!state.terminalRunning" class="pty-persistence"
       ><input v-model="persistent" type="checkbox" :disabled="starting" />持久
@@ -263,7 +324,7 @@ onBeforeUnmount(() => {
           : persistentNote ||
             (state.terminalSessionName
               ? "断开网页终端会保留 tmux 会话；可在 Tmux 页面重新连接。"
-              : "普通 PTY 支持网络断线恢复；服务重启会结束 Shell。")
+              : "Tab 补全与命令历史由目标 Shell 提供；关闭工作区会保留终端，服务重启会结束普通 Shell。")
       }}
     </div>
   </div>
@@ -287,12 +348,26 @@ onBeforeUnmount(() => {
   padding: 8px 14px;
   border-bottom: 1px solid #303236;
   font-size: 12px;
+  gap: 8px;
 }
-.pty-toolbar span {
+.pty-toolbar > span {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
+.pty-actions { display: flex; align-items: center; flex-shrink: 0; gap: 3px; }
+.pty-actions .icon-button { color: #c4c9cf; width: 29px; height: 29px; }
+.pty-actions .icon-button:disabled { opacity: .35; }
+.pty-tabs { display: flex; gap: 4px; flex: 0 0 auto; overflow-x: auto; padding: 7px 9px 0; border-bottom: 1px solid #303236; scrollbar-width: thin; }
+.pty-tab { display: flex; align-items: center; flex: 0 0 auto; border-radius: 6px 6px 0 0; color: #939aa3; background: #202328; border-bottom: 2px solid transparent; }
+.pty-tab.active { background: #2b3036; color: #e5e7eb; border-bottom-color: #7bc5a0; }
+.pty-tab > button { display: flex; align-items: center; gap: 6px; background: transparent; color: inherit; border: 0; min-height: 33px; padding: 5px 9px; font-size: 11px; }
+.pty-tab > button:first-child { max-width: 180px; }
+.pty-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pty-tab > .pty-tab-close { padding: 5px; margin-right: 3px; min-width: 26px; justify-content: center; }
+.pty-tab-close:hover { background: #454b53; border-radius: 4px; }
+.pty-tab button:focus-visible { outline: 2px solid #7bc5a0; outline-offset: -2px; }
 .pty-toolbar i {
   width: 6px;
   height: 6px;
@@ -354,12 +429,18 @@ onBeforeUnmount(() => {
   opacity: 0.4;
 }
 @media (max-width: 760px) {
+  .pty-toolbar { min-height: 40px; padding: 5px 8px; font-size: 11px; }
+  .pty-actions .icon-button { width: 30px; height: 32px; }
+  .pty-tab > button { min-height: 38px; }
+  .pty-tab > .pty-tab-close { min-width: 32px; }
   .pty-keys {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 4px;
   }
   .pty-keys button {
     min-height: 36px;
-    flex: 1;
+    padding-inline: 4px;
   }
   .pty-hint {
     font-size: 10px;

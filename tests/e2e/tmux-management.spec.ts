@@ -1,5 +1,6 @@
 import type { Page } from "@playwright/test";
 import { test, expect, login, slash, send, MockCodex } from "./fixtures";
+import { interactiveShellCommand } from "../../shared/terminal-shell";
 
 type Session = {
   id: string;
@@ -230,7 +231,7 @@ test("attaching tmux preserves an ordinary shell and pending approvals, and swit
   await slash(page, "terminal");
   await expect
     .poll(() => mock.request("command/exec")?.params.command)
-    .toEqual(["/bin/sh"]);
+    .toEqual(interactiveShellCommand);
   const ordinaryId = mock.request("command/exec")!.params.processId;
   mock.requireApprovalNext = true;
   await send(page, "需要审批的任务");
@@ -270,9 +271,7 @@ test("attaching tmux preserves an ordinary shell and pending approvals, and swit
       },
     ],
   });
-  await page
-    .getByRole("combobox", { name: "选择运行中的终端" })
-    .selectOption(ordinaryId);
+  await page.getByRole("tab", { name: "终端 1", exact: true }).click();
   await expect(page.locator(".pty-toolbar")).toContainText("Shell 正在运行");
   await expect(page.locator(".pty-toolbar")).not.toContainText("tmux ·");
   await expect(

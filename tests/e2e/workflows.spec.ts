@@ -1,4 +1,5 @@
 import { test, expect, login, send, slash } from './fixtures'
+import { interactiveShellCommand } from '../../shared/terminal-shell'
 
 test('password login, new thread and streamed final item keep one user message', async ({ page, mock }) => {
   mock.holdFinalMessage = true
@@ -166,7 +167,7 @@ test('PTY shell sends stdin, resize and termination using connection process id'
   await expect(page.getByLabel('交互式终端')).toBeVisible()
   await expect.poll(() => mock.request('command/exec')?.params.tty).toBe(true)
   const processId = mock.request('command/exec')?.params.processId
-  expect(mock.request('command/exec')?.params).toMatchObject({ command: ['/bin/sh'], cwd: '/workspace/demo', disableTimeout: true })
+  expect(mock.request('command/exec')?.params).toMatchObject({ command: interactiveShellCommand, cwd: '/workspace/demo', disableTimeout: true })
   await page.locator('.xterm-helper-textarea').focus()
   await page.keyboard.type('echo tty')
   await expect.poll(() => mock.requests.filter(request => request.method === 'command/exec/write').map(request => Buffer.from(request.params.deltaBase64, 'base64').toString()).join('')).toContain('echo tty')

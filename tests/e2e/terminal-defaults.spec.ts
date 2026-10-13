@@ -1,4 +1,5 @@
 import { test, expect, login, slash } from "./fixtures";
+import { interactiveShellCommand } from "../../shared/terminal-shell";
 
 test("opening the terminal starts one shell and reopening tabs reuses it", async ({ page, mock }) => {
   await login(page);
@@ -7,7 +8,7 @@ test("opening the terminal starts one shell and reopening tabs reuses it", async
   await expect.poll(() => mock.requests.filter(request => request.method === "command/exec").length).toBe(1);
   await expect(page.locator(".pty-toolbar")).toContainText("Shell 正在运行");
   expect(mock.request("command/exec")?.params).toMatchObject({
-    command: ["/bin/sh"], tty: true, cwd: "/workspace/demo", disableTimeout: true,
+    command: interactiveShellCommand, tty: true, cwd: "/workspace/demo", disableTimeout: true,
   });
   const processId = mock.request("command/exec")!.params.processId;
   await page.locator(".workspace-tabs").getByRole("button", { name: "文件", exact: true }).click();
@@ -42,7 +43,7 @@ test("a restored project PTY is selected before considering a new shell", async 
     { processId: "web-pty-restored", tty: true, cwd: "/workspace/demo", lastOutput: "restored shell\r\n" },
   ] });
   await slash(page, "terminal");
-  await expect(page.getByRole("combobox", { name: "选择运行中的终端", exact: true })).toHaveValue("web-pty-restored");
+  await expect(page.getByRole("tab", { name: "终端 1", exact: true })).toHaveAttribute("aria-selected", "true");
   await expect(page.locator(".pty-toolbar")).toContainText("Shell 正在运行");
   expect(mock.request("command/exec")).toBeUndefined();
 });

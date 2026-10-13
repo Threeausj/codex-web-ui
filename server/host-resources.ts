@@ -210,12 +210,15 @@ export async function readRuntimePausedHosts(dataDir: string) {
 type Dependencies = {
   getHost: (id: string) => Host | undefined; getBridge: (id: string) => Promise<Bridge>; getExistingBridge: (id: string) => Bridge | undefined
   persistRuntime?: () => Promise<void>; releasedThreads?: Map<string, Map<string, ReleasedThread>>; pausedHosts: Set<string>; dataDir: string; bridgeOptions?: BridgeOptions; collect?: (host: Host) => Promise<RawHostResources>; now?: () => number
+  withRuntimeMaintenance?: <T>(hostId: string, work: () => Promise<T>) => Promise<T>
 }
 
 export function registerHostResources(app: Express, dependencies: Dependencies) {
   const cache = new Map<string, { raw?: RawHostResources; value?: ReturnType<typeof resourceRates>; at?: number; inFlight?: Promise<ReturnType<typeof resourceRates>>; host?: Host }>()
   const ownedPids = new WeakMap<Bridge, { transportPid?: number; startedAt?: number; pid?: number; attempted: boolean }>()
   let mutations: Promise<unknown> = Promise.resolve()
+  const reconnections = new Map<string, Promise<unknown>>()
+  const informationCache = new Map<string, { bridge: Bridge; engineId?: string; at: number; value?: unknown; inFlight?: Promise<unknown> }>()
   const now = dependencies.now || Date.now
   const released = dependencies.releasedThreads || new Map<string, Map<string, ReleasedThread>>()
   const persist = dependencies.persistRuntime || (() => writePrivateJson(path.join(dependencies.dataDir, 'runtime-state.json'), { pausedHostIds: [...dependencies.pausedHosts], releasedThreads: [...released].flatMap(([hostId, threads]) => [...threads].map(([threadId, entry]) => ({ hostId, threadId, ...entry }))) }))
@@ -255,6 +258,50 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
   }
   app.get('/api/hosts/:id/resources', (req, res, next) => {
     void (async () => { const host = getHost(String(req.params.id)); const [value, info] = await Promise.all([sample(host), runtime(host)]); res.json({ ...value, runtime: info }) })().catch(next)
+  })
+  app.get('/api/hosts/:id/runtime/information', (req, res, next) => {
+    void (async () => {
+      const host = getHost(String(req.params.id)), bridge = dependencies.getExistingBridge(host.id)
+      if (!bridge?.connected || bridge.paused) {
+        informationCache.delete(host.id)
+        const paused = bridge?.paused || dependencies.pausedHosts.has(host.id)
+        res.json({ checkedAt: now(), runtime: { ...await runtime(host, false), userAgent: bridge?.userAgent || null }, models: [], config: { model: null, model_context_window: null, model_auto_compact_token_limit: null },
+          ...(paused ? { canReconnect: false, reconnectDisabledReason: '此主机已暂停，请在资源管理中恢复连接' } : bridge?.reconnectStatus || { canReconnect: true, reconnectDisabledReason: null }) })
+        return
+      }
+      const engineId = bridge.runtime.engineId
+      let entry = informationCache.get(host.id)
+      if (entry?.bridge !== bridge || entry.engineId !== engineId) { entry = { bridge, engineId, at: 0 }; informationCache.set(host.id, entry) }
+      if (!entry.inFlight && (!entry.value || now() - entry.at >= 3000)) {
+        const current = entry
+        current.inFlight = (async () => {
+          const models: Record<string, unknown>[] = [], seen = new Set<string>()
+          let cursor: string | null = null
+          do {
+            const page = await bridge.request('model/list', { limit: 100, includeHidden: true, cursor }, 10000) as { data?: unknown; nextCursor?: unknown }
+            if (!Array.isArray(page?.data) || page.nextCursor != null && typeof page.nextCursor !== 'string') throw new Error('Codex 返回的模型列表格式不正确')
+            for (const model of page.data) {
+              if (!model || typeof model !== 'object' || typeof model.id !== 'string' || typeof model.model !== 'string') throw new Error('Codex 返回的模型元数据格式不正确')
+              models.push(Object.fromEntries(['id', 'model', 'upgrade', 'upgradeInfo', 'availabilityNux', 'displayName', 'description', 'modelSpecialty', 'hidden', 'supportedReasoningEfforts', 'defaultReasoningEffort', 'inputModalities', 'supportsPersonality', 'multiAgentVersion', 'additionalSpeedTiers', 'serviceTiers', 'defaultServiceTier', 'availableAccessPrograms', 'isDefault'].filter(key => Object.hasOwn(model, key)).map(key => [key, model[key]])))
+            }
+            cursor = page.nextCursor as string | null || null
+            if (models.length > 10000 || cursor && seen.has(cursor)) throw new Error('Codex 模型列表无法完整读取')
+            if (cursor) seen.add(cursor)
+          } while (cursor)
+          const response = await bridge.request('config/read', { includeLayers: false }, 10000) as { config?: Record<string, unknown> }
+          if (!response?.config || typeof response.config !== 'object') throw new Error('Codex 未返回有效配置')
+          if (!bridge.connected || bridge.runtime.engineId !== engineId) throw Object.assign(new Error('Codex 连接已改变，请重新刷新运行信息'), { status: 409 })
+          const positive = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+          const value = { checkedAt: now(), runtime: { ...await runtime(host, false), userAgent: bridge.userAgent || null }, models,
+            config: { model: typeof response.config.model === 'string' ? response.config.model : null, model_context_window: positive(response.config.model_context_window), model_auto_compact_token_limit: positive(response.config.model_auto_compact_token_limit) } }
+          current.value = value; current.at = now()
+          return value
+        })().finally(() => { current.inFlight = undefined })
+      }
+      const value = await entry.inFlight || entry.value
+      if (!bridge.connected || bridge.runtime.engineId !== engineId) throw Object.assign(new Error('Codex 连接已改变，请重新刷新运行信息'), { status: 409 })
+      res.json({ ...(value as object), runtime: { ...await runtime(host, false), userAgent: bridge.userAgent || null }, ...bridge.reconnectStatus })
+    })().catch(next)
   })
   for (const action of ['close', 'resume'] as const) app.post(`/api/hosts/:id/runtime/threads/:threadId/${action}`, (req, res, next) => {
     void (async () => {
@@ -300,6 +347,34 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
         return { ok: true, runtime: await runtime(host, false) }
       })
       mutations = operation.catch(() => {}); res.json(await operation)
+    })().catch(next)
+  })
+  app.post('/api/hosts/:id/runtime/reconnect', (req, res, next) => {
+    void (async () => {
+      const hostId = String(req.params.id); getHost(hostId); z.object({}).strict().parse(req.body)
+      let operation = reconnections.get(hostId)
+      if (!operation) {
+        const reconnect = async () => {
+          // Resolve again after queued resource mutations: deleted or edited
+          // hosts must not refresh an obsolete transport using old credentials.
+          const host = getHost(hostId)
+          if (dependencies.pausedHosts.has(hostId) || dependencies.getExistingBridge(hostId)?.paused)
+            throw Object.assign(new Error('此主机已暂停，请在资源管理中恢复连接'), { status: 409, code: 'runtime_paused' })
+          const bridge = await dependencies.getBridge(hostId)
+          if (bridge.host !== host) throw Object.assign(new Error('主机配置已改变，请重新打开设置后重试'), { status: 409 })
+          if (dependencies.pausedHosts.has(hostId) || bridge.paused)
+            throw Object.assign(new Error('此主机已暂停，请在资源管理中恢复连接'), { status: 409, code: 'runtime_paused' })
+          await bridge.reconnect()
+          ownedPids.delete(bridge)
+          informationCache.delete(hostId)
+          return { ok: true, runtime: await runtime(host, false), userAgent: bridge.userAgent || null, codexHome: bridge.codexHome || null }
+        }
+        operation = mutations.then(() => dependencies.withRuntimeMaintenance ? dependencies.withRuntimeMaintenance(hostId, reconnect) : reconnect())
+          .finally(() => { reconnections.delete(hostId) })
+        reconnections.set(hostId, operation)
+        mutations = operation.catch(() => {})
+      }
+      res.json(await operation)
     })().catch(next)
   })
 }

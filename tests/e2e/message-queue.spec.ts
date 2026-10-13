@@ -129,12 +129,16 @@ test('queue failure preserves the draft, and an unknown outcome blocks blind dup
   await expect(page.locator('.queue-notice')).toContainText('已保留草稿，不会自动重复提交');
   await expect(page.locator('.queue-heading')).toHaveCount(0);
   await page.getByRole('combobox', { name: '消息发送方式' }).selectOption('immediate');
-  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeDisabled();
+  await page.getByRole('textbox', { name: '消息输入框' }).press('Enter');
   expect(mock.requests.filter(request => request.method === 'thread/queue/add')).toHaveLength(1);
+  expect(mock.requests.some(request => ['turn/start', 'turn/steer'].includes(request.method))).toBe(false);
   await page.reload(); await open(page);
   await expect(page.locator('.queue-notice')).toContainText('核对队列和对话后再恢复发送，避免重复');
-  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeDisabled();
+  await page.getByRole('textbox', { name: '消息输入框' }).press('Enter');
   expect(mock.requests.filter(request => request.method === 'thread/queue/add')).toHaveLength(1);
+  expect(mock.requests.some(request => ['turn/start', 'turn/steer'].includes(request.method))).toBe(false);
   await page.getByRole('button', { name: '已核对，恢复发送' }).click();
   await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeEnabled();
 });
