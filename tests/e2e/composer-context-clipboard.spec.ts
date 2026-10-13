@@ -150,6 +150,7 @@ test("context appears left of permissions, uses the latest report and offers com
   const permission = await page.locator(".composer-submit .permission-select").boundingBox();
   expect(left!.x + left!.width).toBeLessThanOrEqual(permission!.x);
   await indicator.click();
+  await page.getByRole("dialog", { name: "上下文用量与压缩" }).getByRole("button", { name: "立即压缩", exact: true }).click();
   await expect.poll(() => mock.request("thread/compact/start")?.params.threadId).toBe("thread-existing");
   await expect(page.locator(".compaction-divider")).toBeVisible();
   mock.emit("thread/tokenUsage/updated", { threadId: "thread-existing", tokenUsage: {
@@ -157,7 +158,9 @@ test("context appears left of permissions, uses the latest report and offers com
   } });
   await expect(indicator).toHaveText("上下文 3%");
   mock.emit("turn/started", { threadId: "thread-existing", turn: { id: "context-busy", status: "inProgress", items: [] } });
-  await expect(indicator).toBeDisabled();
+  await expect(indicator).toBeEnabled();
+  await indicator.click();
+  await expect(page.getByRole("dialog", { name: "上下文用量与压缩" }).getByRole("button", { name: "立即压缩", exact: true })).toBeDisabled();
   expect(mock.requests.filter((rpc) => rpc.method === "thread/compact/start")).toHaveLength(1);
 });
 

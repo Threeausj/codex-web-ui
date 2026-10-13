@@ -888,10 +888,12 @@ hr {
   min-width: 0;
   margin-bottom: 8px;
 }
-.message-images > button {
+.user-message .message-images > button {
+  display: flex;
+  justify-content: flex-end;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 100%;
+  max-width: min(var(--conversation-image-max-width), 100%);
   padding: 0;
 }
 .message-images img {

@@ -11,6 +11,13 @@ const paging = {
   archived: z.boolean().optional(),
 };
 const request = z.discriminatedUnion("method", [
+  z.object({
+    method: z.literal('thread/fork'),
+    params: z.object({
+      threadId, lastTurnId: threadId.optional(),
+      excludeTurns: z.literal(true), deferGoalContinuation: z.literal(true),
+    }).strict(),
+  }).strict(),
   z
     .object({
       method: z.literal("thread/list"),

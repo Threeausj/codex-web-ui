@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, useId } from "vue";
 import Icon from "./Icon.vue";
-import { isPinned, threadActivityAt, threadLabel } from "../lib/navigation";
+import ThreadCopyMenu from './ThreadCopyMenu.vue';
+import { isPinned, threadActivityAt } from "../lib/navigation";
+import { searchableThreadTitle } from '../lib/thread-title-search';
 const props = defineProps<{
   thread: any;
   state: any;
@@ -37,7 +39,7 @@ const pinned = computed(() =>
     props.thread.id,
   ),
 );
-const label = computed(() => threadLabel(props.thread));
+const label = computed(() => searchableThreadTitle(props.thread));
 const running = computed(() =>
   props.thread.status?.type === "active" ||
   (props.state.hostId === hostId.value &&
@@ -69,6 +71,14 @@ async function run(action: () => any, completed?: () => void) {
   } finally {
     pending.value = false;
   }
+}
+function forkThread() {
+  const selectedHost = props.state.hostId, selectedThread = props.state.activeThread?.id;
+  return run(async () => {
+    const result = await props.api.forkThread(props.thread.id, hostId.value);
+    if (result.canSelect && selectedHost === props.state.hostId && selectedThread === props.state.activeThread?.id)
+      emit('select', result);
+  });
 }
 function restoreThread() {
   return run(() => props.api.unarchiveThread(props.thread.id, hostId.value), () =>
@@ -185,6 +195,8 @@ async function submitDialog() {
       </button>
       <button
         v-if="!archived"
+        :disabled="pending || running"
+        :title="running ? '此会话正在运行，请先停止或等待完成后再归档' : undefined"
         @click="run(() => api.archiveThread(thread.id, hostId))"
       >
         <Icon name="Archive" :size="14" />归档对话
@@ -192,6 +204,10 @@ async function submitDialog() {
       <button v-else @click="restoreThread">
         <Icon name="Undo2" :size="14" />恢复对话
       </button>
+      <button :disabled="pending || state.editingMessage || !state.online" @click="forkThread">
+        <Icon name="GitBranch" :size="14" />分叉对话 (Fork)
+      </button>
+      <ThreadCopyMenu :disabled="pending" @copy="format => run(() => api.copyThread(thread.id, format, hostId))" />
       <button
         @click="run(() => api.exportThread(thread.id, 'markdown', hostId))"
       >

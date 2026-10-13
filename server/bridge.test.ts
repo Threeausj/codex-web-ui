@@ -436,6 +436,73 @@ function reconnectableTransport() {
   return { transport, sent }
 }
 
+for (const category of ['inputError', 'transportError', 'transportClose', 'nativeJson', 'nativeFrameLimit'] as const) {
+  test(`diagnostics retain sanitized ${category} and the affected active count after native reconnection`, async () => {
+    const peers: ReturnType<typeof reconnectableTransport>[] = []
+    const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Diagnostic fixture' }, {
+      transportFactory: () => { const peer = reconnectableTransport(); peers.push(peer); return peer.transport },
+    })
+    try {
+      await bridge.connect()
+      assert.equal(bridge.diagnostics().lastDisconnect, null)
+      const peer = peers[0]!
+      for (const internal of [false, true]) {
+        const pending = bridge.request(internal ? 'thread/start' : 'thread/resume', internal
+          ? { ephemeral: true, threadSource: 'thread_title' } : { threadId: 'visible-thread' })
+        await tick()
+        const request = peer.sent.at(-1)!
+        peer.transport.output.emit('data', Buffer.from(`${JSON.stringify({ id: request.id,
+          result: { thread: { id: internal ? 'hidden-title-helper' : 'visible-thread', status: { type: 'active' } } } })}\n`))
+        await pending
+      }
+      assert.equal(bridge.runtime.activeThreadCount, 1)
+      const beforeFailure = Date.now()
+      const privateFailure = new Error('private-command --token=secret-key /private/ssh-path')
+      if (category === 'inputError') peer.transport.input.emit('error', privateFailure)
+      else if (category === 'transportError' || category === 'transportClose') peer.transport.events.emit(category, privateFailure)
+      else if (category === 'nativeJson') peer.transport.output.emit('data', Buffer.from('private native prompt is not JSON\n'))
+      else {
+        const fragment = Buffer.alloc(64 * 1024, 97)
+        for (let index = 0; index <= 1024; index++) peer.transport.output.emit('data', fragment)
+      }
+      assert.equal(bridge.connected, false)
+      const lastDisconnect = bridge.diagnostics().lastDisconnect!
+      assert.ok(lastDisconnect.at >= beforeFailure)
+      assert.deepEqual(lastDisconnect, { at: bridge.diagnostics().lastDisconnectedAt, category, activeThreadCount: 1 })
+      await bridge.connect()
+      assert.equal(peers.length, 2)
+      assert.equal(bridge.connected, true)
+      assert.equal(bridge.lastError, undefined)
+      assert.equal(bridge.diagnostics().reconnectCount, 1)
+      assert.deepEqual(bridge.diagnostics().lastDisconnect, lastDisconnect)
+      assert.equal(bridge.runtime.activeThreadCount, 0)
+      assert.doesNotMatch(JSON.stringify(bridge.diagnostics()), /private-command|secret-key|ssh-path|private native prompt|hidden-title-helper/)
+      peer.transport.events.emit('transportClose', privateFailure)
+      assert.deepEqual(bridge.diagnostics().lastDisconnect, lastDisconnect, 'a stale transport event cannot replace the original cause')
+    } finally { bridge.close() }
+  })
+}
+
+test('a failed native initialization remains diagnosable after a successful retry without retaining its raw error', async () => {
+  let attempts = 0
+  const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Diagnostic fixture' }, {
+    transportFactory: () => {
+      if (!attempts++) throw new Error('private SSH diagnostic secret-key')
+      return reconnectableTransport().transport
+    },
+  })
+  try {
+    await assert.rejects(bridge.connect(), /private SSH diagnostic/)
+    const beforeRetry = bridge.diagnostics().lastDisconnect
+    assert.deepEqual(beforeRetry, { at: bridge.diagnostics().lastDisconnectedAt, category: 'initializeFailure', activeThreadCount: 0 })
+    await bridge.connect()
+    assert.equal(bridge.connected, true)
+    assert.equal(bridge.lastError, undefined)
+    assert.deepEqual(bridge.diagnostics().lastDisconnect, beforeRetry)
+    assert.doesNotMatch(JSON.stringify(bridge.diagnostics()), /private SSH diagnostic|secret-key/)
+  } finally { bridge.close() }
+})
+
 test('pausing releases only this client subscription in proxy mode and keeps every browser paused until explicit resume', async () => {
   const peers: ReturnType<typeof reconnectableTransport>[] = []
   const bridge = new Bridge({ id: 'local', kind: 'local', name: 'Proxy fixture' }, { mode: 'proxy', transportFactory: () => { const value = reconnectableTransport(); peers.push(value); return value.transport } })
@@ -1126,6 +1193,27 @@ test('active or failed native deletion preserves conversation state and never br
     assert.ok(f.bridge.threadContext('running').tokenUsage)
     assert.equal(observer.sent.some(message => message.method === 'bridge/thread/changed' && (message.params as any).method === 'thread/delete'), false)
     assert.equal(f.sent.some(message => ['thread/archive', 'turn/interrupt', 'fs/remove'].includes(message.method || '')), false)
+  } finally { f.bridge.close() }
+})
+
+test('active native turns cannot be archived through HTTP or browser requests, but settled turns can', async () => {
+  const f = fixture(), browser = new Browser()
+  f.bridge.attach('owner', browser.ws(), 'owner')
+  try {
+    await f.bridge.connect()
+    const resume = f.bridge.request('thread/resume', { threadId: 'running' }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/resume')!.id,
+      result: { thread: { id: 'running', status: { type: 'idle' } } } }); await resume
+    f.receive({ method: 'turn/started', params: { threadId: 'running', turn: { id: 'turn', status: 'inProgress' } } })
+    await tick()
+    await assert.rejects(f.bridge.request('thread/archive', { threadId: 'running' }, 1000), /正在运行.*归档/)
+    browser.request({ id: 'active-archive', method: 'thread/archive', params: { threadId: 'running' } }); await tick()
+    assert.match(browser.sent.find(message => message.id === 'active-archive')!.error!.message, /正在运行.*归档/)
+    assert.equal(f.sent.some(message => message.method === 'thread/archive' || message.method === 'turn/interrupt'), false)
+    f.receive({ method: 'turn/completed', params: { threadId: 'running', turn: { id: 'turn', status: 'completed' } } })
+    await tick()
+    const archive = f.bridge.request('thread/archive', { threadId: 'running' }); await tick()
+    f.receive({ id: f.sent.findLast(message => message.method === 'thread/archive')!.id, result: {} }); await archive
   } finally { f.bridge.close() }
 })
 

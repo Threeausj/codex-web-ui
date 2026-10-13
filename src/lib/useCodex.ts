@@ -1,8 +1,10 @@
 import { methodAccepts } from "./integration-capabilities";
+import { copyText } from './copy-text';
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
-import { reactive, toRaw } from "vue";
+import { reactive, ref, toRaw } from "vue";
 import { randomUUID } from "./uuid";
 import { browserStorage } from "./browser-storage";
+import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache } from "./thread-title-search";
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
@@ -521,6 +523,9 @@ function activateConversationCache() {
   return cacheActivation;
 }
 function clearConversationCaches() {
+  titleSearchPages.clear();
+  titleSearchSupport.clear();
+  ++titleSearchRevision.value;
   clearConversationMarkdownCache();
   clearTimeout(snapshotTimer);
   itemCache.clear();
@@ -821,6 +826,13 @@ function validateSession(): Promise<SessionStatus | null> {
 }
 const navigationRequests = new Map<string, Promise<void>>();
 const navigationRevisions = new Map<string, number>();
+const titleSearchPages = new ThreadTitlePageCache<any>();
+const titleSearchSupport = new Map<string, boolean>();
+const titleSearchRevision = ref(0);
+function invalidateThreadTitleSearch(hostId: string) {
+  titleSearchPages.clearHost(hostId);
+  ++titleSearchRevision.value;
+}
 function hostNavigation(hostId: string): HostNavigation {
   return (state.navigation[hostId] ??= {
     threads: [],
@@ -840,7 +852,9 @@ function navigationThreads(): any[] {
     ).map((thread) => ({ ...thread, hostId: host.id })),
   );
 }
-function navigationMore() {
+function navigationMore(hostId?: string) {
+  if (hostId)
+    return hostId === state.hostId ? state.moreThreads : !!state.navigation[hostId]?.cursor;
   return (
     state.moreThreads ||
     state.hosts.some(
@@ -921,6 +935,7 @@ async function threadPage(
   hostId: string,
   method: "thread/list" | "thread/search",
   params: any,
+  metadataOnly = false,
 ) {
   const supportKey = `${hostId}:${method}`;
   const supported = recencySortSupport.get(supportKey) !== false;
@@ -944,16 +959,24 @@ async function threadPage(
       sortKey: "updated_at",
     });
   }
+  // Title search needs metadata, not a history read per match on old servers.
+  if (metadataOnly) return {
+    ...result,
+    data: (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id))),
+  };
   return normalizeThreadPage(hostId, result);
 }
 function mergeNavigation(hostId: string, threads: any[], replace = false) {
   const nav = hostNavigation(hostId);
+  const previousTitles = new Map(nav.threads.map(thread => [thread.id, searchableThreadTitle(thread)]));
   const records = new Map(
     (replace ? [] : nav.threads).map((thread) => [thread.id, thread]),
   );
   for (const thread of threads)
     if (!deletedThreads.has(recencyKey(hostId, thread.id))) records.set(thread.id, { ...records.get(thread.id), ...thread });
   nav.threads = [...records.values()];
+  if (nav.threads.length !== previousTitles.size || nav.threads.some(thread => previousTitles.get(thread.id) !== searchableThreadTitle(thread)))
+    invalidateThreadTitleSearch(hostId);
 }
 function refreshHostNavigation(hostId: string): Promise<void> {
   if (pausedHosts.has(hostId)) return Promise.resolve();
@@ -1014,6 +1037,8 @@ function refreshHostNavigation(hostId: string): Promise<void> {
 }
 async function refreshNavigation(force = false) {
   if (force) {
+    titleSearchPages.clear();
+    ++titleSearchRevision.value;
     loadedMorePages = false;
     loadedGlobalPages = false;
     state.projectThreadPages = {};
@@ -1046,12 +1071,12 @@ async function retryNavigationHost(hostId: string) {
     );
   }
 }
-async function loadMoreNavigation() {
+async function loadMoreNavigation(hostId?: string) {
   await Promise.allSettled([
-    loadMoreThreads(),
+    !hostId || hostId === state.hostId ? loadMoreThreads() : Promise.resolve(),
     ...state.hosts
       .filter(
-        (host) => host.id !== state.hostId && state.navigation[host.id]?.cursor,
+        (host) => host.id !== state.hostId && (!hostId || host.id === hostId) && state.navigation[host.id]?.cursor,
       )
       .map(async (host) => {
         const nav = hostNavigation(host.id);
@@ -1227,6 +1252,8 @@ function updateThread(thread: any, options: { authoritativePreview?: boolean } =
     const key = recencyKey(state.hostId, thread.id);
     threadNameRevisions.set(key, (threadNameRevisions.get(key) ?? 0) + 1);
   }
+  if (!previous || searchableThreadTitle({ ...previous, ...thread }) !== searchableThreadTitle(previous))
+    invalidateThreadTitleSearch(state.hostId);
   threadRevisions.set(thread.id, ++threadEventSequence);
   removedThreads.delete(thread.id);
   if (state.activeThread?.id === thread.id)
@@ -2097,6 +2124,7 @@ async function refreshThreads() {
       (threadRevisions.get(thread.id) ?? 0) > revision,
   );
   for (const thread of changed) seen.add(thread.id);
+  const previousTitles = new Map(state.threads.map(thread => [thread.id, searchableThreadTitle(thread)]));
   state.threads = [
     ...changed,
     ...fresh,
@@ -2106,6 +2134,8 @@ async function refreshThreads() {
         )
       : []),
   ];
+  if (state.threads.length !== previousTitles.size || state.threads.some(thread => previousTitles.get(thread.id) !== searchableThreadTitle(thread)))
+    invalidateThreadTitleSearch(requestScope);
   const active = state.activeThread;
   const listed = active && fresh.find((thread: any) => thread.id === active.id);
   if (listed && (listed.name !== active.name || listed.preview !== active.preview)) {
@@ -3359,17 +3389,29 @@ async function interruptOnce() {
     if (current()) throw fail(error);
   }
 }
+async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string) {
+  const authentication = authenticationGeneration;
+  const selection = selectionGeneration, selectedHost = state.hostId, selectedThread = state.activeThread?.id;
+  const result = await scopedRpc(hostId, "thread/fork", {
+    threadId: id, lastTurnId, excludeTurns: true, deferGoalContinuation: true,
+  });
+  if (authentication !== authenticationGeneration || !state.authenticated)
+    throw new Error('登录状态已变化，请重新同步对话后确认已创建的分支');
+  if (!result.thread?.id) throw new Error('无法确认已创建的分支，请同步对话');
+  invalidateThreadTitleSearch(hostId);
+  if (hostId === state.hostId) updateThread(result.thread);
+  else mergeNavigation(hostId, [result.thread]);
+  toast("已创建对话分支");
+  return { id: result.thread.id as string, hostId,
+    canSelect: selection === selectionGeneration && selectedHost === state.hostId && selectedThread === state.activeThread?.id };
+}
 async function fork(lastTurnId?: string) {
   if (!state.activeThread) return;
   if (!state.threadReady || state.runtimePaused) throw fail(new Error('请先恢复当前会话连接。'));
-  const result = await rpc("thread/fork", {
-    threadId: state.activeThread.id,
-    lastTurnId,
-    excludeTurns: true,
-  });
-  updateThread(result.thread);
-  await selectThread(result.thread.id);
-  toast("已创建对话分支");
+  const hostId = state.hostId, id = state.activeThread.id, selection = selectionGeneration;
+  const result = await forkThread(id, hostId, lastTurnId);
+  if (hostId === state.hostId && id === state.activeThread?.id && selection === selectionGeneration)
+    await selectThread(result.id);
 }
 async function compact() {
   const id = state.activeThread?.id;
@@ -3414,6 +3456,7 @@ function setAutoCompact(enabled: boolean, threshold = 85) {
   );
 }
 function applyThreadRename(id: string, name: string, hostId = state.hostId) {
+  invalidateThreadTitleSearch(hostId);
   const key = recencyKey(hostId, id);
   if (deletedThreads.has(key)) return;
   threadNameRevisions.set(key, (threadNameRevisions.get(key) ?? 0) + 1);
@@ -3444,6 +3487,7 @@ async function renameThread(name: string, id = state.activeThread?.id, hostId = 
 }
 function cleanupDeletedThread(id: string, hostId = state.hostId) {
   if (!id) return;
+  invalidateThreadTitleSearch(hostId);
   forgetAsyncQuestions(id, hostId);
   const key = recencyKey(hostId, id);
   deletedThreads.add(key);
@@ -3508,6 +3552,8 @@ async function deleteThread(id: string, hostId = state.hostId) {
   if (authentication === authenticationGeneration && state.hosts.some(host => host.id === hostId)) cleanupDeletedThread(id, hostId);
 }
 function cleanupArchivedThread(id: string) {
+  invalidateThreadTitleSearch(state.hostId);
+  navigationRevisions.set(state.hostId, (navigationRevisions.get(state.hostId) ?? 0) + 1);
   forgetAsyncQuestions(id);
   removedThreads.add(id);
   threadRevisions.set(id, ++threadEventSequence);
@@ -3518,7 +3564,14 @@ function cleanupArchivedThread(id: string) {
   tokenUsages.delete(recencyKey(state.hostId, id));
 }
 async function archiveThread(id: string, hostId = state.hostId) {
+  const known = hostId === state.hostId ? state.threads.find(thread => thread.id === id)
+    : state.navigation[hostId]?.threads.find(thread => thread.id === id);
+  if (known?.status?.type === 'active' || hostId === state.hostId && state.activeThread?.id === id && state.busy)
+    throw new Error('此会话正在运行，请先停止或等待完成后再归档');
+  const authentication = authenticationGeneration;
   await scopedRpc(hostId, "thread/archive", { threadId: id });
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  invalidateThreadTitleSearch(hostId);
   if (hostId === state.hostId) cleanupArchivedThread(id);
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter((thread) => thread.id !== id);
@@ -4835,6 +4888,7 @@ async function rememberSideBranch(hostId: string, id: string, label: string) {
     throw new Error('主机或登录状态已变化，请重新核对保存的分支');
   if (!result?.thread || result.thread.id !== id || result.thread.ephemeral)
     throw new Error('无法确认已保存的正式分支');
+  invalidateThreadTitleSearch(hostId);
   // A native fork with injected context can remain absent from thread/list
   // until its first explicit turn. Pins hydrate metadata by ID after reload.
   if (!state.preferences.pins.some(pin => pin.kind === 'thread' && pin.hostId === hostId && pin.id === id))
@@ -4916,38 +4970,39 @@ async function queryThreads(
   cursor: string | null = null,
   hostId = state.hostId,
 ) {
-  let result;
-  if (search.trim()) {
+  const query = search.trim().normalize("NFKC").toLowerCase();
+  const revision = navigationRevisions.get(hostId) ?? 0;
+  const key = JSON.stringify(hostId) + ":" + JSON.stringify([authenticationGeneration, revision, archived, query, cursor]);
+  return titleSearchPages.query(key, async () => {
+    let result;
+    const params = { archived, cursor, limit: 60, modelProviders: [] };
     try {
-      result = await threadPage(hostId, "thread/search", {
-        searchTerm: search.trim(),
-        archived,
-        cursor,
-        limit: 60,
-      });
-    } catch {
       result = await threadPage(hostId, "thread/list", {
-        searchTerm: search.trim(),
-        archived,
-        cursor,
-        limit: 60,
-        modelProviders: [],
-      });
+        ...params,
+        ...(query && titleSearchSupport.get(hostId) !== false ? { searchTerm: query } : {}),
+      }, true);
+      if (query && !titleSearchSupport.has(hostId)) titleSearchSupport.set(hostId, true);
+    } catch (error: any) {
+      // Old app-servers can reject this optional field. Keep paginating their
+      // metadata locally; never fall back to full-text thread/search.
+      if (!query || titleSearchSupport.get(hostId) === false ||
+          !/search_?term/i.test(error.message) ||
+          !/unknown|invalid|unsupported|unexpected|field/i.test(error.message)) throw error;
+      titleSearchSupport.set(hostId, false);
+      result = await threadPage(hostId, "thread/list", params, true);
     }
-  } else
-    result = await threadPage(hostId, "thread/list", {
-      archived,
-      cursor,
-      limit: 60,
-      modelProviders: [],
-    });
-  return result;
+    return {
+      ...result,
+      data: result.data.filter((thread: any) => !query || matchesThreadTitle(thread, query)),
+    };
+  });
 }
 async function queryNavigationThreads(
   search = "",
   archived = false,
   cursors?: Record<string, string>,
 ) {
+  const authentication = authenticationGeneration;
   const nextCursors: Record<string, string> = {};
   const data: any[] = [];
   const hosts = state.hosts
@@ -4965,6 +5020,7 @@ async function queryNavigationThreads(
         host.id,
       );
       if (
+        authentication !== authenticationGeneration || !state.authenticated ||
         !state.hosts.some((item) => item.id === host.id) ||
         host.revision !== (navigationRevisions.get(host.id) ?? 0)
       )
@@ -4980,6 +5036,7 @@ async function queryNavigationThreads(
     if (result.status === "rejected") {
       const host = hosts[index];
       if (
+        authentication === authenticationGeneration && state.authenticated &&
         host &&
         state.hosts.some((item) => item.id === host.id) &&
         host.revision === (navigationRevisions.get(host.id) ?? 0)
@@ -4991,6 +5048,7 @@ async function queryNavigationThreads(
 }
 async function unarchiveThread(id: string, hostId = state.hostId) {
   const result = await scopedRpc(hostId, "thread/unarchive", { threadId: id });
+  invalidateThreadTitleSearch(hostId);
   if (hostId === state.hostId) {
     removedThreads.delete(id);
     if (result.thread) updateThread(result.thread);
@@ -5001,21 +5059,32 @@ async function unarchiveThread(id: string, hostId = state.hostId) {
   }
   toast("对话已恢复");
 }
-async function exportThread(
+async function readThreadExport(
   id: string,
   format: "markdown" | "json" = "markdown",
   hostId = state.hostId,
 ) {
+  const authentication = authenticationGeneration;
+  const checkSession = () => {
+    if (authentication !== authenticationGeneration || !state.authenticated)
+      throw new Error('登录状态已变化，导出已取消');
+  };
   const metadata = await scopedRpc(hostId, "thread/read", {
     threadId: id,
     includeTurns: false,
   });
+  checkSession();
+  if (metadata.thread?.id !== id) throw new Error('返回的会话与请求不一致，导出已取消');
   const pages: any[][] = [];
   const cursors = new Set<string>();
   let cursor: string | null = null;
   let count = 0;
   do {
     const page = await history(id, cursor, hostId, true);
+    checkSession();
+    if (page.data.some((turn: any) => (turn.itemsView && turn.itemsView !== 'full')
+        || turn.cacheTruncated || turn.items?.some((item: any) => item.cacheTruncated)))
+      throw new Error('历史内容尚未完整加载，导出已取消，请同步后重试');
     count += page.data.length;
     if (count > 5000) throw new Error("对话过长，请通过终端导出原始 rollout");
     pages.unshift([...page.data].reverse());
@@ -5038,6 +5107,32 @@ async function exportThread(
           2,
         )
       : exportThreadMarkdown(metadata.thread, turns);
+  return { content, thread: metadata.thread };
+}
+async function copyThread(id: string, format: 'link' | 'markdown' | 'cwd', hostId = state.hostId) {
+  const authentication = authenticationGeneration;
+  const checkSession = () => {
+    if (authentication !== authenticationGeneration || !state.authenticated)
+      throw new Error('登录状态已变化，复制已取消');
+  };
+  let text: string;
+  if (format === 'link') {
+    const url = new URL('/', location.origin);
+    url.searchParams.set('host', hostId); url.searchParams.set('thread', id);
+    text = url.href;
+  } else if (format === 'markdown') text = (await readThreadExport(id, 'markdown', hostId)).content;
+  else {
+    const result = await scopedRpc(hostId, 'thread/read', { threadId: id, includeTurns: false });
+    if (result.thread?.id !== id) throw new Error('返回的会话与请求不一致，复制已取消');
+    if (typeof result.thread?.cwd !== 'string' || !result.thread.cwd) throw new Error('此对话没有工作目录');
+    text = result.thread.cwd;
+  }
+  await copyText(text, checkSession);
+  checkSession();
+  toast(format === 'link' ? '已复制对话链接' : format === 'markdown' ? '已复制 Markdown' : '已复制工作目录');
+}
+async function exportThread(id: string, format: 'markdown' | 'json' = 'markdown', hostId = state.hostId) {
+  const { content, thread } = await readThreadExport(id, format, hostId);
   const blob = new Blob([content], {
     type:
       format === "json" ? "application/json" : "text/markdown;charset=utf-8",
@@ -5045,7 +5140,7 @@ async function exportThread(
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${(metadata.thread.name || id).replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").slice(0, 100)}.${format === "json" ? "json" : "md"}`;
+  link.download = `${(thread.name || id).replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").slice(0, 100)}.${format === "json" ? "json" : "md"}`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
@@ -5114,6 +5209,7 @@ export function useCodex() {
     cancelMessageEdit,
     interrupt,
     fork,
+    forkThread,
     compact,
     setAutoCompact,
     renameThread,
@@ -5152,6 +5248,7 @@ export function useCodex() {
     setCollapsed,
     queryThreads,
     queryNavigationThreads,
+    titleSearchVersion: () => titleSearchRevision.value,
     navigationThreads,
     navigationMore,
     navigationProjectPage,
@@ -5162,6 +5259,7 @@ export function useCodex() {
     retryNavigationHost,
     unarchiveThread,
     exportThread,
+    copyThread,
     projectRoots,
     selectPermissionProfile,
     setPermission,

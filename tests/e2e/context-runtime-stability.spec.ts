@@ -84,6 +84,7 @@ test('compression acknowledgement retains usage and in-progress reminder until n
   mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: { last: { totalTokens: 24000 }, modelContextWindow: 100000 } });
   await expect(page.locator('.context-usage')).toHaveText('上下文 24%');
   await page.locator('.context-usage').click();
+  await page.getByRole('dialog', { name: '上下文用量与压缩' }).getByRole('button', { name: '立即压缩', exact: true }).click();
   await expect.poll(() => !!mock.request('thread/compact/start')).toBe(true);
   await expect(page.locator('.compaction-status')).toContainText('正在压缩');
   await expect(page.locator('.compaction-divider')).toHaveCount(0);
@@ -143,6 +144,7 @@ test('a legacy completion-only compression stays before subsequent turns, surviv
   await page.locator('[data-section="recent"] .thread-row').first().click();
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   await page.locator('.context-usage').click();
+  await page.getByRole('dialog', { name: '上下文用量与压缩' }).getByRole('button', { name: '立即压缩', exact: true }).click();
   await expect(page.locator('.compaction-status')).toBeVisible();
   mock.emit('thread/compacted', { threadId: 'thread-existing' });
   await expect(page.locator('.compaction-divider')).toContainText('上下文已压缩');
@@ -213,6 +215,7 @@ test('a definitive compression failure keeps the last usage and dismisses the pr
   mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: { last: { totalTokens: 24000 }, modelContextWindow: 100000 } });
   await expect(page.locator('.context-usage')).toHaveText('上下文 24%');
   await page.locator('.context-usage').click();
+  await page.getByRole('dialog', { name: '上下文用量与压缩' }).getByRole('button', { name: '立即压缩', exact: true }).click();
   await expect(page.getByText('压缩测试失败', { exact: true })).toBeVisible();
   await expect(page.locator('.context-usage')).toHaveText('上下文 24%');
   await expect(page.locator('.compaction-status')).toHaveCount(0);

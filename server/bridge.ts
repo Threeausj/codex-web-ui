@@ -20,6 +20,7 @@ export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?
 type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
+type DisconnectCategory = 'inputError' | 'nativeJson' | 'nativeFrameLimit' | 'transportError' | 'transportClose' | 'initializeFailure' | 'requestWrite' | 'runtimePaused' | 'serverClosed'
 export type ReleasedThread = { name: string; restoreThreadIds: string[] }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
 
@@ -89,6 +90,7 @@ export class Bridge {
   private connectionAttempts = 0
   private lastConnectedAt?: number
   private lastDisconnectedAt?: number
+  private lastDisconnect?: { at: number; category: DisconnectCategory; activeThreadCount: number }
   private lastProtocolError?: { at: number; code: number; method: string; category: string }
   private contexts = new Map<string, { tokenUsage: ThreadTokenUsage | null; compacting: boolean }>()
   private compactions = new Map<string, { requests: Set<string>; items: Map<string, string | undefined> }>()
@@ -193,7 +195,7 @@ export class Bridge {
       transport = this.options.transportFactory ? this.options.transportFactory(this.host)
         : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile })
     } catch (error) {
-      if (generation === this.generation) this.disconnect(error as Error)
+      if (generation === this.generation) this.disconnect(error as Error, 'initializeFailure')
       throw error
     }
     this.transport = transport
@@ -210,11 +212,11 @@ export class Bridge {
     transport.output.on('data', (chunk: Buffer) => {
       if (generation !== this.generation) return
       try { reader.write(chunk) }
-      catch (error) { this.disconnect(error instanceof RangeError ? error : new Error('Invalid JSON from app-server')) }
+      catch (error) { this.disconnect(error instanceof RangeError ? error : new Error('Invalid JSON from app-server'), error instanceof RangeError ? 'nativeFrameLimit' : 'nativeJson') }
     })
-    transport.input.on('error', error => { if (generation === this.generation) this.disconnect(error) })
-    transport.events.on('transportError', error => { if (generation === this.generation) this.disconnect(error) })
-    transport.events.on('transportClose', error => { if (generation === this.generation) this.disconnect(error) })
+    transport.input.on('error', error => { if (generation === this.generation) this.disconnect(error, 'inputError') })
+    transport.events.on('transportError', error => { if (generation === this.generation) this.disconnect(error, 'transportError') })
+    transport.events.on('transportClose', error => { if (generation === this.generation) this.disconnect(error, 'transportClose') })
     try {
       const result = await this.rawRequest('initialize', { clientInfo: { name: this.clientName, title: 'Codex Web', version: '0.1.0' }, capabilities: { experimentalApi: true } }, undefined, undefined, 30000) as { userAgent?: string; codexHome?: string }
       if (generation !== this.generation || this.paused) throw new Error('App-server connection changed')
@@ -225,7 +227,7 @@ export class Bridge {
       this.lastConnectedAt = Date.now()
       for (const key of this.clients.keys()) this.status(key)
     } catch (error) {
-      if (generation === this.generation) this.disconnect(error as Error)
+      if (generation === this.generation) this.disconnect(error as Error, 'initializeFailure')
       throw error
     }
   }
@@ -271,6 +273,8 @@ export class Bridge {
     const id = (params as { threadId?: string } | undefined)?.threadId
     if (id && method === 'thread/delete' && this.activeThreads.has(id))
       throw Object.assign(new Error('此会话正在运行，请先暂停或等待完成后再删除'), { status: 409 })
+    if (id && method === 'thread/archive' && this.activeThreads.has(id))
+      throw Object.assign(new Error('此会话正在运行，请先停止或等待完成后再归档'), { status: 409 })
     if (id && !['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/goal/get'].includes(method) &&
       (this.releasing.has(id) || this.releasedThreads.has(id) || [...this.releasedThreads.values()].some(entry => entry.restoreThreadIds.includes(id))))
       throw Object.assign(new Error('此会话的 Web 连接已关闭，请在资源管理中重新连接会话后重试'), { code: 'thread_released', status: 409 })
@@ -380,7 +384,7 @@ export class Bridge {
     try {
       // A timer never grants permission, chooses an option or sends drafts.
       this.send({ id: approval.message.id, result: { answers: {} } })
-    } catch (error) { this.disconnect(error as Error); return }
+    } catch (error) { this.disconnect(error as Error, 'requestWrite'); return }
     this.removeApproval(key)
     this.announceResolution(approval)
     for (const client of this.clients.keys()) this.status(client)
@@ -391,6 +395,7 @@ export class Bridge {
     return { engineId: this.engineId || null, userAgent: this.userAgent || null, connected: this.connected, paused: this.paused,
       connectionMode: this.mode, reconnectCount: Math.max(0, this.connectionAttempts - 1),
       lastConnectedAt: this.lastConnectedAt || null, lastDisconnectedAt: this.lastDisconnectedAt || null,
+      lastDisconnect: this.lastDisconnect ? { ...this.lastDisconnect } : null,
       lastProtocolError: this.lastProtocolError || null,
       browsers: { connected: this.clients.size, failures: { ...this.browserFailures },
         queuedBytes: [...this.clientChannels.values()].reduce((bytes, channel) => bytes + channel.diagnostics.queuedBytes, 0),
@@ -738,8 +743,12 @@ export class Bridge {
     }
   }
 
-  private disconnect(error: Error) {
+  private disconnect(error: Error, category: DisconnectCategory) {
     this.lastDisconnectedAt = Date.now()
+    // Keep only a fixed category and count after recovery; raw native errors
+    // can contain prompts, command arguments, paths or SSH diagnostics.
+    this.lastDisconnect = { at: this.lastDisconnectedAt, category,
+      activeThreadCount: [...this.activeThreads].filter(id => !this.internalThreads.has(id)).length }
     ++this.generation
     this.connected = false
     this.lastError = error.message
@@ -853,7 +862,7 @@ export class Bridge {
     const transport = this.transport
     this.pausing = (async () => {
       if (this.connected) await Promise.allSettled([...this.subscribedThreads].map(threadId => this.rawRequest('thread/unsubscribe', { threadId }, undefined, undefined, 2000)))
-      this.disconnect(new Error('Web Codex 已释放，可切换到桌面端或 CLI'))
+      this.disconnect(new Error('Web Codex 已释放，可切换到桌面端或 CLI'), 'runtimePaused')
       if (transport?.closed) {
         let timer: ReturnType<typeof setTimeout> | undefined
         try { await Promise.race([transport.closed, new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); timer.unref?.() })]) }
@@ -873,7 +882,7 @@ export class Bridge {
 
   close(reason = 'Server stopping', code = 1001) {
     this.disposed = true
-    this.disconnect(new Error('Host connection closed'))
+    this.disconnect(new Error('Host connection closed'), 'serverClosed')
     for (const client of this.clients.values()) client.close(code, reason)
     for (const channel of this.clientChannels.values()) channel.close()
     this.clientChannels.clear()
