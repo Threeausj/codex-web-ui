@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 withDefaults(defineProps<{ panelId?: string }>(), { panelId: 'workspace-panel' });
 
 const storageKey = "codex.workspaceWidth";
+const widthChangeEvent = "codex:workspace-width";
 function savedWidth() {
   try {
     const value = Number(localStorage.getItem(storageKey));
@@ -39,13 +40,22 @@ function measure() {
   availableWidth.value = Math.max(0,
     (parent?.getBoundingClientRect().width ?? window.innerWidth) -
     (sidebar?.getBoundingClientRect().width ?? 0));
-  if (mobile.value && dragging.value) finish(false);
+  if (mobile.value && dragging.value) finish();
 }
 function persist() {
   try {
     if (preferredWidth.value === null) localStorage.removeItem(storageKey);
     else localStorage.setItem(storageKey, String(preferredWidth.value));
   } catch { /* Resizing still works when browser storage is unavailable. */ }
+  // The workspace and retained side chat can both stay mounted. Storage events
+  // do not fire in the writing window, so share committed preferences directly.
+  window.dispatchEvent(new CustomEvent(widthChangeEvent, { detail: preferredWidth.value }));
+}
+function syncPreferredWidth(event: Event) {
+  const value: unknown = (event as CustomEvent).detail;
+  if (!dragging.value && (value === null ||
+    (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 10_000)))
+    preferredWidth.value = value;
 }
 function begin(event: PointerEvent) {
   if (mobile.value || event.button !== 0 || dragging.value) return;
@@ -80,10 +90,18 @@ function finish(commit = true) {
     handle.value.releasePointerCapture(captured);
   if (commit) persist();
 }
-function finishPointer(event: PointerEvent, commit: boolean) {
-  if (event.pointerId === pointerId) finish(commit);
+function finishPointer(event: PointerEvent) {
+  if (event.pointerId !== pointerId) return;
+  // A fast release can arrive after the browser coalesces the final move.
+  move(event);
+  finish();
 }
-function cancelDrag() { finish(false); }
+function interruptPointer(event: PointerEvent) {
+  if (event.pointerId === pointerId) finish();
+}
+// Preview focus and capture changes end the gesture, rather than undoing it.
+// Escape and explicit cancellation still restore the width from before dragging.
+function interruptDrag() { finish(); }
 function reset() {
   finish(false);
   preferredWidth.value = null;
@@ -113,13 +131,15 @@ onMounted(() => {
   const sidebar = parent?.querySelector<HTMLElement>(".sidebar");
   if (sidebar) observer.observe(sidebar);
   window.addEventListener("resize", measure);
-  window.addEventListener("blur", cancelDrag);
+  window.addEventListener("blur", interruptDrag);
+  window.addEventListener(widthChangeEvent, syncPreferredWidth);
 });
 onBeforeUnmount(() => {
   finish(false);
   observer?.disconnect();
   window.removeEventListener("resize", measure);
-  window.removeEventListener("blur", cancelDrag);
+  window.removeEventListener("blur", interruptDrag);
+  window.removeEventListener(widthChangeEvent, syncPreferredWidth);
 });
 </script>
 
@@ -131,8 +151,8 @@ onBeforeUnmount(() => {
       :aria-controls="panelId" :aria-valuemin="minWidth"
       :aria-valuemax="maxWidth" :aria-valuenow="width" :aria-valuetext="`${width} 像素`"
       title="拖动调整宽度 · 双击重置"
-      @pointerdown="begin" @pointermove="move" @pointerup="finishPointer($event, true)"
-      @pointercancel="finishPointer($event, false)" @lostpointercapture="finish(false)"
+      @pointerdown="begin" @pointermove="move" @pointerup="finishPointer"
+      @pointercancel="interruptPointer" @lostpointercapture="interruptPointer"
       @keydown="keydown" @dblclick="reset" />
     <slot />
     <Teleport to="body">

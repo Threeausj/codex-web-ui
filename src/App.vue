@@ -28,6 +28,7 @@ import Composer from "./components/Composer.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
 import ReviewPanel from "./components/ReviewPanel.vue";
 import ResizableWorkspace from "./components/ResizableWorkspace.vue";
+import ResizableSidebar from "./components/ResizableSidebar.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
@@ -967,7 +968,7 @@ watch(() => [state.authenticated, state.loading], () => {
       class="sidebar-backdrop"
       @click="sidebarOpen = false"
     ></div>
-    <aside class="sidebar" :class="{ 'mobile-open': sidebarOpen }">
+    <ResizableSidebar :collapsed="sidebarCollapsed" :workspace-visible="workspaceOpen || sideChat.state.open" :class="{ 'mobile-open': sidebarOpen }">
       <header class="sidebar-header">
         <a class="brand" href="#" @click.prevent="newThread"
           ><span class="codex-mark"><Icon name="Command" :size="16" /></span
@@ -1020,7 +1021,7 @@ watch(() => [state.authenticated, state.loading], () => {
           }}</span>
         </button>
       </footer>
-    </aside>
+    </ResizableSidebar>
     <section class="main-column">
       <header class="main-header">
         <div class="header-left">
