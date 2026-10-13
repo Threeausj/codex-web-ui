@@ -38,6 +38,7 @@ function hostTransport(host: Host) {
       if (message.method === 'initialize') result = { userAgent: `fixture:${host.id}`, codexHome: `/home/${host.id}/.codex` }
       if (message.method === 'thread/list' || message.method === 'thread/search') result = { data: [thread], nextCursor: `${host.id}:next` }
       if (message.method === 'thread/read' || message.method === 'thread/unarchive') result = { thread }
+      if (message.method === 'thread/fork') result = { thread: { ...thread, id: `fork-${host.id}`, forkedFromId: thread.id } }
       if (message.method === 'thread/turns/list') result = { data: [{ id: 'same-turn-id', items: [{ type: 'agentMessage', text: host.name }] }], nextCursor: null }
       if (message.method === 'thread/name/set') thread.name = (message.params as { name: string }).name
       queueMicrotask(() => {
@@ -89,6 +90,9 @@ test('navigation endpoint enforces auth/CSRF and limits methods/fields before co
       { method: 'thread/delete', params: { threadId: 'same-thread-id', hostId: 'other-host' } },
       { method: 'thread/delete', params: { threadId: 'same-thread-id', force: true } },
       { method: 'thread/delete', params: { threadId: '' } },
+      { method: 'thread/fork', params: { threadId: 'same-thread-id', excludeTurns: true, deferGoalContinuation: true, cwd: '/other' } },
+      { method: 'thread/fork', params: { threadId: 'same-thread-id', excludeTurns: false, deferGoalContinuation: true } },
+      { method: 'thread/fork', params: { threadId: 'same-thread-id', excludeTurns: true, deferGoalContinuation: false } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: '   ' } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: 'x'.repeat(1001) } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: 'Name', hostId: 'other-host' } },
@@ -130,6 +134,7 @@ test('navigation isolates matching thread IDs across hosts and keeps the active 
       { method: 'thread/turns/list', params: { threadId: 'same-thread-id', limit: 30, cursor: null, sortDirection: 'desc', itemsView: 'full' } },
       { method: 'thread/archive', params: { threadId: 'same-thread-id' } },
       { method: 'thread/unarchive', params: { threadId: 'same-thread-id' } },
+      { method: 'thread/fork', params: { threadId: 'same-thread-id', excludeTurns: true, deferGoalContinuation: true } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: 'Renamed remote session' } },
       { method: 'thread/delete', params: { threadId: 'same-thread-id' } },
     ]

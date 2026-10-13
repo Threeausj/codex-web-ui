@@ -85,16 +85,17 @@ test("pinned projects and chats form collapsible trees, and the fold state survi
   ).toBe(true);
 });
 
-test("full-text search, archive recovery and complete markdown export use the selected thread", async ({
+test("title-only search, archive recovery and complete markdown export use the selected thread", async ({
   page,
   mock,
 }) => {
   await login(page);
   await page
     .getByRole("textbox", { name: "搜索对话", exact: true })
-    .fill("历史保持可读");
+    .fill("已有测试历史");
   await expect(page.locator(".nav-search-results .thread-row")).toHaveCount(1);
-  expect(mock.request("thread/search")?.params.searchTerm).toBe("历史保持可读");
+  expect(mock.request("thread/search")).toBeUndefined();
+  await expect.poll(() => mock.request("thread/list")?.params.searchTerm).toBe("已有测试历史");
   await page.getByRole("button", { name: "返回会话导航", exact: true }).click();
   await recent(page).locator(".thread-row").first().click();
   await page.getByRole("button", { name: "对话操作", exact: true }).click();

@@ -4,6 +4,8 @@ import Icon from "./Icon.vue";
 import ProjectGroup from "./ProjectGroup.vue";
 import ThreadRow from "./ThreadRow.vue";
 import { isPinned, sortedThreads } from "../lib/navigation";
+import { browserStorage } from "../lib/browser-storage";
+import { matchesThreadTitle } from "../lib/thread-title-search";
 const props = defineProps<{ api: any; state: any }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
@@ -24,6 +26,7 @@ const results = ref<any[]>([]);
 const cursors = ref<Record<string, string>>({});
 const hasMoreResults = computed(() => Object.keys(cursors.value).length > 0);
 const recentLimit = ref(20);
+const recentHost = ref(browserStorage.local.getItem("codex.recentHostFilter") || "");
 const expandedProjects = ref({ pinned: false, projects: false });
 const projectLimit = 4;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -68,14 +71,25 @@ const pinnedThreads = computed(() =>
     )
     .filter(Boolean),
 );
-const recentThreads = computed(() =>
+const filteredRecentThreads = computed(() =>
   sortedThreads<any>(
     allThreads.value.filter(
       (thread: any) =>
+        (!recentHost.value || thread.hostId === recentHost.value) &&
         !isPinned(pins.value, thread.hostId, "thread", thread.id),
     ),
-  ).slice(0, recentLimit.value),
+  ),
 );
+const recentThreads = computed(() => filteredRecentThreads.value.slice(0, recentLimit.value));
+const moreRecentAvailable = computed(() =>
+  props.api.navigationMore(recentHost.value || undefined) || filteredRecentThreads.value.length > recentLimit.value,
+);
+function filterRecent(hostId: string) {
+  recentHost.value = hostId;
+  recentLimit.value = 20;
+  if (hostId) browserStorage.local.setItem("codex.recentHostFilter", hostId);
+  else browserStorage.local.removeItem("codex.recentHostFilter");
+}
 // One shared topology; migrate the former selected-host collapse preference.
 const key = (section: string) => `section:all:${section}`;
 const collapsed = (section: string) =>
@@ -91,6 +105,8 @@ async function fold(section: string) {
 async function query(more = false) {
   const request = ++generation;
   searching.value = true;
+  if (!more && !archived.value)
+    results.value = sortedThreads<any>(allThreads.value.filter((thread: any) => matchesThreadTitle(thread, search.value)));
   try {
     const result = await props.api.queryNavigationThreads(
       search.value,
@@ -98,19 +114,11 @@ async function query(more = false) {
       more ? cursors.value : undefined,
     );
     if (request !== generation) return;
-    const known = new Set(
-      more
-        ? results.value.map((thread) => `${thread.hostId}:${thread.id}`)
-        : [],
-    );
-    results.value = [
-      ...(more ? results.value : []),
-      ...sortedThreads<any>(
-        result.data.filter(
-          (thread: any) => !known.has(`${thread.hostId}:${thread.id}`),
-        ),
-      ),
-    ];
+    const records = new Map<string, any>();
+    for (const thread of result.data) records.set(`${thread.hostId}:${thread.id}`, thread);
+    for (const thread of more ? results.value : archived.value ? [] : allThreads.value.filter((thread: any) => matchesThreadTitle(thread, search.value)))
+      records.set(`${thread.hostId}:${thread.id}`, thread);
+    results.value = sortedThreads<any>([...records.values()]);
     cursors.value = result.nextCursors;
   } catch (error: any) {
     if (request === generation) emit("error", error.message);
@@ -120,9 +128,9 @@ async function query(more = false) {
 }
 async function moreRecent() {
   recentLimit.value += 20;
-  if (props.api.navigationMore()) {
+  if (props.api.navigationMore(recentHost.value || undefined)) {
     try {
-      await props.api.loadMoreNavigation();
+      await props.api.loadMoreNavigation(recentHost.value || undefined);
     } catch (error: any) {
       emit("error", error.message);
     }
@@ -148,7 +156,8 @@ function resultChanged(thread: { id: string; hostId: string; name?: string }, re
   const matches = (item: any) => item.id === thread.id && item.hostId === thread.hostId;
   results.value = remove
     ? results.value.filter((item) => !matches(item))
-    : results.value.map((item) => matches(item) ? { ...item, name: thread.name } : item);
+    : results.value.map((item) => matches(item) ? { ...item, name: thread.name } : item)
+      .filter((item) => matchesThreadTitle(item, search.value));
 }
 const seenChanges = new Set<string>();
 const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
@@ -179,6 +188,9 @@ const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any)
     resultChanged({ id: params.threadId, hostId, name: params.threadName ?? params.name });
 }) || (() => {});
 watch(() => [props.state.hostId, props.state.authenticated], () => seenChanges.clear());
+watch(() => props.state.hosts.map((host: any) => host.id), (hosts) => {
+  if (hosts.length && recentHost.value && !hosts.includes(recentHost.value)) filterRecent("");
+});
 watch(
   () => [
     search.value,
@@ -190,7 +202,11 @@ watch(
     clearTimeout(searchTimer);
     results.value = [];
     cursors.value = {};
-    if (searchMode.value) searchTimer = setTimeout(() => void query(), 220);
+    if (searchMode.value) {
+      if (!archived.value)
+        results.value = sortedThreads<any>(allThreads.value.filter((thread: any) => matchesThreadTitle(thread, search.value)));
+      searchTimer = setTimeout(() => void query(), 220);
+    }
   },
 );
 watch(
@@ -213,7 +229,7 @@ onBeforeUnmount(() => {
     <div class="nav-search">
       <Icon name="Search" :size="14" /><input
         v-model="search"
-        placeholder="搜索全部对话…"
+        placeholder="搜索对话标题…"
         aria-label="搜索对话"
       /><button
         v-if="search"
@@ -411,6 +427,12 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <div v-if="!collapsed('recent')">
+          <div class="recent-host-filter" role="group" aria-label="按设备筛选最近对话">
+            <button type="button" :aria-pressed="!recentHost" :class="{ selected: !recentHost }" @click="filterRecent('')">全部</button>
+            <button v-for="host in state.hosts" :key="host.id" type="button"
+              :aria-pressed="recentHost === host.id" :class="{ selected: recentHost === host.id }"
+              :title="host.name" @click="filterRecent(host.id)">{{ host.name }}</button>
+          </div>
           <ThreadRow
             v-for="thread in recentThreads"
             :key="`${thread.hostId}:${thread.id}`"
@@ -420,9 +442,9 @@ onBeforeUnmount(() => {
             @select="emit('select', $event)"
             @error="emit('error', $event)"
           />
-          <p v-if="!recentThreads.length" class="nav-empty">暂无最近对话</p>
+          <p v-if="!recentThreads.length" class="nav-empty">{{ recentHost ? "此设备暂无最近对话" : "暂无最近对话" }}</p>
           <button
-            v-if="api.navigationMore() || allThreads.length > recentLimit"
+            v-if="moreRecentAvailable"
             class="nav-load-more"
             @click="moreRecent"
           >
@@ -435,6 +457,31 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.recent-host-filter {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  padding: 0 6px 6px;
+  margin-bottom: 3px;
+}
+.recent-host-filter button {
+  flex: 0 0 auto;
+  max-width: 144px;
+  min-height: 27px;
+  padding: 3px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-host-filter button:hover { background: var(--hover); color: var(--text); }
+.recent-host-filter button.selected { background: var(--selected); color: var(--text); border-color: var(--border); }
 .nav-overflow-toggle {
   display: flex;
   align-items: center;
@@ -442,6 +489,7 @@ onBeforeUnmount(() => {
   min-height: 32px;
 }
 @media (max-width: 760px) {
+  .recent-host-filter button { min-height: 36px; }
   .nav-overflow-toggle {
     min-height: 40px;
   }

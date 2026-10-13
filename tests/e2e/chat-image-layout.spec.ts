@@ -40,6 +40,16 @@ async function expectRightAlignedRows(message: Locator) {
   }
 }
 
+async function expectAttachmentAboveBubble(message: Locator) {
+  const position = await message.evaluate(element => {
+    const images = element.querySelector('.message-images')!.getBoundingClientRect();
+    const bubble = element.querySelector('.user-bubble')!.getBoundingClientRect();
+    return { imageBottom: images.bottom, bubbleTop: bubble.top };
+  });
+  expect(position.imageBottom).toBeLessThanOrEqual(position.bubbleTop);
+  expect(position.bubbleTop - position.imageBottom).toBeLessThanOrEqual(9);
+}
+
 async function expectImagesLoaded(message: Locator, count: number) {
   await expect(message.locator('.message-images img')).toHaveCount(count);
   for (const image of await message.locator('.message-images img').all()) {
@@ -47,6 +57,11 @@ async function expectImagesLoaded(message: Locator, count: number) {
     await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(1600);
     // Native-history pictures and new upload previews use the same thumbnail size.
     expect((await image.boundingBox())!.width).toBeLessThanOrEqual(230);
+    const alignment = await image.evaluate(element => ({
+      imageRight: element.getBoundingClientRect().right,
+      controlRight: element.parentElement!.getBoundingClientRect().right,
+    }));
+    expect(alignment.imageRight, 'the visible image reaches the attachment control right edge').toBeCloseTo(alignment.controlRight, 0);
   }
   await expectRightAlignedRows(message);
 }
@@ -105,5 +120,36 @@ for (const viewport of viewports) {
     await page.reload();
     await expect(message.locator('.conversation-image')).toHaveCount(4);
     await expectImagesLoaded(message, 4);
+  });
+}
+
+for (const viewport of [{ width: 1440, height: 900 }, { width: 820, height: 900 }, { width: 390, height: 844 }]) {
+  test(`a single image stays aligned with a long user bubble through workspace resize and streaming at ${viewport.width}px`, async ({ page, mock }) => {
+    await page.setViewportSize(viewport);
+    await page.route('**/api/hosts/*/images?*', route => route.fulfill({ contentType: 'image/svg+xml', body: picture }));
+    const turn = mock.turns.get('thread-existing')![0];
+    turn.items[0].content = [
+      { type: 'text', text: '1.优化会话显示与筛选\n2.这是带有一张图片的较长消息，图片应与此消息的右侧边缘对齐。'.repeat(4), text_elements: [] },
+      { type: 'localImage', path: imagePath(0) },
+    ];
+    await openExisting(page);
+    const message = page.locator('.user-message');
+    await expectImagesLoaded(message, 1);
+    await expectAttachmentAboveBubble(message);
+    if (viewport.width > 760) {
+      await page.getByRole('button', { name: '切换工作区', exact: true }).click();
+      const handle = page.getByRole('separator', { name: '调整工作区宽度', exact: true });
+      await expect(handle).toBeVisible();
+      await handle.focus();
+      await page.keyboard.press('End');
+      await expectImagesLoaded(message, 1);
+      await expectAttachmentAboveBubble(message);
+      await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    }
+    mock.emit('item/agentMessage/delta', { threadId: 'thread-existing', turnId: 'turn-history', itemId: 'history-agent', delta: '\n收到图片后继续检查。' });
+    await expect(page.locator('.agent-message')).toContainText('收到图片后继续检查。');
+    await expectImagesLoaded(message, 1);
+    await expectAttachmentAboveBubble(message);
+    await page.screenshot({ path: `.data/chat-image-alignment-${viewport.width}.png` });
   });
 }

@@ -109,7 +109,7 @@ test("pin, search and archive target the row's host without replacing the active
   ).toHaveText("开发服务器");
   await page
     .getByRole("textbox", { name: "搜索对话", exact: true })
-    .fill("远程会话内容");
+    .fill("远程项目历史");
   await expect(page.locator(".nav-search-results .thread-row")).toHaveCount(1);
   await expect(page.locator(".nav-search-results .host-badge")).toHaveText(
     "开发服务器",

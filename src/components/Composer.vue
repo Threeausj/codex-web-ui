@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
 import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
 import MessageQueuePanel from "./MessageQueuePanel.vue";
@@ -172,14 +172,14 @@ const selectedModel = computed(() =>
   ),
 );
 const effortLabels: Record<string, string> = {
-  none: "无",
-  minimal: "最低",
-  low: "低",
-  medium: "中",
-  high: "高",
-  xhigh: "极高",
-  max: "最高",
-  ultra: "超高",
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+  ultra: "Ultra",
 };
 const efforts = computed(
   () => selectedModel.value?.supportedReasoningEfforts || [],
@@ -241,11 +241,77 @@ const contextTitle = computed(() => {
   const details = context.value
     ? `${context.value.used.toLocaleString()} / ${context.value.limit.toLocaleString()} tokens（当前上下文）`
     : props.state.activeThread ? "Codex 尚未报告当前上下文用量" : "新对话尚未使用上下文";
-  return `${details}\n${props.state.compacting ? "正在压缩上下文，请稍候" : props.state.busy ? "任务结束后可压缩上下文" : "点击压缩上下文"}`;
+  return `${details}\n${desktopContext.value ? "点击查看上下文用量与压缩选项" : compactDisabledReason.value || "点击压缩上下文"}`;
 });
-const compactDisabled = computed(() => !props.state.activeThread || !props.state.connected ||
-  props.state.busy || props.state.compacting || props.state.threadConflict || props.state.threadReady === false ||
-  props.state.runtimePaused || contextDisabled.value);
+const compactDisabledReason = computed(() => {
+  if (!props.state.activeThread) return "先开始一个对话，再压缩上下文";
+  if (props.state.compacting) return "正在压缩上下文，请稍候";
+  if (props.state.busy) return "任务结束后可压缩上下文";
+  if (props.state.online === false || !props.state.connected) return "工作站未连接，请先恢复连接";
+  if (props.state.threadConflict) return "请先处理会话连接冲突";
+  if (props.state.runtimePaused || props.state.threadReleased) return "请先恢复当前会话连接";
+  if (props.state.threadReady === false || props.state.selectingThread || props.state.switchingHost || props.contextBusy)
+    return "会话加载中，请稍候";
+  if (props.state.editingMessage) return "请先完成消息编辑";
+  if (props.state.modeBusy) return "正在切换对话模式，请稍候";
+  if (uploading.value) return "文件上传完成后可压缩上下文";
+  if (submitting.value) return "消息提交完成后可压缩上下文";
+  return "";
+});
+const compactDisabled = computed(() => !!compactDisabledReason.value);
+const desktopContext = ref(window.innerWidth > 760);
+const contextMenuOpen = ref(false);
+const contextButton = ref<HTMLButtonElement>();
+const contextMenu = ref<HTMLElement>();
+const contextMenuId = `context-usage-${useId()}`;
+const contextMenuPosition = ref({ left: '0px', bottom: '0px', maxHeight: '400px' });
+function tokenCount(value: number) {
+  if (value < 1000) return value.toLocaleString();
+  const scale = value >= 1_000_000 ? 1_000_000 : 1000;
+  return `${Number((value / scale).toFixed(1))}${scale === 1000 ? 'k' : 'm'}`;
+}
+function positionContextMenu() {
+  const desktop = window.innerWidth > 760;
+  desktopContext.value = desktop;
+  if (!desktop) { contextMenuOpen.value = false; return; }
+  if (!contextMenuOpen.value || !contextButton.value) return;
+  const bounds = contextButton.value.getBoundingClientRect();
+  const width = Math.min(280, window.innerWidth - 24);
+  contextMenuPosition.value = {
+    left: `${Math.max(12, Math.min(bounds.right - width, window.innerWidth - width - 12))}px`,
+    bottom: `${Math.max(12, window.innerHeight - bounds.top + 8)}px`,
+    maxHeight: `${Math.max(80, bounds.top - 20)}px`,
+  };
+}
+function closeContextMenu(restoreFocus = false) {
+  contextMenuOpen.value = false;
+  if (restoreFocus) contextButton.value?.focus({ preventScroll: true });
+}
+function contextOutside(event: Event) {
+  if (!contextMenuOpen.value || contextMenu.value?.contains(event.target as Node) ||
+      contextButton.value?.contains(event.target as Node)) return;
+  closeContextMenu();
+}
+function contextKey(event: KeyboardEvent) {
+  if (contextMenuOpen.value && event.key === 'Escape') {
+    event.preventDefault(); event.stopPropagation(); closeContextMenu(true);
+  }
+}
+function requestCompaction() {
+  if (compactDisabled.value) return;
+  closeContextMenu(); emit('command', 'compact');
+}
+async function clickContext() {
+  if (!desktopContext.value) { requestCompaction(); return; }
+  if (contextMenuOpen.value) { closeContextMenu(); return; }
+  contextMenuOpen.value = true;
+  positionContextMenu();
+  await nextTick();
+  if (contextMenuOpen.value) contextMenu.value?.focus({ preventScroll: true });
+}
+watch([() => props.state.hostId, () => props.state.projectPath, () => props.state.activeThread?.id,
+  () => props.state.authenticationGeneration, () => props.state.authenticated], () => closeContextMenu(), { flush: 'sync' });
+watch([contextLabel, compactDisabledReason, delivery], () => { void nextTick(positionContextMenu); });
 const canSend = computed(
   () =>
     !props.state.threadConflict &&
@@ -617,12 +683,20 @@ watch(
 onMounted(() => {
   window.addEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.addEventListener("resize", fitPickerAfterLayout);
+  window.addEventListener('resize', positionContextMenu);
+  document.addEventListener('scroll', positionContextMenu, true);
+  document.addEventListener('pointerdown', contextOutside, true);
+  document.addEventListener('keydown', contextKey, true);
 });
 onBeforeUnmount(() => {
   ++uploadContextGeneration;
   if (searchTimer) clearTimeout(searchTimer);
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);
+  window.removeEventListener('resize', positionContextMenu);
+  document.removeEventListener('scroll', positionContextMenu, true);
+  document.removeEventListener('pointerdown', contextOutside, true);
+  document.removeEventListener('keydown', contextKey, true);
 });
 defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext,
   working: computed(() => uploading.value || submitting.value) });
@@ -910,12 +984,16 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
             </select><Icon name="ChevronDown" :size="11" />
           </label>
           <button
+            ref="contextButton"
             class="context-usage"
             :class="{ 'context-high': context && context.percent >= 80 }"
             :title="contextTitle"
             :aria-label="contextLabel"
-            :disabled="compactDisabled"
-            @click="emit('command', 'compact')"
+            :disabled="!desktopContext && compactDisabled"
+            :aria-haspopup="desktopContext ? 'dialog' : undefined"
+            :aria-expanded="desktopContext ? contextMenuOpen : undefined"
+            :aria-controls="desktopContext ? contextMenuId : undefined"
+            @click="clickContext"
           >
             <span class="context-ring" :style="{ '--context-percent': `${context?.percent || 0}%` }" aria-hidden="true"></span>
             <span>{{ contextLabel }}</span>
@@ -989,7 +1067,6 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
           >
             <span></span></button
           ><button
-            v-if="!state.busy || canSend"
             class="send-button"
             :disabled="!canSend"
             @click="send"
@@ -1006,6 +1083,35 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
       </div>
     </div>
   </div>
+  <Teleport to="body">
+    <section
+      v-if="contextMenuOpen"
+      ref="contextMenu"
+      :id="contextMenuId"
+      class="context-usage-menu"
+      :style="contextMenuPosition"
+      role="dialog"
+      aria-label="上下文用量与压缩"
+      tabindex="-1"
+    >
+      <header><strong>上下文用量</strong><span v-if="context">{{ context.percent }}%</span></header>
+      <template v-if="context">
+        <p class="context-token-count" :title="`${context.used.toLocaleString()} / ${context.limit.toLocaleString()} tokens`">
+          <strong>{{ tokenCount(context.used) }} / {{ tokenCount(context.limit) }}</strong><span>tokens</span>
+        </p>
+        <div class="context-usage-bar" role="progressbar" aria-label="上下文使用比例"
+          :aria-valuenow="context.percent" :aria-valuemin="0" :aria-valuemax="100">
+          <span :style="{ width: `${context.percent}%` }" :class="{ 'context-high': context.percent >= 80 }"></span>
+        </div>
+      </template>
+      <p v-else class="context-menu-note">{{ state.activeThread ? 'Codex 尚未报告当前上下文用量' : '新对话尚未使用上下文' }}</p>
+      <button class="context-compact-action" :disabled="compactDisabled" @click="requestCompaction"
+        :aria-describedby="compactDisabledReason ? `${contextMenuId}-reason` : undefined">
+        <Icon name="RefreshCw" :size="14" />立即压缩
+      </button>
+      <p v-if="compactDisabledReason" :id="`${contextMenuId}-reason`" class="context-menu-note">{{ compactDisabledReason }}</p>
+    </section>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -1081,14 +1187,32 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .goal-budget-error { color: var(--red); font-size: 10px; }
 .text-button { padding: 3px 0; font-size: 11px; color: var(--muted); }
 .text-button:hover:not(:disabled) { color: var(--text); }
-.composer .composer-tools { min-width: 0; }
+.composer .composer-toolbar { flex-wrap: wrap; }
+.composer .composer-tools { min-width: 0; flex: 1 1 auto; }
+.composer .composer-submit { flex-wrap: wrap; max-width: 100%; margin-left: auto; justify-content: flex-end; }
 .composer .model-select { min-width: 0; }
 .composer .model-select select { width: 100%; min-width: 0; text-overflow: ellipsis; }
+.composer .effort-select { flex: 0 0 auto; }
+.composer .effort-select select { width: auto; max-width: none; }
 .context-usage { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; min-height: 28px; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .context-usage:hover:not(:disabled) { color: var(--text); background: var(--soft); }
 .context-usage:disabled { opacity: 1; cursor: default; }
 .context-usage.context-high { color: var(--warning); }
 .context-ring { display: inline-block; width: 13px; height: 13px; flex: 0 0 auto; border-radius: 50%; background: conic-gradient(currentColor var(--context-percent), var(--border) 0); mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0); }
+.context-usage-menu { position: fixed; z-index: 70; width: min(280px, calc(100vw - 24px)); padding: 14px; overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); outline: none; }
+.context-usage-menu header { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
+.context-usage-menu header strong { font-weight: 500; }
+.context-usage-menu header span { color: var(--muted); }
+.context-token-count { display: flex; align-items: baseline; gap: 7px; margin: 13px 0 10px; }
+.context-token-count strong { font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.context-token-count span, .context-menu-note { color: var(--muted); font-size: 11px; }
+.context-usage-bar { height: 4px; overflow: hidden; border-radius: 4px; background: var(--soft); }
+.context-usage-bar > span { display: block; height: 100%; background: var(--muted); }
+.context-usage-bar > .context-high { background: var(--warning); }
+.context-compact-action { display: flex; align-items: center; gap: 8px; width: 100%; margin-top: 12px; padding: 9px 0 2px; border: 0; background: transparent; color: var(--text); text-align: left; font-size: 12px; }
+.context-compact-action:hover:not(:disabled) { color: var(--green); }
+.context-compact-action:disabled { color: var(--muted); cursor: default; }
+.context-menu-note { margin: 9px 0 0; line-height: 1.6; }
 @media (max-width: 600px) {
   .composer-area { border-radius: 15px; }
   .composer { padding: 12px 12px 10px; }
@@ -1110,7 +1234,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   .composer .model-select { flex: 1 1 0; margin-left: 0; gap: 3px; }
   .composer .model-select select { flex: 1 1 0; max-width: none; min-height: 36px; font-size: 12px; }
   .composer .effort-select { flex: 0 0 auto; margin: 0 0 0 4px; gap: 3px; }
-  .composer .effort-select select { width: 36px; max-width: 36px; min-height: 36px; padding-inline: 0; font-size: 12px; }
+  .composer .effort-select select { min-height: 36px; padding-inline: 0; font-size: 12px; }
   .composer .composer-submit { min-width: 0; width: 100%; justify-content: flex-end; gap: 7px; }
   .context-usage { margin-right: auto; min-height: 36px; font-size: 11px; gap: 4px; padding-inline: 0; }
   .composer .permission-select { min-width: 0; max-width: calc(100% - 50px); }

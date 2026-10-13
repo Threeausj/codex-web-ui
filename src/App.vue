@@ -33,10 +33,12 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
+import ThreadCopyMenu from './components/ThreadCopyMenu.vue';
 import ProjectDialog from "./components/ProjectDialog.vue";
 import BookmarksPanel from './components/BookmarksPanel.vue';
 import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
 import { isPinned, threadLabel } from "./lib/navigation";
+import { matchesThreadTitle, searchableThreadTitle } from './lib/thread-title-search';
 import { initializeDevicePush, onPushNavigate, pwaState, updatePwa, setPwaUpdateGuard, resumeDeferredPwaUpdate, cancelDeferredPwaUpdate } from "./lib/pwa";
 import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navigation";
 
@@ -100,6 +102,10 @@ const reviewOpen = ref(false);
 const settingsTab = ref("general");
 const paletteOpen = ref(false);
 const paletteQuery = ref("");
+const paletteThreads = ref<any[]>([]);
+const paletteSearching = ref(false);
+let paletteSearchTimer: ReturnType<typeof setTimeout> | undefined;
+let paletteSearchGeneration = 0;
 const paletteInput = ref<HTMLInputElement>();
 const paletteSelected = ref(0);
 const searchOpen = ref(false);
@@ -277,32 +283,43 @@ const paletteActions = [
   },
 ];
 const paletteResults = computed(() => {
-  const q = paletteQuery.value.toLowerCase();
+  const q = paletteQuery.value.trim().toLowerCase();
   const actions: any[] = paletteActions
     .filter(
       (action) => !q || `${action.name} ${action.id}`.toLowerCase().includes(q),
     )
     .map((action) => ({ ...action, kind: "action" }));
-  const threads = api
-    .navigationThreads()
-    .filter(
-      (thread: any) =>
-        !q ||
-        `${thread.name || ""} ${thread.preview || ""}`
-          .toLowerCase()
-          .includes(q),
-    )
+  const known = new Map<string, any>();
+  for (const thread of [...paletteThreads.value, ...api.navigationThreads()])
+    known.set(`${thread.hostId}:${thread.id}`, thread);
+  const threads = [...known.values()]
+    .filter((thread: any) => !q || matchesThreadTitle(thread, q))
     .slice(0, q ? 12 : 5)
     .map((thread: any) => ({
       id: thread.id,
       hostId: thread.hostId,
-      name: thread.name || thread.preview || "未命名对话",
+      name: searchableThreadTitle(thread),
       detail:
         state.hosts.find((host) => host.id === thread.hostId)?.name || "对话",
       icon: "Command",
       kind: "thread",
     }));
   return [...actions, ...threads];
+});
+watch(() => [paletteOpen.value, paletteQuery.value, state.authenticated, state.hosts.map(host => host.id).join(','), api.titleSearchVersion()], () => {
+  const generation = ++paletteSearchGeneration;
+  clearTimeout(paletteSearchTimer);
+  paletteThreads.value = []; paletteSearching.value = false;
+  const query = paletteQuery.value.trim();
+  if (!paletteOpen.value || !state.authenticated || !query) return;
+  paletteSearching.value = true;
+  paletteSearchTimer = setTimeout(async () => {
+    try {
+      const result = await api.queryNavigationThreads(query);
+      if (generation === paletteSearchGeneration) paletteThreads.value = result.data;
+    } catch { /* Loaded titles remain usable while a host is unavailable. */ }
+    finally { if (generation === paletteSearchGeneration) paletteSearching.value = false; }
+  }, 220);
 });
 function displayTime(value: number | string) {
   if (!value) return "";
@@ -880,6 +897,7 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  ++paletteSearchGeneration; clearTimeout(paletteSearchTimer);
   cancelDeferredPwaUpdate();
   setPwaUpdateGuard(() => true);
   conversationImages.close();
@@ -1119,7 +1137,7 @@ watch(() => [state.authenticated, state.loading], () => {
                     ? "取消置顶"
                     : "置顶对话"
                 }}</button
-              ><button
+              ><ThreadCopyMenu :disabled="!state.activeThread || actionPending" @copy="format => { threadMenu = false; action(() => api.copyThread(state.activeThread.id, format)); }" /><button
                 :disabled="!state.activeThread"
                 @click="
                   threadMenu = false;
@@ -1447,7 +1465,7 @@ watch(() => [state.authenticated, state.loading], () => {
           <Icon name="Search" :size="20" /><input
             ref="paletteInput"
             v-model="paletteQuery"
-            placeholder="搜索对话或输入指令…"
+            placeholder="搜索标题或输入指令…"
             aria-label="搜索对话或指令"
             @keydown="paletteKey"
           /><kbd @click="paletteOpen = false">Esc</kbd>
@@ -1455,7 +1473,7 @@ watch(() => [state.authenticated, state.loading], () => {
         <div class="palette-results">
           <button
             v-for="(result, index) in paletteResults"
-            :key="result.kind + result.id"
+            :key="JSON.stringify([result.kind, result.hostId, result.id])"
             :class="{ selected: index === paletteSelected }"
             @click="pickPalette(result)"
           >
@@ -1468,7 +1486,7 @@ watch(() => [state.authenticated, state.loading], () => {
             />
           </button>
           <div v-if="!paletteResults.length" class="palette-empty">
-            没有找到匹配的对话或指令
+            {{ paletteSearching ? '正在搜索标题…' : '没有找到匹配的对话或指令' }}
           </div>
         </div>
         <footer>↑ ↓ 选择<span>↵ 打开</span></footer>
