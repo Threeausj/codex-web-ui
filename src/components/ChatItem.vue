@@ -2,7 +2,7 @@
 import { historyDisclosures } from "../lib/history-disclosures";
 import { fileLinkLocation } from "../lib/file-preview";
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/conversation-markdown'
+import { conversationMarkdown, conversationMarkdownBlocks, userMessageMath } from '../lib/conversation-markdown'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
 import { conversationImageViewer } from '../lib/conversation-image-viewer'
@@ -66,6 +66,7 @@ watch(() => props.busy, busy => { if (!busy) renderedText.value = text.value })
 onBeforeUnmount(() => { if (markdownFrame != null) cancelAnimationFrame(markdownFrame) })
 const markdownBlocks = computed(() => props.item.type === 'agentMessage' ? conversationMarkdownBlocks(renderedText.value, props.hostId, props.cwd || props.item.cwd) : []);
 const html = computed(() => conversationMarkdown(renderedText.value, props.hostId, props.cwd || props.item.cwd))
+const userMath = computed(() => props.item.type === 'userMessage' ? userMessageMath(text.value) : null)
 const findings = computed(() => props.item.type === 'exitedReviewMode' ? reviewFindings(props.item.review) : []);
 const disclosures = historyDisclosures();
 const reasoningExpanded = ref(disclosures?.reasoning.get(props.item.id) ?? !!props.busy);
@@ -175,6 +176,7 @@ function onLink(event: MouseEvent) {
         <button type="submit" class="button button-small button-primary" :disabled="editPending || editDisabled || !!editSession?.uploading || !hasEditInput"><Icon v-if="editPending" name="LoaderCircle" :size="15" class="spin" />{{ editPending ? '正在重新发送…' : '保存并重新发送' }}</button>
       </div>
     </form>
+    <div v-else-if="userMath !== null" class="user-bubble message-math" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" v-html="userMath"></div>
     <div v-else class="user-bubble" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId">{{ text }}</div>
     <div v-if="!editorOpen && (text || canEdit || canFork)" class="message-actions">
       <button v-if="text" class="icon-button" @click="copy" :title="copied ? '已复制' : '复制消息'" aria-label="复制消息"><Icon :name="copied ? 'Check' : 'Copy'" :size="15" /></button>
