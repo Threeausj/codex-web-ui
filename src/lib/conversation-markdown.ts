@@ -1,7 +1,9 @@
 import DOMPurify from 'dompurify';
-import { marked } from 'marked';
 import { isImagePath, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
+import { clearConversationMathCache, createConversationMarkdownParser, plainMessageMath } from './conversation-math';
+
+const marked = createConversationMarkdownParser();
 
 function markImage(image: HTMLImageElement) {
   image.dataset.conversationImage = 'true';
@@ -40,7 +42,7 @@ function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
 
 const cache = new Map<string, { html: string; bytes: number }>();
 let cacheBytes = 0;
-export function clearConversationMarkdownCache() { cache.clear(); cacheBytes = 0; }
+export function clearConversationMarkdownCache() { cache.clear(); cacheBytes = 0; clearConversationMathCache(); }
 function cached(key: string, render: () => string) {
   const previous = cache.get(key);
   if (previous) { cache.delete(key); cache.set(key, previous); return previous.html; }
@@ -53,6 +55,13 @@ function cached(key: string, render: () => string) {
 }
 export function conversationMarkdown(text: string, hostId = 'local', cwd = '') {
   return cached(JSON.stringify(['document', hostId, cwd, text]), () => sanitizeMarkdown(marked.parse(text, { async: false }) as string, hostId, cwd));
+}
+/** User messages stay plain text except for complete, valid math. The generated
+ * KaTeX/MathML is sanitized with the same policy as conversation Markdown. */
+export function userMessageMath(text: string): string | null {
+  if (!/[\$\\]/.test(text)) return null;
+  const html = plainMessageMath(text);
+  return html === null ? null : cached(JSON.stringify(['user-math', text]), () => sanitizeMarkdown(html, 'local', ''));
 }
 /** Stable parsed blocks keep completed paragraph DOM intact during streaming.
  * The lexer resolves reference definitions across the entire message first. */

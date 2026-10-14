@@ -798,6 +798,41 @@ hr {
   overflow-wrap: anywhere;
   color: var(--text);
 }
+.markdown .katex,
+.message-math .katex {
+  color: inherit;
+  white-space: normal;
+  overflow-wrap: normal;
+}
+.markdown .katex:not(.katex-display > .katex),
+.message-math .katex:not(.katex-display > .katex) {
+  display: inline-flex;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: baseline;
+  overscroll-behavior-x: contain;
+}
+.markdown .katex:not(.katex-display > .katex) > .katex-html,
+.message-math .katex:not(.katex-display > .katex) > .katex-html {
+  flex: none;
+}
+.markdown .katex-display,
+.message-math .katex-display {
+  max-width: 100%;
+  margin: 0.8em 0;
+  padding: 0.2em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: normal;
+  overscroll-behavior-x: contain;
+}
+.markdown .katex-display > .katex,
+.message-math .katex-display > .katex {
+  width: max-content;
+  min-width: 100%;
+  white-space: nowrap;
+}
 .markdown p {
   margin: 0 0 14px;
 }

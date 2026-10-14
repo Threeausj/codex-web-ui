@@ -1,5 +1,6 @@
 import { createApp } from 'vue';
 import App from './App.vue';
+import 'katex/dist/katex.min.css';
 import './style.css';
 import { initPwa } from './lib/pwa';
 
