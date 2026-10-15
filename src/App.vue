@@ -14,7 +14,8 @@ import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
 import { ReadingPositions, type ReadingPosition } from "./lib/reading-positions";
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
-import { bookmarkTextRange, useConversationBookmarks } from './lib/conversation-bookmarks';
+import { bookmarkTextRange, matchesBookmark, useConversationBookmarks } from './lib/conversation-bookmarks';
+import { bookmarkProjectDetails } from './lib/bookmark-project';
 import type { ConversationBookmark, ConversationBookmarkInput } from '../shared/bookmarks';
 import Icon from "./components/Icon.vue";
 import CommandLogo from "./components/CommandLogo.vue";
@@ -68,6 +69,10 @@ watch(() => state.authenticated, authenticated => { if (!authenticated) {
   clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
   ++bookmarkNavigation;
 } });
+watch(() => [state.authenticated, JSON.stringify(state.hosts.map(host => host.id))], () => {
+  const changed = bookmarks.setHosts(state.authenticated ? state.hosts.map(host => host.id) : []);
+  if (changed && state.authenticated && bookmarks.state.open) void bookmarks.refresh();
+}, { immediate: true });
 const sideChat = useSideChat(api, state);
 const sideChatPanel = ref<InstanceType<typeof SideChatPanel>>();
 useSubagentPrefetch(api, state);
@@ -245,6 +250,7 @@ const editableItemId = computed(() => {
   return item && api.canEditMessage(item.id) ? item.id : undefined;
 });
 const paletteActions = [
+  { id: "bookmarks", name: "收藏对话", detail: "按项目查看收藏", icon: "Bookmark" },
   {
     id: "new",
     name: "新建对话",
@@ -304,7 +310,13 @@ const paletteResults = computed(() => {
       icon: "Command",
       kind: "thread",
     }));
-  return [...actions, ...threads];
+  const saved = q ? bookmarks.state.allEntries.filter(entry => matchesBookmark(entry, q)).slice(0, 12)
+    .map(entry => {
+      const project = bookmarkProjectDetails(entry, state.projects, state.hosts);
+      return { id: entry.id, hostId: entry.hostId, name: entry.name,
+        detail: `收藏 · ${project.projectName} · ${project.hostName}`, icon: 'Bookmark', kind: 'bookmark', bookmark: entry };
+    }) : [];
+  return [...actions, ...saved, ...threads];
 });
 watch(() => [paletteOpen.value, paletteQuery.value, state.authenticated, state.hosts.map(host => host.id).join(','), api.titleSearchVersion()], () => {
   const generation = ++paletteSearchGeneration;
@@ -312,6 +324,7 @@ watch(() => [paletteOpen.value, paletteQuery.value, state.authenticated, state.h
   paletteThreads.value = []; paletteSearching.value = false;
   const query = paletteQuery.value.trim();
   if (!paletteOpen.value || !state.authenticated || !query) return;
+  void bookmarks.ensureIndex();
   paletteSearching.value = true;
   paletteSearchTimer = setTimeout(async () => {
     try {
@@ -636,10 +649,21 @@ function openPalette() {
   paletteOpen.value = true;
   void nextTick(() => paletteInput.value?.focus());
 }
+function openAllBookmarks() {
+  paletteOpen.value = false;
+  threadMenu.value = false;
+  void bookmarks.openAll();
+}
+async function openSavedBookmark(entry: ConversationBookmark) {
+  // Keep the saved excerpt and a retry surface if its native source moved.
+  openAllBookmarks();
+  await openBookmark(entry);
+}
 async function execute(command: string) {
   threadMenu.value = false;
   paletteOpen.value = false;
   if (command === "new") await newThread();
+  else if (command === "bookmarks") openAllBookmarks();
   else if (command === "side-chat") openSideChat();
   else if (command === "compact") {
     if (state.activeThread && !state.busy) await action(() => api.compact());
@@ -785,7 +809,8 @@ async function loadOlder() {
 async function pickPalette(result: any) {
   if (!result) return;
   paletteOpen.value = false;
-  if (result.kind === "thread")
+  if (result.kind === "bookmark") await openSavedBookmark(result.bookmark);
+  else if (result.kind === "thread")
     await selectThread({ id: result.id, hostId: result.hostId });
   else await execute(result.id);
 }
@@ -1010,15 +1035,17 @@ watch(() => [state.authenticated, state.loading], () => {
         <button class="sidebar-action new-thread-button" :disabled="state.editingMessage" @click="newThread">
           <Icon name="SquarePen" :size="17" /><span>新建对话</span
           ><kbd>⌘ ⇧ O</kbd></button
-        ><button class="sidebar-action" @click="openPalette">
-          <Icon name="Search" :size="17" /><span>搜索与指令</span><kbd>⌘ K</kbd>
+        ><button class="sidebar-action" @click="openAllBookmarks">
+          <Icon name="Bookmark" :size="17" /><span>收藏对话</span>
         </button>
       </div>
       <div class="sidebar-scroll">
         <ConversationNav
           :api="api"
           :state="state"
+          :bookmarks="bookmarks"
           @select="selectThread"
+          @bookmark="openSavedBookmark"
           @project="selectProject"
           @project-action="projectAction"
           @settings="openSettings"
@@ -1399,7 +1426,7 @@ watch(() => [state.authenticated, state.loading], () => {
     </section>
     <ConversationImageViewer v-if="conversationImages.image.value" :image="conversationImages.image.value" @close="conversationImages.close" />
     <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
-    <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
+    <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
     <ResizableWorkspace v-if="workspaceOpen" v-show="!sideChat.state.open">
       <WorkspacePanel
@@ -1465,7 +1492,7 @@ watch(() => [state.authenticated, state.loading], () => {
           <Icon name="Search" :size="20" /><input
             ref="paletteInput"
             v-model="paletteQuery"
-            placeholder="搜索标题或输入指令…"
+            placeholder="搜索标题、收藏或输入指令…"
             aria-label="搜索对话或指令"
             @keydown="paletteKey"
           /><kbd @click="paletteOpen = false">Esc</kbd>
@@ -1486,7 +1513,11 @@ watch(() => [state.authenticated, state.loading], () => {
             />
           </button>
           <div v-if="!paletteResults.length" class="palette-empty">
-            {{ paletteSearching ? '正在搜索标题…' : '没有找到匹配的对话或指令' }}
+            {{ paletteSearching || bookmarks.state.indexLoading ? '正在搜索标题与收藏…' : '没有找到匹配的对话、收藏或指令' }}
+          </div>
+          <div v-if="paletteQuery.trim() && bookmarks.state.indexError" class="palette-empty" role="alert">
+            {{ bookmarks.state.indexError }}
+            <button type="button" @click="bookmarks.ensureIndex({ force: true })">重试收藏搜索</button>
           </div>
         </div>
         <footer>↑ ↓ 选择<span>↵ 打开</span></footer>

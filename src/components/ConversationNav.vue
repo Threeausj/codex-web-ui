@@ -6,12 +6,16 @@ import ThreadRow from "./ThreadRow.vue";
 import { isPinned, sortedThreads } from "../lib/navigation";
 import { browserStorage } from "../lib/browser-storage";
 import { matchesThreadTitle } from "../lib/thread-title-search";
-const props = defineProps<{ api: any; state: any }>();
+import { matchesBookmark, type useConversationBookmarks } from "../lib/conversation-bookmarks";
+import { bookmarkProjectDetails } from "../lib/bookmark-project";
+import type { ConversationBookmark } from "../../shared/bookmarks";
+const props = defineProps<{ api: any; state: any; bookmarks: ReturnType<typeof useConversationBookmarks> }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
   project: [project: any];
   settings: [tab: string];
   error: [message: string];
+  bookmark: [entry: ConversationBookmark];
   projectAction: [
     action: {
       action: "files" | "edit" | "archive" | "remove" | "bookmarks";
@@ -32,6 +36,12 @@ const projectLimit = 4;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 let generation = 0;
 const searchMode = computed(() => !!search.value.trim() || archived.value);
+const savedResults = computed(() => !archived.value && search.value.trim()
+  ? props.bookmarks.state.allEntries.filter(entry => matchesBookmark(entry, search.value)) : []);
+function bookmarkDetail(entry: ConversationBookmark) {
+  const project = bookmarkProjectDetails(entry, props.state.projects, props.state.hosts);
+  return `${project.projectName} · ${project.hostName}`;
+}
 const hostProjects = computed(() => props.state.projects);
 const pins = computed(() => props.state.preferences.pins);
 const allThreads = computed(() => props.api.navigationThreads());
@@ -138,7 +148,10 @@ async function moreRecent() {
 }
 async function refresh() {
   try {
-    await props.api.refreshNavigation(true);
+    await Promise.all([
+      props.api.refreshNavigation(true),
+      search.value.trim() && !archived.value ? props.bookmarks.ensureIndex({ force: true }) : undefined,
+    ]);
     if (searchMode.value) await query();
   } catch (error: any) {
     emit("error", error.message);
@@ -203,6 +216,7 @@ watch(
     results.value = [];
     cursors.value = {};
     if (searchMode.value) {
+      if (!archived.value && props.state.authenticated) void props.bookmarks.ensureIndex();
       if (!archived.value)
         results.value = sortedThreads<any>(allThreads.value.filter((thread: any) => matchesThreadTitle(thread, search.value)));
       searchTimer = setTimeout(() => void query(), 220);
@@ -229,7 +243,7 @@ onBeforeUnmount(() => {
     <div class="nav-search">
       <Icon name="Search" :size="14" /><input
         v-model="search"
-        placeholder="搜索对话标题…"
+        placeholder="搜索对话标题或收藏…"
         aria-label="搜索对话"
       /><button
         v-if="search"
@@ -266,6 +280,17 @@ onBeforeUnmount(() => {
           <Icon name="ArrowLeft" :size="14" />
         </button>
       </div>
+      <section v-if="!archived && search.trim()" class="nav-bookmark-results" aria-label="收藏搜索结果">
+        <div class="sidebar-section-heading"><strong>收藏对话</strong><span>{{ savedResults.length }}</span></div>
+        <button v-for="entry in savedResults" :key="entry.id" type="button" class="nav-bookmark-result"
+          :disabled="!!bookmarks.state.busyId" :aria-label="`跳转到收藏 ${entry.name}`" @click="emit('bookmark', entry)">
+          <Icon name="Bookmark" :size="14" />
+          <span><strong>{{ entry.name }}</strong><small>{{ bookmarkDetail(entry) }}</small><span class="nav-bookmark-excerpt">{{ entry.source.text.slice(0, 180) }}</span></span>
+        </button>
+        <p v-if="bookmarks.state.indexError" class="nav-bookmark-error" role="alert">{{ bookmarks.state.indexError }}<button type="button" @click="bookmarks.ensureIndex({ force: true })">重试</button></p>
+        <p v-else-if="!savedResults.length" class="nav-empty">{{ bookmarks.state.indexLoading ? '正在搜索收藏…' : '没有匹配的收藏' }}</p>
+      </section>
+      <div v-if="!archived && search.trim()" class="sidebar-section-heading"><strong>对话标题</strong></div>
       <ThreadRow
         v-for="thread in results"
         :key="`${thread.hostId}:${thread.id}`"
@@ -457,6 +482,17 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.nav-bookmark-result { display: flex; align-items: flex-start; gap: 9px; width: 100%; padding: 10px 12px; border: 0; border-radius: 9px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.nav-bookmark-result:hover { background: var(--hover); }
+.nav-bookmark-result:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
+.nav-bookmark-result > svg { flex: none; margin-top: 3px; color: var(--muted); }
+.nav-bookmark-result > span { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.nav-bookmark-result strong { font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.nav-bookmark-result small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-bookmark-excerpt { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.nav-bookmark-result:disabled { opacity: .6; cursor: default; }
+.nav-bookmark-error { padding: 0 12px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.nav-bookmark-error button { margin-left: 6px; padding: 4px 8px; background: var(--hover); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
 .recent-host-filter {
   display: flex;
   gap: 4px;

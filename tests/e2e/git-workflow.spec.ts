@@ -376,8 +376,8 @@ test('review validates commit and custom scopes and preserves the existing compo
   await installGit(page);
   await login(page);
   await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('未发送的审阅前草稿');
-  await page.getByRole('button', { name: '搜索与指令', exact: false }).click();
-  await page.getByPlaceholder('搜索对话或输入指令…').fill('审查代码变更');
+  await page.keyboard.press('Control+k');
+  await page.getByRole('textbox', { name: '搜索对话或指令', exact: true }).fill('审查代码变更');
   await page.locator('.palette-results button').filter({ hasText: '审查代码变更' }).click();
   const dialog = page.getByRole('dialog', { name: '代码审阅', exact: true });
   await dialog.getByRole('combobox', { name: '审阅范围' }).selectOption('commit');

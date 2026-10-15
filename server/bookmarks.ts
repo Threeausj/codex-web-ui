@@ -16,6 +16,7 @@ const projectPath = z.string().min(1).max(4096)
 const scopeSchema = z.object({ hostId: identifier, projectPath }).strict();
 const queryScopeSchema = scopeSchema.extend({ _request: z.string().max(256).optional() })
   .transform(({ hostId, projectPath }) => ({ hostId, projectPath }));
+const allQuerySchema = z.object({ all: z.literal('true'), _request: z.string().max(256).optional() }).strict();
 export const bookmarkInput = scopeSchema.extend({
   name,
   source: z.object({
@@ -34,6 +35,7 @@ const bookmarkSchema = bookmarkInput.extend({
 }).strict();
 const persistedSchema = z.object({ version: z.literal(1), bookmarks: z.array(bookmarkSchema).max(MAX_BOOKMARKS) }).strict();
 const matchingScope = (bookmark: BookmarkScope, scope: BookmarkScope) => bookmark.hostId === scope.hostId && bookmark.projectPath === scope.projectPath;
+const newestFirst = (a: ConversationBookmark, b: ConversationBookmark) => b.createdAt - a.createdAt || a.id.localeCompare(b.id);
 const failure = (status: number, message: string) => Object.assign(new Error(message), { status });
 const missing = () => failure(404, '收藏不存在或已移除');
 
@@ -62,7 +64,11 @@ export class Bookmarks {
   list(input: unknown): ConversationBookmark[] {
     const scope = scopeSchema.parse(input);
     return structuredClone(this.bookmarks.filter(bookmark => matchingScope(bookmark, scope))
-      .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id)));
+      .sort(newestFirst));
+  }
+
+  listAll(): ConversationBookmark[] {
+    return structuredClone([...this.bookmarks].sort(newestFirst));
   }
 
   add(input: unknown): Promise<ConversationBookmark> {
@@ -129,7 +135,12 @@ export async function registerBookmarks(app: Express, dataDir: string, hostExist
     return scope;
   };
   app.get('/api/bookmarks', (req, res, next) => {
-    try { res.json({ bookmarks: bookmarks.list(checkedScope(req.query)) }); }
+    try {
+      if (Object.hasOwn(req.query, 'all')) {
+        allQuerySchema.parse(req.query);
+        res.json({ bookmarks: bookmarks.listAll().filter(bookmark => hostExists(bookmark.hostId)) });
+      } else res.json({ bookmarks: bookmarks.list(checkedScope(req.query)) });
+    }
     catch (error) { next(error); }
   });
   app.post('/api/bookmarks', (req, res, next) => {
