@@ -27,55 +27,178 @@ export function mergeBookmarkMessages<T extends { id: string }>(known: readonly 
   const ids = new Set(prefix);
   return [...prefix.map(id => merged.get(id)).filter((item): item is T => !!item), ...known.filter(item => !ids.has(item.id))];
 }
+
+/** Match saved names, quotations and conversation titles without searching unrelated history. */
+export function matchesBookmark(entry: ConversationBookmark, query: string): boolean {
+  const tokens = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const text = [entry.name, entry.source.text, entry.source.threadName].join('\n').toLocaleLowerCase();
+  return tokens.every(token => text.includes(token));
+}
+
 export function useConversationBookmarks(api: Api) {
-  const state = reactive({ open: false, scope: null as BookmarkScope | null, projectName: '', entries: [] as ConversationBookmark[], loading: false, error: '', busyId: '' });
-  let generation = 0;
+  const state = reactive({
+    open: false, scope: null as BookmarkScope | null, projectName: '', allProjects: false,
+    entries: [] as ConversationBookmark[], loading: false, error: '', busyId: '',
+    allEntries: [] as ConversationBookmark[], indexLoading: false, indexError: '',
+  });
+  let generation = 0, lifetime = 0, mutationRevision = 0, indexGeneration = 0;
+  let indexAuthentication = api.runtimeIdentity().authenticationGeneration, indexLoaded = false;
+  let indexPending: { authentication: number; lifetime: number; promise: Promise<void> } | undefined;
+  let hosts: Set<string> | undefined;
+  const hostRevisions = new Map<string, number>();
+  const knownHost = (hostId: string) => !hosts || hosts.has(hostId);
+  const hostRevision = (hostId: string) => hostRevisions.get(hostId) || 0;
+  const sameScope = (a: BookmarkScope, b: BookmarkScope) => a.hostId === b.hostId && a.projectPath === b.projectPath;
+  const key = (entry: ConversationBookmark) => JSON.stringify([entry.hostId, entry.projectPath, entry.id]);
+  const changes = new Map<string, { revision: number; entry: ConversationBookmark | null; scope: BookmarkScope }>();
+  const reads = new Set<{ revision: number }>();
   const query = (scope: BookmarkScope) => new URLSearchParams({ hostId: scope.hostId, projectPath: scope.projectPath }).toString();
-  const sameScope = (scope: BookmarkScope) => state.scope?.hostId === scope.hostId && state.scope?.projectPath === scope.projectPath;
+  const showsScope = (scope: BookmarkScope) => !state.allProjects && !!state.scope && sameScope(state.scope, scope);
+  const validSession = (authentication: number, epoch: number) => epoch === lifetime && authentication === api.runtimeIdentity().authenticationGeneration;
+  const newestFirst = (a: ConversationBookmark, b: ConversationBookmark) => b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+  function synchronizeAllPanel() {
+    if (!state.allProjects) return;
+    state.entries = [...state.allEntries]; state.loading = state.indexLoading; state.error = state.indexError;
+  }
+  function releaseRead(read: { revision: number }) {
+    reads.delete(read);
+    // Keep only mutations that an outstanding snapshot could still overwrite.
+    const oldest = reads.size ? Math.min(...[...reads].map(item => item.revision)) : mutationRevision;
+    for (const [id, change] of changes) if (change.revision <= oldest) changes.delete(id);
+  }
+  function mergeChanges(entries: ConversationBookmark[], revision: number, scope?: BookmarkScope) {
+    const result = new Map(entries.map(entry => [key(entry), entry]));
+    for (const [id, change] of changes) if (change.revision > revision && (!scope || sameScope(change.scope, scope))) {
+      if (change.entry) result.set(id, change.entry);
+      else result.delete(id);
+    }
+    return [...result.values()].filter(entry => knownHost(entry.hostId)).sort(newestFirst);
+  }
+  function applyChange(entry: ConversationBookmark, remove = false) {
+    if (!knownHost(entry.hostId)) return;
+    const id = key(entry);
+    const change = { revision: ++mutationRevision, entry: remove ? null : entry, scope: { hostId: entry.hostId, projectPath: entry.projectPath } };
+    if (reads.size) changes.set(id, change);
+    state.allEntries = state.allEntries.filter(item => key(item) !== id);
+    if (!remove) state.allEntries.push(entry);
+    state.allEntries.sort(newestFirst);
+    if (state.allProjects) synchronizeAllPanel();
+    else if (showsScope(entry)) {
+      state.entries = state.entries.filter(item => key(item) !== id);
+      if (!remove) state.entries.push(entry);
+      state.entries.sort(newestFirst);
+    }
+  }
+  function synchronizeIndexAuthentication(authentication: number) {
+    if (indexAuthentication === authentication) return;
+    ++indexGeneration; indexAuthentication = authentication; indexLoaded = false; indexPending = undefined;
+    state.allEntries = []; state.indexLoading = false; state.indexError = ''; synchronizeAllPanel();
+  }
+  /** Host changes invalidate snapshots without fetching an index until a view needs it. */
+  function setHosts(hostIds: string[]): boolean {
+    const next = new Set(hostIds);
+    if (hosts && hosts.size === next.size && [...hosts].every(id => next.has(id))) return false;
+    if (hosts) for (const hostId of new Set([...hosts, ...next])) if (hosts.has(hostId) !== next.has(hostId)) {
+      hostRevisions.set(hostId, hostRevision(hostId) + 1);
+    }
+    hosts = next;
+    ++indexGeneration; indexLoaded = false; indexPending = undefined;
+    state.allEntries = state.allEntries.filter(entry => knownHost(entry.hostId));
+    state.indexLoading = false; state.indexError = '';
+    for (const [id, change] of changes) if (!knownHost(change.scope.hostId)) changes.delete(id);
+    if (state.allProjects) synchronizeAllPanel();
+    else if (state.scope && !knownHost(state.scope.hostId)) {
+      ++generation; state.entries = []; state.loading = false; state.error = ''; state.busyId = '';
+    }
+    return true;
+  }
+  /** The cross-project catalog is loaded only when a bookmark view or search needs it. */
+  function ensureIndex(options: { force?: boolean } = {}): Promise<void> {
+    const authentication = api.runtimeIdentity().authenticationGeneration;
+    synchronizeIndexAuthentication(authentication);
+    if (indexPending?.authentication === authentication && indexPending.lifetime === lifetime) return indexPending.promise;
+    if (indexLoaded && !options.force) return Promise.resolve();
+    const revision = ++indexGeneration, epoch = lifetime, read = { revision: mutationRevision };
+    reads.add(read);
+    state.indexLoading = true; state.indexError = ''; synchronizeAllPanel();
+    const current = () => revision === indexGeneration && validSession(authentication, epoch);
+    let completed = false;
+    const promise = (async () => {
+      try {
+        const result = await api.requestHttp('/bookmarks?all=true', {}, false);
+        if (current()) {
+          state.allEntries = mergeChanges(result.bookmarks, read.revision); indexLoaded = true;
+          synchronizeAllPanel();
+        }
+      } catch (error: any) {
+        if (current()) { state.indexError = error?.message || '无法读取收藏，请重试'; synchronizeAllPanel(); }
+      } finally {
+        completed = true;
+        if (current()) { state.indexLoading = false; indexPending = undefined; synchronizeAllPanel(); }
+        releaseRead(read);
+      }
+    })();
+    if (!completed) indexPending = { authentication, lifetime: epoch, promise };
+    return promise;
+  }
   async function refresh() {
+    if (state.allProjects) return ensureIndex({ force: true });
     const scope = state.scope;
     if (!scope) return;
-    const revision = ++generation, authentication = api.runtimeIdentity().authenticationGeneration;
+    if (!knownHost(scope.hostId)) { state.entries = []; state.loading = false; state.error = ''; return; }
+    const revision = ++generation, authentication = api.runtimeIdentity().authenticationGeneration, epoch = lifetime;
+    const read = { revision: mutationRevision }; reads.add(read);
+    const current = () => revision === generation && validSession(authentication, epoch) && showsScope(scope) && knownHost(scope.hostId);
     state.loading = true; state.error = '';
     try {
       const result = await api.requestHttp('/bookmarks?' + query(scope), {}, false);
-      if (revision === generation && authentication === api.runtimeIdentity().authenticationGeneration && sameScope(scope)) state.entries = result.bookmarks;
-    } catch (error: any) { if (revision === generation && authentication === api.runtimeIdentity().authenticationGeneration) state.error = error?.message || '无法读取收藏，请重试'; }
-    finally { if (revision === generation && authentication === api.runtimeIdentity().authenticationGeneration) state.loading = false; }
+      if (current()) state.entries = mergeChanges(result.bookmarks, read.revision, scope);
+    } catch (error: any) { if (current()) state.error = error?.message || '无法读取收藏，请重试'; }
+    finally { if (current()) state.loading = false; releaseRead(read); }
   }
   function open(scope: BookmarkScope, projectName: string) {
+    ++generation; state.allProjects = false;
     state.scope = { ...scope }; state.projectName = projectName; state.entries = []; state.open = true; state.busyId = '';
     return refresh();
   }
+  function openAll() {
+    ++generation; state.scope = null; state.projectName = ''; state.allProjects = true; state.open = true; state.busyId = '';
+    synchronizeAllPanel();
+    return ensureIndex();
+  }
   function close() { state.open = false; }
-  function clear() { ++generation; state.open = false; state.scope = null; state.entries = []; state.error = ''; state.loading = false; state.busyId = ''; }
+  function clear() {
+    ++generation; ++lifetime; ++indexGeneration; changes.clear(); reads.clear(); indexLoaded = false; indexPending = undefined;
+    hosts = undefined; hostRevisions.clear();
+    indexAuthentication = api.runtimeIdentity().authenticationGeneration;
+    state.open = false; state.scope = null; state.projectName = ''; state.allProjects = false;
+    state.entries = []; state.error = ''; state.loading = false; state.busyId = '';
+    state.allEntries = []; state.indexError = ''; state.indexLoading = false;
+  }
   async function save(input: ConversationBookmarkInput | ConversationBookmark, name: string) {
-    const authentication = api.runtimeIdentity().authenticationGeneration;
+    const authentication = api.runtimeIdentity().authenticationGeneration, epoch = lifetime, host = hostRevision(input.hostId);
+    synchronizeIndexAuthentication(authentication);
     const editing = 'id' in input;
     const result = await api.requestHttp(editing ? `/bookmarks/${encodeURIComponent(input.id)}?${query(input)}` : '/bookmarks', {
       method: editing ? 'PATCH' : 'POST', body: JSON.stringify(editing ? { name } : { ...input, name }),
     }, false);
-    if (authentication === api.runtimeIdentity().authenticationGeneration && sameScope(input)) {
-      ++generation; state.loading = false;
-      const index = state.entries.findIndex(entry => entry.id === result.bookmark.id);
-      if (index >= 0) state.entries[index] = result.bookmark;
-      else state.entries.unshift(result.bookmark);
-    }
+    if (validSession(authentication, epoch) && knownHost(input.hostId) && host === hostRevision(input.hostId)) applyChange(result.bookmark);
     return result.bookmark as ConversationBookmark;
   }
   async function remove(entry: ConversationBookmark) {
     if (state.busyId) return;
-    const authentication = api.runtimeIdentity().authenticationGeneration;
+    const authentication = api.runtimeIdentity().authenticationGeneration, epoch = lifetime, panel = generation, host = hostRevision(entry.hostId);
+    synchronizeIndexAuthentication(authentication);
+    const currentMutation = () => validSession(authentication, epoch) && knownHost(entry.hostId) && host === hostRevision(entry.hostId);
+    const currentPanel = () => panel === generation && currentMutation() && (state.allProjects || showsScope(entry));
     state.busyId = entry.id; state.error = '';
     try {
       await api.requestHttp(`/bookmarks/${encodeURIComponent(entry.id)}?${query(entry)}`, { method: 'DELETE' }, false);
-      if (authentication === api.runtimeIdentity().authenticationGeneration && sameScope(entry)) {
-        ++generation; state.loading = false; state.entries = state.entries.filter(item => item.id !== entry.id);
-      }
-    } catch (error: any) { if (authentication === api.runtimeIdentity().authenticationGeneration && sameScope(entry)) state.error = error?.message || '无法移除收藏，请重试'; }
-    finally { if (authentication === api.runtimeIdentity().authenticationGeneration && sameScope(entry) && state.busyId === entry.id) state.busyId = ''; }
+      if (currentMutation()) applyChange(entry, true);
+    } catch (error: any) { if (currentPanel()) state.error = error?.message || '无法移除收藏，请重试'; }
+    finally { if (panel === generation && validSession(authentication, epoch) && state.busyId === entry.id) state.busyId = ''; }
   }
-  return { state, open, close, clear, refresh, save, remove };
+  return { state, open, openAll, close, clear, refresh, ensureIndex, setHosts, save, remove };
 }
 
 /** Highlight a saved quotation without changing Markdown DOM or opening selection actions. */

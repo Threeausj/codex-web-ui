@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, useId, watch } from 'vue';
 import type { ConversationBookmark } from '../../shared/bookmarks';
+import { matchesBookmark } from '../lib/conversation-bookmarks';
+import { bookmarkProjectDetails } from '../lib/bookmark-project';
 import Icon from './Icon.vue';
 
 const props = defineProps<{
@@ -9,6 +11,9 @@ const props = defineProps<{
   loading?: boolean;
   error?: string;
   busyId?: string;
+  allProjects?: boolean;
+  projects?: { hostId?: string; name?: string; path?: string; rootPaths?: string[] }[];
+  hosts?: { id: string; name?: string }[];
 }>();
 const emit = defineEmits<{
   close: [];
@@ -21,19 +26,30 @@ const dialog = ref<HTMLDialogElement>();
 const search = ref('');
 const titleId = `bookmarks-title-${useId()}`;
 const entries = computed(() => {
-  const needle = search.value.trim().toLocaleLowerCase();
-  if (!needle) return props.entries;
-  return props.entries.filter(entry =>
-    [entry.name, entry.source.threadName || '', entry.source.text]
-      .some(text => text.toLocaleLowerCase().includes(needle)),
-  );
+  const tokens = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return props.entries;
+  return props.entries.filter(entry => {
+    const project = bookmarkProjectDetails(entry, props.projects, props.hosts);
+    const context = props.allProjects ? `${project.projectName} ${project.projectPath} ${project.hostName}`.toLocaleLowerCase() : '';
+    return tokens.every(token => matchesBookmark(entry, token) || context.includes(token));
+  });
+});
+const groups = computed(() => {
+  const result = new Map<string, ReturnType<typeof bookmarkProjectDetails> & { entries: ConversationBookmark[] }>();
+  for (const entry of entries.value) {
+    const details = bookmarkProjectDetails(entry, props.projects, props.hosts);
+    const key = props.allProjects ? details.key : 'project';
+    if (!result.has(key)) result.set(key, { ...details, entries: [] });
+    result.get(key)!.entries.push(entry);
+  }
+  return [...result.values()];
 });
 function time(value: string | number) {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) ? date.toLocaleDateString() : '';
 }
 function close() { if (!props.busyId) emit('close'); }
-watch(() => props.projectName, () => { search.value = ''; });
+watch(() => [props.projectName, props.allProjects], () => { search.value = ''; });
 onMounted(() => dialog.value?.showModal());
 </script>
 
@@ -43,7 +59,7 @@ onMounted(() => dialog.value?.showModal());
       <header class="bookmarks-header">
         <div class="bookmarks-heading">
           <Icon name="Bookmark" :size="20" />
-          <div><h2 :id="titleId">收藏对话</h2><p>{{ projectName }}</p></div>
+          <div><h2 :id="titleId">收藏对话</h2><p>{{ allProjects ? '全部项目' : projectName }}</p></div>
         </div>
         <button type="button" class="icon-button" aria-label="关闭收藏对话" :disabled="!!busyId" @click="close"><Icon name="X" :size="19" /></button>
       </header>
@@ -54,8 +70,14 @@ onMounted(() => dialog.value?.showModal());
       <p v-if="error" class="bookmarks-error" role="alert">{{ error }}</p>
       <div class="bookmarks-content" :aria-busy="loading">
         <p v-if="loading && !entries.length" class="bookmarks-empty" role="status">正在加载收藏…</p>
-        <ul v-else-if="entries.length" class="bookmarks-list">
-          <li v-for="entry in entries" :key="entry.id" class="bookmark-entry" :class="{ busy: busyId === entry.id }">
+        <div v-else-if="entries.length" class="bookmark-groups">
+          <section v-for="group in groups" :key="group.key" class="bookmark-project-group" :aria-label="allProjects ? `${group.projectName} · ${group.hostName}` : undefined">
+            <header v-if="allProjects" class="bookmark-project-heading">
+              <div><Icon name="Folder" :size="16" /><h3>{{ group.projectName }}</h3><span class="bookmark-project-count">{{ group.entries.length }}</span></div>
+              <p><span class="bookmark-project-host">{{ group.hostName }}</span><span class="bookmark-project-path" :title="group.projectPath">{{ group.projectPath }}</span></p>
+            </header>
+            <ul class="bookmarks-list">
+          <li v-for="entry in group.entries" :key="entry.id" class="bookmark-entry" :class="{ busy: busyId === entry.id }">
             <button type="button" class="bookmark-open" :disabled="!!busyId" :aria-label="`跳转到收藏 ${entry.name}`" @click="emit('open', entry)">
               <span class="bookmark-name">{{ entry.name }}<Icon name="ArrowUpRight" :size="15" /></span>
               <span class="bookmark-excerpt">{{ entry.source.text }}</span>
@@ -66,8 +88,10 @@ onMounted(() => dialog.value?.showModal());
               <button type="button" class="icon-button" :disabled="!!busyId" :aria-label="`取消收藏 ${entry.name}`" title="取消收藏" @click="emit('remove', entry)"><Icon :name="busyId === entry.id ? 'LoaderCircle' : 'Trash2'" :size="15" :class="{ spin: busyId === entry.id }" /></button>
             </div>
           </li>
-        </ul>
-        <div v-else class="bookmarks-empty"><Icon name="Bookmark" :size="24" /><p>{{ search.trim() ? '没有匹配的收藏' : '此项目还没有收藏' }}</p><span v-if="!search.trim()">选中对话中的文字，点击“收藏”即可保存位置。</span></div>
+            </ul>
+          </section>
+        </div>
+        <div v-else class="bookmarks-empty"><Icon name="Bookmark" :size="24" /><p>{{ search.trim() ? '没有匹配的收藏' : allProjects ? '还没有收藏' : '此项目还没有收藏' }}</p><span v-if="!search.trim()">选中对话中的文字，点击“收藏”即可保存位置。</span></div>
       </div>
       <footer><span>{{ search.trim() ? `${entries.length} / ${props.entries.length}` : props.entries.length }} 条收藏</span><span>点击收藏可回到原文</span></footer>
     </dialog>
@@ -89,7 +113,16 @@ h2 { margin: 0; font-size: 17px; line-height: 1.5; font-weight: 600; }
 .bookmarks-search:focus-within { border-color: var(--green); }
 .bookmarks-search svg { flex: none; }
 .bookmarks-search input { width: 100%; min-width: 0; padding: 0; border: 0; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 13px; }
-.bookmarks-content { min-height: 130px; overflow-y: auto; overscroll-behavior: contain; }
+.bookmarks-content { min-height: 130px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.bookmark-project-group + .bookmark-project-group { border-top: 1px solid var(--border); }
+.bookmark-project-heading { padding: 16px 22px 3px; }
+.bookmark-project-heading > div { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.bookmark-project-heading svg { flex: none; color: var(--muted); }
+.bookmark-project-heading h3 { min-width: 0; margin: 0; font-size: 13px; line-height: 1.5; font-weight: 600; overflow-wrap: anywhere; }
+.bookmark-project-count { flex: none; margin-left: auto; color: var(--muted); font-size: 11px; }
+.bookmark-project-heading p { display: flex; gap: 8px; min-width: 0; margin: 5px 0 0 23px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.bookmark-project-host { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bookmark-project-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bookmarks-list { margin: 0; padding: 8px 12px; list-style: none; }
 .bookmark-entry { display: flex; align-items: flex-start; gap: 2px; border-radius: 11px; }
 .bookmark-entry:hover { background: var(--hover); }
@@ -116,6 +149,7 @@ footer { display: flex; justify-content: space-between; gap: 10px; padding: 12px
   .bookmarks-search { min-height: 42px; }
   .bookmarks-search input { font-size: 16px; }
   .bookmarks-list { padding: 6px; }
+  .bookmark-project-heading { padding: 14px 16px 3px; }
   .bookmark-actions { flex-direction: column; padding: 8px 2px 0 0; }
   .bookmark-actions .icon-button { width: 38px; height: 38px; }
   .bookmark-open { padding: 12px 10px; }

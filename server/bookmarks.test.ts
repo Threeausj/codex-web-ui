@@ -65,6 +65,26 @@ test('bookmark scope normalizes project paths but isolates different hosts and s
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('global bookmark snapshots include all projects in stable newest-first order and cannot mutate stored selections', async () => {
+  const root = await directory();
+  try {
+    const file = path.join(root, 'bookmarks.json');
+    const first = { ...savedBookmark(1), id: '00000000-0000-4000-8000-000000000001', createdAt: 30 };
+    const second = { ...savedBookmark(2), id: '00000000-0000-4000-8000-000000000002', hostId: 'remote', createdAt: 30 };
+    const older = { ...savedBookmark(3), projectPath: '/another-project', createdAt: 10 };
+    await fs.writeFile(file, JSON.stringify({ version: 1, bookmarks: [older, second, first] }));
+    const store = new Bookmarks(file);
+    await store.init();
+    assert.deepEqual(store.listAll(), [first, second, older]);
+    const snapshot = store.listAll();
+    snapshot[0]!.name = 'Changed name';
+    snapshot[0]!.source.text = 'Changed selected text';
+    snapshot.pop();
+    assert.deepEqual(store.listAll(), [first, second, older]);
+    assert.deepEqual(store.list(scope), [first]);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('identical selections are idempotent across concurrent requests and do not overwrite the saved name', async () => {
   const root = await directory();
   try {
@@ -189,6 +209,7 @@ test('bookmark HTTP routes require auth/CSRF, reject foreign origins and preserv
     const query = f.scoped();
     for (const [url, method, body] of [
       [`/api/bookmarks?${query}`, 'GET', undefined],
+      ['/api/bookmarks?all=true', 'GET', undefined],
       ['/api/bookmarks', 'POST', input()],
       [`/api/bookmarks/${randomUUID()}?${query}`, 'PATCH', { name: 'Renamed' }],
       [`/api/bookmarks/${randomUUID()}?${query}`, 'DELETE', undefined],
@@ -238,6 +259,50 @@ test('bookmark API keeps identical native IDs on different configured hosts sepa
     assert.deepEqual((await (await f.request(`/api/bookmarks?${remoteScope}`)).json() as { bookmarks: ConversationBookmark[] }).bookmarks, [remote]);
     assert.equal((await f.request(`/api/bookmarks/${local.id}?${remoteScope}`, 'DELETE')).status, 404);
     assert.equal((await f.request(`/api/bookmarks/${local.id}?${remoteScope}`, 'PATCH', { name: 'Cross-host edit' })).status, 404);
+    assert.equal(f.application.bridges.size, 0);
+  } finally { await f.close(); }
+});
+
+test('global bookmark API includes configured hosts and projects, excludes removed hosts, and keeps scoped routes isolated', async () => {
+  const f = await apiFixture();
+  try {
+    const remote = await f.application.storage.addHost({ name: 'Remote bookmark host', hostname: 'remote.invalid' });
+    const removed = await f.application.storage.addHost({ name: 'Removed bookmark host', hostname: 'removed.invalid' });
+    const created: ConversationBookmark[] = [];
+    for (const value of [input(), input({ projectPath: '/other-project' }), input({ hostId: remote.id }), input({ hostId: removed.id })]) {
+      const response = await f.request('/api/bookmarks', 'POST', value);
+      assert.equal(response.status, 201);
+      created.push((await response.json() as { bookmark: ConversationBookmark }).bookmark);
+    }
+    const sorted = (values: ConversationBookmark[]) => [...values].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+    const all = await f.request('/api/bookmarks?all=true', 'GET', undefined, { cookie: f.cookie });
+    assert.equal(all.status, 200);
+    assert.equal(all.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await all.json(), { bookmarks: sorted(created) });
+    assert.deepEqual(await (await f.request('/api/bookmarks?all=true&_request=cache-buster')).json(), { bookmarks: sorted(created) });
+    assert.deepEqual(await (await f.request(`/api/bookmarks?${f.scoped()}`)).json(), { bookmarks: [created[0]] });
+    assert.deepEqual(await (await f.request(`/api/bookmarks?${f.scoped({ hostId: remote.id, projectPath: '/project' })}`)).json(), { bookmarks: [created[2]] });
+    await f.application.storage.deleteHost(removed.id);
+    assert.deepEqual(await (await f.request('/api/bookmarks?all=true')).json(), { bookmarks: sorted(created.slice(0, 3)) });
+    assert.equal((await f.request(`/api/bookmarks?${f.scoped({ hostId: removed.id, projectPath: '/project' })}`)).status, 404);
+    assert.equal(f.application.bridges.size, 0);
+  } finally { await f.close(); }
+});
+
+test('bookmark listing requires either an explicit global flag or a complete strict scope', async () => {
+  const f = await apiFixture();
+  try {
+    for (const query of [
+      '', 'all=false', 'all=1', 'all=', 'all=True', 'all=true&all=true',
+      'all=true&hostId=local', 'all=true&projectPath=%2Fproject',
+      `all=true&${f.scoped()}`, 'all=true&unknown=true', 'all=true&_request=one&_request=two',
+      'all=true&_request=' + 'a'.repeat(257), 'hostId=local', 'projectPath=%2Fproject',
+      '_request=cache-buster', `${f.scoped()}&unknown=true`, `${f.scoped()}&hostId=other`,
+    ]) assert.equal((await f.request(`/api/bookmarks?${query}`)).status, 400, query);
+    for (const method of ['PATCH', 'DELETE']) {
+      assert.equal((await f.request(`/api/bookmarks/${randomUUID()}?all=true`, method, method === 'PATCH' ? { name: 'Invalid global edit' } : undefined)).status, 400);
+    }
+    assert.deepEqual(await (await f.request('/api/bookmarks?all=true')).json(), { bookmarks: [] });
     assert.equal(f.application.bridges.size, 0);
   } finally { await f.close(); }
 });

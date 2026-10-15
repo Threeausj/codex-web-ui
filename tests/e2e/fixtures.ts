@@ -202,7 +202,7 @@ export class MockCodex {
         const body = ['POST', 'PATCH'].includes(method) ? request.postDataJSON() : undefined;
         this.bookmarkRequests.push({ method, path: url.pathname, hostId, projectPath, ...(body ? { body } : {}) });
         const matching = (entry: ConversationBookmark) => entry.hostId === hostId && entry.projectPath === projectPath;
-        if (method === 'GET') return respond({ bookmarks: this.bookmarks.filter(matching) });
+        if (method === 'GET') return respond({ bookmarks: url.searchParams.get('all') === 'true' ? this.bookmarks.filter(entry => this.hosts.some(host => host.id === entry.hostId)) : this.bookmarks.filter(matching) });
         if (this.failBookmarkSaveNext && ['POST', 'PATCH'].includes(method)) {
           this.failBookmarkSaveNext = false;
           return respond({ error: '模拟收藏保存失败，请重试' }, 503);
