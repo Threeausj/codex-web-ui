@@ -63,6 +63,8 @@ systemctl reload caddy
 
 ## SSH 工作站
 
+文件与图片上传到 SSH 主机时，后端复用受信任的 SSH 配置和指纹，调用固定 Python 3 脚本写入项目下的 `.codex-web-uploads`。目录权限为 `0700`，文件为 `0600`；远端上传不调用 Codex 命令沙箱，因此不要求启用非特权用户命名空间。SSH 账户仍需对项目目录有写入权限。
+
 Web 后端调用本机 OpenSSH，不保存 SSH 密码。可以在网页上传无口令私钥，也可以使用服务端已有密钥或 ssh-agent。先以运行 Node 服务的账户，在终端确认目标机器可通过密钥或 ssh-agent 登录，并核对主机指纹：
 
 ```sh
