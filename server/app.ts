@@ -29,6 +29,7 @@ import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
+import { registerUploads } from './uploads.js'
 import { registerDiagnostics } from './diagnostics.js'
 import { registerThreadContext } from './thread-context.js'
 import { registerHostConnection } from './host-connection.js'
@@ -234,38 +235,7 @@ export async function createApp(options: AppOptions = {}) {
     await storage.removeProject(hostId, projectPath)
     res.json({ projects: await storage.projects() })
   }))
-  const upload = multer({ storage: multer.memoryStorage(), limits: { files: 8, fileSize: 20 * 1024 * 1024, fields: 4, fieldSize: 8192 } })
-  app.post('/api/uploads', upload.array('files', 8), asyncRoute(async (req, res) => {
-    const files = req.files as Express.Multer.File[] | undefined
-    if (!files?.length) { res.status(400).json({ error: 'Select at least one file' }); return }
-    const hostId = z.string().default('local').parse(req.body?.hostId)
-    const host = storage.host(hostId)
-    if (!host) { res.status(404).json({ error: 'Host not found' }); return }
-    const bridge = await getBridge(hostId)
-    const uploadId = randomUUID()
-    const uploadCwd = host.kind === 'local' ? cwd : absolutePath.parse(req.body?.cwd || host.cwd)
-    const baseDirectory = host.kind === 'local' ? path.join(dataDir, 'uploads') : path.posix.join(uploadCwd, '.codex-web-uploads')
-    const directory = path.posix.join(baseDirectory, uploadId)
-    if (host.kind === 'local') { await fs.mkdir(directory, { recursive: true, mode: 0o700 }); await fs.chmod(baseDirectory, 0o700); await fs.chmod(directory, 0o700) }
-    else {
-      await bridge.request('fs/createDirectory', { path: directory, recursive: true })
-      const result = await bridge.request('command/exec', { command: ['chmod', '700', baseDirectory, directory], cwd: uploadCwd, timeoutMs: 10000, outputBytesCap: 1024, sandboxPolicy: { type: 'workspaceWrite', writableRoots: [uploadCwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } }) as { exitCode: number }
-      if (result.exitCode !== 0) throw new Error('Unable to secure the remote upload directory')
-    }
-    const saved: { name: string; path: string; mime: string; size: number }[] = []
-    for (const [index, file] of files.entries()) {
-      const name = path.posix.basename(file.originalname.replace(/\\/g, '/')).replace(/[\x00-\x1f]/g, '').slice(0, 180) || 'upload'
-      const destination = path.posix.join(directory, `${index}-${name}`)
-      await bridge.request('fs/writeFile', { path: destination, dataBase64: file.buffer.toString('base64') })
-      if (host.kind === 'local') await fs.chmod(destination, 0o600)
-      else {
-        const result = await bridge.request('command/exec', { command: ['chmod', '600', destination], cwd: uploadCwd, timeoutMs: 10000, outputBytesCap: 1024, sandboxPolicy: { type: 'workspaceWrite', writableRoots: [uploadCwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } }) as { exitCode: number }
-        if (result.exitCode !== 0) throw new Error('Unable to secure the uploaded file')
-      }
-      saved.push({ name, path: destination, mime: file.mimetype, size: file.size })
-    }
-    res.status(201).json({ files: saved })
-  }))
+  registerUploads(app, { getHost: id => storage.host(id), getBridge, cwd, dataDir, bridgeOptions })
   app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' }))
   if (options.serveStatic !== false) {
     const dist = path.resolve(options.staticDir || process.env.STATIC_DIR || path.join(cwd, 'dist'))
