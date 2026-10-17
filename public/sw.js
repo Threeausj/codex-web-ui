@@ -32,7 +32,9 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  // Keep the message event alive until the browser accepts activation, even
+  // when Android suspends the app immediately after the update tap.
+  if (event.data?.type === "SKIP_WAITING") event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener("fetch", (event) => {
