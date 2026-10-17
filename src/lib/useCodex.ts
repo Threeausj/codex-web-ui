@@ -4,7 +4,7 @@ import { useHostSettings } from './host-settings';
 import { interactiveShellCommand } from '../../shared/terminal-shell';
 import { waitForCompaction } from './compaction-send';
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
-import { reactive, ref, toRaw } from "vue";
+import { reactive, ref, shallowReactive, toRaw, watch } from "vue";
 import { randomUUID } from "./uuid";
 import { browserStorage } from "./browser-storage";
 import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache } from "./thread-title-search";
@@ -239,7 +239,9 @@ let historyRestoration: { threadId: string; generation: number; promise: Promise
 const tokenUsages = new Map<string, any>();
 const tokenUsageRevisions = new Map<string, number>();
 const compactionRevisions = new Map<string, number>();
-const compactions = new Map<string, { turnId?: string; requested?: boolean }>();
+// A deferred send can precede turn/started. Its watcher must observe the later
+// dedicated turn binding before item/completed removes this record.
+const compactions = shallowReactive(new Map<string, { turnId?: string; itemId?: string; requested?: boolean; acknowledged?: boolean; requestId?: string }>());
 const compactionResults = new Map<string, boolean>();
 const pausedHosts = new Set<string>();
 const releasedThreads = new Map<string, Set<string>>();
@@ -724,16 +726,59 @@ function beginCompactionUsage(threadId: string) {
   compactionResults.delete(key);
   if (state.activeThread?.id === threadId) state.compacting = true;
 }
-function finishCompaction(threadId: string, turnId?: string, completed = true) {
+function finishCompaction(threadId: string, turnId?: string, completed = true, outcome?: string) {
   const key = recencyKey(state.hostId, threadId);
   const current = compactions.get(key);
   if (current?.turnId && turnId && current.turnId !== turnId) return;
+  const targetTurn = turnId || current?.turnId;
+  for (const item of currentItems(threadId)) {
+    if (item.type !== 'contextCompaction' || (item.status !== 'inProgress' && !(current && item.status == null)) ||
+        (targetTurn && item.turnId !== targetTurn) || (current?.itemId && item.id !== current.itemId)) continue;
+    item.status = completed ? 'completed' : outcome === 'interrupted' ? 'interrupted' : 'failed';
+    noteItem(threadId, item.id);
+  }
   if (current) compactionResults.set(key, completed);
   compactions.delete(key);
   compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
   if (current?.requested && !activeTurns.has(threadId)) noteRuntime(threadId, false);
   if (completed) compactedSinceInput.add(threadId);
   if (state.activeThread?.id === threadId) state.compacting = false;
+}
+function settleCompactionRuntime(threadId: string, status: string | undefined) {
+  if (!['idle', 'notLoaded', 'systemError'].includes(status || '')) return;
+  const compaction = compactions.get(recencyKey(state.hostId, threadId));
+  // A read/idle notification can precede acceptance of a newly submitted
+  // compaction. Only native progress or its acknowledgement makes it recoverable.
+  if (!compaction || compaction.acknowledged === false) return;
+  const turn = state.activeThread?.id === threadId
+    ? state.turns.find(turn => turn.id === compaction.turnId) : undefined;
+  const completed = status !== 'systemError' && !['failed', 'interrupted'].includes(turn?.status);
+  if (turn?.status === 'inProgress') {
+    turn.status = completed ? 'completed' : 'failed';
+    completedTurns.add(turn.id);
+  }
+  noteRuntime(threadId, false);
+  finishCompaction(threadId, compaction.turnId, completed, turn?.status);
+}
+function reconcileCompactionHistory(threadId: string, revision: number, runtimeStatus?: string) {
+  const key = recencyKey(state.hostId, threadId);
+  if ((compactionRevisions.get(key) || 0) !== revision) return;
+  settleCompactionRuntime(threadId, runtimeStatus);
+  const compaction = compactions.get(key);
+  if (!compaction || compaction.acknowledged === false) return;
+  const turn = state.turns.find(turn => turn.id === compaction.turnId);
+  if (turn && ['completed', 'failed', 'interrupted'].includes(turn.status)) {
+    finishCompaction(threadId, turn.id, turn.status === 'completed', turn.status);
+    return;
+  }
+  const items = currentItems(threadId);
+  const index = items.findIndex(item => item.type === 'contextCompaction' &&
+    (compaction.itemId ? item.id === compaction.itemId : item.turnId === compaction.turnId));
+  // Compaction items have no status in the native history schema. A later
+  // assistant/reasoning item in that same turn proves execution has resumed.
+  if (index >= 0 && (items[index].status === 'completed' || items.slice(index + 1).some(item =>
+    item.turnId === items[index].turnId && ['agentMessage', 'reasoning'].includes(item.type))))
+    finishCompaction(threadId, compaction.turnId);
 }
 function compactionTurnId(threadId: string, explicit?: string) {
   return explicit || compactions.get(recencyKey(state.hostId, threadId))?.turnId || activeTurns.get(threadId)
@@ -754,18 +799,41 @@ async function refreshContextUsage(hostId: string, threadId: string) {
   const revision = tokenUsageRevisions.get(key) || 0;
   const compaction = compactions.get(key);
   const compactionRevision = compactionRevisions.get(key) || 0;
+  const runtimeRevision = turnRevisions.get(threadId) || 0;
+  const selectedEngine = engineId;
   try {
-    const context = await http(`/hosts/${encodeURIComponent(hostId)}/threads/${encodeURIComponent(threadId)}/context`, {}, false);
-    if (authentication !== authenticationGeneration || hostId !== state.hostId) return;
+    const recovery = compaction && compaction.acknowledged !== false ? '?recoverCompaction=1' : '';
+    const context = await http(`/hosts/${encodeURIComponent(hostId)}/threads/${encodeURIComponent(threadId)}/context${recovery}`, {}, false);
+    if (authentication !== authenticationGeneration || hostId !== state.hostId || selectedEngine !== engineId) return;
     if ((tokenUsageRevisions.get(key) || 0) === revision && context.tokenUsage) applyTokenUsage(threadId, context.tokenUsage);
     // A slow history/context read cannot clear a compression started meanwhile.
     if ((compactionRevisions.get(key) || 0) === compactionRevision && compactions.get(key) === compaction && typeof context.compacting === 'boolean') {
-      if (context.compacting) beginCompactionUsage(threadId);
-      else if (compaction && !threadBusy.get(threadId) && !activeTurns.has(threadId)) finishCompaction(threadId, undefined, false);
+      if (context.compacting && !compaction) beginCompactionUsage(threadId);
+      else if (!context.compacting && compaction && compaction.acknowledged !== false) {
+        if ((turnRevisions.get(threadId) || 0) === runtimeRevision)
+          settleCompactionRuntime(threadId, context.runtimeStatus);
+        if (compactions.has(key)) finishCompaction(threadId);
+      }
     }
     if (state.activeThread?.id === threadId) scheduleConversationSnapshot(threadId);
   } catch { /* Older servers and transient reads retain the last measurement. */ }
 }
+// Completion events can be lost while Android is suspended, even if the
+// connection later stays healthy. Only read native state while compression is
+// pending; do not reload large history, reacquire writers or replay submissions.
+watch(() => [state.compacting, state.activeThread?.id, state.hostId, state.connected,
+  state.online, state.authenticated, state.runtimePaused] as const, ([compacting, threadId, hostId], _, onCleanup) => {
+  if (!compacting || !threadId || !state.connected || !state.online || !state.authenticated || state.runtimePaused) return;
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout>;
+  const check = async () => {
+    if (cancelled) return;
+    await refreshContextUsage(hostId, threadId);
+    if (!cancelled) timer = setTimeout(check, 2000);
+  };
+  timer = setTimeout(check, 2000);
+  onCleanup(() => { cancelled = true; clearTimeout(timer); });
+}, { flush: 'sync' });
 // Android may discard the renderer rather than emit a normal unload event.
 // Commit small private snapshots while hidden; the server retains the runtime.
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('pagehide', () => { void flushConversationCache(); });
@@ -1671,6 +1739,7 @@ function receive(message: any) {
       && ['errored', 'interrupted', 'shutdown'].includes(previous?.status || '');
     state.agentActivity[p.threadId] = { ...previous, status: retainFailure ? previous!.status : status, updatedAt: Date.now() };
     noteRuntime(p.threadId, p.status?.type === "active");
+    settleCompactionRuntime(p.threadId, p.status?.type);
   }
   if (method === "thread/archived") {
     if (
@@ -1693,6 +1762,10 @@ function receive(message: any) {
   }
   if (method?.startsWith("item/") && p.threadId) {
     if (p.item?.type === 'contextCompaction') {
+      const previous = currentItems(p.threadId).find(item => item.id === p.item.id);
+      if (method === 'item/started' && previous &&
+          (['completed', 'failed', 'interrupted'].includes(previous.status) ||
+            !!previous.turnId && completedTurns.has(previous.turnId))) return;
       // Legacy runtimes omit turnId on item events. Anchor the divider now;
       // subsequent replies must never make it a permanent conversation footer.
       p.turnId = compactionTurnId(p.threadId, p.turnId);
@@ -1704,6 +1777,8 @@ function receive(message: any) {
     }
     const items = currentItems(p.threadId);
     const itemId = p.item?.id ?? p.itemId;
+    const previousItem = items.find(item => item.id === itemId);
+    const newItem = itemId && !previousItem;
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
     const item = items.find(item => item.id === itemId);
@@ -1716,13 +1791,22 @@ function receive(message: any) {
     if (p.item?.type === "contextCompaction" && method === "item/started") {
       beginCompactionUsage(p.threadId);
       const key = recencyKey(state.hostId, p.threadId);
-      compactions.set(key, { ...compactions.get(key), turnId: p.turnId });
+      compactions.set(key, { ...compactions.get(key), turnId: p.turnId, itemId: p.item.id, acknowledged: true });
     }
     if (p.item?.type === "contextCompaction" && method === "item/completed") {
-      finishCompaction(p.threadId, p.turnId);
-      if (state.activeThread?.id === p.threadId) toast("上下文已压缩");
+      const current = compactions.get(recencyKey(state.hostId, p.threadId));
+      const olderCompletion = current?.requested && !current.itemId &&
+        (previousItem?.status === 'completed' || !!p.turnId && completedTurns.has(p.turnId));
+      if (!olderCompletion && (!current?.itemId || current.itemId === p.item.id)) {
+        finishCompaction(p.threadId, p.turnId);
+        if (state.activeThread?.id === p.threadId) toast("上下文已压缩");
+      }
       void refreshContextUsage(state.hostId, p.threadId);
     }
+    const compaction = compactions.get(recencyKey(state.hostId, p.threadId));
+    if (compaction?.turnId === p.turnId && newItem && ['agentMessage', 'reasoning'].includes(item?.type || '') &&
+        (method === 'item/started' || method === 'item/agentMessage/delta' || method === 'item/reasoning/summaryTextDelta'))
+      finishCompaction(p.threadId, p.turnId);
   }
   if (method === 'thread/compacted' && p.threadId) {
     const items = currentItems(p.threadId);
@@ -1731,7 +1815,9 @@ function receive(message: any) {
       const item = { id: `legacy-compaction:${turnId || randomUUID()}`, type: 'contextCompaction', turnId, status: 'completed', legacyCompaction: true };
       upsertItem(items, item); noteItem(p.threadId, item.id);
     }
-    finishCompaction(p.threadId, turnId);
+    const current = compactions.get(recencyKey(state.hostId, p.threadId));
+    const olderCompletion = current?.requested && !current.turnId && p.turnId && completedTurns.has(p.turnId);
+    if (!olderCompletion) finishCompaction(p.threadId, turnId);
     void refreshContextUsage(state.hostId, p.threadId);
   }
   if (method === "turn/started") {
@@ -1754,8 +1840,11 @@ function receive(message: any) {
   if (method === "turn/completed") {
     if (state.activeThread?.id === p.threadId) state.permissionChangePending = false;
     const compaction = compactions.get(recencyKey(state.hostId, p.threadId));
-    if (compaction && (!compaction.turnId || compaction.turnId === p.turn?.id)) {
-      finishCompaction(p.threadId, p.turn?.id, p.turn?.status === 'completed');
+    const completesUnboundCompaction = !compaction?.turnId && (!compaction?.requested ||
+      p.turn?.items?.some((item: DisplayItem) => item.type === 'contextCompaction' &&
+        !currentItems(p.threadId).some(previous => previous.id === item.id && previous.status === 'completed')));
+    if (compaction && (compaction.turnId === p.turn?.id || completesUnboundCompaction)) {
+      finishCompaction(p.threadId, p.turn?.id, p.turn?.status === 'completed', p.turn?.status);
       if (p.turn?.status !== 'completed') for (const item of currentItems(p.threadId)) {
         if (item.type === 'contextCompaction' && item.turnId === p.turn?.id && item.status === 'inProgress') item.status = p.turn?.status || 'failed';
       }
@@ -2506,6 +2595,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     state.goalReadError = "";
   }
   const modeKey = recencyKey(hostId, id);
+  const compactionRevision = compactionRevisions.get(modeKey) || 0;
   const nameRevision = threadNameRevisions.get(modeKey) ?? 0;
   const rememberedMode = conversationModes.get(modeKey) || (previousId === id ? (state.goalMode ? 'goal' : state.collaborationMode) : 'default');
   state.collaborationMode = rememberedMode === 'plan' ? 'plan' : 'default';
@@ -2721,11 +2811,12 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     disconnectedWithMutation = false;
     writerAttachment = { hostId, threadId: id, engineId };
     if (eventGapRevision === continuityRevision) socketHasEventGap = false;
+    reconcileCompactionHistory(id, compactionRevision, runtimeChanged ? undefined : result.thread.status?.type);
     const inProgressCompaction = state.items.find(item => item.type === 'contextCompaction' && item.status === 'inProgress' &&
       state.turns.some(turn => turn.id === item.turnId && turn.status === 'inProgress'));
     if (inProgressCompaction) {
       beginCompactionUsage(id);
-      compactions.set(modeKey, { turnId: inProgressCompaction.turnId });
+      compactions.set(modeKey, { ...compactions.get(modeKey), turnId: inProgressCompaction.turnId, itemId: inProgressCompaction.id });
     }
     void refreshContextUsage(hostId, id);
     rememberThread(id);
@@ -3565,15 +3656,26 @@ async function compact() {
   const hostId = state.hostId;
   noteRuntime(id, true);
   const key = recencyKey(state.hostId, id);
+  const requestId = randomUUID();
   beginCompactionUsage(id);
-  compactions.set(key, { requested: true });
+  compactions.set(key, { requested: true, acknowledged: false, requestId });
   try {
     await rpc("thread/compact/start", { threadId: id });
     // This is an immediate acknowledgement, not the completion event.
+    const current = compactions.get(key);
+    if (hostId === state.hostId && current?.requestId === requestId) {
+      compactions.set(key, { ...current, acknowledged: true });
+      compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
+    }
   } catch (error) {
-    if (hostId === state.hostId && !(error as any)?.uncertain) {
+    if (hostId === state.hostId && compactions.get(key)?.requestId === requestId && !(error as any)?.uncertain) {
       finishCompaction(id, undefined, false);
       if (!activeTurns.has(id)) noteRuntime(id, false);
+    } else if (hostId === state.hostId && compactions.get(key)?.requestId === requestId) {
+      // An uncertain RPC is not replayed. Native read-only recovery must still
+      // be able to settle it after a lost ACK or transport interruption.
+      compactions.set(key, { ...compactions.get(key), acknowledged: true });
+      compactionRevisions.set(key, (compactionRevisions.get(key) || 0) + 1);
     }
     throw error;
   }

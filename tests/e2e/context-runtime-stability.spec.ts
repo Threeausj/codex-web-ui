@@ -244,6 +244,102 @@ test('a replacement browser socket rejoins the same native writer and reads miss
   expect(mock.request('turn/start')).toBeUndefined();
 });
 
+test('reconnection clears missed compaction completion from authoritative idle history without replaying deferred input', async ({ page, mock }) => {
+  const bridge = persistentBridge(mock);
+  await bridge.install(page);
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
+  const turn = { id: 'lost-compaction-turn', status: 'inProgress', items: [
+    { id: 'lost-compaction-item', type: 'contextCompaction', status: 'inProgress' },
+  ] };
+  mock.turns.get('thread-existing')!.push(turn);
+  mock.threads[0]!.status = { type: 'active' };
+  bridge.emit('turn/started', { threadId: 'thread-existing', turn });
+  bridge.emit('item/started', { threadId: 'thread-existing', turnId: turn.id, item: turn.items[0] });
+  await expect(page.locator('.context-usage')).toContainText('正在压缩');
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('断线后不能偷偷重发');
+  await page.getByRole('button', { name: '追加指令', exact: true }).click();
+  await expect(page.locator('.compaction-send-note')).toBeVisible();
+  const histories = mock.requests.filter(request => request.method === 'thread/turns/list').length;
+  const resumes = mock.requests.filter(request => request.method === 'thread/resume').length;
+  // The server has finished, but both completion notifications were lost.
+  turn.status = 'completed';
+  turn.items[0]!.status = 'completed';
+  mock.threads[0]!.status = { type: 'idle' };
+  bridge.skipEvent();
+  await mock.sockets[0]!.close({ code: 1006, reason: 'Compaction completion lost' });
+  await expect.poll(() => mock.sockets.length, { timeout: 12000 }).toBe(2);
+  await expect.poll(() => mock.requests.filter(request => request.method === 'thread/turns/list').length).toBeGreaterThan(histories);
+  await expect(page.locator('.compaction-divider')).toContainText('上下文已压缩');
+  await expect(page.locator('.context-usage')).not.toContainText('正在压缩');
+  await expect(page.locator('.compaction-status')).toHaveCount(0);
+  await expect(page.locator('.compaction-send-note')).toHaveCount(0);
+  await expect(input).toHaveValue('断线后不能偷偷重发');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
+  expect(mock.requests.filter(request => request.method === 'thread/resume')).toHaveLength(resumes);
+  expect(mock.request('turn/start')).toBeUndefined();
+  expect(mock.request('turn/steer')).toBeUndefined();
+});
+
+test('an idle runtime notification ends a completed compaction even when item and turn completion were missed', async ({ page, mock }) => {
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: any, request: any) => {
+    if (request.method !== 'thread/compact/start') return receive(socket, request);
+    mock.requests.push(request);
+    const turn = { id: 'idle-compaction', status: 'inProgress', items: [
+      { id: 'idle-compaction-item', type: 'contextCompaction', status: 'inProgress' },
+    ] };
+    mock.turns.get(request.params.threadId)!.push(turn);
+    mock.emit('turn/started', { threadId: request.params.threadId, turn });
+    mock.emit('item/started', { threadId: request.params.threadId, turnId: turn.id, item: turn.items[0] });
+    socket.send(JSON.stringify({ id: request.id, result: {} }));
+  };
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await page.locator('.context-usage').click();
+  await page.getByRole('dialog', { name: '上下文用量与压缩' }).getByRole('button', { name: '立即压缩', exact: true }).click();
+  await expect(page.locator('.context-usage')).toContainText('正在压缩');
+  const turn = mock.turns.get('thread-existing')!.at(-1)!;
+  turn.status = 'completed';
+  turn.items[0].status = 'completed';
+  mock.emit('thread/status/changed', { threadId: 'thread-existing', status: { type: 'idle' } });
+  await expect(page.locator('.context-usage')).not.toContainText('正在压缩');
+  await expect(page.locator('.compaction-divider')).toContainText('上下文已压缩');
+  await expect(page.locator('.compaction-status')).toHaveCount(0);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('运行时已完成可以继续');
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
+  expect(mock.request('turn/start')).toBeUndefined();
+});
+
+test('native history without a compaction item status recovers when later assistant output proves the active turn resumed', async ({ page, mock }) => {
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').first().click();
+  await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
+  const turn = { id: 'active-history-compaction', status: 'inProgress', items: [
+    { id: 'schema-compaction-item', type: 'contextCompaction' },
+  ] as any[] };
+  mock.turns.get('thread-existing')!.push(turn);
+  mock.threads[0]!.status = { type: 'active' };
+  mock.emit('turn/started', { threadId: 'thread-existing', turn });
+  mock.emit('item/started', { threadId: 'thread-existing', turnId: turn.id, item: turn.items[0] });
+  await expect(page.locator('.context-usage')).toContainText('正在压缩');
+  // The native schema does not serialize a ContextCompaction status. Only the
+  // subsequent assistant item in the same active turn proves it is finished.
+  turn.items.push({ id: 'after-schema-compaction', type: 'agentMessage', text: '历史确认压缩后已经继续' });
+  const histories = mock.requests.filter(request => request.method === 'thread/turns/list').length;
+  await foreground(page);
+  await expect.poll(() => mock.requests.filter(request => request.method === 'thread/turns/list').length).toBeGreaterThan(histories);
+  await expect(page.getByText('历史确认压缩后已经继续', { exact: true })).toBeVisible();
+  await expect(page.locator('.context-usage')).not.toContainText('正在压缩');
+  await expect(page.locator('.compaction-divider')).toContainText('上下文已压缩');
+  await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('历史恢复后正常补充');
+  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeEnabled();
+  expect(mock.request('turn/steer')).toBeUndefined();
+});
+
 test('a native event gap triggers a read-only history refresh while retaining the live writer', async ({ page, mock }) => {
   const bridge = persistentBridge(mock);
   await bridge.install(page);
