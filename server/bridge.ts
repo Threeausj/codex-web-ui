@@ -17,7 +17,8 @@ export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
-type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Compaction = { requests: Set<string>; items: Map<string, string | undefined>; revision: number }
+type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
 type DisconnectCategory = 'inputError' | 'nativeJson' | 'nativeFrameLimit' | 'transportError' | 'transportClose' | 'initializeFailure' | 'requestWrite' | 'runtimePaused' | 'runtimeReconnect' | 'serverClosed'
@@ -93,7 +94,8 @@ export class Bridge {
   private lastDisconnect?: { at: number; category: DisconnectCategory; activeThreadCount: number }
   private lastProtocolError?: { at: number; code: number; method: string; category: string }
   private contexts = new Map<string, { tokenUsage: ThreadTokenUsage | null; compacting: boolean }>()
-  private compactions = new Map<string, { requests: Set<string>; items: Map<string, string | undefined> }>()
+  private compactions = new Map<string, Compaction>()
+  private contextItemIds = new Set<string>()
   private disposed = false
   private pausing?: Promise<void>
   private reconnecting?: Promise<void>
@@ -124,7 +126,7 @@ export class Bridge {
   threadContext(threadId: string) { return this.contexts.get(threadId) ?? { tokenUsage: null, compacting: false } }
   private compaction(threadId: string) {
     let state = this.compactions.get(threadId)
-    if (!state) { state = { requests: new Set(), items: new Map() }; this.compactions.set(threadId, state) }
+    if (!state) { state = { requests: new Set(), items: new Map(), revision: 0 }; this.compactions.set(threadId, state) }
     return state
   }
   private updateCompaction(threadId: string) {
@@ -138,27 +140,75 @@ export class Bridge {
     this.compactions.get(threadId)?.requests.delete(requestId)
     this.updateCompaction(threadId)
   }
+  private finishCompaction(threadId: string, turnId?: string) {
+    const state = this.compactions.get(threadId)
+    if (!state) return
+    // An idle snapshot or resumed output describes work already accepted by
+    // Codex. A second request still awaiting its ACK may belong to newer work.
+    if (!turnId) for (const id of state.requests) if (!this.pending.has(id)) state.requests.delete(id)
+    for (const [id, itemTurnId] of state.items) if (!turnId || !itemTurnId || itemTurnId === turnId) state.items.delete(id)
+    this.updateCompaction(threadId)
+  }
+  private rememberContextItem(threadId: string, item: { id?: string; type?: string } | undefined) {
+    if (typeof item?.id !== 'string' || !['contextCompaction', 'agentMessage', 'reasoning'].includes(item.type || '')) return false
+    const key = JSON.stringify([threadId, item.id])
+    const fresh = !this.contextItemIds.has(key)
+    this.contextItemIds.delete(key); this.contextItemIds.add(key)
+    if (this.contextItemIds.size > 8192) this.contextItemIds.delete(this.contextItemIds.values().next().value!)
+    return fresh
+  }
+  private reconcileCompaction(pending: Pending, thread: { id?: string; status?: { type?: string }; turns?: { id?: string; status?: string }[] } | undefined) {
+    const threadId = (pending.params as { threadId?: string })?.threadId
+    const snapshot = pending.compactionSnapshot
+    if (!threadId || thread?.id !== threadId || !snapshot || this.compactions.get(threadId) !== snapshot.state || snapshot.state.revision !== snapshot.revision) return
+    // Readers can outlive a compaction start. Only a snapshot requested after
+    // the latest start can retire its progress; old reads cannot unlock it.
+    if (['idle', 'notLoaded', 'systemError'].includes(thread.status?.type || '')) {
+      this.finishCompaction(threadId)
+      if (!this.threadContext(threadId).compacting) { this.activeThreads.delete(threadId); this.nativeActiveThreads.delete(threadId) }
+    }
+    else for (const turn of thread.turns || []) if (turn.id && ['completed', 'failed', 'interrupted'].includes(turn.status || '') && [...snapshot.state.items.values()].some(turnId => turnId === turn.id)) this.finishCompaction(threadId, turn.id)
+  }
   private observeContext(message: RpcMessage) {
     const p = message.params as any
     if (typeof p?.threadId !== 'string') return
     const previous = this.threadContext(p.threadId)
-    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage: { ...p.tokenUsage, modelContextWindow: p.tokenUsage.modelContextWindow ?? previous.tokenUsage?.modelContextWindow ?? null } })
-    if (p.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
-      const state = this.compaction(p.threadId)
-      state.requests.clear()
-      if (message.method === 'item/started') state.items.set(p.item.id, p.turnId)
-      else state.items.delete(p.item.id)
-      this.updateCompaction(p.threadId)
-    }
-    if (message.method === 'turn/completed') {
+    if (message.method === 'turn/started' || message.method === 'thread/status/changed' && p.status?.type === 'active') {
       const state = this.compactions.get(p.threadId)
-      if (state && (!state.items.size || [...state.items.values()].some(turnId => !turnId || turnId === p.turn?.id))) {
-        state.requests.clear()
-        for (const [id, turnId] of state.items) if (!turnId || turnId === p.turn?.id) state.items.delete(id)
+      if (state) ++state.revision
+    }
+    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage: { ...p.tokenUsage, modelContextWindow: p.tokenUsage.modelContextWindow ?? previous.tokenUsage?.modelContextWindow ?? null } })
+    const freshItem = ['item/started', 'item/completed'].includes(message.method || '') && this.rememberContextItem(p.threadId, p.item)
+    if (p.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
+      if (message.method === 'item/started' && freshItem) {
+        const state = this.compaction(p.threadId)
+        state.requests.clear(); state.items.set(p.item.id, p.turnId); ++state.revision
+        this.updateCompaction(p.threadId)
+      } else if (message.method === 'item/completed' && this.compactions.get(p.threadId)?.items.has(p.item.id)) {
+        // A late completion belongs only to its observed start. It cannot
+        // retire a newer accepted request which has not started its item yet.
+        this.compactions.get(p.threadId)!.items.delete(p.item.id)
         this.updateCompaction(p.threadId)
       }
     }
-    if (['thread/compacted', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '')) {
+    if (message.method === 'turn/completed') {
+      const state = this.compactions.get(p.threadId)
+      if (typeof p.turn?.id === 'string' && state && [...state.items.values()].some(turnId => turnId === p.turn.id)) {
+        this.finishCompaction(p.threadId, p.turn?.id)
+      }
+    }
+    if (message.method === 'thread/status/changed' && ['idle', 'notLoaded', 'systemError'].includes(p.status?.type)) this.finishCompaction(p.threadId)
+    if (message.method === 'item/started' && freshItem && ['agentMessage', 'reasoning'].includes(p.item?.type) && typeof p.turnId === 'string') {
+      const state = this.compactions.get(p.threadId)
+      if (state && [...state.items.values()].some(turnId => turnId === p.turnId)) this.finishCompaction(p.threadId, p.turnId)
+    }
+    if (message.method === 'thread/compacted' && typeof p.turnId === 'string') {
+      const state = this.compactions.get(p.threadId)
+      if (state && [...state.items.values()].some(turnId => turnId === p.turnId)) this.finishCompaction(p.threadId, p.turnId)
+      // A completion for an unbound/older turn cannot identify a newly accepted
+      // compact request. Metadata idle recovery covers completion-only runtimes.
+    }
+    if (['thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/compacted' && typeof p.turnId !== 'string') {
       this.compactions.delete(p.threadId)
       this.contexts.set(p.threadId, { ...this.threadContext(p.threadId), compacting: false })
     }
@@ -252,7 +302,9 @@ export class Bridge {
       this.observeProtocol({ method: 'bridge/thread/requested', params: { threadId: targetThread, method,
         ...(method === 'thread/name/set' && typeof (params as any)?.name === 'string' ? { name: (params as any).name } : {}) } })
     const compactThread = method === 'thread/compact/start' ? (params as { threadId?: string })?.threadId : undefined
-    if (typeof compactThread === 'string') { this.compaction(compactThread).requests.add(id); this.updateCompaction(compactThread) }
+    if (typeof compactThread === 'string') { const state = this.compaction(compactThread); state.requests.add(id); ++state.revision; this.updateCompaction(compactThread) }
+    const compactionState = typeof targetThread === 'string' && ['thread/read', 'thread/resume'].includes(method) ? this.compactions.get(targetThread) : undefined
+    const compactionSnapshot = compactionState ? { state: compactionState, revision: compactionState.revision } : undefined
     const command = params as { processId?: string; tty?: boolean; cwd?: string } | undefined
     const processId = method === 'command/exec' && typeof command?.processId === 'string' ? command.processId : undefined
     if (processId && !this.processes.has(processId)) {
@@ -268,7 +320,7 @@ export class Bridge {
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
-      this.pending.set(id, { method, params, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
+      this.pending.set(id, { method, params, compactionSnapshot, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
       try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { this.removeCompactionRequest(compactThread, id); clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
@@ -666,6 +718,11 @@ export class Bridge {
       else {
         const params = pending.params as { threadId?: string } | undefined
         const result = message.result as { thread?: { id?: string; name?: string; preview?: string; status?: { type?: string } } } | undefined
+        this.reconcileCompaction(pending, result?.thread)
+        const history = result?.thread as { id?: string; turns?: { items?: { id?: string; type?: string }[] }[] } | undefined
+        if (typeof history?.id === 'string' && Array.isArray(history.turns)) for (const turn of history.turns)
+          if (Array.isArray(turn.items)) for (const item of turn.items)
+            if (['agentMessage', 'reasoning'].includes(item.type || '')) this.rememberContextItem(history.id, item)
         if (result?.thread?.id && (result.thread.name || result.thread.preview)) this.threadNames.set(result.thread.id, (result.thread.name || result.thread.preview || '').slice(0, 160))
         if (pending.method === 'thread/name/set' && params?.threadId && (pending.params as any)?.name) this.threadNames.set(params.threadId, (pending.params as any).name.slice(0, 160))
         if (['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
@@ -784,6 +841,7 @@ export class Bridge {
     this.internalThreads.clear()
     this.contexts.clear()
     this.compactions.clear()
+    this.contextItemIds.clear()
     this.observeProtocol({ method: 'bridge/disconnected', params: {} })
     for (const key of this.clients.keys()) this.status(key)
   }

@@ -393,6 +393,183 @@ test('a second compaction rejection cannot clear running progress; a timed out r
     assert.equal(value.bridge.threadContext('timeout-thread').compacting, false)
   } finally { value.bridge.close() }
 })
+test('native idle and resumed work retire compaction progress when completion items are omitted', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    for (const type of ['idle', 'notLoaded', 'systemError']) {
+      const accepted = value.bridge.request('thread/compact/start', { threadId: 'recovering-thread' })
+      await tick()
+      value.receive({ id: value.sent.at(-1)!.id, result: {} }); await accepted
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, true, 'An ACK still only accepts work')
+      value.receive({ method: 'thread/status/changed', params: { threadId: 'recovering-thread', status: { type: 'active' } } })
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, true)
+      value.receive({ method: 'thread/status/changed', params: { threadId: 'recovering-thread', status: { type } } })
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, false)
+    }
+    for (const type of ['agentMessage', 'reasoning']) {
+      value.receive({ method: 'item/started', params: { threadId: 'recovering-thread', turnId: 'compact-turn', item: { type, id: `${type}-before-compaction` } } })
+      value.receive({ method: 'item/started', params: { threadId: 'recovering-thread', turnId: 'compact-turn', item: { type: 'contextCompaction', id: `missing-${type}-completion` } } })
+      value.receive({ method: 'item/started', params: { threadId: 'recovering-thread', turnId: 'compact-turn', item: { type, id: `${type}-before-compaction` } } })
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, true, 'A repeated old assistant item cannot finish newer compaction')
+      value.receive({ method: 'item/started', params: { threadId: 'recovering-thread', turnId: 'other-turn', item: { type, id: 'unrelated' } } })
+      value.receive({ method: 'item/commandExecution/outputDelta', params: { threadId: 'recovering-thread', turnId: 'compact-turn', delta: 'old output' } })
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, true, 'Unrelated or buffered output cannot finish compaction')
+      value.receive({ method: 'item/started', params: { threadId: 'recovering-thread', turnId: 'compact-turn', item: { type, id: `${type}-resumed-work` } } })
+      assert.equal(value.bridge.threadContext('recovering-thread').compacting, false)
+    }
+  } finally { value.bridge.close() }
+})
+
+test('fresh metadata restores missing compaction completion while stale reads cannot unlock newer work', async () => {
+  const value = fixture()
+  const read = async () => {
+    const result = value.bridge.request('thread/read', { threadId: 'snapshot-thread', includeTurns: false })
+    await tick()
+    return { result, id: value.sent.at(-1)!.id }
+  }
+  let itemCounter = 0
+  const started = (id = `compact-item-${++itemCounter}`) => value.receive({ method: 'item/started', params: { threadId: 'snapshot-thread', turnId: 'compact-turn', item: { type: 'contextCompaction', id } } })
+  try {
+    await value.bridge.connect()
+    const resumed = value.bridge.request('thread/resume', { threadId: 'snapshot-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: { thread: { id: 'snapshot-thread', status: { type: 'active' } } } }); await resumed
+    assert.equal(value.bridge.runtime.activeThreadCount, 1)
+    const old = await read()
+    started()
+    value.receive({ id: old.id, result: { thread: { id: 'snapshot-thread', status: { type: 'idle' } } } }); await old.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, true, 'A read started before compaction cannot finish it')
+    const racing = await read()
+    started('newer-compact-item')
+    value.receive({ id: racing.id, result: { thread: { id: 'snapshot-thread', status: { type: 'idle' } } } }); await racing.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, true, 'A newer start supersedes an in-flight snapshot')
+    const active = await read()
+    value.receive({ id: active.id, result: { thread: { id: 'snapshot-thread', status: { type: 'active' }, turns: [{ id: 'old-unrelated-turn', status: 'completed' }] } } }); await active.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, true)
+    const fresh = await read()
+    value.receive({ id: fresh.id, result: { thread: { id: 'snapshot-thread', status: { type: 'idle' } } } }); await fresh.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, false)
+    assert.equal(value.bridge.runtime.activeThreadCount, 0, 'An authoritative idle recovery also retires stale runtime activity')
+    started()
+    const staleActivity = await read()
+    value.receive({ method: 'turn/started', params: { threadId: 'snapshot-thread', turn: { id: 'new-active-turn', status: 'inProgress' } } })
+    value.receive({ id: staleActivity.id, result: { thread: { id: 'snapshot-thread', status: { type: 'idle' } } } }); await staleActivity.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, true)
+    assert.equal(value.bridge.runtime.activeThreadCount, 1, 'An older idle read cannot retire a newer active turn')
+    const completed = await read()
+    value.receive({ id: completed.id, result: { thread: { id: 'snapshot-thread', status: { type: 'active' }, turns: [{ id: 'compact-turn', status: 'completed' }] } } }); await completed.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, false, 'A completed compacted turn can be recovered during later active work')
+    const accepted = value.bridge.request('thread/compact/start', { threadId: 'snapshot-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: {} }); await accepted
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, true)
+    const omitted = await read()
+    value.receive({ id: omitted.id, result: { thread: { id: 'snapshot-thread', status: { type: 'idle' } } } }); await omitted.result
+    assert.equal(value.bridge.threadContext('snapshot-thread').compacting, false, 'A successful ACK without either item event can still recover from idle metadata')
+  } finally { value.bridge.close() }
+})
+
+test('idle recovery never discards a newer compact request still awaiting its acknowledgement', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    value.receive({ method: 'item/started', params: { threadId: 'queued-thread', turnId: 'old-turn', item: { id: 'old-compact', type: 'contextCompaction' } } })
+    const newer = value.bridge.request('thread/compact/start', { threadId: 'queued-thread' })
+    await tick()
+    const request = value.sent.at(-1)!
+    value.receive({ method: 'thread/status/changed', params: { threadId: 'queued-thread', status: { type: 'idle' } } })
+    assert.equal(value.bridge.threadContext('queued-thread').compacting, true)
+    value.receive({ id: request.id, result: {} }); await newer
+    assert.equal(value.bridge.threadContext('queued-thread').compacting, true)
+    value.receive({ method: 'item/started', params: { threadId: 'queued-thread', turnId: 'new-turn', item: { id: 'new-compact', type: 'contextCompaction' } } })
+    value.receive({ method: 'item/completed', params: { threadId: 'queued-thread', turnId: 'new-turn', item: { id: 'new-compact', type: 'contextCompaction' } } })
+    assert.equal(value.bridge.threadContext('queued-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
+
+test('late compaction items and unrelated completed turns cannot retire a newer accepted request', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    const old = { threadId: 'late-thread', turnId: 'old-turn', item: { id: 'old-compact', type: 'contextCompaction' } }
+    value.receive({ method: 'item/started', params: old })
+    value.receive({ method: 'item/completed', params: old })
+    const newer = value.bridge.request('thread/compact/start', { threadId: 'late-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: {} }); await newer
+    for (const event of [
+      { method: 'item/completed', params: old },
+      { method: 'item/completed', params: { ...old, item: { ...old.item, id: 'unknown-older-item' } } },
+      { method: 'turn/completed', params: { threadId: 'late-thread', turn: { id: 'unrelated-turn', status: 'completed' } } },
+      { method: 'item/started', params: old },
+    ]) {
+      value.receive(event)
+      assert.equal(value.bridge.threadContext('late-thread').compacting, true, `${event.method} must not complete unbound newer work`)
+    }
+    const current = { ...old, turnId: 'new-turn', item: { ...old.item, id: 'new-compact' } }
+    value.receive({ method: 'item/started', params: current })
+    value.receive({ method: 'item/completed', params: old })
+    assert.equal(value.bridge.threadContext('late-thread').compacting, true)
+    value.receive({ method: 'item/completed', params: current })
+    assert.equal(value.bridge.threadContext('late-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
+
+test('completing an older observed compaction leaves an accepted newer request pending', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    const old = { threadId: 'overlap-thread', turnId: 'old-turn', item: { id: 'old-compact', type: 'contextCompaction' } }
+    value.receive({ method: 'item/started', params: old })
+    const newer = value.bridge.request('thread/compact/start', { threadId: 'overlap-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: {} }); await newer
+    value.receive({ method: 'item/completed', params: old })
+    assert.equal(value.bridge.threadContext('overlap-thread').compacting, true)
+    value.receive({ method: 'turn/completed', params: { threadId: 'overlap-thread', turn: { id: 'old-turn', status: 'completed' } } })
+    assert.equal(value.bridge.threadContext('overlap-thread').compacting, true)
+    value.receive({ method: 'thread/status/changed', params: { threadId: 'overlap-thread', status: { type: 'idle' } } })
+    assert.equal(value.bridge.threadContext('overlap-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
+
+test('assistant identities already present in native history do not count as fresh resumed output', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    const read = value.bridge.request('thread/read', { threadId: 'history-thread', includeTurns: true })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: { thread: { id: 'history-thread', status: { type: 'active' }, turns: [{ id: 'history-turn', items: [{ type: 'agentMessage', id: 'history-answer' }] }] } } }); await read
+    value.receive({ method: 'item/started', params: { threadId: 'history-thread', turnId: 'history-turn', item: { type: 'contextCompaction', id: 'new-compaction' } } })
+    value.receive({ method: 'item/started', params: { threadId: 'history-thread', turnId: 'history-turn', item: { type: 'agentMessage', id: 'history-answer' } } })
+    assert.equal(value.bridge.threadContext('history-thread').compacting, true)
+    value.receive({ method: 'item/started', params: { threadId: 'history-thread', turnId: 'history-turn', item: { type: 'agentMessage', id: 'fresh-answer' } } })
+    assert.equal(value.bridge.threadContext('history-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
+
+test('legacy completion with an explicit old turn cannot finish newer work while turnless legacy completion remains supported', async () => {
+  const value = fixture()
+  try {
+    await value.bridge.connect()
+    const accepted = value.bridge.request('thread/compact/start', { threadId: 'legacy-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: {} }); await accepted
+    value.receive({ method: 'thread/compacted', params: { threadId: 'legacy-thread', turnId: 'older-turn' } })
+    assert.equal(value.bridge.threadContext('legacy-thread').compacting, true, 'An explicit unbound completion requires idle verification')
+    value.receive({ method: 'item/started', params: { threadId: 'legacy-thread', turnId: 'current-turn', item: { id: 'current-compact-item', type: 'contextCompaction' } } })
+    value.receive({ method: 'thread/compacted', params: { threadId: 'legacy-thread', turnId: 'older-turn' } })
+    assert.equal(value.bridge.threadContext('legacy-thread').compacting, true)
+    value.receive({ method: 'thread/compacted', params: { threadId: 'legacy-thread', turnId: 'current-turn' } })
+    assert.equal(value.bridge.threadContext('legacy-thread').compacting, false)
+    const turnless = value.bridge.request('thread/compact/start', { threadId: 'legacy-thread' })
+    await tick()
+    value.receive({ id: value.sent.at(-1)!.id, result: {} }); await turnless
+    value.receive({ method: 'thread/compacted', params: { threadId: 'legacy-thread' } })
+    assert.equal(value.bridge.threadContext('legacy-thread').compacting, false)
+  } finally { value.bridge.close() }
+})
 function fixture(options: BridgeOptions = {}, host: Host = { id: 'local', kind: 'local', name: 'Test' }) {
   const input = new PassThrough()
   const output = new PassThrough()

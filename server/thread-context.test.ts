@@ -51,6 +51,9 @@ test('context endpoint authenticates, hydrates persisted usage without a writer 
   const filename = path.join(directory, 'rollout-context-thread.jsonl')
   await fs.writeFile(filename, event(7000))
   const input = new PassThrough(); const output = new PassThrough(); const calls: RpcMessage[] = []
+  let threadStatus: { type: string } | undefined
+  let heldReads: RpcMessage[] | undefined
+  let rejectRead = false
   let buffer = ''
   input.on('data', data => {
     buffer += data.toString()
@@ -58,7 +61,9 @@ test('context endpoint authenticates, hydrates persisted usage without a writer 
     while ((end = buffer.indexOf('\n')) >= 0) {
       const request = JSON.parse(buffer.slice(0, end)) as RpcMessage; buffer = buffer.slice(end + 1)
       calls.push(request)
-      if (request.id !== undefined) queueMicrotask(() => output.write(JSON.stringify({ id: request.id, result: request.method === 'initialize' ? { userAgent: 'fixture' } : { thread: { id: 'context-thread', path: filename } } }) + '\n'))
+      if (request.method === 'thread/read' && heldReads) { heldReads.push(request); continue }
+      if (request.method === 'thread/read' && rejectRead) { queueMicrotask(() => output.write(JSON.stringify({ id: request.id, error: { code: -32000, message: 'Read unavailable' } }) + '\n')); continue }
+      if (request.id !== undefined) queueMicrotask(() => output.write(JSON.stringify({ id: request.id, result: request.method === 'initialize' ? { userAgent: 'fixture' } : { thread: { id: 'context-thread', path: filename, status: threadStatus } } }) + '\n'))
     }
   })
   const application = await createServer({ dataDir: path.join(directory, 'data'), password: 'context-fixture-password', serveStatic: false, bridgeOptions: { transportFactory: () => ({ input, output, events: new EventEmitter(), dispose: () => { input.destroy(); output.destroy() } }) } })
@@ -91,6 +96,41 @@ test('context endpoint authenticates, hydrates persisted usage without a writer 
     assert.equal(partial.tokenUsage.modelContextWindow, 200000)
     output.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'context-thread', item: { type: 'contextCompaction', id: 'compact' } } }) + '\n')
     assert.equal((await (await fetch(base + route, { headers: { cookie } })).json()).compacting, false)
+    // Recover an omitted completion event using metadata even when usage is
+    // already cached. Parallel browser checks share one read and no writer.
+    output.write(JSON.stringify({ method: 'item/started', params: { threadId: 'context-thread', turnId: 'lost-completion-turn', item: { type: 'contextCompaction', id: 'lost-completion' } } }) + '\n')
+    threadStatus = { type: 'idle' }
+    const readsBefore = calls.filter(call => call.method === 'thread/read').length
+    heldReads = []
+    const recoveredResponses = Promise.all([fetch(base + route, { headers: { cookie } }), fetch(base + route, { headers: { cookie } })])
+    for (let attempt = 0; attempt < 100 && !heldReads.length; ++attempt) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(heldReads.length, 1)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(calls.filter(call => call.method === 'thread/read').length, readsBefore + 1)
+    output.write(JSON.stringify({ id: heldReads[0]!.id, result: { thread: { id: 'context-thread', path: filename, status: threadStatus } } }) + '\n')
+    heldReads = undefined
+    for (const response of await recoveredResponses) {
+      const recovered = await response.json()
+      assert.equal(recovered.compacting, false)
+      assert.equal(recovered.runtimeStatus, 'idle')
+      assert.equal(recovered.tokenUsage.last.totalTokens, 1000)
+      assert.equal(recovered.tokenUsage.modelContextWindow, 200000)
+    }
+    const ordinary = await (await fetch(base + route, { headers: { cookie } })).json()
+    assert.equal('runtimeStatus' in ordinary, false, 'Normal cached usage reads need no metadata probe')
+    const restored = await (await fetch(base + route + '?recoverCompaction=1', { headers: { cookie } })).json()
+    assert.equal(restored.runtimeStatus, 'idle', 'A browser which missed completion can verify runtime even after the bridge recovered')
+    assert.equal(restored.compacting, false)
+    assert.equal(calls.filter(call => call.method === 'thread/read').length, readsBefore + 2)
+    output.write(JSON.stringify({ method: 'item/started', params: { threadId: 'context-thread', turnId: 'still-running-turn', item: { type: 'contextCompaction', id: 'still-running' } } }) + '\n')
+    rejectRead = true
+    const unavailable = await fetch(base + route + '?recoverCompaction=1', { headers: { cookie } })
+    assert.equal(unavailable.status, 200)
+    const retained = await unavailable.json()
+    assert.equal(retained.compacting, true, 'A failed native probe cannot manufacture completion')
+    assert.equal(retained.tokenUsage.last.totalTokens, 1000)
+    assert.equal('runtimeStatus' in retained, false)
+    rejectRead = false
     assert.equal(calls.some(call => ['thread/resume', 'turn/start', 'command/exec'].includes(call.method || '')), false)
     assert.equal((await fetch(base + '/api/hosts/unknown/threads/context-thread/context', { headers: { cookie } })).status, 404)
   } finally { await application.close(); await fs.rm(directory, { recursive: true, force: true }) }

@@ -5,7 +5,7 @@ import type { Host } from './types.js'
 import type { ThreadTokenUsage } from './context-types.js'
 import { runHostPython } from './host-helper.js'
 
-type Context = { tokenUsage: ThreadTokenUsage | null; compacting: boolean }
+type Context = { tokenUsage: ThreadTokenUsage | null; compacting: boolean; runtimeStatus?: 'active' | 'idle' | 'notLoaded' | 'systemError' }
 type Dependencies = {
   getHost: (id: string) => Host | undefined
   getBridge: (id: string) => Promise<Pick<Bridge, 'request' | 'threadContext'>>
@@ -77,6 +77,16 @@ print(json.dumps(result,allow_nan=False,separators=(',',':')))
 export function registerThreadContext(app: Express, deps: Dependencies) {
   const fallback = new Map<string, { expiresAt: number; value: ThreadTokenUsage | null }>()
   const pending = new Map<string, Promise<ThreadTokenUsage | null>>()
+  type Snapshot = { thread?: { id?: string; path?: string | null; status?: { type?: Context['runtimeStatus'] } } }
+  const snapshots = new Map<string, Promise<Snapshot>>()
+  const readThread = (key: string, bridge: Pick<Bridge, 'request'>, threadId: string) => {
+    let read = snapshots.get(key)
+    if (!read) {
+      read = bridge.request('thread/read', { threadId, includeTurns: false }, 10000).then(result => result as Snapshot).finally(() => { snapshots.delete(key) })
+      snapshots.set(key, read)
+    }
+    return read
+  }
   app.get('/api/hosts/:hostId/threads/:threadId/context', (req, res, next) => {
     void (async () => {
       const hostId = identifier.parse(req.params.hostId)
@@ -84,15 +94,23 @@ export function registerThreadContext(app: Express, deps: Dependencies) {
       const host = deps.getHost(hostId)
       if (!host) throw Object.assign(new Error('主机不存在'), { status: 404 })
       const bridge = await deps.getBridge(hostId)
-      const context = bridge.threadContext(threadId)
-      if (context.tokenUsage?.modelContextWindow) { res.json(context); return }
       const key = JSON.stringify([hostId, threadId])
+      // Native releases can omit the compaction completion item. A cheap
+      // metadata read recovers an authoritative idle state in Bridge without
+      // resuming a writer or loading a large conversation. Share concurrent
+      // phone/desktop checks, and retain progress if the native read fails.
+      let snapshot: Snapshot | undefined
+      if (bridge.threadContext(threadId).compacting || req.query.recoverCompaction === '1') snapshot = await readThread(key, bridge, threadId).catch(() => undefined)
+      const context = bridge.threadContext(threadId)
+      const status = snapshot?.thread?.id === threadId ? snapshot.thread.status?.type : undefined
+      const runtime = (current: ReturnType<Bridge['threadContext']>) => status && ['active', 'idle', 'notLoaded', 'systemError'].includes(status) && (!current.compacting || status === 'active') ? { runtimeStatus: status } : {}
+      if (context.tokenUsage?.modelContextWindow) { res.json({ ...context, ...runtime(context) } satisfies Context); return }
       let value = fallback.get(key)
       if (!value || value.expiresAt <= Date.now()) {
         let read = pending.get(key)
         if (!read) {
           read = (async () => {
-            const result = await bridge.request('thread/read', { threadId, includeTurns: false }, 10000) as { thread?: { id?: string; path?: string | null } }
+            const result = snapshot || await readThread(key, bridge, threadId)
             if (result.thread?.id !== threadId) throw Object.assign(new Error('会话不存在'), { status: 404 })
             if (!result.thread.path) return null
             return deps.readRollout ? deps.readRollout(host, result.thread.path)
@@ -107,7 +125,7 @@ export function registerThreadContext(app: Express, deps: Dependencies) {
       }
       const latest = bridge.threadContext(threadId)
       const tokenUsage = latest.tokenUsage ? { ...latest.tokenUsage, modelContextWindow: latest.tokenUsage.modelContextWindow ?? value.value?.modelContextWindow ?? null } : value.value
-      res.json({ tokenUsage, compacting: latest.compacting } satisfies Context)
+      res.json({ tokenUsage, compacting: latest.compacting, ...runtime(latest) } satisfies Context)
     })().catch(next)
   })
 }
