@@ -263,7 +263,7 @@ const contextTitle = computed(() => {
   const details = context.value
     ? `${context.value.used.toLocaleString()} / ${context.value.limit.toLocaleString()} tokens（当前上下文）`
     : props.state.activeThread ? "Codex 尚未报告当前上下文用量" : "新对话尚未使用上下文";
-  return `${details}\n${desktopContext.value ? "点击查看上下文用量与压缩选项" : compactDisabledReason.value || "点击压缩上下文"}`;
+  return `${details}\n点击查看上下文用量与压缩选项`;
 });
 const compactDisabledReason = computed(() => {
   if (!props.state.activeThread) return "先开始一个对话，再压缩上下文";
@@ -281,28 +281,30 @@ const compactDisabledReason = computed(() => {
   return "";
 });
 const compactDisabled = computed(() => !!compactDisabledReason.value);
-const desktopContext = ref(window.innerWidth > 760);
 const contextMenuOpen = ref(false);
 const contextButton = ref<HTMLButtonElement>();
 const contextMenu = ref<HTMLElement>();
 const contextMenuId = `context-usage-${useId()}`;
-const contextMenuPosition = ref({ left: '0px', bottom: '0px', maxHeight: '400px' });
+const contextMenuPosition = ref({ left: '0px', bottom: '0px', maxHeight: '400px', width: '280px' });
 function tokenCount(value: number) {
   if (value < 1000) return value.toLocaleString();
   const scale = value >= 1_000_000 ? 1_000_000 : 1000;
   return `${Number((value / scale).toFixed(1))}${scale === 1000 ? 'k' : 'm'}`;
 }
 function positionContextMenu() {
-  const desktop = window.innerWidth > 760;
-  desktopContext.value = desktop;
-  if (!desktop) { contextMenuOpen.value = false; return; }
   if (!contextMenuOpen.value || !contextButton.value) return;
   const bounds = contextButton.value.getBoundingClientRect();
-  const width = Math.min(280, window.innerWidth - 24);
+  const viewport = window.visualViewport;
+  const left = viewport?.offsetLeft || 0, top = viewport?.offsetTop || 0;
+  const height = viewport?.height || window.innerHeight;
+  const width = Math.min(280, (viewport?.width || window.innerWidth) - 24);
+  const menuHeight = Math.min((contextMenu.value?.scrollHeight || 238) + 2, Math.max(1, height - 24));
+  const bottom = Math.max(top + menuHeight + 12, Math.min(bounds.top - 8, top + height - 12));
   contextMenuPosition.value = {
-    left: `${Math.max(12, Math.min(bounds.right - width, window.innerWidth - width - 12))}px`,
-    bottom: `${Math.max(12, window.innerHeight - bounds.top + 8)}px`,
-    maxHeight: `${Math.max(80, bounds.top - 20)}px`,
+    left: `${Math.max(left + 12, Math.min(bounds.right - width, left + (viewport?.width || window.innerWidth) - width - 12))}px`,
+    bottom: `${window.innerHeight - bottom}px`,
+    maxHeight: `${Math.max(1, bottom - top - 12)}px`,
+    width: `${width}px`,
   };
 }
 function closeContextMenu(restoreFocus = false) {
@@ -324,12 +326,14 @@ function requestCompaction() {
   closeContextMenu(); emit('command', 'compact');
 }
 async function clickContext() {
-  if (!desktopContext.value) { requestCompaction(); return; }
   if (contextMenuOpen.value) { closeContextMenu(); return; }
   contextMenuOpen.value = true;
   positionContextMenu();
   await nextTick();
-  if (contextMenuOpen.value) contextMenu.value?.focus({ preventScroll: true });
+  if (contextMenuOpen.value) {
+    positionContextMenu();
+    contextMenu.value?.focus({ preventScroll: true });
+  }
 }
 watch([() => props.state.hostId, () => props.state.projectPath, () => props.state.activeThread?.id,
   () => props.state.authenticationGeneration, () => props.state.authenticated], () => closeContextMenu(), { flush: 'sync' });
@@ -709,6 +713,8 @@ onMounted(() => {
   window.addEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.addEventListener("resize", fitPickerAfterLayout);
   window.addEventListener('resize', positionContextMenu);
+  window.visualViewport?.addEventListener('resize', positionContextMenu);
+  window.visualViewport?.addEventListener('scroll', positionContextMenu);
   document.addEventListener('scroll', positionContextMenu, true);
   document.addEventListener('pointerdown', contextOutside, true);
   document.addEventListener('keydown', contextKey, true);
@@ -720,11 +726,13 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", fitPickerAfterLayout);
   window.visualViewport?.removeEventListener("resize", fitPickerAfterLayout);
   window.removeEventListener('resize', positionContextMenu);
+  window.visualViewport?.removeEventListener('resize', positionContextMenu);
+  window.visualViewport?.removeEventListener('scroll', positionContextMenu);
   document.removeEventListener('scroll', positionContextMenu, true);
   document.removeEventListener('pointerdown', contextOutside, true);
   document.removeEventListener('keydown', contextKey, true);
 });
-defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext,
+defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext, contextMenuOpen, closeContextMenu,
   working: computed(() => uploading.value || submitting.value) });
 </script>
 
@@ -1015,10 +1023,9 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
             :class="{ 'context-high': context && context.percent >= 80 }"
             :title="contextTitle"
             :aria-label="contextLabel"
-            :disabled="!desktopContext && compactDisabled"
-            :aria-haspopup="desktopContext ? 'dialog' : undefined"
-            :aria-expanded="desktopContext ? contextMenuOpen : undefined"
-            :aria-controls="desktopContext ? contextMenuId : undefined"
+            aria-haspopup="dialog"
+            :aria-expanded="contextMenuOpen"
+            :aria-controls="contextMenuId"
             @click="clickContext"
           >
             <span class="context-ring" :style="{ '--context-percent': `${context?.percent || 0}%` }" aria-hidden="true"></span>
@@ -1117,7 +1124,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
       aria-label="上下文用量与压缩"
       tabindex="-1"
     >
-      <header><strong>上下文用量</strong><span v-if="context">{{ context.percent }}%</span></header>
+      <header><strong>上下文用量</strong><div class="context-menu-actions"><span v-if="context">{{ context.percent }}%</span><button type="button" class="icon-button" aria-label="关闭上下文用量" @click="closeContextMenu(true)"><Icon name="X" :size="16" /></button></div></header>
       <template v-if="context">
         <p class="context-token-count" :title="`${context.used.toLocaleString()} / ${context.limit.toLocaleString()} tokens`">
           <strong>{{ tokenCount(context.used) }} / {{ tokenCount(context.limit) }}</strong><span>tokens</span>
@@ -1227,6 +1234,8 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .context-usage-menu header { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
 .context-usage-menu header strong { font-weight: 500; }
 .context-usage-menu header span { color: var(--muted); }
+.context-menu-actions { display: flex; align-items: center; gap: 8px; }
+.context-menu-actions .icon-button { width: 28px; height: 28px; }
 .context-token-count { display: flex; align-items: baseline; gap: 7px; margin: 13px 0 10px; }
 .context-token-count strong { font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .context-token-count span, .context-menu-note { color: var(--muted); font-size: 11px; }
@@ -1237,6 +1246,10 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .context-compact-action:hover:not(:disabled) { color: var(--green); }
 .context-compact-action:disabled { color: var(--muted); cursor: default; }
 .context-menu-note { margin: 9px 0 0; line-height: 1.6; }
+@media (max-width: 760px) {
+  .context-menu-actions .icon-button { width: 40px; height: 40px; }
+  .context-compact-action { min-height: 44px; font-size: 13px; }
+}
 @media (max-width: 600px) {
   .composer-area { border-radius: 15px; }
   .composer { padding: 12px 12px 10px; }
