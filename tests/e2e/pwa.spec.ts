@@ -552,6 +552,103 @@ test("stalled worker activation shows progress, reports a timeout and permits re
   } finally { workerRevision = ""; }
 });
 
+async function installActivationCallbackLoss(page: Page) {
+  await page.addInitScript(() => {
+    const add = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, callback, options) {
+      const lifecycle = (this instanceof ServiceWorkerContainer && type === 'controllerchange') || (this instanceof ServiceWorker && type === 'statechange');
+      if (!lifecycle || !callback) return add.call(this, type, callback, options);
+      const target = this;
+      add.call(this, type, function (event) {
+        const lost = (window as any).lostActivationWorker;
+        if (lost && (type === 'controllerchange' || target === lost)) {
+          const key = `codex.testSuppressedUpdate.${type}`;
+          sessionStorage.setItem(key, String(Number(sessionStorage.getItem(key) || 0) + 1));
+          return;
+        }
+        if (typeof callback === 'function') callback.call(target, event);
+        else callback.handleEvent(event);
+      }, options);
+    };
+  });
+}
+
+async function suppressActivationCallbacks(page: Page) {
+  await page.evaluate(async () => {
+    const registration = (await navigator.serviceWorker.getRegistration())!;
+    const waiting = registration.waiting!;
+    if (!waiting || waiting.state !== 'installed') throw new Error('The update worker must already be installed');
+    // The real worker continues through activation and replaces registration.active.
+    // Only lifecycle callbacks to this page are lost, as with a suspended Android PWA.
+    (window as any).lostActivationWorker = waiting;
+  });
+}
+
+test('a mobile update recovers from lost worker activation callbacks without losing its draft or replaying a turn', async ({ page, mock }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installActivationCallbackLoss(page);
+  await loginBuilt(page);
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('安卓更新激活回调丢失时保留的草稿');
+  workerRevision = '\n// lost-mobile-activation-callback-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    const update = page.getByRole('button', { name: '更新应用', exact: true });
+    await expect(update).toBeVisible();
+    await suppressActivationCallbacks(page);
+    await Promise.all([page.waitForEvent('domcontentloaded', { timeout: 6000 }), update.click()]);
+    await expect(input).toHaveValue('安卓更新激活回调丢失时保留的草稿');
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+    await expect(update).toHaveCount(0);
+    expect(await page.evaluate(() => Number(sessionStorage.getItem('codex.testSuppressedUpdate.statechange')))).toBeGreaterThan(0);
+    expect(mock.request('turn/start')).toBeUndefined();
+    expect(mock.authenticated).toBe(true);
+  } finally { workerRevision = ''; }
+});
+
+test('recovered worker activation waits for work that started after updating was requested', async ({ page, mock }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installActivationCallbackLoss(page);
+  await loginBuilt(page);
+  workerRevision = '\n// lost-activation-started-work-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await expect(page.getByRole('button', { name: '更新应用', exact: true })).toBeVisible();
+    await suppressActivationCallbacks(page);
+    await page.evaluate(() => {
+      const original = ServiceWorker.prototype.postMessage;
+      let pending: (() => void) | undefined;
+      (window as any).releaseUpdateActivation = () => { pending?.(); };
+      ServiceWorker.prototype.postMessage = function (message: any, options: any) {
+        if (message?.type === 'SKIP_WAITING') pending = () => original.call(this, message, options);
+        else original.call(this, message, options);
+      };
+    });
+    let navigations = 0;
+    page.on('domcontentloaded', () => { navigations++; });
+    await page.getByRole('button', { name: '更新应用', exact: true }).click();
+    await expect(page.getByRole('button', { name: '正在更新…', exact: true })).toBeDisabled();
+    mock.holdFinalMessage = true;
+    await send(page, '激活更新期间开始的任务不能中断');
+    await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+    const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+    await input.fill('任务完成后更新仍保留的草稿');
+    await page.evaluate(() => (window as any).releaseUpdateActivation());
+    await expect.poll(() => page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())!.waiting)).toBe(false);
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();
+    expect(navigations).toBe(0);
+    // With a nonempty draft the running composer shows its steer action.
+    await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeEnabled();
+    await expect(page.getByRole('combobox', { name: '选择模型', exact: true })).toBeDisabled();
+    await expect(input).toHaveValue('任务完成后更新仍保留的草稿');
+    await Promise.all([page.waitForEvent('domcontentloaded', { timeout: 6000 }), Promise.resolve().then(() => mock.finishStream())]);
+    await expect(input).toHaveValue('任务完成后更新仍保留的草稿');
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+    expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+    expect(navigations).toBe(1);
+  } finally { workerRevision = ''; }
+});
+
 test("rotated VAPID keys retire the old device subscription without automatic consent or resubscription", async ({ page }) => {
   const oldKey = webPush.generateVAPIDKeys().publicKey;
   const calls: PushCall[] = [];

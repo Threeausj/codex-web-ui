@@ -4,13 +4,14 @@ import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { build } from 'esbuild';
 
-async function withPwa(run: (value: any) => Promise<void>, options: { serviceWorker?: boolean } = {}) {
+async function withPwa(run: (value: any) => Promise<void>, options: { serviceWorker?: boolean; initialController?: boolean } = {}) {
   const names = ['window', 'navigator', 'localStorage', 'Notification', 'matchMedia', 'location', 'document', 'DOMParser', 'fetch'];
   const previous = names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const);
   const messages: unknown[] = [];
-  const waiting = Object.assign(new EventTarget(), { state: 'installed', postMessage(value: unknown) { messages.push(value); } });
-  const registration = Object.assign(new EventTarget(), { waiting: waiting as typeof waiting | null, installing: null, active: {}, update: async () => registration });
-  const container = Object.assign(new EventTarget(), { controller: {} as unknown, register: async () => registration, ready: Promise.resolve(registration) });
+  const waiting = Object.assign(new EventTarget(), { state: 'installed', scriptURL: 'https://fixture.invalid/sw.js?build=new', postMessage(value: unknown) { messages.push(value); } });
+  const active = Object.assign(new EventTarget(), { state: 'activated', scriptURL: 'https://fixture.invalid/sw.js?build=old' });
+  const registration = Object.assign(new EventTarget(), { waiting: waiting as typeof waiting | null, installing: null, active: active as unknown, update: async () => registration });
+  const container = Object.assign(new EventTarget(), { controller: options.initialController === false ? null : active as unknown, register: async () => registration, ready: Promise.resolve(registration) });
   const media = () => ({ matches: false, addEventListener() {} });
   const navigator: any = { onLine: true, userAgent: 'test', platform: 'Linux', maxTouchPoints: 0, ...(options.serviceWorker === false ? {} : { serviceWorker: container }) };
   const sources = { current: ['/assets/index-current.js'], server: ['/assets/index-current.js'] };
@@ -22,7 +23,7 @@ async function withPwa(run: (value: any) => Promise<void>, options: { serviceWor
     navigator, window: Object.assign(new EventTarget(), { isSecureContext: true, matchMedia: media }),
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     Notification: { permission: 'granted' }, matchMedia: media, location: { href: 'https://fixture.invalid/?thread=keep-current', origin: 'https://fixture.invalid', reload() { reloads++; } },
-    document: { createElement: () => ({}), querySelectorAll: () => documentFor(sources.current).querySelectorAll() },
+    document: Object.assign(new EventTarget(), { visibilityState: 'visible', createElement: () => ({}), querySelectorAll: () => documentFor(sources.current).querySelectorAll() }),
     DOMParser: class { parseFromString(_html: string, type: string) { assert.equal(type, 'text/html'); return documentFor(sources.server); } },
     fetch: async (input: URL, init: RequestInit) => { requests.push({ input, init }); return fetchResponse(); },
   };
@@ -34,10 +35,13 @@ async function withPwa(run: (value: any) => Promise<void>, options: { serviceWor
     await fs.writeFile(destination, compiled.outputFiles[0]!.text, { mode: 0o600 });
     const pwa = await import(destination.href);
     await pwa.initPwa();
-    await run({ pwa, waiting, registration, container, navigator, messages, sources, requests,
-      fetchResponse(value: typeof fetchResponse) { fetchResponse = value; }, reloads: () => reloads, activate() {
-      registration.waiting = null; waiting.state = 'activated'; waiting.dispatchEvent(new Event('statechange'));
-      container.controller = {}; container.dispatchEvent(new Event('controllerchange'));
+    await run({ pwa, waiting, registration, container, navigator, messages, sources, requests, window: globals.window, document: globals.document,
+      fetchResponse(value: typeof fetchResponse) { fetchResponse = value; }, reloads: () => reloads,
+      activate(events: { worker?: boolean; controller?: boolean; changeController?: boolean } = {}) {
+      registration.waiting = null; registration.active = waiting; waiting.state = 'activated';
+      if (events.worker !== false) waiting.dispatchEvent(new Event('statechange'));
+      if (events.changeController !== false) container.controller = waiting;
+      if (events.controller !== false) container.dispatchEvent(new Event('controllerchange'));
     } });
   } finally {
     for (const [name, descriptor] of previous) { if (descriptor) Object.defineProperty(globalThis, name, descriptor); else Reflect.deleteProperty(globalThis, name); }
@@ -68,6 +72,129 @@ test('update clicks share activation, show progress and reload once when the wor
     assert.equal(pwa.pwaState.updateBusy, false);
     assert.equal(pwa.pwaState.updateError, '');
   });
+});
+
+test('worker activation completes an explicit update even when Android omits controllerchange', async () => {
+  await withPwa(async ({ pwa, activate, reloads, messages }) => {
+    await pwa.updatePwa();
+    activate({ controller: false, changeController: false });
+    assert.equal(reloads(), 1);
+    assert.equal(pwa.pwaState.updateBusy, false);
+    assert.equal(pwa.pwaState.updateError, '');
+    assert.deepEqual(messages, [{ type: 'SKIP_WAITING' }]);
+  });
+});
+
+test('missing worker and controller events recover from actual lifecycle state without waiting for the timeout', async t => {
+  await withPwa(async ({ pwa, activate, reloads, waiting }) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await pwa.updatePwa();
+    waiting.scriptURL = 'https://fixture.invalid/sw.js?build=older-page-registration';
+    activate({ worker: false, controller: false, changeController: false });
+    assert.equal(reloads(), 0);
+    t.mock.timers.tick(500);
+    assert.equal(reloads(), 1);
+    assert.equal(pwa.pwaState.updateBusy, false);
+    assert.equal(pwa.pwaState.updateError, '');
+    t.mock.timers.tick(15000);
+    assert.equal(reloads(), 1);
+    assert.equal(pwa.pwaState.updateError, '');
+  });
+});
+
+test('a replacement active worker is recognized even if the requested worker was superseded', async t => {
+  await withPwa(async ({ pwa, registration, waiting, reloads }) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await pwa.updatePwa();
+    waiting.state = 'redundant';
+    registration.waiting = null;
+    registration.active = Object.assign(new EventTarget(), { state: 'activated', scriptURL: waiting.scriptURL });
+    t.mock.timers.tick(500);
+    assert.equal(reloads(), 1);
+    assert.equal(pwa.pwaState.updateError, '');
+  });
+});
+
+test('an old activated worker callback cannot finish a newer update that is still waiting', async t => {
+  await withPwa(async ({ pwa, registration, waiting: oldWorker, activate, reloads, messages }) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    activate();
+    const nextWorker = Object.assign(new EventTarget(), { state: 'installed', postMessage(value: unknown) { messages.push(value); } });
+    registration.waiting = nextWorker;
+    registration.installing = nextWorker;
+    registration.dispatchEvent(new Event('updatefound'));
+    await pwa.updatePwa();
+    oldWorker.dispatchEvent(new Event('statechange'));
+    assert.equal(reloads(), 0, 'The previous worker does not acknowledge this update');
+    assert.equal(pwa.pwaState.updateBusy, true);
+    assert.equal(nextWorker.state, 'installed');
+    t.mock.timers.tick(500);
+    assert.equal(reloads(), 0);
+    nextWorker.state = 'activated';
+    registration.waiting = null;
+    registration.active = nextWorker;
+    nextWorker.dispatchEvent(new Event('statechange'));
+    assert.equal(reloads(), 1);
+    assert.equal(pwa.pwaState.updateBusy, false);
+    assert.deepEqual(messages, [{ type: 'SKIP_WAITING' }]);
+  });
+});
+
+test('polling activation rechecks the guard and defers when a new task begins', async t => {
+  await withPwa(async ({ pwa, activate, reloads }) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let safe = true;
+    pwa.setPwaUpdateGuard(() => safe);
+    await pwa.updatePwa();
+    safe = false;
+    activate({ worker: false, controller: false });
+    t.mock.timers.tick(500);
+    assert.equal(reloads(), 0);
+    assert.equal(pwa.pwaState.updateBusy, false);
+    assert.equal(pwa.pwaState.updateDeferred, true);
+    assert.equal(pwa.pwaState.updateAvailable, true);
+    t.mock.timers.tick(15000);
+    assert.equal(pwa.pwaState.updateError, '');
+    safe = true;
+    await pwa.resumeDeferredPwaUpdate();
+    assert.equal(reloads(), 1);
+  });
+});
+
+test('resuming a PWA detects another tab activation without automatically reloading its conversation', async () => {
+  await withPwa(async ({ pwa, activate, reloads, window, messages }) => {
+    activate({ worker: false, controller: false, changeController: false });
+    window.dispatchEvent(new Event('focus'));
+    assert.equal(reloads(), 0);
+    assert.equal(pwa.pwaState.updateAvailable, true);
+    await pwa.updatePwa();
+    assert.equal(reloads(), 1);
+    assert.deepEqual(messages, []);
+  });
+});
+
+test('visibility resume clears an obsolete timeout after late activation but retains explicit reload', async t => {
+  await withPwa(async ({ pwa, activate, reloads, document }) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await pwa.updatePwa();
+    t.mock.timers.tick(15000);
+    assert.match(pwa.pwaState.updateError, /更新超时/);
+    activate({ worker: false, controller: false, changeController: false });
+    document.dispatchEvent(new Event('visibilitychange'));
+    assert.equal(pwa.pwaState.updateError, '');
+    assert.equal(reloads(), 0);
+    assert.equal(pwa.pwaState.updateAvailable, true);
+    await pwa.updatePwa();
+    assert.equal(reloads(), 1);
+  });
+});
+
+test('first installation without an existing controller does not produce an update prompt', async () => {
+  await withPwa(async ({ pwa, activate, reloads }) => {
+    activate();
+    assert.equal(pwa.pwaState.updateAvailable, false);
+    assert.equal(reloads(), 0);
+  }, { initialController: false });
 });
 
 test('activation timeout enables retry and late activation never reloads a resumed conversation automatically', async t => {

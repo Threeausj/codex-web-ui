@@ -8,7 +8,7 @@ const source = (await readFile(new URL('../public/sw.js', import.meta.url), 'utf
   .replace('__CODEX_PRECACHE__', JSON.stringify(['/index.html', '/offline.html', '/assets/public.js']))
   .replace('__CODEX_PUBLIC_ASSETS__', JSON.stringify(['/index.html', '/offline.html', '/assets/public.js', '/assets/pdf-worker.js']));
 
-function worker() {
+function worker(options: { skipWaiting?: () => Promise<void> } = {}) {
   const listeners = new Map<string, (event: any) => void>();
   const notifications: { title: string; options: any }[] = [];
   const opened: string[] = [];
@@ -25,7 +25,7 @@ function worker() {
       async openWindow(url: string) { opened.push(url); },
       async claim() {},
     },
-    async skipWaiting() {},
+    skipWaiting: options.skipWaiting || (async () => {}),
   };
   vm.runInNewContext(source, {
     self, URL, Response,
@@ -51,6 +51,22 @@ function worker() {
   }
   return { fire, listeners, notifications, opened, networkRequests, cached, setClients(value: any[]) { clients = value; }, setOffline(value: boolean) { offline = value; } };
 }
+
+test('an explicit update keeps its worker message alive until activation is accepted', async () => {
+  let accepted!: () => void;
+  let calls = 0;
+  const target = worker({ skipWaiting: () => { calls++; return new Promise<void>(resolve => { accepted = resolve; }); } });
+  await target.fire('message', { data: { type: 'UNRELATED' } });
+  assert.equal(calls, 0);
+  let settled = false;
+  const activation = target.fire('message', { data: { type: 'SKIP_WAITING' } }).then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(settled, false, 'The worker must not end the event before skipWaiting resolves');
+  accepted();
+  await activation;
+  assert.equal(settled, true);
+});
 
 test('push displays nested server destinations and generic notifications for malformed payloads', async () => {
   const target = worker();

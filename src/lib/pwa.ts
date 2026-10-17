@@ -67,7 +67,10 @@ let serverBuildChanged = false;
 let updateCheck: Promise<boolean> | null = null;
 let canReloadUpdatedApp: () => boolean = () => true;
 let lastController = inBrowser && 'serviceWorker' in navigator ? navigator.serviceWorker.controller : null;
+let lastActiveWorker: ServiceWorker | null = null;
 let updateTimer: ReturnType<typeof setTimeout> | undefined;
+let updatePoll: ReturnType<typeof setTimeout> | undefined;
+let updateWorker: ServiceWorker | null = null;
 const observedRegistrations = new WeakSet<ServiceWorkerRegistration>();
 const observedWorkers = new WeakSet<ServiceWorker>();
 let listenersInstalled = false;
@@ -95,9 +98,15 @@ function pushHttp(api: HttpApi, path: string, init: RequestInit = {}, reportErro
 function refreshUpdateAvailability() {
   pwaState.updateAvailable = serverBuildChanged || pageNeedsReload || !!(registration?.waiting && registration.waiting.state !== 'redundant');
 }
-function reloadUpdatedApp() {
+function clearUpdateActivation() {
   clearTimeout(updateTimer);
+  clearTimeout(updatePoll);
   updateTimer = undefined;
+  updatePoll = undefined;
+  updateWorker = null;
+}
+function reloadUpdatedApp() {
+  clearUpdateActivation();
   wantsReload = false;
   pwaState.updateBusy = false;
   // Work may have started while an update was activating in the background.
@@ -105,6 +114,33 @@ function reloadUpdatedApp() {
   pwaState.updateDeferred = false;
   pwaState.updateError = '';
   location.reload();
+}
+
+/** Android can activate a worker without delivering controllerchange to a resumed PWA. */
+function recognizeWorkerActivation(worker: ServiceWorker | null = updateWorker): boolean {
+  if (!('serviceWorker' in navigator)) return false;
+  const controller = navigator.serviceWorker.controller;
+  const active = registration?.active;
+  const controllerChanged = !!lastController && !!controller && controller !== lastController;
+  const activeChanged = !!lastActiveWorker && !!active && active !== lastActiveWorker && active.state === 'activated';
+  // A delayed callback from the previous worker must not acknowledge a newer
+  // waiting worker that the user has just asked to activate.
+  const requestedActivated = !!updateWorker && worker === updateWorker && worker.state === 'activated';
+  if (!requestedActivated && !controllerChanged && !activeChanged) return false;
+  // A first install does not make this page obsolete. Existing pages still need
+  // an explicit reload when another tab activates the update.
+  if (lastController || wantsReload) pageNeedsReload = true;
+  lastController = controller;
+  if (active?.state === 'activated') lastActiveWorker = active;
+  pwaState.updateError = '';
+  refreshUpdateAvailability();
+  if (wantsReload) reloadUpdatedApp();
+  return true;
+}
+
+function pollWorkerActivation() {
+  if (!wantsReload || recognizeWorkerActivation()) return;
+  updatePoll = setTimeout(pollWorkerActivation, 500);
 }
 
 /** Return true only when a reload will not interrupt work or an open editor. */
@@ -197,6 +233,7 @@ function observeRegistration(result: ServiceWorkerRegistration) {
     if (!worker || observedWorkers.has(worker)) return;
     observedWorkers.add(worker);
     worker.addEventListener('statechange', () => {
+      recognizeWorkerActivation(worker);
       refreshUpdateAvailability();
       if (worker.state === 'installed' && (navigator.serviceWorker.controller || result.active)) pwaState.updateAvailable = true;
     });
@@ -234,8 +271,12 @@ function installListeners() {
   });
   window.addEventListener('focus', () => {
     if ('Notification' in window) pwaState.pushPermission = Notification.permission;
+    recognizeWorkerActivation();
     refreshUpdateAvailability();
-    if (registration && navigator.onLine) void registration.update().then(refreshUpdateAvailability).catch(() => {});
+    if (registration && navigator.onLine) void registration.update().then(() => { recognizeWorkerActivation(); refreshUpdateAvailability(); }).catch(() => {});
+  });
+  if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { recognizeWorkerActivation(); refreshUpdateAvailability(); }
   });
   const displayMode = matchMedia('(display-mode: standalone)');
   displayMode.addEventListener('change', () => { pwaState.installed = installed(); });
@@ -253,10 +294,9 @@ function installListeners() {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       // An update in another tab must not interrupt this tab's current chat.
       const controller = navigator.serviceWorker.controller;
-      if (lastController && controller !== lastController) pageNeedsReload = true;
+      recognizeWorkerActivation();
       lastController = controller;
       refreshUpdateAvailability();
-      if (wantsReload) reloadUpdatedApp();
     });
     navigator.serviceWorker.addEventListener('message', (event) => {
       if (event.data?.type !== 'PUSH_NAVIGATE') return;
@@ -278,6 +318,7 @@ export function initPwa(): Promise<ServiceWorkerRegistration | null> {
     try {
       const result = await deadline(navigator.serviceWorker.register(`/sw.js?build=${import.meta.env.VITE_BUILD_ID}`, { scope: '/', updateViaCache: 'none' }));
       registration = result;
+      if (!lastActiveWorker) lastActiveWorker = result.active;
       observeRegistration(result);
       refreshUpdateAvailability();
       // Push subscriptions require an active worker, rather than a still-installing one.
@@ -285,6 +326,7 @@ export function initPwa(): Promise<ServiceWorkerRegistration | null> {
         const timeout = setTimeout(() => reject(new Error('应用资源准备超时，请连接网络后刷新重试。')), 15_000);
         navigator.serviceWorker.ready.then((worker) => { clearTimeout(timeout); resolve(worker); }, (cause) => { clearTimeout(timeout); reject(cause); });
       });
+      if (!lastActiveWorker) lastActiveWorker = registration.active;
       observeRegistration(registration);
       refreshUpdateAvailability();
       pwaState.registrationStatus = 'ready';
@@ -322,6 +364,7 @@ export async function updatePwa() {
   pwaState.updateBusy = true;
   try {
     if (!registration) await initPwa();
+    recognizeWorkerActivation();
     refreshUpdateAvailability();
     const worker = registration?.waiting;
     if (!worker || worker.state === 'redundant') {
@@ -332,16 +375,22 @@ export async function updatePwa() {
       return;
     }
     wantsReload = true;
-    clearTimeout(updateTimer);
+    clearUpdateActivation();
+    updateWorker = worker;
     updateTimer = setTimeout(() => {
+      // Check the actual lifecycle before reporting a network error: browser
+      // events and timer callbacks can both be delayed while the PWA is hidden.
+      if (recognizeWorkerActivation()) return;
+      clearUpdateActivation();
       wantsReload = false;
       pwaState.updateBusy = false;
       refreshUpdateAvailability();
-      pwaState.updateError = '应用更新超时，请检查网络后重试，或手动刷新页面。';
+      pwaState.updateError = '应用更新超时，新版尚未完成激活，请重试或手动刷新页面。';
     }, 15000);
     worker.postMessage({ type: 'SKIP_WAITING' });
+    pollWorkerActivation();
   } catch (cause: any) {
-    clearTimeout(updateTimer);
+    clearUpdateActivation();
     wantsReload = false;
     pwaState.updateBusy = false;
     refreshUpdateAvailability();
