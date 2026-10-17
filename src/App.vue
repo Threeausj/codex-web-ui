@@ -83,6 +83,7 @@ let foregroundTimer: ReturnType<typeof setTimeout> | undefined;
 const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
+const composer = ref<InstanceType<typeof Composer>>();
 useMobilePanelBack(() => state.authenticated, [
   { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
@@ -92,12 +93,12 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
   { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
   { id: 'image-preview', visible: () => !!conversationImages.image.value, close: () => conversationImages.close() },
+  { id: 'context-usage', visible: () => !!composer.value?.contextMenuOpen, close: () => composer.value?.closeContextMenu(true) },
 ]);
 const workspaceTab = ref("files");
 const workspacePath = ref("");
 const workspaceLine = ref<number>();
 const workspace = ref<InstanceType<typeof WorkspacePanel>>();
-const composer = ref<InstanceType<typeof Composer>>();
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
 const settingsOpen = ref(false);

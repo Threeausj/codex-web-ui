@@ -87,19 +87,166 @@ test('context menu closes on outside clicks, Escape, conversation changes and lo
   expect(mock.request('thread/compact/start')).toBeUndefined();
 });
 
-test('new conversations explain unavailable compaction and switching to mobile restores direct compaction', async ({ page, mock }) => {
+test('new conversations explain unavailable compaction and resizing to mobile keeps explicit confirmation', async ({ page, mock }) => {
   await login(page);
   await indicator(page).click();
   await expect(menu(page)).toContainText('新对话尚未使用上下文');
   await expect(menu(page)).toContainText('先开始一个对话，再压缩上下文');
   await expect(menu(page).getByRole('button', { name: '立即压缩', exact: true })).toBeDisabled();
   await page.setViewportSize({ width: 390, height: 844 });
+  await expect(menu(page)).toBeVisible();
+  await expect(menu(page)).toContainText('先开始一个对话，再压缩上下文');
+  await menu(page).getByRole('button', { name: '关闭上下文用量', exact: true }).click();
   await expect(menu(page)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => !!history.state?.codexMobilePanel)).toBe(false);
   await page.getByRole('button', { name: '打开侧边栏', exact: true }).click();
   await existingRow(page).click();
   await indicator(page).click();
+  await expect(menu(page)).toBeVisible();
+  expect(mock.request('thread/compact/start')).toBeUndefined();
+  await menu(page).getByRole('button', { name: '立即压缩', exact: true }).click();
   await expect.poll(() => mock.request('thread/compact/start')?.params.threadId).toBe('thread-existing');
   await expect(menu(page)).toHaveCount(0);
+});
+
+test.describe('touch context usage', () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  async function openMobileThread(page: Page, width = 390) {
+    await page.setViewportSize({ width, height: 844 });
+    await login(page);
+    await page.getByRole('button', { name: '打开侧边栏', exact: true }).tap();
+    await existingRow(page).tap();
+    await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => !!history.state?.codexMobilePanel)).toBe(false);
+  }
+
+  for (const width of [320, 390]) {
+    test(`${width}px tapping context inspects tokens without compacting, preserves the draft and only explicit confirmation compacts`, async ({ page, mock }) => {
+      await openMobileThread(page, width);
+      mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: {
+        last: { totalTokens: 218000 }, modelContextWindow: 500000,
+      } });
+      await expect(indicator(page)).toHaveText('上下文 44%');
+      const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+      await input.fill('查看用量时保留的草稿');
+      const message = page.getByText('历史保持可读', { exact: true });
+      const beforeMessage = await message.boundingBox();
+      const beforeComposer = await page.locator('.composer-area').boundingBox();
+      await indicator(page).tap();
+      await expect(menu(page)).toBeVisible();
+      await expect(indicator(page)).toHaveAttribute('aria-haspopup', 'dialog');
+      await expect(indicator(page)).toHaveAttribute('aria-expanded', 'true');
+      await expect(menu(page).locator('.context-token-count')).toHaveText('218k / 500ktokens');
+      await expect(menu(page).getByRole('progressbar')).toHaveAttribute('aria-valuenow', '44');
+      await expect(input).toHaveValue('查看用量时保留的草稿');
+      expect(await message.boundingBox()).toEqual(beforeMessage);
+      expect(await page.locator('.composer-area').boundingBox()).toEqual(beforeComposer);
+      expect(mock.request('thread/compact/start')).toBeUndefined();
+      expect(mock.request('turn/start')).toBeUndefined();
+      const bounds = (await menu(page).boundingBox())!;
+      expect(bounds.x).toBeGreaterThanOrEqual(12);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(width - 12);
+      expect(bounds.y).toBeGreaterThanOrEqual(12);
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(844 - 12);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      const action = menu(page).getByRole('button', { name: '立即压缩', exact: true });
+      expect((await action.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      if (width === 390) await page.screenshot({ path: '.data/mobile-context-menu.png' });
+      await action.tap();
+      await expect.poll(() => mock.requests.filter(request => request.method === 'thread/compact/start').length).toBe(1);
+      expect(mock.request('thread/compact/start')!.params.threadId).toBe('thread-existing');
+      await expect(menu(page)).toHaveCount(0);
+      await expect(input).toHaveValue('查看用量时保留的草稿');
+    });
+  }
+
+  test('touch menus dismiss by close button, repeated tap, outside tap and Android Back without navigation or compaction', async ({ page, mock }) => {
+    await openMobileThread(page);
+    const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+    await input.fill('返回手势保留草稿');
+    const url = page.url();
+    for (const dismissal of ['close', 'toggle', 'outside', 'back']) {
+      await indicator(page).tap();
+      await expect(menu(page)).toBeVisible();
+      await expect.poll(() => page.evaluate(() => !!history.state?.codexMobilePanel)).toBe(true);
+      if (dismissal === 'close') {
+        await menu(page).getByRole('button', { name: '关闭上下文用量', exact: true }).tap();
+        await expect(indicator(page)).toBeFocused();
+      } else if (dismissal === 'toggle') await indicator(page).tap();
+      else if (dismissal === 'outside') await page.getByText('历史保持可读', { exact: true }).tap();
+      else await page.evaluate(() => history.back());
+      await expect(menu(page)).toHaveCount(0);
+      await expect(indicator(page)).toHaveAttribute('aria-expanded', 'false');
+      await expect.poll(() => page.evaluate(() => !!history.state?.codexMobilePanel)).toBe(false);
+      await expect(input).toHaveValue('返回手势保留草稿');
+      expect(page.url()).toBe(url);
+    }
+    expect(mock.request('thread/compact/start')).toBeUndefined();
+    expect(mock.request('turn/interrupt')).toBeUndefined();
+    expect(mock.request('turn/start')).toBeUndefined();
+  });
+
+  test('mobile running and compacting tasks still expose live usage while repeat compaction stays disabled', async ({ page, mock }) => {
+    await openMobileThread(page);
+    mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: {
+      last: { totalTokens: 218000 }, modelContextWindow: 500000,
+    } });
+    mock.emit('turn/started', { threadId: 'thread-existing', turn: { id: 'mobile-context-running', status: 'inProgress', items: [] } });
+    await expect(indicator(page)).toBeEnabled();
+    await indicator(page).tap();
+    await expect(menu(page)).toContainText('218k / 500k');
+    await expect(menu(page)).toContainText('任务结束后可压缩上下文');
+    await expect(menu(page).getByRole('button', { name: '立即压缩', exact: true })).toBeDisabled();
+    mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: {
+      last: { totalTokens: 225000 }, modelContextWindow: 500000,
+    } });
+    await expect(menu(page)).toContainText('225k / 500k');
+    mock.emit('item/started', { threadId: 'thread-existing', turnId: 'mobile-context-running', item: {
+      id: 'mobile-context-compacting', type: 'contextCompaction', status: 'inProgress',
+    } });
+    await expect(indicator(page)).toHaveText('正在压缩');
+    await expect(menu(page)).toContainText('正在压缩上下文，请稍候');
+    await expect(menu(page).getByRole('button', { name: '立即压缩', exact: true })).toBeDisabled();
+    await menu(page).getByRole('button', { name: '关闭上下文用量', exact: true }).tap();
+    await expect(indicator(page)).toBeEnabled();
+    await indicator(page).tap();
+    await expect(menu(page)).toContainText('225k / 500k');
+    expect(mock.request('thread/compact/start')).toBeUndefined();
+    expect(mock.request('turn/interrupt')).toBeUndefined();
+  });
+
+  test('the context popover stays inside the visible viewport when a mobile keyboard resizes and scrolls it', async ({ page, mock }) => {
+    await openMobileThread(page);
+    mock.emit('thread/tokenUsage/updated', { threadId: 'thread-existing', tokenUsage: {
+      last: { totalTokens: 218000 }, modelContextWindow: 500000,
+    } });
+    await expect(indicator(page)).toHaveText('上下文 44%');
+    await indicator(page).tap();
+    await expect(menu(page)).toBeVisible();
+    for (const visible of [
+      { left: 20, top: 120, width: 320, height: 320, event: 'resize' },
+      { left: 40, top: 200, width: 310, height: 280, event: 'scroll' },
+    ]) {
+      // Chromium cannot display Android's keyboard in headless mode. Dispatch
+      // its real visualViewport events with the same reduced visible bounds.
+      await page.evaluate(bounds => {
+        const viewport = window.visualViewport!;
+        for (const [key, value] of Object.entries({
+          offsetLeft: bounds.left, offsetTop: bounds.top, width: bounds.width, height: bounds.height,
+        })) Object.defineProperty(viewport, key, { configurable: true, value });
+        viewport.dispatchEvent(new Event(bounds.event));
+      }, visible);
+      await expect.poll(async () => {
+        const box = (await menu(page).boundingBox())!;
+        return box.x >= visible.left + 12 && box.x + box.width <= visible.left + visible.width - 12 &&
+          box.y >= visible.top + 12 && box.y + box.height <= visible.top + visible.height - 8;
+      }).toBe(true);
+      await expect(menu(page).getByRole('button', { name: '立即压缩', exact: true })).toBeInViewport();
+      await expect(menu(page).getByRole('button', { name: '关闭上下文用量', exact: true })).toBeInViewport();
+      expect(mock.request('thread/compact/start')).toBeUndefined();
+    }
+  });
 });
 
 test('a narrow desktop conversation wraps its tools without overlap, keeps context accessible and repeated send clicks never stop the task', async ({ page, mock }) => {
