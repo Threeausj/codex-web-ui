@@ -40,6 +40,8 @@ test("navigation preferences persist with private permissions and concurrent col
   }
 });
 test("preferences reject unknown fields and prototype keys", () => {
+  assert.equal(preferencesPatch.safeParse({ defaultPermissionExplicit: false }).success, false);
+  assert.equal(preferencesPatch.safeParse({ defaultPermission: "workspace-write", defaultPermissionExplicit: true }).success, false);
   assert.equal(
     preferencesPatch.safeParse({ authToken: "unexpected" }).success,
     false,
@@ -86,16 +88,49 @@ test("global permission defaults migrate and persist independently from navigati
     const store = new Preferences(file);
     await store.init();
     assert.equal(store.get().defaultPermission, "workspace-write");
+    assert.equal(store.get().defaultPermissionExplicit, false);
     for (const mode of ["read-only", "workspace-write", "danger-full-access"] as const) {
       await store.update({ defaultPermission: mode, activePermissionProfileId: "" });
       const restored = new Preferences(file);
       await restored.init();
       assert.equal(restored.get().defaultPermission, mode);
+      assert.equal(restored.get().defaultPermissionExplicit, true);
       assert.equal(restored.get().activePermissionProfileId, "");
       assert.deepEqual(restored.get().pins, [{ kind: "thread", hostId: "remote", id: "existing-thread" }]);
       assert.deepEqual(restored.get().collapsed, { recent: true });
       assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
     }
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+test("permission provenance survives navigation-only writes and conservatively migrates older explicit defaults", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "codex-web-permission-provenance-"));
+  try {
+    const file = path.join(directory, "preferences.json");
+    const fresh = new Preferences(file);
+    await fresh.init();
+    assert.equal(fresh.get().defaultPermissionExplicit, false);
+    await fresh.update({ collapsed: { recent: true } });
+    const reloaded = new Preferences(file);
+    await reloaded.init();
+    assert.equal(reloaded.get().defaultPermissionExplicit, false);
+    await Promise.all([reloaded.update({ defaultPermission: "read-only" }), reloaded.update({ collapsed: { project: true } })]);
+    const explicit = new Preferences(file);
+    await explicit.init();
+    assert.equal(explicit.get().defaultPermission, "read-only");
+    assert.equal(explicit.get().defaultPermissionExplicit, true);
+    await explicit.update({ activePermissionProfileId: "", permissionProfiles: [] });
+    assert.equal(explicit.get().defaultPermissionExplicit, true);
+    for (const mode of ["read-only", "workspace-write", "danger-full-access"] as const) {
+      await fs.writeFile(file, JSON.stringify({ defaultPermission: mode }));
+      const legacy = new Preferences(file);
+      await legacy.init();
+      assert.equal(legacy.get().defaultPermission, mode);
+      assert.equal(legacy.get().defaultPermissionExplicit, true);
+    }
+    await fs.writeFile(file, JSON.stringify({ defaultPermission: "workspace-write", defaultPermissionExplicit: "false" }));
+    await assert.rejects(new Preferences(file).init());
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -178,6 +213,22 @@ test("preferences HTTP routes require authentication and CSRF for writes", async
       ((await response.json()) as any).preferences.collapsed.recent,
       true,
     );
+    const headers = { cookie, "x-csrf-token": csrfToken, "content-type": "application/json" };
+    const automatic = await fetch(base + "/api/preferences", { headers: { cookie } });
+    assert.equal(((await automatic.json()) as any).preferences.defaultPermissionExplicit, false);
+    const explicit = await fetch(base + "/api/preferences", {
+      method: "PATCH", headers, body: JSON.stringify({ defaultPermission: "read-only" }),
+    });
+    assert.equal(explicit.status, 200);
+    assert.equal(((await explicit.json()) as any).preferences.defaultPermissionExplicit, true);
+    const forged = await fetch(base + "/api/preferences", {
+      method: "PATCH", headers, body: JSON.stringify({ defaultPermissionExplicit: false }),
+    });
+    assert.equal(forged.status, 400);
+    const unchanged = await fetch(base + "/api/preferences", { headers: { cookie } });
+    const stored = ((await unchanged.json()) as any).preferences;
+    assert.equal(stored.defaultPermission, "read-only");
+    assert.equal(stored.defaultPermissionExplicit, true);
   } finally {
     await app.close();
     await fs.rm(directory, { recursive: true, force: true });

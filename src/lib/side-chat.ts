@@ -3,7 +3,7 @@ import { getCurrentScope, onScopeDispose, reactive, watch } from 'vue';
 import { resolvePermissionProfile } from './configuration';
 import { nativeCollaborationMode } from './conversation-modes';
 import { applyItemEvent, mergeSnapshotItems, upsertItem, type DisplayItem } from './events';
-import { mergeTurnSnapshot } from './thread-sync';
+import { mergeTurnSnapshot, settleInterruptedTurnItems } from './thread-sync';
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from './conversation-selection';
 import { randomUUID } from './uuid';
 import { interruptConflictCandidate } from './turn-interrupt';
@@ -262,6 +262,8 @@ export function useSideChat(api: any, mainState: any) {
       upsertItem(state.items, { ...item, turnId: turn.id });
       revisions.set(item.id, ++eventRevision);
     }
+    for (const id of settleInterruptedTurnItems(state.items, merged))
+      revisions.set(id, ++eventRevision);
     invalidateSavedTranscript();
   }
   function forkBoundary(source: SideChatSource) {
@@ -756,6 +758,8 @@ export function useSideChat(api: any, mainState: any) {
       const itemId = params.item?.id || params.itemId;
       if (itemId) revisions.set(itemId, ++eventRevision);
       applyItemEvent(state.items, method, params);
+      const turn = state.turns.find(turn => turn.id === params.turnId);
+      if (turn) for (const id of settleInterruptedTurnItems(state.items, turn)) revisions.set(id, ++eventRevision);
       invalidateSavedTranscript();
     }
     if (method === 'turn/started' || method === 'turn/completed') {

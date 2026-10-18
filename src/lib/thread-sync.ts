@@ -1,5 +1,28 @@
 import { mergeSnapshotItems, upsertItem, type DisplayItem } from './events';
 
+const interruptedToolTypes = new Set([
+  'commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall',
+  'collabAgentToolCall', 'imageGeneration', 'sleep',
+]);
+
+/** A terminal interrupted/failed turn can arrive without every nested tool's
+ * completion event. Settle only its still-running operation rows; child agent
+ * state and already confirmed tool outcomes remain independently authoritative. */
+export function settleInterruptedTurnItems(items: DisplayItem[], turn: { id: string; status?: string }): string[] {
+  if (turn.status !== 'interrupted' && turn.status !== 'failed') return [];
+  const touched: string[] = [];
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    if (item.turnId !== turn.id || !interruptedToolTypes.has(item.type) ||
+        !['inProgress', 'running'].includes(item.status)) continue;
+    items[index] = { ...item, status: turn.status,
+      ...('success' in item ? { success: null } : {}),
+    };
+    touched.push(item.id);
+  }
+  return touched;
+}
+
 export function writerConflict(error: unknown): boolean {
   const value = error as { message?: string; data?: { takeoverAvailable?: boolean; code?: string } };
   return value?.data?.takeoverAvailable === true || value?.data?.code === 'THREAD_LOCKED'

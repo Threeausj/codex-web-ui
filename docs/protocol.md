@@ -6,7 +6,7 @@
 
 ## 本地协议基线
 
-开发时核对的 CLI 为 `codex-cli 0.159.2`。`shared/protocol/` 是 CLI 生成的 TypeScript 类型，文件注释本身是各字段约束的直接依据；升级 CLI 后应重新生成并检查差异：
+当前兼容性核对包含 `codex-cli 0.163.0`；此前的隔离历史和 daemon 验证版本在各段单独注明。`shared/protocol/` 是 CLI 生成的 TypeScript 类型，文件注释本身是各字段约束的直接依据；升级 CLI 后应重新生成到临时目录并检查差异，再决定是否更新仓库类型：
 
 ```sh
 codex --version
@@ -18,6 +18,16 @@ npm test
 `npm run protocol:generate` 使用生成器的 `--experimental`，连接初始化另设 `capabilities.experimentalApi=true`；这两项是不同配置。`codex app-server generate-ts --help` 可确认当前生成器支持的参数。生成的类型不代表任意较旧 CLI 都支持。
 
 只读集成测试 `tests/protocol.test.ts` 使用独立临时 `CODEX_HOME`，实际验证 stdio 握手、配置读取、模型列表、空历史列表、文件与目录读取。它不启动推理 turn，也不修改真实桌面会话。CLI 缺失时该测试跳过。
+
+## Codex 0.163 兼容行为
+
+依据 [官方更新日志](https://learn.chatgpt.com/docs/changelog) 和 [app-server 协议](https://learn.chatgpt.com/docs/app-server)，本客户端适配了即时引导、恢复权限及远程命令输出：
+
+- **即时引导**仍使用 `turn/steer`，携带当前 `expectedTurnId`，不期待额外的 `turn/started`。只有明确的轮次冲突才读取最新轮次；确认仍在运行、目标及连接未变化后，使用相同消息 ID 最多重试一次。超时或断线不会自动重发，任务已结束时也不会改为创建新 turn。中断／失败后未收到完成事件的工具行停止显示运行状态，已有结果和部分输出保留。
+- **恢复权限**在用户尚未明确设置网页权限时，`thread/resume` 省略沙箱与审批覆盖，显示 Codex 返回的有效权限；后续发送及队列设置也省略权限覆盖，由原生线程保留网络授权、granular 审批和命名 profile 中的细粒度限制。明确选择的全局／会话权限继续作为覆盖，并接受原生管理策略校验。旧 Web 偏好没有来源标记时，保守保留其已保存的默认选择。Web 命名预设继续使用公开字段转换，不伪造原生 profile ID。
+- **终端输出**遵守所有 `command/exec/outputDelta` 先于最终响应的约定。Bridge 将退出事件与输出一起加入重连回放；快照补充不足一个 UTF-8 字符的字节前缀，避免中文／Emoji 分块乱码。最终响应与流输出分别处理，避免重复追加，也不人为等待“迟到输出”。只打开终端时同样建立回放游标。
+
+这些改动不升级宿主或远端 CLI，Docker 镜像继续使用已有安装。浏览器断线恢复仍受 Bridge 的回放窗口限制；不能将断线时未知结果的写操作当作失败后重试。
 
 ## 客户端标识与模型网关
 
@@ -79,7 +89,7 @@ CLI 0.159.2 的 `thread/revert` 返回空的 `thread.turns` 和分页游标，�
 
 ## 配置来源与权限预设
 
-“设置 → 通用 → 全局默认权限”持久化到 Web 偏好，提供只读、默认（工作区写入）、完全访问三种选择。新建或打开对话使用全局设置；会话内可单独调整，当前页面切换回该会话时保留此选择。重新设置全局权限会清除当前页面的会话权限覆盖，从下一次新 turn 生效，已经运行的 turn 或追加指令不会因此升级权限。选择仍受目标主机的管理策略约束，不修改宿主机、Docker 或 SSH 用户权限。
+“设置 → 通用 → 全局默认权限”持久化到 Web 偏好，提供只读、默认（工作区写入）、完全访问三种选择。用户明确设置后，新建或打开对话使用此选择；尚未明确设置时，恢复对话沿用原生保存的有效权限。会话内可单独调整，当前页面切换回该会话时保留此选择。重新设置全局权限会清除当前页面的会话权限覆盖，从下一次新 turn 生效，已经运行的 turn 或追加指令不会因此升级权限。选择仍受目标主机的管理策略约束，不修改宿主机、Docker 或 SSH 用户权限。
 
 设置页通过 `config/read(includeLayers:true,cwd)` 显示有效配置、逐项 `origins` 和每层的来源、版本及 `disabledReason`。`configRequirements/read` 返回受管限制或 null，当前 schema 没有 params。管理来源与禁止的权限选项显示为只读，配置写入由 app-server 再次验证。用户配置写入附带相应层的 `filePath/expectedVersion`，版本冲突时需要重新读取，避免覆盖其他客户端的修改；`reloadUserConfig:true` 不会热替换正在运行线程的模型、推理强度等静态默认值。
 

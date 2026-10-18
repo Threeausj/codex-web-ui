@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from '../src/lib/thread-sync.js';
+import { mergeAcceptedTurnItems, mergeTurnSnapshot, settleInterruptedTurnItems, writerConflict } from '../src/lib/thread-sync.js';
 import { applyItemEvent, type DisplayItem } from '../src/lib/events.js';
 
 test('accepted turn snapshots hydrate users while preserving newer agent deltas and replacing optimistic aliases', () => {
@@ -134,4 +134,58 @@ test('completion restores native compaction order while anchoring omitted steeri
   mergeAcceptedTurnItems(items, { id: 'current', status: 'completed', items: [items[1], items[2], items[5], items[4]] }, undefined, false);
   assert.deepEqual(items.map(item => item.id), ['older', 'initial', 'before', 'compact', 'steer', 'after', 'next']);
   assert.equal(items[3].status, 'completed');
+});
+
+test('a stopped Code Mode turn settles nested tool rows even when individual completion events were missed', () => {
+  const items: DisplayItem[] = [
+    { id: 'code-mode', type: 'dynamicToolCall', namespace: 'functions', tool: 'exec', status: 'inProgress', success: true, arguments: { command: 'work()' }, turnId: 'stopped' },
+    { id: 'nested-command', type: 'commandExecution', status: 'inProgress', command: 'long-running-command', aggregatedOutput: 'partial output', turnId: 'stopped' },
+    { id: 'nested-mcp', type: 'mcpToolCall', status: 'inProgress', server: 'remote', tool: 'query', turnId: 'stopped' },
+    { id: 'file-change', type: 'fileChange', status: 'running', changes: [{ path: 'file.txt', diff: '+saved' }], turnId: 'stopped' },
+  ];
+  assert.deepEqual(settleInterruptedTurnItems(items, { id: 'stopped', status: 'interrupted' }), items.map(item => item.id));
+  assert.ok(items.every(item => item.status === 'interrupted'));
+  assert.equal(items[0].success, null);
+  assert.equal(items[1].aggregatedOutput, 'partial output');
+  assert.deepEqual(items[3].changes, [{ path: 'file.txt', diff: '+saved' }]);
+  assert.deepEqual(settleInterruptedTurnItems(items, { id: 'stopped', status: 'interrupted' }), []);
+});
+
+test('failed turn cleanup retains confirmed tool results, other turns and independently running child agents', () => {
+  const protectedItems: DisplayItem[] = [
+    { id: 'successful-tool', type: 'dynamicToolCall', status: 'completed', success: true, turnId: 'failed' },
+    { id: 'failed-tool', type: 'mcpToolCall', status: 'failed', error: { message: 'native failure' }, turnId: 'failed' },
+    { id: 'declined-tool', type: 'commandExecution', status: 'declined', turnId: 'failed' },
+    { id: 'other-turn-tool', type: 'dynamicToolCall', status: 'inProgress', turnId: 'other' },
+    { id: 'child-agent', type: 'subAgentActivity', status: 'inProgress', turnId: 'failed' },
+    { id: 'answer', type: 'agentMessage', status: 'inProgress', text: 'partial answer', turnId: 'failed' },
+  ];
+  const items = [...protectedItems, { id: 'tool', type: 'dynamicToolCall', status: 'inProgress', success: true, turnId: 'failed' }];
+  assert.deepEqual(settleInterruptedTurnItems(items, { id: 'failed', status: 'failed' }), ['tool']);
+  assert.deepEqual(items.slice(0, -1), protectedItems);
+  for (let index = 0; index < protectedItems.length; index++) assert.equal(items[index], protectedItems[index]);
+  assert.equal(items.at(-1)!.status, 'failed');
+  assert.equal(items.at(-1)!.success, null);
+});
+
+test('a successfully completed or still-active turn does not invent a missing tool outcome', () => {
+  for (const status of ['completed', 'inProgress', undefined]) {
+    const tool = { id: 'tool', type: 'dynamicToolCall', turnId: 'turn', status: 'inProgress', success: null };
+    const items = [tool];
+    assert.deepEqual(settleInterruptedTurnItems(items, { id: 'turn', status }), []);
+    assert.equal(items[0], tool);
+    assert.equal(items[0].status, 'inProgress');
+  }
+});
+
+test('a later native tool result replaces fallback interruption without losing its output or terminal success', () => {
+  const items: DisplayItem[] = [{ id: 'tool', type: 'dynamicToolCall', turnId: 'turn', status: 'inProgress', success: null }];
+  settleInterruptedTurnItems(items, { id: 'turn', status: 'interrupted' });
+  applyItemEvent(items, 'item/completed', { turnId: 'turn', item: {
+    id: 'tool', type: 'dynamicToolCall', status: 'completed', success: true, contentItems: [{ type: 'inputText', text: 'native result' }],
+  } });
+  assert.equal(items[0].status, 'completed');
+  assert.equal(items[0].success, true);
+  assert.deepEqual(items[0].contentItems, [{ type: 'inputText', text: 'native result' }]);
+  assert.deepEqual(settleInterruptedTurnItems(items, { id: 'turn', status: 'interrupted' }), []);
 });

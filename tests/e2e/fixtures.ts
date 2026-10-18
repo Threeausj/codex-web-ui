@@ -579,13 +579,28 @@ export class MockCodex {
           model: p.model || models[0].model,
         });
       }
-      case "thread/resume":
+      case "thread/resume": {
+        const thread = this.threads.find((t) => t.id === p.threadId);
+        const workspace = p.config?.sandbox_workspace_write;
+        // Mirror the native override contract. Returning an unrelated saved
+        // sandbox used to make explicit Web permission tests depend on the
+        // frontend discarding the app-server's effective policy.
+        const sandbox = p.sandbox === "read-only" ? { type: "readOnly", networkAccess: false }
+          : p.sandbox === "danger-full-access" ? { type: "dangerFullAccess" }
+          : {
+            type: "workspaceWrite", writableRoots: workspace?.writable_roots ?? [thread?.cwd || "/workspace/demo"],
+            networkAccess: workspace?.network_access ?? false,
+            excludeTmpdirEnvVar: workspace?.exclude_tmpdir_env_var ?? false,
+            excludeSlashTmp: workspace?.exclude_slash_tmp ?? false,
+          };
         return this.reply(socket, request, {
-          thread: this.threads.find((t) => t.id === p.threadId),
+          thread,
           model: this.config.model,
           reasoningEffort: "medium",
-          sandbox: { type: "workspaceWrite" },
+          sandbox,
+          approvalPolicy: p.approvalPolicy ?? "on-request",
         });
+      }
       case "thread/turns/list":
         if (this.failHistoryNext) {
           this.failHistoryNext = false;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, provide, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import ProjectGroup from "./ProjectGroup.vue";
 import ThreadRow from "./ThreadRow.vue";
@@ -9,6 +9,7 @@ import { matchesThreadTitle } from "../lib/thread-title-search";
 import { matchesBookmark, type useConversationBookmarks } from "../lib/conversation-bookmarks";
 import { bookmarkProjectDetails } from "../lib/bookmark-project";
 import type { ConversationBookmark } from "../../shared/bookmarks";
+import { createThreadIndicators, threadIndicatorsKey, threadIndicatorStorageKey } from '../lib/thread-indicators';
 const props = defineProps<{ api: any; state: any; bookmarks: ReturnType<typeof useConversationBookmarks> }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
@@ -45,6 +46,35 @@ function bookmarkDetail(entry: ConversationBookmark) {
 const hostProjects = computed(() => props.state.projects);
 const pins = computed(() => props.state.preferences.pins);
 const allThreads = computed(() => props.api.navigationThreads());
+const indicators = createThreadIndicators(browserStorage.local);
+provide(threadIndicatorsKey, indicators);
+function markVisibleConversation() {
+  const visible = props.state.authenticated && props.state.threadReady && !props.state.selectingThread && !props.state.changingContext &&
+    document.visibilityState === 'visible' && document.hasFocus();
+  indicators.setVisible(props.state.hostId, visible ? props.state.activeThread?.id : null);
+}
+watch(() => [props.state.hostId, props.state.activeThread?.id, props.state.threadReady, props.state.selectingThread,
+  props.state.changingContext, props.state.authenticated], markVisibleConversation, { immediate: true, flush: 'post' });
+watch(() => allThreads.value.map((thread: any) => ({ hostId: thread.hostId, id: thread.id, status: thread.status,
+  // createdAt/updatedAt can change without a newly completed conversation.
+  activityAt: thread.recencyAt || 0 })), threads => {
+  if (props.state.authenticated) indicators.observeThreads(threads);
+}, { immediate: true });
+watch(() => {
+  const turn = props.state.turns?.at(-1);
+  return [props.state.hostId, props.state.activeThread?.id, props.state.threadReady, props.state.selectingThread,
+    props.state.changingContext, props.state.busy, turn?.id, turn?.status, turn?.startedAt, turn?.completedAt];
+}, () => {
+  if (!props.state.authenticated || !props.state.threadReady || props.state.selectingThread || props.state.changingContext || props.state.busy || !props.state.activeThread?.id) return;
+  indicators.reconcileCompletedTurn(props.state.hostId, props.state.activeThread.id, props.state.turns?.at(-1));
+}, { flush: 'post' });
+function mergeReadReceipts(event: StorageEvent) {
+  if (event.key === threadIndicatorStorageKey) indicators.merge(event.newValue);
+}
+document.addEventListener('visibilitychange', markVisibleConversation);
+window.addEventListener('focus', markVisibleConversation);
+window.addEventListener('blur', markVisibleConversation);
+window.addEventListener('storage', mergeReadReceipts);
 const pinnedProjects = computed(() =>
   hostProjects.value.filter((project: any) =>
     isPinned(pins.value, project.hostId || "local", "project", project.path),
@@ -174,6 +204,7 @@ function resultChanged(thread: { id: string; hostId: string; name?: string }, re
 }
 const seenChanges = new Set<string>();
 const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
+  if (props.state.authenticated) indicators.observe(hostId, message);
   const params = message.params || {};
   if (message.method === "bridge/disconnecting" ||
       (message.method === "bridge/status" && params.connected && !props.state.connected)) {
@@ -236,6 +267,10 @@ onBeforeUnmount(() => {
   clearTimeout(searchTimer);
   ++generation;
   unsubscribe();
+  document.removeEventListener('visibilitychange', markVisibleConversation);
+  window.removeEventListener('focus', markVisibleConversation);
+  window.removeEventListener('blur', markVisibleConversation);
+  window.removeEventListener('storage', mergeReadReceipts);
 });
 </script>
 <template>

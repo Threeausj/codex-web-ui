@@ -212,7 +212,7 @@ const profiles = computed(() =>
 const selectedPermission = computed(() =>
   props.state.activePermissionProfileId
     ? `profile:${props.state.activePermissionProfileId}`
-    : props.state.runtimePolicy
+    : props.state.runtimePolicy && props.state.runtimePolicy.source !== 'web'
       ? "resumed"
       : props.state.permission,
 );
@@ -1054,7 +1054,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
               "
             >
               <option
-                v-if="state.runtimePolicy && !state.activePermissionProfileId"
+                v-if="state.runtimePolicy && state.runtimePolicy.source !== 'web' && !state.activePermissionProfileId"
                 value="resumed"
               >
                 当前会话权限

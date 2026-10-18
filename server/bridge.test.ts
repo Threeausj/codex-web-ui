@@ -1244,6 +1244,105 @@ test('running terminal survives browser disconnect and completion reaches reconn
   } finally { f.bridge.close() }
 })
 
+test('terminal completion and the final streamed chunk replay in order without repeating the private RPC result', async () => {
+  const f = fixture()
+  try {
+    const owner = new Browser(); f.bridge.attach('session:owner', owner.ws(), 'owner')
+    await tick()
+    owner.request({ id: 'command', method: 'command/exec', params: { command: ['printf', 'done'], processId: 'streamed', streamStdoutStderr: true } })
+    await tick()
+    const request = f.sent.find(message => message.method === 'command/exec')!
+    f.receive({ method: 'command/exec/outputDelta', params: { processId: 'streamed', stream: 'stdout', deltaBase64: Buffer.from('before ').toString('base64') } })
+    const engineId = (owner.sent.filter(message => message.method === 'bridge/status').at(-1)!.params as any).engineId
+    const afterSequence = Number(owner.sent.at(-1)!.bridgeEventSequence)
+    owner.close()
+    f.receive({ method: 'command/exec/outputDelta', params: { processId: 'streamed', stream: 'stdout', deltaBase64: Buffer.from('last output').toString('base64') } })
+    f.receive({ id: request.id, result: { exitCode: 0, stdout: '', stderr: '' } })
+    await tick()
+    const recovered = new Browser(); f.bridge.attach('session:owner', recovered.ws(), 'owner', () => true, { engineId, afterSequence })
+    const replay = recovered.sent.filter(message => message.bridgeEventSequence)
+    assert.deepEqual(replay.map(message => message.method), ['command/exec/outputDelta', 'bridge/terminal/completed'])
+    assert.ok(Number(replay[0].bridgeEventSequence) < Number(replay[1].bridgeEventSequence))
+    assert.deepEqual(replay[1].params, { processId: 'streamed', result: { exitCode: 0, stdout: '', stderr: '' }, outputTail: '' })
+    assert.equal(recovered.sent.some(message => message.id === 'command'), false)
+    assert.deepEqual((recovered.sent.at(-1)!.params as any).activeProcesses, [])
+    assert.equal((recovered.sent.at(-1)!.params as any).replayComplete, true)
+  } finally { f.bridge.close() }
+})
+
+test('terminal snapshots preserve split UTF-8 prefixes on each stream for a reconnect', async () => {
+  const f = fixture()
+  try {
+    const owner = new Browser(); f.bridge.attach('owner', owner.ws(), 'owner')
+    await tick()
+    owner.request({ id: 'command', method: 'command/exec', params: { command: ['sh'], processId: 'utf8', tty: true } })
+    await tick()
+    const output = (stream: string, bytes: Buffer) => f.receive({ method: 'command/exec/outputDelta', params: { processId: 'utf8', stream, deltaBase64: bytes.toString('base64') } })
+    const character = Buffer.from('完'), emoji = Buffer.from('🚀')
+    output('stdout', Buffer.concat([Buffer.from('ready '), character.subarray(0, 1)]))
+    output('stdout', character.subarray(1, 2))
+    output('stderr', Buffer.concat([Buffer.from('err '), emoji.subarray(0, 3)]))
+    owner.close()
+    const recovered = new Browser(); f.bridge.attach('recovered', recovered.ws(), 'recovered')
+    const process = (recovered.sent[0].params as any).activeProcesses[0]
+    assert.equal(process.lastOutput, 'ready err ')
+    assert.deepEqual(process.pendingOutputBase64, { stdout: character.subarray(0, 2).toString('base64'), stderr: emoji.subarray(0, 3).toString('base64') })
+    assert.equal('decoders' in process, false)
+    // The public snapshot is enough to resume decoding; it cannot duplicate
+    // the complete text which lastOutput already restored.
+    for (const [stream, tail, expected] of [['stdout', character.subarray(2), '完'], ['stderr', emoji.subarray(3), '🚀']] as const) {
+      const decoder = new TextDecoder()
+      assert.equal(decoder.decode(Buffer.from(process.pendingOutputBase64[stream], 'base64'), { stream: true }), '')
+      assert.equal(decoder.decode(tail, { stream: true }), expected)
+      output(stream, tail)
+    }
+    const next = new Browser(); f.bridge.attach('next', next.ws(), 'next')
+    assert.equal((next.sent[0].params as any).activeProcesses[0].lastOutput, 'ready err 完🚀')
+    assert.deepEqual((next.sent[0].params as any).activeProcesses[0].pendingOutputBase64, {})
+  } finally { f.bridge.close() }
+})
+
+test('terminal completion flushes unfinished UTF-8 once while keeping buffered stdout and stderr intact', async () => {
+  const f = fixture()
+  try {
+    const owner = new Browser(); f.bridge.attach('owner', owner.ws(), 'owner')
+    await tick()
+    owner.request({ id: 'command', method: 'command/exec', params: { command: ['sh'], processId: 'partial', streamStdoutStderr: true } })
+    await tick()
+    const request = f.sent.find(message => message.method === 'command/exec')!
+    f.receive({ method: 'command/exec/outputDelta', params: { processId: 'partial', stream: 'stdout', deltaBase64: Buffer.from([0xe4, 0xbd]).toString('base64') } })
+    f.receive({ id: request.id, result: { exitCode: 0, stdout: '', stderr: '' } })
+    // A duplicate native response cannot flush or complete the command twice.
+    f.receive({ id: request.id, result: { exitCode: 0, stdout: '', stderr: '' } })
+    await tick()
+    const completion = owner.sent.filter(message => message.method === 'bridge/terminal/completed')
+    assert.equal(completion.length, 1)
+    assert.equal((completion[0].params as any).outputTail, '�')
+    owner.request({ id: 'buffered', method: 'command/exec', params: { command: ['printf', 'buffered'], processId: 'buffered' } })
+    await tick()
+    const buffered = f.sent.filter(message => message.method === 'command/exec').at(-1)!
+    const result = { exitCode: 0, stdout: 'final stdout', stderr: 'final stderr' }
+    f.receive({ id: buffered.id, result })
+    await tick()
+    assert.deepEqual((owner.sent.filter(message => message.method === 'bridge/terminal/completed').at(-1)!.params as any).result, result)
+    assert.equal(owner.sent.filter(message => message.method === 'command/exec/outputDelta').length, 1)
+  } finally { f.bridge.close() }
+})
+
+test('terminal reconnect snapshots retain an output-cap warning even on an empty final chunk', async () => {
+  const f = fixture()
+  try {
+    const owner = new Browser(); f.bridge.attach('owner', owner.ws(), 'owner')
+    await tick()
+    owner.request({ id: 'command', method: 'command/exec', params: { command: ['sh'], processId: 'capped', tty: true } })
+    await tick()
+    f.receive({ method: 'command/exec/outputDelta', params: { processId: 'capped', stream: 'stdout', deltaBase64: Buffer.from('partial').toString('base64') } })
+    f.receive({ method: 'command/exec/outputDelta', params: { processId: 'capped', stream: 'stdout', deltaBase64: '', capReached: true } })
+    const recovered = new Browser(); f.bridge.attach('recovered', recovered.ws(), 'recovered')
+    assert.equal((recovered.sent[0].params as any).activeProcesses[0].lastOutput, 'partial\r\n[输出已截断]\r\n')
+  } finally { f.bridge.close() }
+})
+
 test('current-time callbacks are answered once without a browser, approval or replayed prompt', async () => {
   const value = fixture();
   try {
