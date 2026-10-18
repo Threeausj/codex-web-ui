@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, useId } from "vue";
+import { computed, inject, nextTick, ref, useId } from "vue";
 import Icon from "./Icon.vue";
 import ThreadCopyMenu from './ThreadCopyMenu.vue';
 import { isPinned, threadActivityAt } from "../lib/navigation";
 import { searchableThreadTitle } from '../lib/thread-title-search';
+import { threadIndicatorsKey } from '../lib/thread-indicators';
 const props = defineProps<{
   thread: any;
   state: any;
@@ -45,6 +46,12 @@ const running = computed(() =>
   (props.state.hostId === hostId.value &&
     props.state.activeThread?.id === props.thread.id && props.state.busy),
 );
+const indicators = inject(threadIndicatorsKey, null);
+const indicator = computed(() => indicators?.known(hostId.value, props.thread.id)
+  ? indicators.indicator(hostId.value, props.thread.id,
+    props.state.hostId === hostId.value && props.state.activeThread?.id === props.thread.id && props.state.busy)
+  : (running.value ? 'running' : props.thread.status?.type === 'systemError' ? 'error' : null));
+const indicatorLabel = computed(() => indicator.value === 'running' ? '运行中' : indicator.value === 'error' ? '运行出错' : '运行完成，尚未查看');
 const time = computed(() => {
   const timestamp = threadActivityAt(props.thread);
   if (!timestamp) return "";
@@ -152,8 +159,12 @@ async function submitDialog() {
       :disabled="pending"
     >
       <span
-        v-if="thread.status?.type === 'active'"
-        class="thread-running-dot"
+        v-if="indicator"
+        class="thread-status-dot"
+        :class="`thread-status-${indicator}`"
+        role="img"
+        :aria-label="indicatorLabel"
+        :title="indicatorLabel"
       ></span
       ><Icon v-else-if="archived" name="Archive" :size="12" /><span
         class="thread-title"
@@ -275,6 +286,11 @@ async function submitDialog() {
   </Teleport>
 </template>
 <style scoped>
+.thread-status-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; }
+.thread-status-running { background: #d98a31; animation: pulse 1.5s ease infinite; }
+.thread-status-error { background: var(--red); }
+.thread-status-unread { background: var(--green); }
+@media (prefers-reduced-motion: reduce) { .thread-status-running { animation: none; } }
 .nav-context-menu .delete-thread-action { color: var(--danger); }
 .nav-context-menu button:disabled { opacity: .5; cursor: not-allowed; }
 .delete-thread-note { color: var(--muted); font-size: 11px; padding: 0 9px 5px; margin: 0; }

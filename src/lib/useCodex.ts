@@ -15,8 +15,10 @@ import type { ReviewTarget } from "../../shared/protocol/v2/ReviewTarget";
 import { subagentStatus } from "./subagents";
 import { mergeContextUsage } from "./context-usage";
 import { editableMessage, editedMessageInput, type MessageEditAttachment } from "./message-edit";
-import { mergeAcceptedTurnItems, mergeTurnSnapshot, writerConflict } from "./thread-sync";
+import { mergeAcceptedTurnItems, mergeTurnSnapshot, settleInterruptedTurnItems, writerConflict } from "./thread-sync";
 import { interruptConflictCandidate } from './turn-interrupt';
+import { steerWithConfirmedTurn } from './turn-steer';
+import { explicitWebPermissionSelection, resolveResumePermissionOverrides, restoreRuntimePermissionPolicy } from './resume-permissions';
 import { ConversationCache, ConversationMemoryCache, conversationSessionScope, type ConversationSnapshot } from "./conversation-cache";
 import { revokeDevicePush } from "./pwa";
 import { useMessageQueue } from "./message-queue";
@@ -101,6 +103,7 @@ const state = reactive({
     permissionProfiles: [] as any[],
     activePermissionProfileId: "",
     defaultPermission: "workspace-write",
+    defaultPermissionExplicit: undefined as boolean | undefined,
   },
   activePermissionProfileId: "",
   requirements: null as any,
@@ -117,7 +120,7 @@ const state = reactive({
   runtimePaused: false,
   threadReleased: false,
   switchingHost: false,
-  runtimePolicy: null as { sandboxPolicy: any; approvalPolicy: any } | null,
+  runtimePolicy: null as { sandboxPolicy: any; approvalPolicy: any; source?: 'native' | 'web' } | null,
   items: [] as DisplayItem[],
   turns: [] as any[],
   moreTurns: false,
@@ -710,8 +713,9 @@ function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
   const metadata = state.threads.find(thread => thread.id === id);
   state.activeThread = { ...snapshot.thread, ...metadata, id };
   state.items = itemCache.get(id) ?? snapshot.items;
-  rememberAsyncQuestions(id, state.items);
   state.turns = snapshot.turns;
+  settleLoadedToolItems(state.items, state.turns);
+  rememberAsyncQuestions(id, state.items);
   historyWindowTruncated = snapshot.historyTruncated === true;
   const key = recencyKey(state.hostId, id);
   if (!tokenUsages.has(key)) tokenUsages.set(key, snapshot.tokenUsage);
@@ -853,6 +857,22 @@ function appendTerminal(chunk: string, processId = state.terminalProcessId) {
 function subscribeTerminal(listener: (chunk: string) => void) {
   terminalListeners.add(listener);
   return () => terminalListeners.delete(listener);
+}
+function clearTerminalDecoders(processId: string) {
+  const prefix = `${state.hostId}:${processId}:`;
+  for (const key of terminalDecoders.keys()) if (key.startsWith(prefix)) terminalDecoders.delete(key);
+}
+function restoreTerminalDecoders(process: any) {
+  clearTerminalDecoders(process.processId);
+  for (const stream of ['stdout', 'stderr']) {
+    const pending = process.pendingOutputBase64?.[stream];
+    if (typeof pending !== 'string' || pending.length > 8) continue;
+    try {
+      const decoder = new TextDecoder();
+      decoder.decode(Uint8Array.from(atob(pending), character => character.charCodeAt(0)), { stream: true });
+      terminalDecoders.set(`${state.hostId}:${process.processId}:${stream}`, decoder);
+    } catch { /* Older/invalid optional snapshots must not break reconnection. */ }
+  }
 }
 function terminalIds(): Record<string, string> {
   try {
@@ -1478,11 +1498,17 @@ function hydrateTurnItems(threadId: string, turn: any, accepted?: any, preserveL
   if (!turn?.id || discardedTurns.has(turn.id)) return;
   for (const itemId of mergeAcceptedTurnItems(currentItems(threadId), turn, accepted, preserveLive))
     noteItem(threadId, itemId);
+  for (const itemId of settleInterruptedTurnItems(currentItems(threadId), turn))
+    noteItem(threadId, itemId);
   projectAcceptedThreadPreview(threadId, [
     ...(turn.items || []),
     ...(Array.isArray(accepted?.input) ? [{ type: 'userMessage', content: accepted.input }] : []),
   ]);
   rememberAsyncQuestions(threadId, currentItems(threadId));
+}
+function settleLoadedToolItems(items: DisplayItem[], turns: any[]) {
+  for (const turn of turns)
+    if (turn.status === 'interrupted' || turn.status === 'failed') settleInterruptedTurnItems(items, turn);
 }
 function receiveThreadChange(change: any) {
   const { threadId, method, result = {}, request = {}, changeId } = change;
@@ -1519,7 +1545,7 @@ function receiveThreadChange(change: any) {
     if (request.effort) state.effort = request.effort;
     if (request.sandboxPolicy) {
       state.permission = sandboxName(request.sandboxPolicy.type);
-      state.runtimePolicy = { sandboxPolicy: request.sandboxPolicy, approvalPolicy: request.approvalPolicy ?? approvalPolicy(state.permission) };
+      state.runtimePolicy = { sandboxPolicy: request.sandboxPolicy, approvalPolicy: request.approvalPolicy ?? approvalPolicy(state.permission), source: 'web' };
       state.activePermissionProfileId = '';
       permissionSelections.set(recencyKey(state.hostId, threadId), { mode: state.permission, profileId: '' });
     }
@@ -1650,15 +1676,22 @@ function receive(message: any) {
       if (state.goalReadError) void refreshCurrentGoal();
     }
     if (p.connected && !state.runtimePaused && Array.isArray(p.activeProcesses)) {
+      const previousIds = new Set(state.terminalProcesses.map(process => process.processId));
+      for (const snapshot of p.activeProcesses)
+        if (reconnecting || changedEngine || !previousIds.has(snapshot.processId)) restoreTerminalDecoders(snapshot);
       state.terminalProcesses = p.activeProcesses;
       const process = p.activeProcesses.find(
         (process: any) => process.processId === state.terminalProcessId,
       );
       state.terminalRunning = !!process;
       if (process && (reconnecting || !state.terminalOutput)) {
-        for (const key of terminalDecoders.keys()) if (key.startsWith(`${state.hostId}:${process.processId}:`)) terminalDecoders.delete(key);
         restoreTerminalOutput(process.lastOutput || "");
       }
+      // With no selected conversation there is no writer/history to hydrate.
+      // The complete process snapshot establishes a terminal replay cursor;
+      // eventGapRevision still invalidates cached conversations selected later.
+      if (!state.activeThread && typeof p.engineId === 'string' && typeof p.eventSequence === 'number')
+        socketHasEventGap = false;
     }
     if (p.connected) clearTimeout(reconnectTimer);
     if (!state.runtimePaused && state.authenticated) {
@@ -1668,7 +1701,18 @@ function receive(message: any) {
     return;
   }
   if (method === "bridge/terminal/completed") {
-    for (const key of terminalDecoders.keys()) if (key.startsWith(`${state.hostId}:${p.processId}:`)) terminalDecoders.delete(key);
+    const firstCompletion = !completedTerminalProcesses.has(p.processId);
+    if (firstCompletion) {
+      let tail = typeof p.outputTail === 'string' ? p.outputTail : '';
+      // New bridges flush their decoder into outputTail. Older bridges leave
+      // that job to the live browser; never flush both copies of the same tail.
+      if (p.outputTail === undefined) {
+        const prefix = `${state.hostId}:${p.processId}:`;
+        for (const [key, decoder] of terminalDecoders) if (key.startsWith(prefix)) tail += decoder.decode();
+      }
+      if (tail) appendTerminal(tail, p.processId);
+    }
+    clearTerminalDecoders(p.processId);
     terminalSessionNames.delete(`${state.hostId}:${p.processId}`);
     state.terminalProcesses = state.terminalProcesses.filter(
       (process) => process.processId !== p.processId,
@@ -1676,17 +1720,17 @@ function receive(message: any) {
     if (p.processId === state.terminalProcessId) {
       state.terminalRunning = false;
       state.terminalSessionName = "";
-      if (!completedTerminalProcesses.has(p.processId))
+      if (firstCompletion)
         appendTerminal(
           p.error
             ? `\r\n[终端结束：${p.error.message}]\r\n`
             : `\r\n[进程退出 ${p.result?.exitCode ?? "?"}]\r\n${p.result?.stdout ?? ""}${p.result?.stderr ?? ""}`,
         );
-      completedTerminalProcesses.add(p.processId);
       const ids = terminalIds();
       if (ids[state.hostId] === p.processId) delete ids[state.hostId];
       browserStorage.session.setItem("codex.terminalProcessIds", JSON.stringify(ids));
     }
+    completedTerminalProcesses.add(p.processId);
     return;
   }
   if (method === "bridge/error") {
@@ -1781,6 +1825,10 @@ function receive(message: any) {
     const newItem = itemId && !previousItem;
     if (itemId) noteItem(p.threadId, itemId);
     applyItemEvent(items, method, p);
+    if (p.threadId === state.activeThread?.id) {
+      const turn = state.turns.find(turn => turn.id === p.turnId);
+      if (turn) for (const touched of settleInterruptedTurnItems(items, turn)) noteItem(p.threadId, touched);
+    }
     const item = items.find(item => item.id === itemId);
     if ((method === 'item/started' || method === 'item/completed') && p.item?.type === 'userMessage')
       projectAcceptedThreadPreview(p.threadId, [p.item]);
@@ -2123,12 +2171,16 @@ async function bootstrap() {
   }
   for (const id of data.runtimePausedHostIds || []) if (typeof id === 'string') pausedHosts.add(id);
   if (data.preferences)
-    state.preferences = { ...state.preferences, ...data.preferences };
+    state.preferences = { ...state.preferences, ...data.preferences,
+      defaultPermissionExplicit: data.preferences.defaultPermissionExplicit ??
+        (Object.hasOwn(data.preferences, 'defaultPermission') ? undefined : false) };
   else {
     try {
       const stored = await http("/preferences");
       if (stored.preferences)
-        state.preferences = { ...state.preferences, ...stored.preferences };
+        state.preferences = { ...state.preferences, ...stored.preferences,
+          defaultPermissionExplicit: stored.preferences.defaultPermissionExplicit ??
+            (Object.hasOwn(stored.preferences, 'defaultPermission') ? undefined : false) };
     } catch {
       state.error = "";
     }
@@ -2443,13 +2495,19 @@ async function history(
   hostId = state.hostId,
   full = false,
 ) {
-  return historyReader.turns(JSON.stringify([authenticationGeneration, hostId, engineId]),
+  const page = await historyReader.turns(JSON.stringify([authenticationGeneration, hostId, engineId]),
     (method, params) => scopedRpc(hostId, method, params), {
     threadId,
     cursor,
     limit: 30,
     sortDirection: "desc",
   }, full);
+  for (const turn of page.data) {
+    if (turn.status !== 'interrupted' && turn.status !== 'failed') continue;
+    const items = (turn.items || []).map((item: DisplayItem) => ({ ...item, turnId: turn.id }));
+    if (settleInterruptedTurnItems(items, turn).length) turn.items = items;
+  }
+  return page;
 }
 
 function loadTurnDetails(turnId: string): Promise<void> {
@@ -2475,6 +2533,7 @@ function loadTurnDetails(turnId: string): Promise<void> {
       .filter(([, value]) => value > revision).map(([id]) => id));
     const merged = mergeHistoryDetails(state.items, state.turns, state.turns[index], page, changed);
     state.items = merged.items;
+    settleLoadedToolItems(state.items, [merged.turn]);
     rememberAsyncQuestions(threadId, state.items);
     state.turns[index] = merged.turn;
     itemCache.set(threadId, state.items);
@@ -2665,17 +2724,17 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       if (!current()) return;
     }
     if (!preserveWriter && !preserveMetadataChoices()) applyPermissionDefault();
+    const resumeSelection = explicitWebPermissionSelection(state.preferences, permissionSelections.get(modeKey));
     const resumeProfile = availablePermissionProfiles(state.preferences.permissionProfiles)
-      .find(profile => profile.id === state.activePermissionProfileId);
-    const webPermission = !preserveWriter ? resolveWebPermissionSelection(state.permission as any, {
+      .find(profile => profile.id === resumeSelection?.profileId);
+    const webPermission = !preserveWriter ? resolveResumePermissionOverrides(resumeSelection, {
       profile: resumeProfile, cwd: state.activeThread?.cwd || state.projectPath, requirements: state.requirements,
-    }) : null;
+    }) : {};
     const resumeRequest = preserveWriter ? rpc('thread/read', { threadId: id, includeTurns: false }, 45000, { silentError: true }) : rpc("thread/resume", {
       threadId: id,
       excludeTurns: true,
-      sandbox: webPermission!.sandbox,
-      approvalPolicy: webPermission!.approvalPolicy,
-      config: { 'features.default_mode_request_user_input': true },
+      ...webPermission,
+      config: { ...webPermission.config, 'features.default_mode_request_user_input': true },
     }, 45000, { silentError: true });
     // History reads do not acquire a writer, so they can run beside resume.
     // Neither cached content nor this read authorizes sending until both finish.
@@ -2761,17 +2820,38 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     }
     if (!preserveChoices) state.effort =
       result.reasoningEffort ?? result.thread.reasoningEffort ?? state.effort;
-    if (!preserveChoices && result.sandbox?.type) {
-      state.permission = sandboxName(result.sandbox.type);
-      state.runtimePolicy = {
-        sandboxPolicy: { ...sandboxPolicy(), ...result.sandbox },
-        approvalPolicy:
-          result.approvalPolicy ??
-          (previousId === id ? previousPolicy?.approvalPolicy : null) ??
-          "on-request",
-      };
+    if (!preserveChoices) {
+      // The native response includes saved network grants and the effective
+      // managed policy. An implicit Web default must not erase either one.
+      const currentSelection = explicitWebPermissionSelection(state.preferences, permissionSelections.get(modeKey));
+      const selectedProfile = availablePermissionProfiles(state.preferences.permissionProfiles)
+        .find(profile => profile.id === currentSelection?.profileId);
+      const retainedWeb = preserveWriter && previousId === id && state.runtimePolicy?.source === 'web' &&
+        currentSelection?.mode === sandboxName(state.runtimePolicy.sandboxPolicy.type)
+        ? restoreRuntimePermissionPolicy({}, state.runtimePolicy) : null;
+      applyPermissionDefault();
+      const restored = restoreRuntimePermissionPolicy(result, previousId === id ? previousPolicy : null);
+      if (retainedWeb) {
+        const requirements = state.requirements;
+        if (requirements?.allowedSandboxModes && !requirements.allowedSandboxModes.includes(currentSelection!.mode) ||
+            requirements?.allowedApprovalPolicies && !requirements.allowedApprovalPolicies.some((policy: any) => JSON.stringify(policy) === JSON.stringify(retainedWeb.approvalPolicy)))
+          throw new Error('保存的会话权限已不符合当前主机管理策略，请重新选择权限。');
+        state.runtimePolicy = { ...retainedWeb, source: 'web' };
+        state.permission = sandboxName(retainedWeb.sandboxPolicy.type);
+      } else if (currentSelection) {
+        // Resuming an already loaded thread may only rejoin its writer and
+        // report the previous policy. Keep an explicit Web choice for the next
+        // turn instead of accepting a broader policy from that response.
+        const selected = resolveWebPermissionSelection(currentSelection.mode, {
+          profile: selectedProfile, cwd: state.projectPath, requirements: state.requirements,
+        });
+        state.runtimePolicy = { sandboxPolicy: selected.sandboxPolicy, approvalPolicy: selected.approvalPolicy, source: 'web' };
+        state.permission = selected.sandbox;
+      } else if (restored) {
+        state.runtimePolicy = { ...restored, source: 'native' };
+        state.permission = sandboxName(restored.sandboxPolicy.type);
+      }
     }
-    if (!preserveChoices) applyPermissionDefault();
     const live = [...currentItems(id)];
     const liveTurns = runtimeChanged ? [...state.turns] : [];
     if (reuseHistory) page.data = retainHistoryDetails(page.data, loadedHistory!.turns, live);
@@ -2796,6 +2876,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
       retainedTurnIds: new Set(state.turns.map(turn => turn.id)),
       summarizedTurnIds: new Set(page.data.filter((turn: any) => turn.historySummary).map((turn: any) => turn.id)),
     });
+    settleLoadedToolItems(state.items, state.turns);
     rememberAsyncQuestions(id, state.items);
     // Deprecated runtimes may expose compression only as thread/compacted.
     // Keep that positional marker while its recorded turn remains retained;
@@ -2925,6 +3006,7 @@ async function restoreHistoryWindow(id: string, hostId: string, generation: numb
       retainedTurnIds: new Set(state.turns.map(turn => turn.id)),
       summarizedTurnIds: new Set([...turns.values()].filter(turn => turn.historySummary).map(turn => turn.id)),
     });
+    settleLoadedToolItems(state.items, state.turns);
     rememberAsyncQuestions(id, state.items);
     const turnIds = new Set(state.turns.map(turn => turn.id));
     const compactionIds = new Set(state.items.filter(item => item.type === 'contextCompaction').map(item => item.turnId));
@@ -3147,10 +3229,12 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   const generation = selectionGeneration;
   const authentication = authenticationGeneration;
   const cwd = state.projectPath;
+  const sendSocket = socket, sendEngine = engineId;
   const model = state.model;
   const serviceTier = serviceTierParams(state);
   const effort = state.effort;
   const permission = state.permission;
+  const nativePermission = !!state.activeThread && state.runtimePolicy?.source === 'native';
   const profile = availablePermissionProfiles(
     state.preferences.permissionProfiles,
   ).find((profile) => profile.id === state.activePermissionProfileId);
@@ -3181,6 +3265,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     ).sandboxPolicy;
   const approval =
     resolvedProfile?.approvalPolicy ??
+    resumed?.approvalPolicy ??
     resolveWebPermissionSelection(permission as any, { cwd, requirements: state.requirements }).approvalPolicy;
   const workspaceRoots = projectRoots(cwd);
   if (policy.type === "workspaceWrite" && (!resumed || resolvedProfile))
@@ -3321,13 +3406,30 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     });
     noteItem(id!, messageId);
     if (busy) {
-      const result = await rpc("turn/steer", {
+      const threadId = id!;
+      const steerGoalRevision = goalRevisions.get(recencyKey(hostId, threadId)) || 0;
+      const result = await steerWithConfirmedTurn(targetTurnId!, expectedTurnId => rpc("turn/steer", {
         threadId: id!,
-        expectedTurnId: targetTurnId!,
+        expectedTurnId,
         clientUserMessageId: messageId,
         input: inputs,
+      }, 45000, { silentError: true }), {
+        current: () => authentication === authenticationGeneration && hostId === state.hostId &&
+          threadId === state.activeThread?.id && generation === selectionGeneration && cwd === state.projectPath &&
+          sendSocket === socket && sendEngine === engineId && state.connected && state.online &&
+          steerGoalRevision === (goalRevisions.get(recencyKey(hostId, threadId)) || 0) &&
+          state.authenticated && state.threadReady && !state.runtimePaused && !state.threadReleased &&
+          !state.threadConflict && !state.selectingThread && !state.switchingHost && !state.changingContext,
+        runtime: () => ({ turnId: activeTurns.get(threadId), busy: threadBusy.get(threadId) === true,
+          revision: turnRevisions.get(threadId) || 0 }),
+        readLatest: async () => (await historyReader.turns(JSON.stringify([authentication, hostId, sendEngine]),
+          (method, params) => rpc(method, params, 15000, { silentError: true }),
+          { threadId, cursor: null, limit: 1, sortDirection: 'desc' })).data[0],
+        terminal: turnId => completedTurns.has(turnId),
+        discarded: turnId => discardedTurns.has(turnId),
+        acceptActiveTurn: turnId => noteRuntime(threadId, true, turnId),
       });
-      if (hostId === state.hostId) {
+      if (authentication === authenticationGeneration && hostId === state.hostId) {
         // Some runtimes acknowledge the input without emitting a user item.
         // Confirm the optimistic message in place, including observing caches.
         hydrateTurnItems(id!, { id: result.turnId }, {
@@ -3350,8 +3452,9 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
         runtimeWorkspaceRoots: workspaceRoots,
         model: model || undefined,
         effort: effort as any,
-        approvalPolicy: approval,
-        sandboxPolicy: policy,
+        // Native profiles can contain grants/denials not represented by the
+        // legacy sandbox projection. Keep them sticky until a Web choice.
+        ...(!nativePermission ? { approvalPolicy: approval, sandboxPolicy: policy } : {}),
         ...(supportsCollaborationModes ? { collaborationMode: nativeCollaborationMode(collaborationMode, model, effort) } : {}),
       });
       if (hostId === state.hostId)
@@ -3390,7 +3493,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       state.selectedSkills = state.selectedSkills.filter(skill => !selectedSkills.some(sent => sent.path === skill.path));
     }
   } catch (error) {
-    if (id && hostId === state.hostId) {
+    if (id && hostId === state.hostId && authentication === authenticationGeneration) {
       const items = currentItems(id);
       const index = items.findIndex((item) => item.id === messageId);
       if ((error as { uncertain?: boolean }).uncertain) {
@@ -3406,7 +3509,9 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       threadBusy.set(id, activeTurns.has(id));
       if (state.activeThread?.id === id) state.busy = activeTurns.has(id);
     }
-    throw fail(error);
+    if (authentication === authenticationGeneration && hostId === state.hostId &&
+        generation === selectionGeneration && (!id || state.activeThread?.id === id)) throw fail(error);
+    throw error;
   } finally {
     sendInFlight = false;
   }
@@ -3479,7 +3584,8 @@ async function resendEditedMessage(itemId: string, text: string, attachments?: M
     ? pendingMessageEdit.item : state.items.find(item => item.id === itemId)!;
   const input = editedMessageInput(original, text, attachments);
   const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === state.activePermissionProfileId);
-  resolvePermissionProfile(profile || { id: 'edit', name: '消息权限', sandboxMode: state.permission as any, approvalPolicy: approvalPolicy(), networkAccess: state.permission === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
+  if (profile || !state.runtimePolicy)
+    resolvePermissionProfile(profile || { id: 'edit', name: '消息权限', sandboxMode: state.permission as any, approvalPolicy: approvalPolicy(), networkAccess: state.permission === 'danger-full-access' }, { cwd: state.projectPath, requirements: state.requirements });
   const selectedModel = state.models.find(model => model.model === state.model);
   if (selectedModel?.inputModalities?.length && !selectedModel.inputModalities.includes('image') && input.some(entry => ['image', 'localImage'].includes(entry.type)))
     throw fail(new Error('当前模型不支持图片，请选择支持图片的模型后重新发送'));
@@ -5124,6 +5230,7 @@ function updatePreferences(patch: Partial<typeof state.preferences>) {
   state.preferences = {
     ...state.preferences,
     ...patch,
+    ...(Object.hasOwn(patch, 'defaultPermission') ? { defaultPermissionExplicit: true } : {}),
     collapsed: { ...state.preferences.collapsed, ...patch.collapsed },
   };
   const update = preferencesQueue.then(async () => {
@@ -5428,9 +5535,13 @@ function requireQueueSettingsUnlocked() {
 async function prepareQueuedSettings(hostId: string, threadId: string, capabilities: any) {
   if (hostId !== state.hostId || threadId !== state.activeThread?.id) throw new Error('队列上下文已变化');
   const profile = state.activePermissionProfileId ? availablePermissionProfiles(state.preferences.permissionProfiles).find(profile => profile.id === state.activePermissionProfileId) : undefined;
-  const policy = profile ? resolvePermissionProfile(profile, { cwd: state.projectPath, requirements: state.requirements }) : resolveWebPermissionSelection(state.permission as any, { cwd: state.projectPath, requirements: state.requirements });
+  const policy = !profile && state.runtimePolicy
+    ? state.runtimePolicy
+    : resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
   const params: any = { threadId, cwd: state.projectPath, model: state.model || undefined, effort: state.effort,
-    sandboxPolicy: profile ? policy.sandboxPolicy : sandboxPolicy(), approvalPolicy: profile ? policy.approvalPolicy : state.runtimePolicy?.approvalPolicy ?? policy.approvalPolicy };
+    ...(state.runtimePolicy?.source !== 'native' ? {
+      sandboxPolicy: profile ? policy.sandboxPolicy : sandboxPolicy(), approvalPolicy: profile ? policy.approvalPolicy : state.runtimePolicy?.approvalPolicy ?? policy.approvalPolicy,
+    } : {}) };
   if (state.modeCapabilities.plan) params.collaborationMode = nativeCollaborationMode(state.collaborationMode, state.model, state.effort);
   if (!methodAccepts(capabilities, 'thread/settings/update', Object.keys(params))) throw new Error('当前 Codex 无法保存下一轮设置，请更新 Codex 后使用队列');
   await sideChatRpc(hostId, 'thread/settings/update', params);

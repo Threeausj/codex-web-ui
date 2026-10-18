@@ -239,12 +239,20 @@ test("browser state handles out-of-order RPCs and live events without reviving t
     switch (request.method) {
       case "thread/list":
         return { data: [thread("a"), thread("b")], nextCursor: null };
-      case "thread/resume":
+      case "thread/resume": {
+        const selected = request.params.sandbox;
+        const workspace = request.params.config?.sandbox_workspace_write;
         return {
           thread: thread(request.params.threadId),
           model: "test",
-          sandbox: { type: "workspaceWrite" },
+          sandbox: selected === "read-only" ? { type: "readOnly", networkAccess: false }
+            : selected === "danger-full-access" ? { type: "dangerFullAccess" }
+            : { type: "workspaceWrite", writableRoots: workspace?.writable_roots ?? ["/workspace/a"],
+              networkAccess: workspace?.network_access ?? false, excludeTmpdirEnvVar: workspace?.exclude_tmpdir_env_var ?? false,
+              excludeSlashTmp: workspace?.exclude_slash_tmp ?? false },
+          approvalPolicy: request.params.approvalPolicy ?? "on-request",
         };
+      }
       case "thread/turns/list":
         return { data: [], nextCursor: null };
       case "config/read":
@@ -329,6 +337,7 @@ test("browser state handles out-of-order RPCs and live events without reviving t
           projects: [],
           cwd: "/workspace/a",
           connectionMode: "spawn",
+          preferences: { pins: [], collapsed: {}, permissionProfiles: [], activePermissionProfileId: "", defaultPermission: "workspace-write", defaultPermissionExplicit: false },
         }
       : {
           authenticated: sessionActive && !pathname.endsWith("/logout"),
@@ -551,7 +560,7 @@ test("browser state handles out-of-order RPCs and live events without reviving t
       },
     );
     await t.test(
-      "thread selection blocks sends until its project and global permission are hydrated",
+      "thread selection blocks sends until its project and saved native permissions are hydrated",
       async () => {
         let held!: Request;
         handle = (request) =>
@@ -581,25 +590,18 @@ test("browser state handles out-of-order RPCs and live events without reviving t
         });
         await loading;
         assert.equal(api.state.selectingThread, false);
+        assert.equal(Object.hasOwn(held.params, 'sandbox'), false);
+        assert.equal(Object.hasOwn(held.params, 'approvalPolicy'), false);
+        assert.equal(api.state.permission, 'read-only');
+        assert.equal(api.state.runtimePolicy?.source, 'native');
+        assert.equal(api.state.runtimePolicy?.sandboxPolicy.networkAccess, true);
+        assert.equal(api.state.runtimePolicy?.approvalPolicy, 'untrusted');
         await api.send("Use the selected thread policy");
-        assert.equal(
-          ws.requests
-            .filter((request) => request.method === "turn/start")
-            .at(-1)!.params.cwd,
-          "/workspace/other",
-        );
-        assert.equal(
-          ws.requests
-            .filter((request) => request.method === "turn/start")
-            .at(-1)!.params.approvalPolicy,
-          "on-request",
-        );
-        assert.equal(
-          ws.requests
-            .filter((request) => request.method === "turn/start")
-            .at(-1)!.params.sandboxPolicy.networkAccess,
-          false,
-        );
+        const params = ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params;
+        assert.equal(params.cwd, "/workspace/other");
+        assert.equal(Object.hasOwn(params, 'approvalPolicy'), false);
+        assert.equal(Object.hasOwn(params, 'sandboxPolicy'), false);
+        assert.equal(Object.hasOwn(params, 'permissions'), false);
         handle = defaults;
         await api.setProject("/workspace/a");
       },
@@ -607,37 +609,131 @@ test("browser state handles out-of-order RPCs and live events without reviving t
     await t.test(
       "resuming full access applies the global workspace policy instead of restoring full access",
       async () => {
-        handle = (request) =>
-          request.method === "thread/resume"
-            ? {
-                thread: thread("strict-full"),
-                model: "test",
-                sandbox: { type: "dangerFullAccess" },
-                approvalPolicy: "untrusted",
-              }
-            : defaults(request);
-        await api.selectThread("strict-full");
-        await api.send("Use the global workspace policy");
-        assert.equal(
-          ws.requests
-            .filter((request) => request.method === "turn/start")
-            .at(-1)!.params.approvalPolicy,
-          "on-request",
-        );
-        assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
-        await api.selectThread("strict-full");
-        await api.send("Use the global policy after reconnect hydration");
-        assert.equal(
-          ws.requests
-            .filter((request) => request.method === "turn/start")
-            .at(-1)!.params.approvalPolicy,
-          "on-request",
-        );
-        assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
-        handle = defaults;
-        await api.setProject("/workspace/a");
+        const previousPreferences = api.state.preferences;
+        api.state.preferences = { ...previousPreferences, defaultPermission: 'workspace-write', defaultPermissionExplicit: true, activePermissionProfileId: '' };
+        try {
+          handle = (request) =>
+            request.method === "thread/resume"
+              ? {
+                  thread: thread("strict-full"),
+                  model: "test",
+                  sandbox: { type: "dangerFullAccess" },
+                  approvalPolicy: "untrusted",
+                }
+              : defaults(request);
+          await api.selectThread("strict-full");
+          await api.send("Use the global workspace policy");
+          assert.equal(
+            ws.requests
+              .filter((request) => request.method === "turn/start")
+              .at(-1)!.params.approvalPolicy,
+            "on-request",
+          );
+          assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
+          await api.selectThread("strict-full");
+          await api.send("Use the global policy after reconnect hydration");
+          assert.equal(
+            ws.requests
+              .filter((request) => request.method === "turn/start")
+              .at(-1)!.params.approvalPolicy,
+            "on-request",
+          );
+          assert.equal(ws.requests.filter((request) => request.method === "turn/start").at(-1)!.params.sandboxPolicy.type, "workspaceWrite");
+        } finally {
+          api.state.preferences = previousPreferences;
+          handle = defaults;
+          await api.setProject("/workspace/a");
+        }
       },
     );
+    await t.test('synchronizing a Web policy from another client preserves its complete network and approval override', async () => {
+      const threadId = 'broadcast-web-policy';
+      const policy = { type: 'workspaceWrite', writableRoots: ['/workspace/a', '/approved/data'], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true };
+      handle = request => request.method === 'thread/read' && request.params.threadId === threadId
+        ? { thread: thread(threadId) } : defaults(request);
+      try {
+        await api.selectThread(threadId);
+        ws.deliver({ method: 'bridge/thread/changed', params: {
+          threadId, method: 'thread/settings/update', changeId: 'broadcast-web-policy-settings', result: {},
+          request: { sandboxPolicy: policy, approvalPolicy: 'untrusted' },
+        } });
+        assert.equal(api.state.runtimePolicy?.source, 'web');
+        assert.deepEqual(api.state.runtimePolicy?.sandboxPolicy, policy);
+        assert.equal(api.state.runtimePolicy?.approvalPolicy, 'untrusted');
+        // The read-only refresh used by sync and a retained writer reconnect.
+        await api.selectThread(threadId, { preserveWriter: true });
+        assert.equal(api.state.activeThread.id, threadId);
+        assert.equal(api.state.threadReady, true);
+        assert.equal(api.state.runtimePolicy?.source, 'web');
+        assert.deepEqual(api.state.runtimePolicy?.sandboxPolicy, policy);
+        assert.equal(api.state.runtimePolicy?.approvalPolicy, 'untrusted');
+        await api.send('Continue with the complete synchronized Web override');
+        const request = ws.requests.filter(request => request.method === 'turn/start').at(-1)!;
+        assert.equal(request.params.threadId, threadId);
+        assert.equal(request.params.cwd, '/workspace/a');
+        assert.deepEqual(request.params.sandboxPolicy, policy);
+        assert.equal(request.params.approvalPolicy, 'untrusted');
+      } finally {
+        handle = defaults;
+        await api.setProject('/workspace/a');
+      }
+    });
+    await t.test('failed and interrupted tool history settles its running rows without inventing tool outcomes', async () => {
+      try {
+        for (const status of ['failed', 'interrupted']) {
+          const threadId = `terminal-tool-history-${status}`;
+          const turnId = `${threadId}-turn`;
+          handle = request => request.method === 'thread/turns/list' && request.params.threadId === threadId ? {
+            data: [{ id: turnId, status, items: [
+              { id: `${threadId}-command`, type: 'commandExecution', status: 'inProgress', command: 'long-running-command', aggregatedOutput: 'retained partial output', exitCode: null },
+              { id: `${threadId}-confirmed`, type: 'commandExecution', status: 'completed', command: 'already-finished-command', exitCode: 7 },
+              { id: `${threadId}-mcp`, type: 'mcpToolCall', status: 'running', success: true },
+              { id: `${threadId}-agents`, type: 'collabAgentToolCall', status: 'inProgress', agentsStates: { child: { status: 'running' } } },
+            ] }], nextCursor: null,
+          } : defaults(request);
+          await api.selectThread(threadId);
+          assert.equal(api.state.activeThread.id, threadId);
+          assert.equal(api.state.busy, false);
+          assert.equal(api.state.turns[0].status, status);
+          const item = (suffix: string) => api.state.items.find(item => item.id === `${threadId}-${suffix}`)!;
+          assert.equal(item('command').status, status);
+          assert.equal(item('command').aggregatedOutput, 'retained partial output');
+          assert.equal(item('command').exitCode, null);
+          assert.equal(item('confirmed').status, 'completed');
+          assert.equal(item('confirmed').exitCode, 7);
+          assert.equal(item('mcp').status, status);
+          assert.equal(item('mcp').success, null);
+          assert.equal(item('agents').status, status);
+          assert.deepEqual(item('agents').agentsStates, { child: { status: 'running' } });
+        }
+      } finally {
+        handle = defaults;
+        await api.setProject('/workspace/a');
+      }
+    });
+    await t.test('late operation and turn-start events cannot revive tools after their turn was interrupted', async () => {
+      const threadId = 'late-interrupted-tool', turnId = 'late-interrupted-turn';
+      await api.selectThread(threadId);
+      const command = { id: 'late-command', type: 'commandExecution', status: 'inProgress', command: 'partial-command', aggregatedOutput: 'partial output' };
+      ws.deliver({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });
+      ws.deliver({ method: 'item/started', params: { threadId, turnId, item: command } });
+      ws.deliver({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'interrupted', items: [] } } });
+      assert.equal(api.state.busy, false);
+      assert.equal(api.state.items.find(item => item.id === command.id)?.status, 'interrupted');
+      ws.deliver({ method: 'item/started', params: { threadId, turnId, item: { ...command, aggregatedOutput: 'late preserved output' } } });
+      ws.deliver({ method: 'item/started', params: { threadId, turnId, item: { id: 'late-new-mcp', type: 'mcpToolCall', status: 'inProgress', success: true } } });
+      ws.deliver({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress', items: [command] } } });
+      assert.equal(api.state.busy, false);
+      assert.equal(api.state.turns.at(-1)?.status, 'interrupted');
+      assert.equal(api.state.items.find(item => item.id === command.id)?.status, 'interrupted');
+      assert.equal(api.state.items.find(item => item.id === command.id)?.aggregatedOutput, 'late preserved output');
+      assert.equal(api.state.items.find(item => item.id === 'late-new-mcp')?.status, 'interrupted');
+      assert.equal(api.state.items.find(item => item.id === 'late-new-mcp')?.success, null);
+      const before = ws.requests.length;
+      await api.interrupt();
+      assert.equal(ws.requests.length, before);
+      await api.setProject('/workspace/a');
+    });
     await t.test(
       "desktop archive notifications clear the selected chat immediately",
       async () => {

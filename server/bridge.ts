@@ -20,7 +20,8 @@ export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?
 type Compaction = { requests: Set<string>; items: Map<string, string | undefined>; revision: number }
 type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
-type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, StringDecoder> }
+type ProcessDecoder = { decoder: StringDecoder; suffix: Buffer }
+type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, ProcessDecoder> }
 type DisconnectCategory = 'inputError' | 'nativeJson' | 'nativeFrameLimit' | 'transportError' | 'transportClose' | 'initializeFailure' | 'requestWrite' | 'runtimePaused' | 'runtimeReconnect' | 'serverClosed'
 export type ReleasedThread = { name: string; restoreThreadIds: string[] }
 export class RpcFailure extends Error { constructor(readonly rpc: NonNullable<RpcMessage['error']>) { super(rpc.message) } }
@@ -484,17 +485,32 @@ export class Bridge {
   }
 
   private status(key: string, clientId?: string, replayComplete?: boolean) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, ...(replayComplete !== undefined ? { replayComplete } : {}), hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders: _decoders, ...process }) => process) } })
+    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, ...(replayComplete !== undefined ? { replayComplete } : {}), hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders, ...process }) => ({ ...process, pendingOutputBase64: this.pendingProcessOutput(decoders) })) } })
+  }
+
+  private pendingProcessOutput(decoders: Map<string, ProcessDecoder>) {
+    const pending: Record<string, string> = {}
+    // A snapshot's decoded text omits an unfinished UTF-8 character. Preserve
+    // just that prefix so a reconnected browser can decode the next chunk.
+    // Probe the last three bytes rather than depending on StringDecoder's
+    // undocumented internal fields; a UTF-8 prefix is at most three bytes.
+    for (const [stream, { suffix }] of decoders) for (let start = 0; start < suffix.length; ++start) {
+      const bytes = suffix.subarray(start)
+      if (new StringDecoder('utf8').write(bytes) === '') { pending[stream] = bytes.toString('base64'); break }
+    }
+    return pending
   }
 
   private finishProcess(requestId: string, result?: unknown, error?: RpcMessage['error']) {
     const process = [...this.processes.values()].find(process => process.requestId === requestId)
     if (!process) return
+    const outputTail = [...process.decoders.values()].map(({ decoder }) => decoder.end()).join('')
     this.processes.delete(process.processId)
-    for (const key of this.clients.keys()) {
-      this.clientSend(key, { method: 'bridge/terminal/completed', params: { processId: process.processId, result, error } })
-      this.status(key)
-    }
+    // Native command/exec guarantees all streamed chunks precede this response.
+    // Sequence completion with those chunks so reconnects also recover the
+    // final buffered result and a final partial UTF-8 sequence exactly once.
+    this.broadcast({ method: 'bridge/terminal/completed', params: { processId: process.processId, result, error, outputTail } })
+    for (const key of this.clients.keys()) this.status(key)
   }
 
   /** Mutation responses can contain items which Codex never emits as events.
@@ -784,13 +800,15 @@ export class Bridge {
         if (message.method === 'thread/closed') { this.subscribedThreads.delete(event.threadId); this.activeThreads.delete(event.threadId) }
       }
       if (message.method === 'command/exec/outputDelta') {
-        const params = message.params as { processId?: string; stream?: string; deltaBase64?: string } | undefined
+        const params = message.params as { processId?: string; stream?: string; deltaBase64?: string; capReached?: boolean } | undefined
         const process = params?.processId ? this.processes.get(params.processId) : undefined
-        if (process && params?.deltaBase64) {
+        if (process && typeof params?.deltaBase64 === 'string') {
           const stream = params.stream || 'stdout'
           let decoder = process.decoders.get(stream)
-          if (!decoder) { decoder = new StringDecoder('utf8'); process.decoders.set(stream, decoder) }
-          process.lastOutput = (process.lastOutput + decoder.write(Buffer.from(params.deltaBase64, 'base64'))).slice(-200000)
+          if (!decoder) { decoder = { decoder: new StringDecoder('utf8'), suffix: Buffer.alloc(0) }; process.decoders.set(stream, decoder) }
+          const bytes = Buffer.from(params.deltaBase64, 'base64')
+          decoder.suffix = Buffer.from((bytes.length >= 3 ? bytes : Buffer.concat([decoder.suffix, bytes])).subarray(-3))
+          process.lastOutput = (process.lastOutput + decoder.decoder.write(bytes) + (params.capReached ? '\r\n[输出已截断]\r\n' : '')).slice(-200000)
         }
       }
       if (message.method === 'serverRequest/resolved') {

@@ -82,6 +82,8 @@ export const preferencesPatch = z
     "Too many collapsed sections",
   );
 export type WebPreferences = z.infer<typeof preferencesPatch>;
+/** Server-owned provenance; an unset Web default must not overwrite saved Codex permissions. */
+export type StoredWebPreferences = Required<WebPreferences> & { defaultPermissionExplicit: boolean };
 export const emptyPreferences = () =>
   ({
     pins: [],
@@ -89,7 +91,8 @@ export const emptyPreferences = () =>
     permissionProfiles: [],
     activePermissionProfileId: "",
     defaultPermission: "workspace-write",
-  }) as Required<WebPreferences>;
+    defaultPermissionExplicit: false,
+  }) as StoredWebPreferences;
 
 export class Preferences {
   private value = emptyPreferences();
@@ -97,11 +100,17 @@ export class Preferences {
   constructor(readonly file: string) {}
   async init() {
     try {
+      const stored = JSON.parse(await fs.readFile(this.file, "utf8"));
+      // Keep the HTTP patch strict. This field is loaded only from our private
+      // file and cannot be supplied by callers to discard an explicit choice.
+      const persisted = z.object({ defaultPermissionExplicit: z.boolean().optional() }).passthrough().parse(stored);
+      const { defaultPermissionExplicit, ...settings } = persisted;
       this.value = {
         ...emptyPreferences(),
-        ...preferencesPatch.parse(
-          JSON.parse(await fs.readFile(this.file, "utf8")),
-        ),
+        ...preferencesPatch.parse(settings),
+        // Older releases persisted no provenance. Conservatively retain every
+        // saved default, including workspace-write, as an explicit Web choice.
+        defaultPermissionExplicit: defaultPermissionExplicit ?? Object.hasOwn(settings, "defaultPermission"),
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -116,6 +125,7 @@ export class Preferences {
       const next = {
         ...this.value,
         ...patch,
+        defaultPermissionExplicit: patch.defaultPermission !== undefined || this.value.defaultPermissionExplicit,
         collapsed: patch.collapsed
           ? { ...this.value.collapsed, ...patch.collapsed }
           : this.value.collapsed,
