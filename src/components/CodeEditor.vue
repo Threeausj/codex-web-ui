@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import { basicSetup } from 'codemirror';
-import { Compartment, EditorState } from '@codemirror/state';
+import { Compartment, EditorState, Prec } from '@codemirror/state';
 import { EditorView, keymap } from '@codemirror/view';
-import { LanguageDescription } from '@codemirror/language';
+import { HighlightStyle, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
-import { oneDark } from '@codemirror/theme-one-dark';
+import { color as oneDarkColor, oneDarkHighlightStyle, oneDarkTheme } from '@codemirror/theme-one-dark';
 const props = defineProps<{ modelValue: string; path: string; readonly?: boolean; allowQuestion?: boolean; line?: number }>();
 const emit = defineEmits<{
   'update:modelValue': [value: string]; save: [];
@@ -16,13 +16,28 @@ const selection = ref<{ text: string; startLine: number; endLine: number } | nul
 const language = new Compartment(), theme = new Compartment(), editable = new Compartment();
 let view: EditorView | undefined, languageGeneration = 0, observer: MutationObserver | undefined;
 const dark = () => document.documentElement.dataset.theme === 'dark' || (document.documentElement.dataset.theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+const darkHighlightStyle = HighlightStyle.define(oneDarkHighlightStyle.specs.map(spec => {
+  if (spec.color === oneDarkColor.ivory) return { ...spec, color: 'var(--text)' };
+  if (spec.color === oneDarkColor.stone) return { ...spec, color: 'var(--muted)' };
+  return spec;
+}));
+const darkTheme = [oneDarkTheme, syntaxHighlighting(darkHighlightStyle)];
 const baseTheme = EditorView.theme({
   '&': { height: '100%', fontSize: '12px', color: 'var(--text)', backgroundColor: 'var(--bg)' },
   '.cm-scroller': { overflow: 'auto', fontFamily: 'var(--font-mono, monospace)' },
   '.cm-gutters': { backgroundColor: 'var(--surface)', color: 'var(--muted)', borderRight: '1px solid var(--border)' },
-  '.cm-content': { padding: '8px 0', minHeight: '100%' },
+  '.cm-content': { padding: '8px 0', minHeight: '100%', caretColor: 'var(--text)' },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--text)' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': { backgroundColor: 'color-mix(in srgb, var(--text) 22%, var(--bg))' },
   '.cm-activeLine': { backgroundColor: 'color-mix(in srgb, var(--text) 4%, transparent)' },
   '.cm-activeLineGutter': { backgroundColor: 'color-mix(in srgb, var(--text) 8%, transparent)' },
+  '.cm-panels': { color: 'var(--text)', backgroundColor: 'var(--surface)' },
+  '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--border)' },
+  '.cm-panels.cm-panels-bottom': { borderTop: '1px solid var(--border)' },
+  '.cm-foldPlaceholder': { color: 'var(--muted)', backgroundColor: 'var(--soft)', border: '1px solid var(--border)' },
+  '.cm-tooltip': { color: 'var(--text)', backgroundColor: 'var(--surface)', border: '1px solid var(--border)' },
+  '.cm-tooltip .cm-tooltip-arrow:after': { borderTopColor: 'var(--surface)', borderBottomColor: 'var(--surface)' },
+  '.cm-tooltip-autocomplete > ul > li[aria-selected]': { color: 'var(--text)', backgroundColor: 'var(--selected)' },
 });
 async function loadLanguage() {
   const generation = ++languageGeneration;
@@ -39,7 +54,7 @@ function focusLine(line: number) {
 }
 onMounted(() => {
   view = new EditorView({ parent: parent.value!, state: EditorState.create({ doc: props.modelValue, extensions: [
-    basicSetup, baseTheme, language.of([]), theme.of(dark() ? oneDark : []),
+    basicSetup, Prec.high(baseTheme), language.of([]), theme.of(dark() ? darkTheme : []),
     editable.of([EditorState.readOnly.of(!!props.readonly), EditorView.editable.of(!props.readonly)]),
     EditorView.contentAttributes.of({ 'aria-label': `${props.path.split('/').pop()} 文件内容`, 'aria-multiline': 'true', role: 'textbox', 'aria-readonly': String(!!props.readonly), spellcheck: 'false' }),
     keymap.of([{ key: 'Mod-s', run: () => { emit('save'); return true; } }]),
@@ -53,7 +68,7 @@ onMounted(() => {
   ] }) });
   void loadLanguage();
   if (props.line) focusLine(props.line);
-  observer = new MutationObserver(() => view?.dispatch({ effects: theme.reconfigure(dark() ? oneDark : []) }));
+  observer = new MutationObserver(() => view?.dispatch({ effects: theme.reconfigure(dark() ? darkTheme : []) }));
   observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 });
 watch(() => props.modelValue, value => {

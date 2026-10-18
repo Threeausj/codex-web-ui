@@ -49,14 +49,14 @@ test("system appearance updates the document canvas, login, native fields and PW
   await readableDark(page.locator(".login-caption"));
   await readableDark(page.locator('.login-password input'));
   expect((await renderedColors(page.locator("html"))).luminance).toBeLessThan(.1);
-  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#20211f");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#171717");
 
   await page.emulateMedia({ colorScheme: "light" });
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(page.locator("html")).toHaveCSS("color-scheme", "light");
   expect((await renderedColors(page.locator("html"))).luminance).toBeGreaterThan(.8);
   expect((await renderedColors(page.locator(".login-caption"))).contrast).toBeGreaterThanOrEqual(4.5);
-  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#fafaf9");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#fff");
 });
 
 test("dark conversation, Markdown, options, approvals and workspace share readable surfaces", async ({ page, mock }) => {
