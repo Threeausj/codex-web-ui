@@ -159,10 +159,10 @@ onMounted(async () => {
     scrollback: 5000,
     convertEol: true,
     theme: {
-      background: "#17191b",
-      foreground: "#e5e7eb",
-      cursor: "#e5e7eb",
-      selectionBackground: "#4a5057",
+      background: "#111111",
+      foreground: "#f5f5f5",
+      cursor: "#f5f5f5",
+      selectionBackground: "#484848",
     },
   });
   fit = new FitAddon();
@@ -336,8 +336,8 @@ onBeforeUnmount(() => {
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  background: #17191b;
-  color: #e5e7eb;
+  background: var(--surface);
+  color: var(--text);
   overflow: hidden;
 }
 .pty-toolbar {
@@ -346,7 +346,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   min-height: 46px;
   padding: 8px 14px;
-  border-bottom: 1px solid #303236;
+  border-bottom: 1px solid var(--border);
   font-size: 12px;
   gap: 8px;
 }
@@ -357,62 +357,64 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 .pty-actions { display: flex; align-items: center; flex-shrink: 0; gap: 3px; }
-.pty-actions .icon-button { color: #c4c9cf; width: 29px; height: 29px; }
+.pty-actions .icon-button { color: var(--muted); width: 29px; height: 29px; }
 .pty-actions .icon-button:disabled { opacity: .35; }
-.pty-tabs { display: flex; gap: 4px; flex: 0 0 auto; overflow-x: auto; padding: 7px 9px 0; border-bottom: 1px solid #303236; scrollbar-width: thin; }
-.pty-tab { display: flex; align-items: center; flex: 0 0 auto; border-radius: 6px 6px 0 0; color: #939aa3; background: #202328; border-bottom: 2px solid transparent; }
-.pty-tab.active { background: #2b3036; color: #e5e7eb; border-bottom-color: #7bc5a0; }
+.pty-tabs { display: flex; gap: 4px; flex: 0 0 auto; overflow-x: auto; padding: 7px 9px 0; border-bottom: 1px solid var(--border); scrollbar-width: thin; }
+.pty-tab { display: flex; align-items: center; flex: 0 0 auto; border-radius: 6px 6px 0 0; color: var(--muted); background: var(--soft); border-bottom: 2px solid transparent; }
+.pty-tab.active { background: var(--selected); color: var(--text); border-bottom-color: var(--green); }
 .pty-tab > button { display: flex; align-items: center; gap: 6px; background: transparent; color: inherit; border: 0; min-height: 33px; padding: 5px 9px; font-size: 11px; }
 .pty-tab > button:first-child { max-width: 180px; }
 .pty-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pty-tab > .pty-tab-close { padding: 5px; margin-right: 3px; min-width: 26px; justify-content: center; }
-.pty-tab-close:hover { background: #454b53; border-radius: 4px; }
-.pty-tab button:focus-visible { outline: 2px solid #7bc5a0; outline-offset: -2px; }
+.pty-tab-close:hover { background: var(--hover); border-radius: 4px; }
+.pty-tab button:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
 .pty-toolbar i {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #777;
+  background: var(--muted);
 }
 .pty-toolbar i.running {
-  background: #7bc5a0;
+  background: var(--green);
 }
 .xterm-container {
   flex: 1;
   min-height: 200px;
   padding: 10px 8px;
+  background: #111111;
+  color: #f5f5f5;
   overflow: hidden;
 }
 .pty-hint {
   padding: 8px 14px;
   font-size: 10px;
-  color: #999;
-  border-top: 1px solid #303236;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
 }
 .pty-persistence {
   display: flex;
   align-items: center;
   gap: 7px;
   font-size: 10px;
-  color: #a4a9b0;
+  color: var(--muted);
   padding: 8px 14px;
-  border-bottom: 1px solid #303236;
+  border-bottom: 1px solid var(--border);
 }
 .pty-persistence input {
-  accent-color: #7bc5a0;
+  accent-color: var(--green);
 }
 .pty-keys {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
   padding: 7px 9px;
-  border-top: 1px solid #303236;
+  border-top: 1px solid var(--border);
 }
 .pty-keys button {
-  border: 1px solid #3b3f44;
+  border: 1px solid var(--border);
   border-radius: 5px;
-  background: #25282c;
-  color: #d9dde2;
+  background: var(--soft);
+  color: var(--text);
   min-width: 29px;
   min-height: 29px;
   padding: 4px 6px;
@@ -422,8 +424,8 @@ onBeforeUnmount(() => {
   touch-action: manipulation;
 }
 .pty-keys button.active {
-  background: #4d7864;
-  border-color: #7bc5a0;
+  background: var(--selected);
+  border-color: var(--green);
 }
 .pty-keys button:disabled {
   opacity: 0.4;
