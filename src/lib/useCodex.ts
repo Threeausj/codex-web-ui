@@ -94,6 +94,7 @@ const state = reactive({
   connected: false,
   connectionMode: "spawn",
   hosts: [] as any[],
+  localEnabled: true,
   navigation: {} as Record<string, HostNavigation>,
   hostId: "local",
   projects: [] as any[],
@@ -180,6 +181,7 @@ let csrfToken = "";
 let authenticationGeneration = 0;
 function advanceAuthentication() {
   state.authenticationGeneration = ++authenticationGeneration;
+  hostAvailabilityRequest = null;
   settingsApi.resetHostSettings();
 }
 type SessionStatus = { authenticated: boolean; authRequired?: boolean; csrfToken?: string };
@@ -340,6 +342,7 @@ async function refreshCurrentRuntimeMetadata() {
   } catch { /* A later reconnect/read retries metadata; never replay mutations. */ }
 }
 async function reconnectRuntime(hostId = state.hostId) {
+  if (!hostId || !state.hosts.some(host => host.id === hostId)) throw new Error('请先添加或启用一个执行主机');
   if (state.runtimeReconnectingHostId) throw new Error('正在重新连接主机，请稍候');
   const authentication = authenticationGeneration;
   const selectedHostGeneration = hostSelectionGeneration;
@@ -1165,7 +1168,7 @@ function mergeNavigation(hostId: string, threads: any[], replace = false) {
     invalidateThreadTitleSearch(hostId);
 }
 function refreshHostNavigation(hostId: string): Promise<void> {
-  if (pausedHosts.has(hostId)) return Promise.resolve();
+  if (!state.hosts.some(host => host.id === hostId) || pausedHosts.has(hostId)) return Promise.resolve();
   const existing = navigationRequests.get(hostId);
   if (existing) return existing;
   const nav = hostNavigation(hostId);
@@ -1597,8 +1600,12 @@ function receive(message: any) {
       state.pendingRequests.push(message);
     return;
   }
-  if (consumed && !['bridge/status', 'serverRequest/resolved', 'thread/deleted'].includes(message.method)) return;
+  if (consumed && !['bridge/status', 'bridge/host-disabled', 'serverRequest/resolved', 'thread/deleted'].includes(message.method)) return;
   const { method, params: p = {} } = message;
+  if (method === 'bridge/host-disabled') {
+    void refreshHostAvailability().catch(error => { if (state.authenticated) fail(error); });
+    return;
+  }
   if (method === 'thread/deleted') { cleanupDeletedThread(p.threadId); return; }
   if (p.threadId && deletedThreads.has(recencyKey(state.hostId, p.threadId))) return;
   if (p.threadId || method === 'bridge/thread/changed') scheduleConversationSnapshot(p.threadId);
@@ -1944,6 +1951,8 @@ function receive(message: any) {
   }
 }
 function connect(): Promise<void> {
+  if (!state.hostId || !state.hosts.some(host => host.id === state.hostId))
+    return Promise.reject(new Error('请先添加或启用一个执行主机'));
   if (!state.online) return Promise.reject(new Error("目前离线，请联网后重试。"));
   if (state.connected && socket?.readyState === WebSocket.OPEN)
     return Promise.resolve();
@@ -2021,6 +2030,10 @@ function connect(): Promise<void> {
       }
       pending.clear();
       reject(new Error("连接已断开"));
+      if (event.code === 4004) {
+        if (state.authenticated) void refreshHostAvailability().catch(error => fail(error));
+        return;
+      }
       if (event.code === 4003) {
         void validateSession().then(session => {
           if (session?.authenticated && socket === ws) scheduleReconnect();
@@ -2046,7 +2059,7 @@ function connect(): Promise<void> {
 }
 function scheduleReconnect(delay = 2500) {
   clearTimeout(reconnectTimer);
-  if (state.authenticated && state.online && !state.runtimePaused)
+  if (state.authenticated && state.online && !state.runtimePaused && state.hosts.some(host => host.id === state.hostId))
     reconnectTimer = setTimeout(() => { void resumeConnection(); }, delay);
 }
 async function probeConnection() {
@@ -2070,6 +2083,7 @@ async function probeConnection() {
   return status;
 }
 function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
+  if (!state.hostId || !state.hosts.some(host => host.id === state.hostId)) return Promise.resolve();
   if (state.runtimePaused && !options.explicit) return Promise.resolve();
   if (options.explicit) { state.runtimePaused = false; pausedHosts.delete(state.hostId); }
   if (!state.online || !state.authenticated || state.loading || state.switchingHost)
@@ -2158,6 +2172,7 @@ async function bootstrap() {
   const data = await http("/bootstrap");
   localCwd = data.cwd;
   state.hosts = data.hosts;
+  state.localEnabled = data.localEnabled ?? state.hosts.some(host => host.id === 'local');
   state.projects = data.projects;
   state.connectionMode = data.connectionMode;
   // Bootstrap carries this small journal to avoid an extra navigation round trip.
@@ -2188,13 +2203,17 @@ async function bootstrap() {
   const preferredHost = saved("codex.hostId", "local");
   state.hostId = state.hosts.some((h) => h.id === preferredHost)
     ? preferredHost
-    : "local";
+    : state.hosts[0]?.id || "";
   state.runtimePaused = pausedHosts.has(state.hostId);
   state.terminalProcessId = terminalIds()[state.hostId] || "";
   const preferred = saved<Record<string, string>>("codex.projectPaths", {})[
     state.hostId
   ];
   const selectedHost = state.hosts.find((h) => h.id === state.hostId);
+  if (!selectedHost) {
+    await setHost("");
+    return;
+  }
   state.projectPath =
     preferred ??
     selectedHost?.cwd ??
@@ -4226,7 +4245,7 @@ async function archiveProject(project: any) {
   toast(`已归档 ${archived} 个对话，可在已归档对话中恢复`);
 }
 async function setHost(id: string, options: { threadId?: string } = {}) {
-  if (!state.hosts.some((host) => host.id === id))
+  if (id ? !state.hosts.some((host) => host.id === id) : state.hosts.length > 0)
     throw fail(new Error("主机不存在"));
   if (id === state.hostId && state.connected && !state.switchingHost) {
     if (options.threadId) await selectThread(options.threadId);
@@ -4298,10 +4317,15 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     terminalSessionNames.get(`${id}:${state.terminalProcessId}`) || "";
   state.terminalProcesses = [];
   browserStorage.local.setItem("codex.hostId", JSON.stringify(id));
-  state.projectPath =
+  state.projectPath = id ?
     saved<Record<string, string>>("codex.projectPaths", {})[id] ??
     state.hosts.find((host) => host.id === id)?.cwd ??
-    (id === "local" ? localCwd : "/tmp");
+    (id === "local" ? localCwd : "/tmp") : "";
+  if (!id) {
+    state.threadReady = false;
+    state.switchingHost = false;
+    return;
+  }
   const target = options.threadId;
   const authentication = authenticationGeneration;
   const selection = selectionGeneration;
@@ -4386,7 +4410,8 @@ async function addHost(host: any) {
     state.hosts.find(
       (item) => item.id !== "local" && !state.navigation[item.id],
     );
-  if (added) void refreshHostNavigation(added.id);
+  if (added && !state.hostId) await setHost(added.id).catch(() => toast("SSH 主机已添加；暂时无法连接"));
+  else if (added) void refreshHostNavigation(added.id);
   toast("SSH 主机已添加");
 }
 async function updateHost(id: string, host: any) {
@@ -4423,9 +4448,48 @@ async function removeHost(id: string) {
   navigationRequests.delete(id);
   delete state.navigation[id];
   state.projects = state.projects.filter((project) => project.hostId !== id);
-  if (state.hostId === id) await setHost("local");
+  if (state.hostId === id) await setHost(state.hosts[0]?.id || "");
   conversationCache.removeHost(id);
   for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
+}
+let hostAvailabilityRequest: Promise<void> | null = null;
+function refreshHostAvailability(): Promise<void> {
+  if (hostAvailabilityRequest) return hostAvailabilityRequest;
+  const authentication = authenticationGeneration;
+  const operation = (async () => {
+    const result = await http('/hosts', {}, false);
+    if (authentication !== authenticationGeneration || !state.authenticated) return;
+    state.hosts = result.hosts;
+    state.localEnabled = result.localEnabled ?? result.hosts.some((host: any) => host.id === 'local');
+    if (Array.isArray(result.projects)) state.projects = result.projects;
+    if (!state.hosts.some(host => host.id === state.hostId)) {
+      await setHost(state.hosts[0]?.id || '').catch(() => toast('连接已更新；远程主机暂时无法连接'));
+    }
+  })();
+  const request = operation.finally(() => { if (hostAvailabilityRequest === request) hostAvailabilityRequest = null; });
+  hostAvailabilityRequest = request;
+  return request;
+}
+/** Disabling a local executor never deletes its projects or conversation cache. */
+async function setLocalEnabled(enabled: boolean) {
+  const authentication = authenticationGeneration;
+  const result = await http('/hosts/local/enabled', {
+    method: 'PATCH', body: JSON.stringify({ enabled }),
+  }, false);
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  state.localEnabled = result.localEnabled ?? enabled;
+  state.hosts = result.hosts;
+  if (Array.isArray(result.projects)) state.projects = result.projects;
+  navigationRevisions.set('local', (navigationRevisions.get('local') ?? 0) + 1);
+  navigationRequests.delete('local');
+  invalidateThreadTitleSearch('local');
+  settingsApi.invalidateHostSettings('local');
+  if (!state.hosts.some(host => host.id === state.hostId)) {
+    // Saving the setting succeeded even when the selected SSH server is offline.
+    await setHost(state.hosts[0]?.id || '').catch(() => toast('设置已保存；所选远程主机暂时无法连接'));
+  } else if (enabled && state.hostId !== 'local') void refreshHostNavigation('local');
+  toast(state.localEnabled ? '本机 Codex 已启用' : '本机 Codex 已停用，Web 服务继续运行');
+  return result;
 }
 async function uploadFiles(files: FileList | File[], reportError = true) {
   const generation = selectionGeneration;
@@ -5621,6 +5685,7 @@ export function useCodex() {
     removeSshKey,
     updateHost,
     removeHost,
+    setLocalEnabled,
     uploadFiles,
     uploadEditFiles,
     removeAttachment,

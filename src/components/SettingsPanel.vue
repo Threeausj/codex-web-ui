@@ -28,8 +28,8 @@ const props = defineProps<{
   initialTab?: string;
 }>();
 const emit = defineEmits<{ close: []; theme: [value: string] }>();
-const section = ref(props.initialTab || "general");
-const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "local");
+const section = ref(props.initialTab || (props.state.hosts?.length ? "general" : "hosts"));
+const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "");
 const codexSettingsBusy = ref(false);
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
@@ -121,7 +121,7 @@ const config = computed(
 );
 const currentHosts = computed(() => props.state.hosts || []);
 const settingsHost = computed(() => currentHosts.value.find((host: any) => host.id === settingsHostId.value));
-const globalSection = computed(() => ["general", "pwa", "account", "shortcuts"].includes(section.value));
+const globalSection = computed(() => ["general", "pwa", "account", "shortcuts", "hosts"].includes(section.value));
 const projectHost = computed(() =>
   currentHosts.value.find((host: any) => host.id === projectHostId.value),
 );
@@ -133,11 +133,11 @@ watch(projectHostId, () => {
   success.value = "";
 });
 watch(currentHosts, (hosts) => {
-  if (!hosts.some((host: any) => host.id === settingsHostId.value)) settingsHostId.value = hosts[0]?.id || "local";
+  if (!hosts.some((host: any) => host.id === settingsHostId.value)) settingsHostId.value = hosts[0]?.id || "";
   if (!hosts.some((host: any) => host.id === projectHostId.value))
     projectHostId.value = hosts.some((host: any) => host.id === props.state.hostId)
       ? props.state.hostId
-      : hosts[0]?.id || "local";
+      : hosts[0]?.id || "";
 });
 watch(settingsHostId, (value) => {
   projectHostId.value = value;
@@ -321,7 +321,7 @@ watch(() => [settingsHostId.value, section.value], () => {
   ++providerGeneration;
   providerCapabilities.value = null;
   providerNotice.value = "";
-  if (["general", "config", "permissions", "integrations"].includes(section.value)) {
+  if (settingsHost.value && ["general", "config", "permissions", "integrations"].includes(section.value)) {
     settingsReading.value = true;
     const api = settingsApi.value;
     void api.readConfig().catch((cause: any) => {
@@ -354,7 +354,8 @@ watch(() => [settingsHostId.value, section.value], () => {
       </header>
       <div class="settings-host-bar">
         <label for="settings-host-select"><Icon name="Server" :size="16" /><span>设置主机</span></label>
-        <select id="settings-host-select" v-model="settingsHostId" class="text-input" aria-label="设置主机" :disabled="saving || codexSettingsBusy || !!state.runtimeReconnectingHostId">
+        <select id="settings-host-select" v-model="settingsHostId" class="text-input" aria-label="设置主机" :disabled="!currentHosts.length || saving || codexSettingsBusy || !!state.runtimeReconnectingHostId">
+          <option v-if="!currentHosts.length" value="">尚未添加执行主机</option>
           <option v-for="host in currentHosts" :key="host.id" :value="host.id">{{ host.name }}{{ host.kind === 'ssh' ? ' · 远程' : ' · 本机' }}</option>
         </select>
         <span v-if="globalSection" class="settings-host-scope">此栏目适用于整个 Web 应用</span>
@@ -377,7 +378,11 @@ watch(() => [settingsHostId.value, section.value], () => {
           <div v-if="success" class="settings-success">
             <Icon name="CheckCircle2" :size="16" />{{ success }}
           </div>
-          <template v-if="section === 'general'">
+          <div v-if="!settingsHost && !globalSection" class="connection-empty">
+            <p>先添加 SSH 连接，或在连接设置中启用本机 Codex。</p>
+            <button class="button button-secondary" @click="section = 'hosts'">打开连接设置</button>
+          </div>
+          <template v-else-if="section === 'general'">
             <h3>按你的方式工作</h3>
             <p class="settings-description">
               网页权限预设和导航偏好保存到 Web 服务，Codex 配置与所选主机同步。
@@ -652,29 +657,40 @@ watch(() => [settingsHostId.value, section.value], () => {
                   /></span>
                   <div class="connection-details">
                     <strong>{{ host.name }}</strong>
-                    <span>运行 Web 服务的主机</span>
+                    <span>本机 Codex 执行节点 · 可停用，Web 服务继续运行</span>
                   </div>
                   <span
                     v-if="state.hostId === host.id"
                     class="connection-current"
                     >当前</span
                   >
-                  <button
-                    v-else
-                    class="icon-button"
-                    @click="action(() => api.setHost(host.id))"
-                    :disabled="saving"
-                    :title="`连接 ${host.name}`"
-                    :aria-label="`连接 ${host.name}`"
-                  >
-                    <Icon name="Link" :size="17" />
-                  </button>
+                  <div class="connection-actions">
+                    <button
+                      v-if="state.hostId !== host.id"
+                      class="icon-button"
+                      @click="action(() => api.setHost(host.id))"
+                      :disabled="saving"
+                      :title="`连接 ${host.name}`"
+                      :aria-label="`连接 ${host.name}`"
+                    >
+                      <Icon name="Link" :size="17" />
+                    </button>
+                    <button class="button button-secondary button-small"
+                      :disabled="saving" @click="action(() => api.setLocalEnabled(false))"
+                      aria-label="停用本机 Codex">停用</button>
+                  </div>
+                </div>
+                <div v-if="state.localEnabled === false" class="connection-row">
+                  <span class="connection-symbol"><Icon name="Monitor" :size="19" /></span>
+                  <div class="connection-details"><strong>本机 Codex 已停用</strong><span>仅部署 Web 服务；本机项目与对话记录保留</span></div>
+                  <button class="button button-secondary button-small" :disabled="saving"
+                    @click="action(() => api.setLocalEnabled(true))" aria-label="启用本机 Codex">启用</button>
                 </div>
               </div>
               <p class="connection-footnote">
                 连接使用此主机的 SSH 配置、已有密钥与 known_hosts。
               </p>
-              <HostDiagnostics :api="api" :host-id="settingsHostId" :host-name="settingsHost?.name" />
+              <HostDiagnostics v-if="settingsHost" :api="api" :host-id="settingsHostId" :host-name="settingsHost?.name" />
             </div>
           </template>
           <template v-else-if="section === 'permissions'">

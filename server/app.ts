@@ -95,7 +95,9 @@ export async function createApp(options: AppOptions = {}) {
     return externalProtocolObserver?.(host, message, responseMethod)
   }
   const bridges = new Map<string, Bridge>()
+  const changingHosts = new Set<string>()
   const getBridge = async (hostId = 'local') => {
+    if (changingHosts.has(hostId)) throw Object.assign(new Error('正在更新此主机的连接状态，请稍后重试'), { status: 409 })
     const host = storage.host(hostId)
     if (!host) throw Object.assign(new Error('Host not found'), { status: 404 })
     let bridge = bridges.get(hostId)
@@ -169,9 +171,27 @@ export async function createApp(options: AppOptions = {}) {
   })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
-    res.json({ hosts: storage.hosts, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
+    res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
   }))
-  app.get('/api/hosts', (_req, res) => res.json({ hosts: storage.hosts }))
+  app.get('/api/hosts', asyncRoute(async (_req, res) => res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects() })))
+  app.patch('/api/hosts/local/enabled', asyncRoute(async (req, res) => {
+    const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body)
+    if (changingHosts.has('local')) throw Object.assign(new Error('正在更新本机连接状态，请稍后重试'), { status: 409 })
+    changingHosts.add('local')
+    try {
+      if (enabled) await storage.setLocalEnabled(true)
+      else await automations!.withHostRuntimeMaintenance('local', async () => {
+        const bridge = bridges.get('local')
+        const persist = () => storage.setLocalEnabled(false)
+        if (bridge) await bridge.retireWhenIdle(persist)
+        else await persist()
+        titleService.cancelHost('local')
+        developmentPreview.deleteHost('local')
+        bridges.delete('local')
+      })
+      res.json({ ok: true, localEnabled: storage.localEnabled, hosts: storage.hosts, projects: await storage.projects() })
+    } finally { changingHosts.delete('local') }
+  }))
   registerHostConnection(app, bridgeOptions)
   const sshKeys = new SshKeys(dataDir, storage)
   registerSshKeys(app, sshKeys)

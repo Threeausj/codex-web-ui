@@ -1082,6 +1082,21 @@ export class Bridge {
     return operation
   }
 
+  /** Permanently detach an idle executable node after its disabled setting is
+   * durable. Reserve native writes before probing, so another tab cannot start
+   * a task between the idle check and the settings commit. */
+  async retireWhenIdle(commit: () => Promise<void>) {
+    if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409 })
+    this.assertRuntimeIdle()
+    this.runtimeMaintenance = true
+    try {
+      await this.assertNativeRuntimeIdle()
+      await commit()
+      this.broadcast({ method: 'bridge/host-disabled', params: { hostId: this.host.id } })
+      this.close('Host execution disabled', 4004)
+    } finally { this.runtimeMaintenance = false }
+  }
+
   close(reason = 'Server stopping', code = 1001) {
     this.disposed = true
     this.disconnect(new Error('Host connection closed'), 'serverClosed')

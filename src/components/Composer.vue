@@ -1148,13 +1148,13 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .compaction-send-note { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; margin: 7px 4px 0; }
 .composer-area {
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 2px 8px #00000004;
+  box-shadow: 0 3px 16px color-mix(in srgb, var(--text) 4%, transparent);
   min-width: 0;
 }
 .composer-area:focus-within {
-  border-color: color-mix(in srgb, var(--muted) 50%, var(--border));
+  border-color: color-mix(in srgb, var(--accent-text) 55%, var(--border));
 }
 .composer {
   border: 0;
@@ -1167,17 +1167,19 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   padding: 6px 15px;
   border: 0;
   border-bottom: 1px solid var(--border);
-  border-radius: 15px 15px 0 0;
+  border-radius: 11px 11px 0 0;
   background: var(--soft);
 }
 .composer-picker {
   bottom: calc(100% + 7px);
+  border-radius: 10px;
   max-height: min(400px, 45dvh);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 .composer-picker > button:disabled { opacity: .55; cursor: default; }
 .composer-picker > button:disabled:hover { background: transparent; }
+.composer-picker > button.selected:not(:disabled) { background: var(--accent-soft); color: var(--accent-text); }
 .picker-label { align-items: center; padding: 3px 6px 5px 10px; }
 .picker-label .picker-heading { flex: 1; }
 .picker-input-hint { flex: 0 0 auto; }
@@ -1194,7 +1196,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .picker-error, .composer-mode-error { color: var(--danger); }
 .composer-mode-error { padding-bottom: 9px; font-size: 12px; }
 .composer-quotes { display: grid; gap: 5px; margin-bottom: 9px; max-height: 125px; overflow-y: auto; }
-.composer-quote { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 5px 7px; border-left: 2px solid var(--muted); border-radius: 5px; background: var(--soft); color: var(--muted); font-size: 12px; }
+.composer-quote { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 5px 7px; border-left: 2px solid var(--accent-text); border-radius: 5px; background: var(--accent-soft); color: var(--muted); font-size: 12px; }
 .composer-quote > svg { flex: 0 0 auto; }
 .composer-quote-source { flex: 0 0 auto; max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .composer-quote > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1230,7 +1232,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .context-usage:disabled { opacity: 1; cursor: default; }
 .context-usage.context-high { color: var(--warning); }
 .context-ring { display: inline-block; width: 13px; height: 13px; flex: 0 0 auto; border-radius: 50%; background: conic-gradient(currentColor var(--context-percent), var(--border) 0); mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0); }
-.context-usage-menu { position: fixed; z-index: 70; width: min(280px, calc(100vw - 24px)); padding: 14px; overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); outline: none; }
+.context-usage-menu { position: fixed; z-index: 70; width: min(280px, calc(100vw - 24px)); padding: 14px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); outline: none; }
 .context-usage-menu header { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
 .context-usage-menu header strong { font-weight: 500; }
 .context-usage-menu header span { color: var(--muted); }
@@ -1240,7 +1242,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
 .context-token-count strong { font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .context-token-count span, .context-menu-note { color: var(--muted); font-size: 11px; }
 .context-usage-bar { height: 4px; overflow: hidden; border-radius: 4px; background: var(--soft); }
-.context-usage-bar > span { display: block; height: 100%; background: var(--muted); }
+.context-usage-bar > span { display: block; height: 100%; background: var(--accent-text); }
 .context-usage-bar > .context-high { background: var(--warning); }
 .context-compact-action { display: flex; align-items: center; gap: 8px; width: 100%; margin-top: 12px; padding: 9px 0 2px; border: 0; background: transparent; color: var(--text); text-align: left; font-size: 12px; }
 .context-compact-action:hover:not(:disabled) { color: var(--green); }
@@ -1251,14 +1253,14 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   .context-compact-action { min-height: 44px; font-size: 13px; }
 }
 @media (max-width: 600px) {
-  .composer-area { border-radius: 15px; }
+  .composer-area { border-radius: 12px; }
   .composer { padding: 12px 12px 10px; }
   .composer-area :deep(.new-context) {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 8px;
     padding: 5px 12px;
-    border-radius: 14px 14px 0 0;
+    border-radius: 11px 11px 0 0;
   }
   .composer-area :deep(.context-choice) { max-width: 100%; }
   .composer-area :deep(.context-choice select) { max-width: 100%; }

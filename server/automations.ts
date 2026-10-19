@@ -155,6 +155,7 @@ export class AutomationService {
     else delete run.finishedAt;
   }
   private async enqueue(task: Automation, occurrence: number) {
+    if (!this.dependencies.getHost(task.hostId)) throw Object.assign(new Error('主机已停用或不存在，请先恢复连接'), { status: 409 });
     if (this.runtimeMaintenance.has(task.hostId)) throw Object.assign(new Error('此主机正在重新连接 Codex，请稍后运行自动化'), { status: 409, code: 'runtime_reconnecting' });
     if (this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) throw Object.assign(new Error('此自动化仍在执行或等待结果核对'), { status: 409 });
     if (this.runs.filter(run => !terminal(run)).length >= 20) throw Object.assign(new Error('自动化等待队列已满'), { status: 409 });
@@ -184,6 +185,7 @@ export class AutomationService {
     try { await this.mutate(async () => {
       this.capacityError = '';
       for (const task of this.tasks) if (task.enabled && task.nextAt != null && task.nextAt <= this.now()) {
+        if (!this.dependencies.getHost(task.hostId)) continue;
         if (this.runtimeMaintenance.has(task.hostId)) continue;
         const occurrence = task.nextAt;
         if (!this.runs.some(run => run.automationId === task.id && (active(run) || run.retryAt || run.phase === 'needs_review'))) {
@@ -199,6 +201,7 @@ export class AutomationService {
       }
       for (const run of this.runs) {
         if (this.closed) return;
+        if (!this.dependencies.getHost(run.spec.hostId)) continue;
         if (this.runtimeMaintenance.has(run.spec.hostId)) continue;
         if (run.phase === 'failed' && run.retryAt && run.retryAt <= this.now()) { run.retryAt = undefined; delete run.error; this.note(run, 'queued', '执行前的连接失败，按配置重试'); await this.save(); }
         if (run.phase !== 'queued' || this.operations.size >= 2) continue;

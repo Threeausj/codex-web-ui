@@ -61,7 +61,9 @@ async function readJson(file: string): Promise<unknown> {
 }
 
 export class Storage {
-  hosts: Host[] = [{ id: 'local', name: '本机', kind: 'local' }]
+  private configuredHosts: Host[] = [{ id: 'local', name: '本机', kind: 'local' }]
+  localEnabled = true
+  get hosts() { return this.configuredHosts.filter(host => host.kind !== 'local' || this.localEnabled) }
   private webProjects: (Project & { hidden?: boolean })[] = []
   // Host deletion changes both collections, so they must share one write queue.
   private writes: Promise<unknown> = Promise.resolve()
@@ -70,26 +72,38 @@ export class Storage {
   async init() {
     await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 })
     await fs.chmod(this.dataDir, 0o700)
+    const local = await readJson(path.join(this.dataDir, 'local-host.json'))
+    if (local !== null) this.localEnabled = z.object({ enabled: z.boolean() }).strict().parse(local).enabled
     const hosts = await readJson(path.join(this.dataDir, 'hosts.json'))
     if (Array.isArray(hosts)) {
       for (const host of hosts) {
         const validated = hostInput.safeParse(host && typeof host === 'object' ? Object.fromEntries(Object.entries(host).filter(([k]) => k !== 'id' && k !== 'kind')) : null)
-        if (validated.success && typeof host.id === 'string' && /^ssh-[a-f0-9-]+$/.test(host.id)) this.hosts.push({ ...validated.data, id: host.id, kind: 'ssh' })
+        if (validated.success && typeof host.id === 'string' && /^ssh-[a-f0-9-]+$/.test(host.id)) this.configuredHosts.push({ ...validated.data, id: host.id, kind: 'ssh' })
       }
     }
     const projects = await readJson(path.join(this.dataDir, 'projects.json'))
-    if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string' && this.host(p.hostId)).map(p => ({ ...p, source: 'web' }))
+    if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string' && this.configuredHosts.some(host => host.id === p.hostId)).map(p => ({ ...p, source: 'web' }))
   }
 
   host(id: string) { return this.hosts.find(h => h.id === id) }
+
+  /** Disconnecting the deployment machine is reversible; its project metadata
+   * and Codex home remain intact while only executable hosts are exposed. */
+  async setLocalEnabled(enabled: boolean) {
+    return this.mutate(async () => {
+      if (enabled === this.localEnabled) return
+      await writePrivateJson(path.join(this.dataDir, 'local-host.json'), { enabled })
+      this.localEnabled = enabled
+    })
+  }
 
   async addHost(input: unknown) {
     const fields = hostInput.parse(input)
     return this.mutate(async () => {
       const host: Host = { ...fields, id: `ssh-${randomUUID()}`, kind: 'ssh' }
-      const hosts = [...this.hosts, host]
+      const hosts = [...this.configuredHosts, host]
       await this.saveHosts(hosts)
-      this.hosts = hosts
+      this.configuredHosts = hosts
       return host
     })
   }
@@ -103,9 +117,9 @@ export class Storage {
       const host: Host = { ...current, ...fields }
       for (const key of connectionFields) if (host[key] === undefined) delete host[key]
       const connectionReset = connectionFields.some(key => current[key] !== host[key])
-      const hosts = this.hosts.map(value => value.id === id ? host : value)
+      const hosts = this.configuredHosts.map(value => value.id === id ? host : value)
       await this.saveHosts(hosts)
-      this.hosts = hosts
+      this.configuredHosts = hosts
       return { host, connectionReset }
     })
   }
@@ -114,19 +128,19 @@ export class Storage {
     return this.mutate(async () => {
       if (id === 'local') throw Object.assign(new Error('The local host cannot be removed'), { status: 400 })
       if (!this.host(id)) throw Object.assign(new Error('Host not found'), { status: 404 })
-      const hosts = this.hosts.filter(h => h.id !== id)
+      const hosts = this.configuredHosts.filter(h => h.id !== id)
       const projects = this.webProjects.filter(p => p.hostId !== id)
       await writePrivateJson(path.join(this.dataDir, 'projects.json'), projects)
       try { await this.saveHosts(hosts) } catch (error) {
         await writePrivateJson(path.join(this.dataDir, 'projects.json'), this.webProjects)
         throw error
       }
-      this.hosts = hosts
+      this.configuredHosts = hosts
       this.webProjects = projects
     })
   }
 
-  private saveHosts(hosts = this.hosts) { return writePrivateJson(path.join(this.dataDir, 'hosts.json'), hosts.filter(h => h.kind === 'ssh')) }
+  private saveHosts(hosts = this.configuredHosts) { return writePrivateJson(path.join(this.dataDir, 'hosts.json'), hosts.filter(h => h.kind === 'ssh')) }
   private mutate<T>(work: () => Promise<T>): Promise<T> {
     const pending = this.writes.then(work)
     this.writes = pending.catch(() => {})
@@ -156,7 +170,7 @@ export class Storage {
     if (!projects.some(p => p.path === this.cwd && p.hostId === 'local')) projects.push({ id: 'web:cwd', name: path.basename(this.cwd), path: this.cwd, hostId: 'local', source: 'web' })
     const unique = new Map<string, Project & { hidden?: boolean }>()
     for (const p of [...projects, ...this.webProjects]) unique.set(`${p.hostId}:${p.path}`, p)
-    return [...unique.values()].filter(project => !project.hidden)
+    return [...unique.values()].filter(project => !project.hidden && this.host(project.hostId))
   }
 
   async addProject(hostId: string, projectPath: string, name?: string, rootPaths?: string[]) {
