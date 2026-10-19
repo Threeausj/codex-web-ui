@@ -208,3 +208,53 @@ test('a delayed current-host project page cannot restore obsolete history after 
   expect(mock.requests.some(request => request.method === 'thread/list' && request.params?.cursor === 'obsolete-third-page')).toBe(false);
   expectNoChatDeletion(mock);
 });
+
+
+for (const background of [false, true]) for (const more of [false, true]) {
+  test(`a title change retains a pending ${more ? 'older' : 'initial'} project page on the ${background ? 'background' : 'current'} host`, async ({ page, mock }) => {
+    const hostId = background ? 'ssh-title-race' : 'local';
+    const target = background ? new MockCodex() : mock;
+    const project = { ...mock.projects[0], id: 'title-race-project', hostId, name: '标题并发项目' };
+    mock.nativeProjectSupported = true;
+    mock.nativeProjectIds.set(JSON.stringify([hostId, sourcePath]), 'native-title-race');
+    if (background) {
+      mock.hosts.push({ id: hostId, name: '标题并发主机', kind: 'ssh' });
+      mock.projects.push(project);
+      mock.hostMocks.set(hostId, target);
+    } else mock.projects[0] = project;
+    Object.assign(target.threads[0], { projectId: 'native-title-race', recencyAt: target.threads[0].createdAt });
+    const snapshot = { ...target.threads[0] };
+    let release: (() => void) | undefined;
+    const receive = target.receive.bind(target);
+    target.receive = (socket, request) => {
+      if (request.method !== 'thread/list' || request.params?.projectId !== 'native-title-race') return receive(socket, request);
+      target.requests.push(request);
+      if (more && !request.params.cursor) {
+        socket.send(JSON.stringify({ id: request.id, result: { data: [], nextCursor: 'title-next-page' } }));
+        return;
+      }
+      release = () => socket.send(JSON.stringify({ id: request.id, result: { data: [
+        snapshot, { ...snapshot, id: 'project-history-only', name: '仅分页中存在的项目历史' },
+      ], nextCursor: 'title-final-page' } }));
+    };
+    await login(page);
+    const projectGroup = group(page, hostId, sourcePath);
+    const recent = page.locator(`[data-section="recent"] [data-host-id="${hostId}"]`).filter({ has: page.locator('.thread-title') }).first();
+    await expect(recent).toBeVisible();
+    if (more) await projectGroup.getByRole('button', { name: '加载项目旧对话', exact: true }).click();
+    await expect.poll(() => !!release).toBe(true);
+    await recent.locator('.nav-row-menu').click();
+    await page.getByRole('button', { name: '重命名对话', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '重命名对话', exact: true });
+    await dialog.getByRole('textbox', { name: '对话名称', exact: true }).fill('分页期间更新的标题');
+    await dialog.getByRole('button', { name: '保存名称', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(recent.locator('.thread-title')).toHaveText('分页期间更新的标题');
+    release!();
+    await expect(projectGroup.locator('.thread-row')).toHaveCount(2);
+    await expect(projectGroup.locator('.thread-row').filter({ hasText: '分页期间更新的标题' })).toHaveCount(1);
+    await expect(projectGroup.locator('.thread-row').filter({ hasText: '仅分页中存在的项目历史' })).toHaveCount(1);
+    await expect(projectGroup.getByRole('button', { name: '加载项目旧对话', exact: true })).toBeVisible();
+    expect(target.requests.some(request => ['thread/archive', 'thread/delete'].includes(request.method || ''))).toBe(false);
+  });
+}

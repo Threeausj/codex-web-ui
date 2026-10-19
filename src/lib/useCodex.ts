@@ -683,7 +683,7 @@ function clearConversationCaches() {
   ++listGeneration;
   ++configGeneration;
   ++integrationGeneration;
-  for (const host of state.hosts) navigationRevisions.set(host.id, (navigationRevisions.get(host.id) || 0) + 1);
+  for (const host of state.hosts) advanceNavigationRevision(host.id);
   navigationRequests.clear();
   void conversationCache.clear();
   void privateState.clear();
@@ -1019,6 +1019,12 @@ function validateSession(): Promise<SessionStatus | null> {
 }
 const navigationRequests = new Map<string, Promise<void>>();
 const navigationRevisions = new Map<string, number>();
+// Renames change labels, not project membership or its pagination cursors.
+const projectPageRevisions = new Map<string, number>();
+function advanceNavigationRevision(hostId: string, projectPages = true) {
+  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  if (projectPages) projectPageRevisions.set(hostId, (projectPageRevisions.get(hostId) ?? 0) + 1);
+}
 const nativeProjectBindingRequests = new Map<string, Promise<void>>();
 const nativeProjectBindingTimes = new Map<string, number>();
 const nativeProjectBindingValues = new Map<string, { path: string; projectId: string }[]>();
@@ -1042,7 +1048,7 @@ function replaceProjects(projects: any[]) {
     if (state.navigation[hostId]) delete state.navigation[hostId].projectPages[project.path];
   }
   for (const hostId of changedHosts) {
-    navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+    advanceNavigationRevision(hostId);
     navigationRequests.delete(hostId);
     invalidateThreadTitleSearch(hostId);
   }
@@ -1303,10 +1309,7 @@ async function refreshNavigation(force = false) {
     state.projectThreadPages = {};
     state.threads = [];
     for (const host of state.hosts) {
-      navigationRevisions.set(
-        host.id,
-        (navigationRevisions.get(host.id) ?? 0) + 1,
-      );
+      advanceNavigationRevision(host.id);
       navigationRequests.delete(host.id);
       delete state.navigation[host.id];
     }
@@ -1371,14 +1374,15 @@ async function loadNavigationProject(
   const nav = hostNavigation(hostId);
   const current = nav.projectPages[projectPath];
   if ((!more && current?.loaded) || (more && !current?.cursor)) return;
-  const revision = navigationRevisions.get(hostId) ?? 0;
+  const revision = projectPageRevisions.get(hostId) ?? 0;
+  const nameRevisions = new Map(threadNameRevisions);
   const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
   if (
-    revision !== (navigationRevisions.get(hostId) ?? 0) ||
+    revision !== (projectPageRevisions.get(hostId) ?? 0) ||
     !state.hosts.some((host) => host.id === hostId)
   )
     return;
-  mergeNavigation(hostId, result.data);
+  mergeNavigation(hostId, result.data.map((thread: any) => ({ ...thread, ...listedThreadLabels(thread, hostId, nameRevisions) })));
   nav.loadedMore = true;
   nav.projectPages[projectPath] = result.page;
 }
@@ -1554,8 +1558,9 @@ function projectAcceptedThreadPreview(threadId: string, items: any[]) {
   scheduleConversationSnapshot(threadId);
 }
 function listedThreadLabels(thread: any, hostId: string, nameRevisions: Map<string, number>) {
-  const live = state.threads.find(current => current.id === thread.id)
-    ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined);
+  const live = hostId === state.hostId
+    ? state.threads.find(current => current.id === thread.id) ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined)
+    : state.navigation[hostId]?.threads.find(current => current.id === thread.id);
   const key = recencyKey(hostId, thread.id);
   const renamed = (threadNameRevisions.get(key) ?? 0) !== (nameRevisions.get(key) ?? 0);
   const name = renamed ? live?.name : thread.name ?? live?.name;
@@ -2416,10 +2421,7 @@ async function logout() {
   state.threads = [];
   state.navigation = {};
   for (const host of state.hosts)
-    navigationRevisions.set(
-      host.id,
-      (navigationRevisions.get(host.id) ?? 0) + 1,
-    );
+    advanceNavigationRevision(host.id);
   state.activeThread = null;
   state.pendingRequests = [];
   state.agentActivity = {};
@@ -2571,7 +2573,7 @@ async function loadMoreThreads() {
 async function loadProjectThreads(projectPath: string, more = false) {
   const hostId = state.hostId;
   const authentication = authenticationGeneration;
-  const revision = navigationRevisions.get(hostId) ?? 0;
+  const revision = projectPageRevisions.get(hostId) ?? 0;
   const current = state.projectThreadPages[projectPath];
   if (!more && current?.loaded) return;
   const cursor = more ? current?.cursor : undefined;
@@ -2579,7 +2581,7 @@ async function loadProjectThreads(projectPath: string, more = false) {
   const nameRevisions = new Map(threadNameRevisions);
   const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
   if (hostId !== state.hostId || authentication !== authenticationGeneration ||
-      !state.authenticated || revision !== (navigationRevisions.get(hostId) ?? 0)) return;
+      !state.authenticated || revision !== (projectPageRevisions.get(hostId) ?? 0)) return;
   const known = new Set(state.threads.map((thread) => thread.id));
   state.threads.push(
     ...result.data.filter(
@@ -3926,7 +3928,7 @@ function applyThreadRename(id: string, name: string, hostId = state.hostId) {
   } else conversationCache.remove(hostId, id);
   const thread = state.navigation[hostId]?.threads.find(thread => thread.id === id);
   if (thread) thread.name = name;
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId, false);
 }
 async function renameThread(name: string, id = state.activeThread?.id, hostId = state.hostId) {
   const trimmed = name.trim();
@@ -3940,7 +3942,7 @@ async function renameThread(name: string, id = state.activeThread?.id, hostId = 
 function applyThreadProject(hostId: string, id: string, projectId: string | null) {
   threadProjectChanges.set(recencyKey(hostId, id), { revision: ++projectChangeSequence, projectId });
   invalidateThreadTitleSearch(hostId);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   if (hostId === state.hostId) {
     const thread = state.threads.find(thread => thread.id === id)
       ?? (state.activeThread?.id === id ? state.activeThread : undefined);
@@ -4012,7 +4014,7 @@ function cleanupDeletedThread(id: string, hostId = state.hostId) {
   }
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter(thread => thread.id !== id);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   conversationCache.remove(hostId, id);
   void conversationCache.flush().catch(() => {});
   for (const records of [goals, conversationModes, tokenUsages, compactions, permissionSelections, legacyRecency]) records.delete(key);
@@ -4058,7 +4060,7 @@ async function deleteThread(id: string, hostId = state.hostId) {
 }
 function cleanupArchivedThread(id: string) {
   invalidateThreadTitleSearch(state.hostId);
-  navigationRevisions.set(state.hostId, (navigationRevisions.get(state.hostId) ?? 0) + 1);
+  advanceNavigationRevision(state.hostId);
   forgetAsyncQuestions(id);
   removedThreads.add(id);
   threadRevisions.set(id, ++threadEventSequence);
@@ -4080,7 +4082,7 @@ async function archiveThread(id: string, hostId = state.hostId) {
   if (hostId === state.hostId) cleanupArchivedThread(id);
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter((thread) => thread.id !== id);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   if (
     state.preferences.pins.some(
       (pin) => pin.hostId === hostId && pin.kind === "thread" && pin.id === id,
@@ -4615,7 +4617,7 @@ async function updateHost(id: string, host: any) {
     conversationCache.removeHost(id);
     for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
     if (state.hostId === id) { state.threadReady = false; itemCache.clear(); }
-    navigationRevisions.set(id, (navigationRevisions.get(id) ?? 0) + 1);
+    advanceNavigationRevision(id);
     navigationRequests.delete(id);
     delete state.navigation[id];
     if (state.hostId === id) {
@@ -4633,7 +4635,7 @@ async function removeHost(id: string) {
     method: "DELETE",
   });
   state.hosts = result.hosts ?? state.hosts.filter((host) => host.id !== id);
-  navigationRevisions.set(id, (navigationRevisions.get(id) ?? 0) + 1);
+  advanceNavigationRevision(id);
   navigationRequests.delete(id);
   delete state.navigation[id];
   replaceProjects(state.projects.filter((project) => project.hostId !== id));
@@ -4669,7 +4671,7 @@ async function setLocalEnabled(enabled: boolean) {
   state.localEnabled = result.localEnabled ?? enabled;
   state.hosts = result.hosts;
   if (Array.isArray(result.projects)) replaceProjects(result.projects);
-  navigationRevisions.set('local', (navigationRevisions.get('local') ?? 0) + 1);
+  advanceNavigationRevision('local');
   navigationRequests.delete('local');
   invalidateThreadTitleSearch('local');
   settingsApi.invalidateHostSettings('local');
@@ -5697,7 +5699,7 @@ async function unarchiveThread(id: string, hostId = state.hostId) {
     if (result.thread) updateThread(result.thread);
     await refreshThreads();
   } else {
-    navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+    advanceNavigationRevision(hostId);
     if (result.thread) mergeNavigation(hostId, [result.thread]);
   }
   toast("对话已恢复");
