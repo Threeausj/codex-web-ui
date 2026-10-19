@@ -22,6 +22,7 @@ import { registerNavigation } from './navigation.js'
 import { registerThreadGoals } from './thread-goals.js'
 import { registerAsyncQuestionAnswers } from './async-question-answers.js'
 import { registerAsyncQuestionNotices } from './async-question-notices.js'
+import { registerThreadReadReceipts } from './thread-read-receipts.js'
 import { registerThreadTakeover } from './thread-takeover.js'
 import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
@@ -158,6 +159,7 @@ export async function createApp(options: AppOptions = {}) {
   registerThreadGoals(app, { getBridge })
   registerAsyncQuestionAnswers(app, getBridge)
   const questionNotices = await registerAsyncQuestionNotices(app, dataDir, id => !!storage.host(id))
+  const threadReadReceipts = await registerThreadReadReceipts(app, dataDir, id => !!storage.host(id))
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
   registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)
@@ -288,7 +290,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, stopPushLogoutListener, stopPushPasswordListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, threadReadReceipts, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -299,6 +301,18 @@ export async function createServer(options: AppOptions = {}) {
       concurrencyLimit: 2, zlibDeflateOptions: { level: 3 } } })
   const sessionSockets = new Map<string, Set<WebSocket>>()
   const socketHeartbeat = new WebSocketHeartbeat()
+  const stopListeningForReadReceipts = context.threadReadReceipts.subscribe(receipts => {
+    const frame = JSON.stringify({ method: 'bridge/thread-read-receipts', params: { receipts } })
+    for (const [sessionId, sockets] of sessionSockets) {
+      if (!context.auth.isSessionActive(sessionId)) continue
+      for (const ws of sockets) {
+        // A reconnect fetches the journal; read indicators must not queue behind
+        // large native history responses on a slow browser connection.
+        if (ws.readyState !== 1 || ws.bufferedAmount > 256 * 1024) continue
+        try { ws.send(frame, error => { if (error) ws.terminate() }) } catch { ws.terminate() }
+      }
+    }
+  })
   const stopListeningForRevocation = context.auth.onSessionRevoked(sessionId => {
     for (const ws of sessionSockets.get(sessionId) || []) ws.close(4003, 'Session expired')
   })
@@ -335,6 +349,7 @@ export async function createServer(options: AppOptions = {}) {
   const close = async () => {
     clearInterval(heartbeat)
     stopListeningForRevocation()
+    stopListeningForReadReceipts()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
     let automationFailure: unknown

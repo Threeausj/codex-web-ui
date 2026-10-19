@@ -10,6 +10,7 @@ import { matchesBookmark, type useConversationBookmarks } from "../lib/conversat
 import { bookmarkProjectDetails } from "../lib/bookmark-project";
 import type { ConversationBookmark } from "../../shared/bookmarks";
 import { createThreadIndicators, threadIndicatorsKey, threadIndicatorStorageKey } from '../lib/thread-indicators';
+import { createThreadReadSync } from '../lib/thread-read-sync';
 const props = defineProps<{ api: any; state: any; bookmarks: ReturnType<typeof useConversationBookmarks> }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
@@ -46,12 +47,16 @@ function bookmarkDetail(entry: ConversationBookmark) {
 const hostProjects = computed(() => props.state.projects);
 const pins = computed(() => props.state.preferences.pins);
 const allThreads = computed(() => props.api.navigationThreads());
-const indicators = createThreadIndicators(browserStorage.local);
+let readSync: ReturnType<typeof createThreadReadSync> | undefined;
+const indicators = createThreadIndicators(browserStorage.local, Date.now, receipt => readSync?.markRead(receipt));
+readSync = createThreadReadSync(props.state, props.api, indicators);
 provide(threadIndicatorsKey, indicators);
 function markVisibleConversation() {
   const visible = props.state.authenticated && props.state.threadReady && !props.state.selectingThread && !props.state.changingContext &&
     document.visibilityState === 'visible' && document.hasFocus();
   indicators.setVisible(props.state.hostId, visible ? props.state.activeThread?.id : null);
+  if (visible && !props.state.busy && props.state.activeThread?.id)
+    indicators.reconcileCompletedTurn(props.state.hostId, props.state.activeThread.id, props.state.turns?.at(-1));
 }
 watch(() => [props.state.hostId, props.state.activeThread?.id, props.state.threadReady, props.state.selectingThread,
   props.state.changingContext, props.state.authenticated], markVisibleConversation, { immediate: true, flush: 'post' });
@@ -69,7 +74,7 @@ watch(() => {
   indicators.reconcileCompletedTurn(props.state.hostId, props.state.activeThread.id, props.state.turns?.at(-1));
 }, { flush: 'post' });
 function mergeReadReceipts(event: StorageEvent) {
-  if (event.key === threadIndicatorStorageKey) indicators.merge(event.newValue);
+  if (event.key === threadIndicatorStorageKey) { indicators.merge(event.newValue); readSync?.captureLocal(); }
 }
 document.addEventListener('visibilitychange', markVisibleConversation);
 window.addEventListener('focus', markVisibleConversation);
@@ -264,6 +269,7 @@ watch(
   },
 );
 onBeforeUnmount(() => {
+  readSync?.stop();
   clearTimeout(searchTimer);
   ++generation;
   unsubscribe();
