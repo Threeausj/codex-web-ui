@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { z } from 'zod'
 import type { Host, Project } from './types.js'
+import { orderHosts } from '../shared/host-order.js'
 
 const cleanText = z.string().trim().min(1).max(256).refine(s => !/[\x00-\x1f]/.test(s), 'Control characters are not allowed')
 const optionalField = <T extends z.ZodType>(schema: T) => z.preprocess(value => value === null || (typeof value === 'string' && !value.trim()) ? undefined : value, schema.optional())
@@ -37,6 +38,13 @@ function normalizeAddress<T extends { hostname?: string; username?: string }>(va
 }
 export const hostInput = hostFields.transform(normalizeAddress)
 export const hostUpdateInput = hostFields.partial().refine(value => Object.keys(value).length > 0, 'Provide at least one editable host field').transform(normalizeAddress)
+const hostIdentifier = z.string().min(1).max(256).regex(/^(?:local|ssh-[a-f0-9-]+)$/)
+const hostOrderDocument = (maximum: number) => z.object({
+  hostIds: z.array(hostIdentifier).min(1).max(maximum).refine(ids => new Set(ids).size === ids.length, 'Host IDs must be unique'),
+}).strict()
+export const hostOrderInput = hostOrderDocument(1000)
+// The journal also retains the disabled local host's slot, outside the request's visible-host limit.
+const savedHostOrderInput = hostOrderDocument(1001)
 const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'codexPath', 'cwd'] as const
 
 export async function writePrivateJson(file: string, value: unknown) {
@@ -62,8 +70,10 @@ async function readJson(file: string): Promise<unknown> {
 
 export class Storage {
   private configuredHosts: Host[] = [{ id: 'local', name: '本机', kind: 'local' }]
+  private hostOrder: string[] = []
+  private hostOrderListeners = new Set<(hostIds: string[]) => void>()
   localEnabled = true
-  get hosts() { return this.configuredHosts.filter(host => host.kind !== 'local' || this.localEnabled) }
+  get hosts() { return orderHosts(this.configuredHosts, this.hostOrder).filter(host => host.kind !== 'local' || this.localEnabled) }
   private webProjects: (Project & { hidden?: boolean })[] = []
   // Host deletion changes both collections, so they must share one write queue.
   private writes: Promise<unknown> = Promise.resolve()
@@ -81,11 +91,39 @@ export class Storage {
         if (validated.success && typeof host.id === 'string' && /^ssh-[a-f0-9-]+$/.test(host.id)) this.configuredHosts.push({ ...validated.data, id: host.id, kind: 'ssh' })
       }
     }
+    let storedOrder: string | undefined
+    try { storedOrder = await fs.readFile(path.join(this.dataDir, 'host-order.json'), 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    if (storedOrder !== undefined) this.hostOrder = savedHostOrderInput.parse(JSON.parse(storedOrder)).hostIds.filter(id => this.configuredHosts.some(host => host.id === id))
     const projects = await readJson(path.join(this.dataDir, 'projects.json'))
     if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string' && this.configuredHosts.some(host => host.id === p.hostId)).map(p => ({ ...p, source: 'web' }))
   }
 
   host(id: string) { return this.hosts.find(h => h.id === id) }
+
+  subscribeHostOrder(listener: (hostIds: string[]) => void) {
+    this.hostOrderListeners.add(listener)
+    return () => { this.hostOrderListeners.delete(listener) }
+  }
+
+  /** Persist only presentation order; host configuration and runtimes stay intact. */
+  async reorderHosts(input: unknown) {
+    const { hostIds } = hostOrderInput.parse(input)
+    return this.mutate(async () => {
+      const enabled = new Set(this.hosts.map(host => host.id))
+      if (hostIds.length !== enabled.size || hostIds.some(id => !enabled.has(id)))
+        throw Object.assign(new Error('主机列表已变化，请刷新后重新排序'), { status: 409 })
+      let next = 0
+      // Disabled hosts retain their slot, so re-enabling local is predictable.
+      const order = orderHosts(this.configuredHosts, this.hostOrder).map(host => enabled.has(host.id) ? hostIds[next++]! : host.id)
+      await writePrivateJson(path.join(this.dataDir, 'host-order.json'), { hostIds: order })
+      this.hostOrder = order
+      for (const listener of this.hostOrderListeners) {
+        try { listener(this.hosts.map(host => host.id)) } catch { /* One consumer must not undo a durable sort. */ }
+      }
+      return this.hosts
+    })
+  }
 
   /** Disconnecting the deployment machine is reversible; its project metadata
    * and Codex home remain intact while only executable hosts are exposed. */

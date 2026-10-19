@@ -2,6 +2,7 @@ import { methodAccepts } from "./integration-capabilities";
 import { copyText } from './copy-text';
 import { useHostSettings } from './host-settings';
 import { interactiveShellCommand } from '../../shared/terminal-shell';
+import { orderHosts } from '../../shared/host-order';
 import { waitForCompaction } from './compaction-send';
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
 import { reactive, ref, shallowReactive, toRaw, watch } from "vue";
@@ -299,6 +300,17 @@ let takeoverOperation = 0;
 let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
 const terminalListeners = new Set<(chunk: string) => void>();
 const protocolListeners = new Set<(hostId: string, message: any) => boolean | void>();
+let hostOrderRevision = 0;
+function validHostOrder(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= 1000 && value.every(id => typeof id === 'string' && id.length > 0 && id.length <= 256 && !/[\x00-\x20\x7f]/.test(id))
+    && new Set(value).size === value.length;
+}
+function receiveHostOrder(hostIds: unknown) {
+  if (!state.authenticated || !validHostOrder(hostIds)) return;
+  ++hostOrderRevision;
+  // Only the order is trusted: an event cannot create or replace a connection.
+  state.hosts = orderHosts(state.hosts, hostIds);
+}
 function subscribeProtocol(listener: (hostId: string, message: any) => boolean | void) {
   protocolListeners.add(listener);
   return () => protocolListeners.delete(listener);
@@ -1670,6 +1682,10 @@ function receiveThreadChange(change: any) {
   }
 }
 function receive(message: any) {
+  if (message.method === 'bridge/host-order/changed') {
+    receiveHostOrder(message.params?.hostIds);
+    return;
+  }
   if (typeof message.bridgeEventSequence === 'number') {
     if (eventSequence !== null && message.bridgeEventSequence <= eventSequence) return;
     if (eventSequence !== null && message.bridgeEventSequence > eventSequence + 1) { socketHasEventGap = true; ++eventGapRevision; }
@@ -4643,6 +4659,21 @@ async function removeHost(id: string) {
   conversationCache.removeHost(id);
   for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
 }
+async function reorderHosts(hostIds: string[]) {
+  if (!validHostOrder(hostIds) || hostIds.length !== state.hosts.length ||
+    hostIds.some(id => !state.hosts.some(host => host.id === id)))
+    throw new Error('连接列表已变化，请重新调整主机顺序');
+  const authentication = authenticationGeneration;
+  const revision = hostOrderRevision;
+  const result = await http('/hosts/order', { method: 'PATCH', body: JSON.stringify({ hostIds }) }, false);
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  const savedIds = Array.isArray(result.hosts) ? result.hosts.map((host: any) => host?.id) : null;
+  if (!validHostOrder(savedIds)) throw new Error('主机顺序响应无效，请重新加载连接列表');
+  // A shared event may arrive before this ACK, including a later change from
+  // another device. Preserve that newer order and any hosts added or removed.
+  if (revision === hostOrderRevision) state.hosts = orderHosts(state.hosts, savedIds);
+  return result;
+}
 let hostAvailabilityRequest: Promise<void> | null = null;
 function refreshHostAvailability(): Promise<void> {
   if (hostAvailabilityRequest) return hostAvailabilityRequest;
@@ -5885,6 +5916,7 @@ export function useCodex() {
     removeSshKey,
     updateHost,
     removeHost,
+    reorderHosts,
     setLocalEnabled,
     uploadFiles,
     uploadEditFiles,

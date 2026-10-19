@@ -138,7 +138,7 @@ npm start
 | 多 Web 端同步 | 同一主机的页面共享持久 app-server，实时同步消息与状态；连续连接轻量检查，事件丢失时补齐历史 | 保留各页面草稿；原生进程变化后重新确认写入资格；桌面/CLI 的独立 app-server 仍受会话写入锁约束 |
 | 强制进入会话 | 写入锁冲突时显示重试与强制进入；先检查占用进程和受影响会话数量，确认后终止并恢复原对话 | Linux 本机/SSH 主机需 Python 3.9+；共享 Codex 进程中的其他会话会一同结束；Docker 无法识别宿主机进程时可改用 SSH 连接宿主机 |
 | 配置与项目加载 | 按 cwd 读取配置来源/版本和受管要求，版本校验保存；加载本机桌面项目、按主机浏览选择项目及额外工作目录；新会话解析原生项目身份并传入 `projectId` | 旧 CLI 保留目录模式；桌面本地保存的旧分类无法通过远端接口同步，详见[项目归属](docs/native-projects.md)。更改新对话位置保留文字，同主机保留附件，跨主机重新上传原文件 |
-| SSH 主机 | 添加/编辑弹窗、私钥上传与替换、未保存配置的连接测试；通过远端交互登录 shell 自动识别 Codex，也可指定路径 | 支持最大 64 KB 的无口令 OpenSSH / PEM 私钥；测试不保存主机、不打断聊天；可在连接弹窗获取并确认新主机指纹；指纹变化需重新确认，需准备远端 CLI 与登录 |
+| SSH 主机 | 设置“连接”中上下移动主机并保存顺序，“最近”的设备筛选同步排序；添加/编辑弹窗、私钥上传与替换、未保存配置的连接测试；通过远端交互登录 shell 自动识别 Codex，也可指定路径 | 支持最大 64 KB 的无口令 OpenSSH / PEM 私钥；测试不保存主机、不打断聊天；可在连接弹窗获取并确认新主机指纹；指纹变化需重新确认，需准备远端 CLI 与登录 |
 | 审批 | 命令/文件改动、额外权限、工具提问与基础 MCP 输入面板；同主机登录设备共享待审批请求 | 首个有效答复生效；依赖当前 Codex sandbox/审批策略，高级 MCP schema 与桌面宿主请求尚未完全覆盖 |
 | 文件与变更 | 多文件标签、行号/语法高亮、选中代码引用/侧边提问、Markdown 源码/预览、图片/PDF 预览、对话图片点击放大；文件名筛选、下载与红绿增删行数 | 最多 16 个标签，单文件最多 8 MB；私人草稿保留原始版本以核对保存冲突；二进制文件禁止文本编辑；[文件工作流](docs/automations-and-editor.md) |
 | 终端与 Tmux | 多终端标签、新建与单独关闭、PTY、Tab 补全、resize、后台输出缓存、复制/粘贴与手机控制键；tmux 会话列表、窗格快照、新建、切换、确认删除 | 优先使用用户交互 Shell，再回退 Bash；补全由 Shell 提供。切换工作区标签保留终端；目标主机需安装 tmux，切换只断开 tmux 客户端 |
@@ -246,7 +246,7 @@ npm run doctor:preview
 
 更新 CLI 后运行 `npm run protocol:generate`，检查 `shared/protocol/` 差异，再运行类型、单元和浏览器检查。
 
-目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。已关闭的异步问题提醒独立保存在私人 `DATA_DIR/async-question-notices.json`，同样应纳入备份。跨设备已读回执保存于私有 `DATA_DIR/thread-read-receipts.json`，仅包含主机、会话、已读轮次及内容活动时间，不保存对话正文；同样随 `webdata` 卷持久保存。
+目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。已关闭的异步问题提醒独立保存在私人 `DATA_DIR/async-question-notices.json`，同样应纳入备份。主机排序保存在私有 `DATA_DIR/host-order.json`，同样随 `webdata` 卷持久保存。跨设备已读回执保存于私有 `DATA_DIR/thread-read-receipts.json`，仅包含主机、会话、已读轮次及内容活动时间，不保存对话正文；同样随 `webdata` 卷持久保存。
 
 最新类型、单元／协议、浏览器、依赖审计与生产构建结果见 [验证清单](docs/validation.md)，代码审查与后续优先级见 [项目审查](docs/project-audit.md)。既往实际环境检查覆盖模型推理、跨进程历史、PTY、隔离 daemon、Git/worktree、Vite HMR、Tmux 与 Docker 数据卷；浏览器尺寸测试不等同于真实手机后台推送验收。早期含本机信息的截图保留在本地，上方公开截图使用独立演示数据。
 

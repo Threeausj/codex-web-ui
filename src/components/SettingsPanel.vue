@@ -210,6 +210,15 @@ function hostSaved() {
   success.value = editingHost.value ? "SSH 配置已更新" : "SSH 连接已添加";
   hostForm.value = false;
 }
+async function moveHost(hostId: string, offset: number) {
+  if (saving.value) return;
+  const ids = currentHosts.value.map((host: any) => host.id);
+  const index = ids.indexOf(hostId);
+  const target = index + offset;
+  if (index < 0 || target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  await action(() => props.api.reorderHosts(ids), "主机顺序已保存");
+}
 async function saveEdits() {
   await action(async () => {
     const edits = JSON.parse(configEdits.value);
@@ -575,7 +584,7 @@ watch(() => [settingsHostId.value, section.value], () => {
             <div class="connections-page">
               <h3>连接</h3>
               <div class="connection-section-heading">
-                <h4>来自这台主机的 SSH 连接</h4>
+                <div><h4>执行主机</h4><p>调整顺序后，侧边栏「最近」的设备筛选同步更新。</p></div>
                 <button
                   class="button button-primary button-small"
                   :disabled="saving"
@@ -587,20 +596,21 @@ watch(() => [settingsHostId.value, section.value], () => {
               </div>
               <div class="connection-list">
                 <div
-                  v-for="host in currentHosts.filter(
-                    (host: any) => host.kind === 'ssh',
-                  )"
+                  v-for="(host, index) in currentHosts"
                   :key="host.id"
                   class="connection-row"
+                  :data-connection-id="host.id"
+                  :data-host-id="host.id"
                 >
                   <span class="connection-symbol"
-                    ><Icon name="Globe" :size="19"
+                    ><Icon :name="host.kind === 'ssh' ? 'Globe' : 'Monitor'" :size="19"
                   /></span>
                   <div class="connection-details">
                     <strong>{{ host.name }}</strong>
-                    <span>{{
+                    <span v-if="host.kind === 'ssh'">{{
                       `${host.username ? host.username + "@" : ""}${host.hostname}${host.port && host.port !== 22 ? ":" + host.port : ""}`
                     }}</span>
+                    <span v-else>本机 Codex 执行节点 · 可停用，Web 服务继续运行</span>
                   </div>
                   <span
                     v-if="state.hostId === host.id"
@@ -608,6 +618,16 @@ watch(() => [settingsHostId.value, section.value], () => {
                     >当前</span
                   >
                   <div class="connection-actions">
+                    <div class="connection-order-actions" role="group" :aria-label="`调整 ${host.name} 的顺序`">
+                      <button class="icon-button" :disabled="saving || index === 0"
+                        @click="moveHost(host.id, -1)" :title="`上移 ${host.name}`" :aria-label="`上移 ${host.name}`">
+                        <Icon name="ArrowUp" :size="16" />
+                      </button>
+                      <button class="icon-button" :disabled="saving || index === currentHosts.length - 1"
+                        @click="moveHost(host.id, 1)" :title="`下移 ${host.name}`" :aria-label="`下移 ${host.name}`">
+                        <Icon name="ArrowDown" :size="16" />
+                      </button>
+                    </div>
                     <button
                       v-if="state.hostId !== host.id"
                       class="icon-button"
@@ -619,6 +639,7 @@ watch(() => [settingsHostId.value, section.value], () => {
                       <Icon name="Link" :size="17" />
                     </button>
                     <button
+                      v-if="host.kind === 'ssh'"
                       class="icon-button"
                       @click="editHost(host)"
                       :disabled="saving"
@@ -628,6 +649,7 @@ watch(() => [settingsHostId.value, section.value], () => {
                       <Icon name="Pencil" :size="16" />
                     </button>
                     <button
+                      v-if="host.kind === 'ssh'"
                       class="icon-button"
                       @click="action(() => api.removeHost(host.id))"
                       :disabled="saving"
@@ -636,53 +658,21 @@ watch(() => [settingsHostId.value, section.value], () => {
                     >
                       <Icon name="Trash2" :size="16" />
                     </button>
+                    <button v-else class="button button-secondary button-small"
+                      :disabled="saving" @click="action(() => api.setLocalEnabled(false))"
+                      aria-label="停用本机 Codex">停用</button>
                   </div>
                 </div>
                 <div
-                  v-if="!currentHosts.some((host: any) => host.kind === 'ssh')"
+                  v-if="!currentHosts.length"
                   class="connection-empty"
                 >
                   添加 SSH 连接，在远端继续你的项目与对话。
                 </div>
               </div>
-              <div class="connection-local-heading">本地主机</div>
-              <div class="connection-list">
-                <div
-                  v-for="host in currentHosts.filter(
-                    (host: any) => host.kind !== 'ssh',
-                  )"
-                  :key="host.id"
-                  class="connection-row"
-                >
-                  <span class="connection-symbol"
-                    ><Icon name="Monitor" :size="19"
-                  /></span>
-                  <div class="connection-details">
-                    <strong>{{ host.name }}</strong>
-                    <span>本机 Codex 执行节点 · 可停用，Web 服务继续运行</span>
-                  </div>
-                  <span
-                    v-if="state.hostId === host.id"
-                    class="connection-current"
-                    >当前</span
-                  >
-                  <div class="connection-actions">
-                    <button
-                      v-if="state.hostId !== host.id"
-                      class="icon-button"
-                      @click="action(() => api.setHost(host.id))"
-                      :disabled="saving"
-                      :title="`连接 ${host.name}`"
-                      :aria-label="`连接 ${host.name}`"
-                    >
-                      <Icon name="Link" :size="17" />
-                    </button>
-                    <button class="button button-secondary button-small"
-                      :disabled="saving" @click="action(() => api.setLocalEnabled(false))"
-                      aria-label="停用本机 Codex">停用</button>
-                  </div>
-                </div>
-                <div v-if="state.localEnabled === false" class="connection-row">
+              <div v-if="state.localEnabled === false" class="connection-local-heading">本地主机</div>
+              <div v-if="state.localEnabled === false" class="connection-list">
+                <div class="connection-row">
                   <span class="connection-symbol"><Icon name="Monitor" :size="19" /></span>
                   <div class="connection-details"><strong>本机 Codex 已停用</strong><span>仅部署 Web 服务；本机项目与对话记录保留</span></div>
                   <button class="button button-secondary button-small" :disabled="saving"
@@ -1121,6 +1111,12 @@ watch(() => [settingsHostId.value, section.value], () => {
   font-size: 13px;
   font-weight: 500;
 }
+.connection-section-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
 .connection-section-heading .button {
   border-radius: 999px;
   min-height: 30px;
@@ -1173,6 +1169,17 @@ watch(() => [settingsHostId.value, section.value], () => {
   width: 28px;
   height: 30px;
 }
+.connection-order-actions {
+  display: flex;
+  gap: 1px;
+  padding-right: 5px;
+  margin-right: 4px;
+  border-right: 1px solid var(--border);
+}
+.connection-order-actions .icon-button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
 .connection-current {
   font-size: 11px;
   color: var(--muted);
@@ -1209,12 +1216,16 @@ watch(() => [settingsHostId.value, section.value], () => {
     font-size: 12px;
   }
   .connection-row {
+    display: grid;
+    grid-template-columns: 19px minmax(0, 1fr);
     gap: 10px;
     padding: 14px 12px;
   }
+  .connection-actions { grid-column: 2; justify-content: flex-end; }
+  .connection-row > .button { grid-column: 2; justify-self: end; }
   .connection-actions .icon-button {
-    width: 30px;
-    height: 36px;
+    width: 38px;
+    height: 38px;
   }
   .connection-details > span {
     font-size: 11px;
