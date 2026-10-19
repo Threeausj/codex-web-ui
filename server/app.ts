@@ -207,7 +207,13 @@ export async function createApp(options: AppOptions = {}) {
     const fields = fingerprintFields.extend({ challenge: z.string().min(16).max(256), replace: z.boolean().default(false) }).strict().parse(req.body)
     res.json({ ok: true, ...await sshHostKeys.trust(fingerprintHost(fields), fields.challenge, fields.replace, req.session!.id) })
   }))
-  app.post('/api/hosts', asyncRoute((req, res) => sshKeys.withHostMutation(async () => res.status(201).json({ host: await storage.addHost(req.body) }))))
+  app.post('/api/hosts', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
+    const host = await storage.addHost(req.body)
+    res.status(201).json({ host, hosts: storage.hosts })
+  })))
+  app.patch('/api/hosts/order', asyncRoute(async (req, res) => {
+    res.json({ hosts: await storage.reorderHosts(req.body) })
+  }))
   app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
     const previousIdentityFile = storage.host(id)?.identityFile
@@ -301,6 +307,16 @@ export async function createServer(options: AppOptions = {}) {
       concurrencyLimit: 2, zlibDeflateOptions: { level: 3 } } })
   const sessionSockets = new Map<string, Set<WebSocket>>()
   const socketHeartbeat = new WebSocketHeartbeat()
+  const stopListeningForHostOrder = context.storage.subscribeHostOrder(hostIds => {
+    const frame = JSON.stringify({ method: 'bridge/host-order/changed', params: { hostIds } })
+    for (const [sessionId, sockets] of sessionSockets) {
+      if (!context.auth.isSessionActive(sessionId)) continue
+      for (const ws of sockets) {
+        if (ws.readyState !== 1 || ws.bufferedAmount > 256 * 1024) continue
+        try { ws.send(frame, error => { if (error) ws.terminate() }) } catch { ws.terminate() }
+      }
+    }
+  })
   const stopListeningForReadReceipts = context.threadReadReceipts.subscribe(receipts => {
     const frame = JSON.stringify({ method: 'bridge/thread-read-receipts', params: { receipts } })
     for (const [sessionId, sockets] of sessionSockets) {
@@ -350,6 +366,7 @@ export async function createServer(options: AppOptions = {}) {
     clearInterval(heartbeat)
     stopListeningForRevocation()
     stopListeningForReadReceipts()
+    stopListeningForHostOrder()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
     let automationFailure: unknown
