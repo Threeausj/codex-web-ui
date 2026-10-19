@@ -30,6 +30,46 @@ test('native project resolution validates exact saved host and path before any R
     await assert.rejects(f.native.resolve(hostId!, directory!), (cause: any) => cause.status === 404)
   assert.equal(f.calls.length, 0)
 })
+test('read-only bindings discover native identities across pages without creating projects', async () => {
+  const other = { ...project, id: 'b', name: 'Other', path: '/other', rootPaths: ['/other'] };
+  const f = fixture((_method, params) => params.cursor
+    ? { data: [entry('native-b', 'Other', ['/other'])], nextCursor: null }
+    : { data: [entry('native-a')], nextCursor: 'second' }, [project, other]);
+  assert.deepEqual(await f.native.bindings('nas'), { supported: true, bindings: [
+    { path: '/workspace', projectId: 'native-a' }, { path: '/other', projectId: 'native-b' },
+  ] });
+  assert.ok(f.calls.every(call => call.method === 'project/list'));
+  await assert.rejects(f.native.bindings('missing'), (error: any) => error.status === 404);
+});
+test('read-only bindings leave unmatched or ambiguous saved projects unresolved', async () => {
+  const f = fixture(() => ({ data: [entry('first', 'Different'), entry('second', 'Another')], nextCursor: null }));
+  assert.deepEqual(await f.native.bindings('nas'), { supported: true, bindings: [] });
+  assert.equal(f.calls.length, 1);
+});
+test('read-only bindings fall back only for explicitly unsupported methods', async () => {
+  const old = fixture(() => { throw new RpcFailure({ code: -32601, message: 'Method not found' }); });
+  assert.deepEqual(await old.native.bindings('nas'), { supported: false, bindings: [] });
+  const failed = fixture(() => { throw new Error('Connection timed out'); });
+  await assert.rejects(failed.native.bindings('nas'), /timed out/);
+});
+test('read-only bindings cannot reuse an older project configuration while its native read is pending', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let reads = 0;
+  const f = fixture(async () => {
+    if (++reads === 1) await gate;
+    return { data: [entry('old-native'), entry('new-native', 'NAS', ['/workspace', '/new-docs'])], nextCursor: null };
+  });
+  const first = f.native.bindings('nas');
+  await new Promise<void>(resolve => setImmediate(resolve));
+  f.projects[0] = { ...project, rootPaths: ['/workspace', '/new-docs'] };
+  const second = f.native.bindings('nas');
+  await new Promise<void>(resolve => setImmediate(resolve));
+  release();
+  assert.deepEqual((await second).bindings, [{ path: '/workspace', projectId: 'new-native' }]);
+  assert.deepEqual((await first).bindings, [{ path: '/workspace', projectId: 'old-native' }]);
+  assert.equal(reads, 2);
+});
 
 test('automation cwd resolution prefers a primary project over another project secondary root', async () => {
   const docs = { ...project, id: 'web-docs', path: '/docs', rootPaths: ['/docs'], name: 'Docs' }

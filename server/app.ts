@@ -230,6 +230,10 @@ export async function createApp(options: AppOptions = {}) {
     res.json({ ok: true })
   })))
   app.get('/api/projects', asyncRoute(async (_req, res) => res.json({ projects: await storage.projects() })))
+  app.get('/api/projects/native-bindings', asyncRoute(async (req, res) => {
+    const { hostId } = z.object({ hostId: z.string().min(1).max(512) }).parse(req.query)
+    res.json(await nativeProjects.bindings(hostId))
+  }))
   app.post('/api/projects/resolve-native', asyncRoute(async (req, res) => {
     const fields = z.object({ hostId: z.string().min(1).max(256), path: absolutePath }).strict().parse(req.body)
     res.json(await nativeProjects.resolve(fields.hostId, fields.path))

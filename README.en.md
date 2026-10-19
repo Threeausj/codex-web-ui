@@ -45,6 +45,8 @@ To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run doc
 
 [Deployment](#docker-quick-start) · [Features and limits](#features-and-limits) · [Development](#development-and-validation) · [Code review and priorities](docs/project-audit.md)
 
+Conversations can be moved between projects on the same host from their menu, using native project membership while retaining the working directory. Settings includes archived chat management for the selected host. Workspace files and unsaved drafts stay isolated by host and project when switching conversations. See [project membership](docs/native-projects.md) and [host settings](docs/host-settings.md).
+
 ## Docker quick start
 
 Install Docker Engine/Desktop with Docker Compose v2, then run these commands from the repository directory:

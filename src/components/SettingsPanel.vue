@@ -10,6 +10,7 @@ import HostDiagnostics from "./HostDiagnostics.vue";
 import IntegrationsSettings from "./IntegrationsSettings.vue";
 import PerformanceSettings from "./PerformanceSettings.vue";
 import CodexSettings from "./CodexSettings.vue";
+import ArchivedChatsPanel from "./ArchivedChatsPanel.vue";
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -36,6 +37,7 @@ const sections = [
   { id: "performance", label: "性能", icon: "Zap" },
   { id: "pwa", label: "应用与通知", icon: "Smartphone" },
   { id: "projects", label: "项目", icon: "Folder" },
+  { id: "archived", label: "已归档的聊天", icon: "Archive" },
   { id: "hosts", label: "连接", icon: "Globe" },
   { id: "permissions", label: "权限预设", icon: "Shield" },
   { id: "codex", label: "Codex", icon: "Bot" },
@@ -882,6 +884,7 @@ watch(() => [settingsHostId.value, section.value], () => {
               </p>
             </div>
           </template>
+          <ArchivedChatsPanel v-else-if="section === 'archived'" :api="api" :state="state" :host-id="settingsHostId" />
           <CodexSettings v-else-if="section === 'codex'" :api="api" :state="state" :host-id="settingsHostId" @busy="codexSettingsBusy = $event" />
           <template v-else-if="section === 'account'">
             <h3>网页账户</h3>

@@ -8,11 +8,14 @@ export function projectKey(hostId: string, path: string) {
   return `project:${hostId}:${path}`;
 }
 export function matchesProject(
-  thread: { cwd?: string; hostId?: string },
-  project: { path: string; rootPaths?: string[]; hostId?: string },
+  thread: { cwd?: string; hostId?: string; projectId?: string | null },
+  project: { path: string; rootPaths?: string[]; hostId?: string; nativeProjectId?: string },
 ) {
   if (thread.hostId && project.hostId && thread.hostId !== project.hostId)
     return false;
+  // Native membership is independent of cwd: desktop moves change only the
+  // project identity, leaving tools in the conversation's original directory.
+  if (thread.projectId) return thread.projectId === project.nativeProjectId;
   const cwd = thread.cwd?.replace(/\/$/, "");
   return [project.path, ...(project.rootPaths || [])].some(
     (root) => root.replace(/\/$/, "") === cwd,

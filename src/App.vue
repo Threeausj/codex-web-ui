@@ -35,6 +35,7 @@ import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
 import ThreadCopyMenu from './components/ThreadCopyMenu.vue';
+import ThreadProjectMoveDialog from './components/ThreadProjectMoveDialog.vue';
 import ProjectDialog from "./components/ProjectDialog.vue";
 import BookmarksPanel from './components/BookmarksPanel.vue';
 import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
@@ -84,6 +85,8 @@ const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
 const composer = ref<InstanceType<typeof Composer>>();
+const movingProject = ref<{ thread: any; hostId: string } | null>(null);
+watch(() => state.authenticated, authenticated => { if (!authenticated) movingProject.value = null; });
 useMobilePanelBack(() => state.authenticated, [
   { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
@@ -98,6 +101,9 @@ useMobilePanelBack(() => state.authenticated, [
 const workspaceTab = ref("files");
 const workspacePath = ref("");
 const workspaceLine = ref<number>();
+const workspacePathScope = ref("");
+const workspaceScope = () => `${state.hostId}\0${state.projectPath}`;
+const scopedWorkspacePath = computed(() => workspacePathScope.value === workspaceScope() ? workspacePath.value : "");
 const workspace = ref<InstanceType<typeof WorkspacePanel>>();
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
@@ -153,10 +159,10 @@ const currentHost = computed(() =>
 const currentProject = computed(() =>
   state.projects.find(
     (project: any) =>
-      [project.path, ...(project.rootPaths || [])].includes(
-        state.projectPath,
-      ) &&
-      (!project.hostId || project.hostId === state.hostId),
+      (!project.hostId || project.hostId === state.hostId) &&
+      (state.activeThread?.projectId
+        ? api.threadMatchesProject(state.activeThread, project)
+        : [project.path, ...(project.rootPaths || [])].includes(state.projectPath)),
   ),
 );
 const projectName = computed(
@@ -472,12 +478,16 @@ async function chooseNewContext(hostId: string, path?: string) {
 }
 function openWorkspace(tab = "files", path = "", line?: number) {
   sideChat.hide();
-  const samePath = workspaceOpen.value && workspacePath.value === path;
+  const targetScope = workspaceScope();
+  const samePath = workspaceOpen.value && workspacePathScope.value === targetScope && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceOpen.value = true;
   workspacePath.value = path;
   workspaceLine.value = line;
-  if (path && samePath) void nextTick(() => workspace.value?.revealPath(path, line));
+  workspacePathScope.value = targetScope;
+  if (path && samePath) void nextTick(() => {
+    if (workspaceScope() === targetScope && workspacePath.value === path) void workspace.value?.revealPath(path, line);
+  });
   else if (!path) void nextTick(() => workspace.value?.setTab(tab));
 }
 function toggleWorkspace() {
@@ -1148,6 +1158,9 @@ watch(() => [state.authenticated, state.loading], () => {
                 <Icon name="RefreshCw" :size="16" />压缩上下文</button
               ><button :disabled="!state.activeThread" @click="openRename">
                 <Icon name="Pencil" :size="16" />重命名对话</button
+              ><button :disabled="!state.activeThread || state.busy || actionPending"
+                @click="threadMenu = false; movingProject = { thread: { ...state.activeThread, hostId: state.hostId }, hostId: state.hostId }">
+                <Icon name="FolderInput" :size="16" />移动到项目</button
               ><button
                 :disabled="!state.activeThread"
                 @click="
@@ -1437,6 +1450,7 @@ watch(() => [state.authenticated, state.loading], () => {
     <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
+    <ThreadProjectMoveDialog v-if="movingProject && state.authenticated" :key="`${movingProject.hostId}:${movingProject.thread.id}`" :thread="movingProject.thread" :host-id="movingProject.hostId" :state="state" :api="api" @close="movingProject = null" />
     <ResizableWorkspace v-if="workspaceOpen && currentHost" v-show="!sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"
@@ -1444,8 +1458,8 @@ watch(() => [state.authenticated, state.loading], () => {
         :api="api"
         :state="state"
         :initial-tab="workspaceTab"
-        :open-path="workspacePath"
-        :open-line="workspaceLine"
+        :open-path="scopedWorkspacePath"
+        :open-line="scopedWorkspacePath ? workspaceLine : undefined"
         @close="workspaceOpen = false"
         @error="showError"
         @add="addToConversation"

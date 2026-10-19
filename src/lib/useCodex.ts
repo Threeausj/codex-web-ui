@@ -7,7 +7,7 @@ import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./servic
 import { reactive, ref, shallowReactive, toRaw, watch } from "vue";
 import { randomUUID } from "./uuid";
 import { browserStorage } from "./browser-storage";
-import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache } from "./thread-title-search";
+import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache, threadTitleQueryKey } from "./thread-title-search";
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
@@ -39,6 +39,7 @@ import {
 } from "./configuration";
 import {
   exportThreadMarkdown,
+  matchesProject,
   historyActivityAt,
   threadActivityAt,
   turnActivityAt,
@@ -70,8 +71,9 @@ type HostNavigation = {
   loading: boolean;
   loaded: boolean;
   error: string;
-  projectPages: Record<string, { cursor: string | null; loaded: boolean }>;
+  projectPages: Record<string, ProjectThreadPage>;
 };
+type ProjectThreadPage = { cursor: string | null; loaded: boolean; nativeCursor?: string | null; legacyCursor?: string | null; nativeProjectId?: string };
 type AsyncQuestionStatus = 'pending' | 'sending' | 'answered' | 'uncertain';
 type AsyncQuestionRecord = { hostId: string; threadId: string; item: DisplayItem };
 type AsyncQuestionOperation = { fingerprint: string; status: AsyncQuestionStatus; receiptReadFailed?: boolean };
@@ -110,10 +112,7 @@ const state = reactive({
   requirements: null as any,
   nativePermissionProfiles: [] as any[],
   projectPath: "",
-  projectThreadPages: {} as Record<
-    string,
-    { cursor: string | null; loaded: boolean }
-  >,
+  projectThreadPages: {} as Record<string, ProjectThreadPage>,
   threads: [] as any[],
   activeThread: null as any,
   selectingThread: false,
@@ -183,6 +182,10 @@ function advanceAuthentication() {
   state.authenticationGeneration = ++authenticationGeneration;
   hostAvailabilityRequest = null;
   settingsApi.resetHostSettings();
+  nativeProjectBindingTimes.clear();
+  nativeProjectBindingValues.clear();
+  nativeProjectBindingRequests.clear();
+  threadProjectChanges.clear();
 }
 type SessionStatus = { authenticated: boolean; authRequired?: boolean; csrfToken?: string };
 let sessionValidation: { generation: number; promise: Promise<SessionStatus | null> } | null = null;
@@ -1015,6 +1018,44 @@ function validateSession(): Promise<SessionStatus | null> {
 }
 const navigationRequests = new Map<string, Promise<void>>();
 const navigationRevisions = new Map<string, number>();
+const nativeProjectBindingRequests = new Map<string, Promise<void>>();
+const nativeProjectBindingTimes = new Map<string, number>();
+const nativeProjectBindingValues = new Map<string, { path: string; projectId: string }[]>();
+const threadProjectChanges = new Map<string, { revision: number; projectId: string | null }>();
+let projectChangeSequence = 0;
+async function loadNativeProjectBindings(hostId = state.hostId, force = false): Promise<void> {
+  if (!hostId || !state.hosts.some(host => host.id === hostId)) return;
+  const scopeKey = () => JSON.stringify([authenticationGeneration, hostId, state.projects.filter(project => (project.hostId || 'local') === hostId)
+    .map(project => [project.path, project.name, project.rootPaths])]);
+  const key = scopeKey();
+  const previous = nativeProjectBindingRequests.get(key);
+  if (previous) return previous;
+  const apply = (bindings: { path: string; projectId: string }[]) => {
+    for (const project of state.projects.filter(project => (project.hostId || 'local') === hostId)) {
+      const binding = bindings.find(entry => entry.path === project.path);
+      if (binding) project.nativeProjectId = binding.projectId;
+      else delete project.nativeProjectId;
+    }
+  };
+  if (!force && Date.now() - (nativeProjectBindingTimes.get(key) || 0) < 30000) {
+    apply(nativeProjectBindingValues.get(key) || []);
+    return;
+  }
+  const authentication = authenticationGeneration;
+  const operation = (async () => {
+    const result = await http(`/projects/native-bindings?hostId=${encodeURIComponent(hostId)}`, {}, false);
+    if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId) || key !== scopeKey()) return;
+    if (typeof result.supported !== 'boolean' || !Array.isArray(result.bindings) ||
+        result.bindings.some((entry: any) => typeof entry?.path !== 'string' || typeof entry?.projectId !== 'string' || !entry.projectId))
+      throw new Error('Codex 项目接口返回格式不兼容，请检查目标服务器的 Codex 版本');
+    apply(result.bindings);
+    nativeProjectBindingValues.set(key, result.bindings);
+    nativeProjectBindingTimes.set(key, Date.now());
+  })().finally(() => { if (nativeProjectBindingRequests.get(key) === operation) nativeProjectBindingRequests.delete(key); });
+  nativeProjectBindingRequests.set(key, operation);
+  return operation;
+}
+function threadMatchesProject(thread: any, project: any) { return matchesProject(thread, project); }
 const titleSearchPages = new ThreadTitlePageCache<any>();
 const titleSearchSupport = new Map<string, boolean>();
 const titleSearchRevision = ref(0);
@@ -1126,6 +1167,7 @@ async function threadPage(
   params: any,
   metadataOnly = false,
 ) {
+  const projectRevision = projectChangeSequence;
   const supportKey = `${hostId}:${method}`;
   const supported = recencySortSupport.get(supportKey) !== false;
   let result;
@@ -1148,6 +1190,10 @@ async function threadPage(
       sortKey: "updated_at",
     });
   }
+  result.data = (result.data || []).map((thread: any) => {
+    const change = threadProjectChanges.get(recencyKey(hostId, thread.id));
+    return change && change.revision > projectRevision ? { ...thread, projectId: change.projectId } : thread;
+  });
   // Title search needs metadata, not a history read per match on old servers.
   if (metadataOnly) return {
     ...result,
@@ -1302,12 +1348,7 @@ async function loadNavigationProject(
   const current = nav.projectPages[projectPath];
   if ((!more && current?.loaded) || (more && !current?.cursor)) return;
   const revision = navigationRevisions.get(hostId) ?? 0;
-  const result = await threadPage(hostId, "thread/list", {
-    limit: 60,
-    cursor: more ? current?.cursor : undefined,
-    cwd: projectRoots(projectPath, hostId),
-    modelProviders: [],
-  });
+  const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
   if (
     revision !== (navigationRevisions.get(hostId) ?? 0) ||
     !state.hosts.some((host) => host.id === hostId)
@@ -1315,7 +1356,28 @@ async function loadNavigationProject(
     return;
   mergeNavigation(hostId, result.data);
   nav.loadedMore = true;
-  nav.projectPages[projectPath] = { loaded: true, cursor: result.nextCursor };
+  nav.projectPages[projectPath] = result.page;
+}
+async function projectThreadPage(hostId: string, projectPath: string, current?: ProjectThreadPage) {
+  await loadNativeProjectBindings(hostId);
+  const projectId = state.projects.find(project => (project.hostId || 'local') === hostId && project.path === projectPath)?.nativeProjectId;
+  const roots = projectRoots(projectPath, hostId);
+  if (!projectId) {
+    const result = await threadPage(hostId, 'thread/list', { limit: 60, cursor: current?.cursor, cwd: roots, modelProviders: [] });
+    return { data: result.data, page: { loaded: true, cursor: result.nextCursor } as ProjectThreadPage };
+  }
+  // A moved thread retains its old cwd. Page native membership separately from
+  // unassigned legacy conversations, preserving both pagination cursors.
+  const sameProject = current?.nativeProjectId === projectId;
+  const nativeCursor = sameProject ? current?.nativeCursor : undefined;
+  const legacyCursor = sameProject ? current?.legacyCursor : undefined;
+  const [native, legacy] = await Promise.all([
+    nativeCursor === null ? { data: [], nextCursor: null } : threadPage(hostId, 'thread/list', { limit: 60, cursor: nativeCursor, projectId, modelProviders: [] }),
+    legacyCursor === null ? { data: [], nextCursor: null } : threadPage(hostId, 'thread/list', { limit: 60, cursor: legacyCursor, cwd: roots, projectId: null, modelProviders: [] }),
+  ]);
+  return { data: [...new Map([...legacy.data, ...native.data].map((thread: any) => [thread.id, thread])).values()],
+    page: { loaded: true, cursor: native.nextCursor || legacy.nextCursor ? 'more' : null,
+      nativeCursor: native.nextCursor, legacyCursor: legacy.nextCursor, nativeProjectId: projectId } as ProjectThreadPage };
 }
 function navigationProjectPage(hostId: string, projectPath: string) {
   return hostId === state.hostId
@@ -1529,6 +1591,11 @@ function receiveThreadChange(change: any) {
   if (method === 'thread/delete') { cleanupDeletedThread(threadId); return; }
   if (method === 'thread/name/set') {
     if (typeof request.name === 'string') applyThreadRename(threadId, request.name);
+    return;
+  }
+  if (method === 'thread/metadata/update' && result.thread?.id === threadId &&
+      (result.thread.projectId === null || typeof result.thread.projectId === 'string')) {
+    applyThreadProject(state.hostId, threadId, result.thread.projectId);
     return;
   }
   if (method === 'thread/revert' || method === 'thread/rollback') {
@@ -1758,12 +1825,8 @@ function receive(message: any) {
   if (method === "thread/started") updateThread(p.thread);
   if (method === "thread/project/updated" &&
       (p.projectId === null || typeof p.projectId === 'string')) {
-    const thread = state.threads.find(entry => entry.id === p.threadId)
-      ?? (state.activeThread?.id === p.threadId ? state.activeThread : undefined);
-    if (thread) {
-      updateThread({ ...thread, projectId: p.projectId });
-      scheduleConversationSnapshot(p.threadId);
-    }
+    applyThreadProject(state.hostId, p.threadId, p.projectId);
+    void loadNativeProjectBindings(state.hostId, true).catch(() => {});
     return;
   }
   if (method === "thread/reverted") {
@@ -2487,14 +2550,8 @@ async function loadProjectThreads(projectPath: string, more = false) {
   if (!more && current?.loaded) return;
   const cursor = more ? current?.cursor : undefined;
   if (more && !cursor) return;
-  const roots = projectRoots(projectPath);
   const nameRevisions = new Map(threadNameRevisions);
-  const result = await threadPage(hostId, "thread/list", {
-    limit: 60,
-    cursor,
-    cwd: roots,
-    modelProviders: [],
-  });
+  const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
   if (hostId !== state.hostId) return;
   const known = new Set(state.threads.map((thread) => thread.id));
   state.threads.push(
@@ -2503,10 +2560,7 @@ async function loadProjectThreads(projectPath: string, more = false) {
     ).map((thread: any) => ({ ...thread, ...listedThreadLabels(thread, hostId, nameRevisions) })),
   );
   loadedMorePages = true;
-  state.projectThreadPages[projectPath] = {
-    loaded: true,
-    cursor: result.nextCursor,
-  };
+  state.projectThreadPages[projectPath] = result.page;
 }
 async function history(
   threadId: string,
@@ -3855,6 +3909,59 @@ async function renameThread(name: string, id = state.activeThread?.id, hostId = 
   await scopedRpc(hostId, 'thread/name/set', { threadId: id, name: trimmed });
   if (authentication !== authenticationGeneration || !state.hosts.some(host => host.id === hostId)) return;
   applyThreadRename(id, trimmed, hostId);
+}
+function applyThreadProject(hostId: string, id: string, projectId: string | null) {
+  threadProjectChanges.set(recencyKey(hostId, id), { revision: ++projectChangeSequence, projectId });
+  invalidateThreadTitleSearch(hostId);
+  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  if (hostId === state.hostId) {
+    const thread = state.threads.find(thread => thread.id === id)
+      ?? (state.activeThread?.id === id ? state.activeThread : undefined);
+    if (thread) updateThread({ ...thread, projectId });
+    state.projectThreadPages = {};
+    if (state.activeThread?.id === id) saveConversationSnapshot();
+    else conversationCache.remove(hostId, id);
+  } else conversationCache.remove(hostId, id);
+  const navigation = state.navigation[hostId];
+  if (navigation) {
+    const thread = navigation.threads.find(thread => thread.id === id);
+    if (thread) thread.projectId = projectId;
+    navigation.projectPages = {};
+  }
+}
+const movingThreadProjects = new Set<string>();
+async function moveThreadToProject(id: string, destinationPath: string, hostId = state.hostId) {
+  const key = recencyKey(hostId, id);
+  if (movingThreadProjects.has(key)) throw new Error('正在调整此对话的项目，请稍候');
+  const authentication = authenticationGeneration;
+  const target = () => state.projects.find(project => (project.hostId || 'local') === hostId && project.path === destinationPath);
+  const current = () => authentication === authenticationGeneration && state.authenticated && state.hosts.some(host => host.id === hostId) && target();
+  const running = () => hostId === state.hostId && state.activeThread?.id === id && state.busy;
+  if (!id || !current()) throw new Error('目标项目必须属于此对话所在的主机，请刷新项目列表后重试');
+  if (running()) throw new Error('此对话正在运行，请先停止或等待任务结束后调整项目');
+  movingThreadProjects.add(key);
+  try {
+    const metadata = await scopedRpc(hostId, 'thread/read', { threadId: id, includeTurns: false });
+    if (!current()) throw new Error('登录状态或目标项目已变化，请重新确认后调整项目');
+    if (metadata.thread?.id !== id) throw new Error('无法确认目标对话，请刷新列表后重试');
+    if (running() || metadata.thread?.status?.type === 'active') throw new Error('此对话正在运行，请先停止或等待任务结束后调整项目');
+    const projectId = await resolveNativeProjectIdentity(hostId, destinationPath);
+    if (!current()) throw new Error('登录状态或目标项目已变化，请重新确认后调整项目');
+    if (!projectId) throw new Error('目标主机的 Codex 不支持原生项目调整，请升级 Codex 后重试；对话归属未修改');
+    if (running()) throw new Error('此对话正在运行，请先停止或等待任务结束后调整项目');
+    const response = await scopedRpc(hostId, 'thread/metadata/update', { threadId: id, projectId });
+    if (!current()) return;
+    if (response.thread?.id !== id || response.thread.projectId !== projectId)
+      throw new Error('Codex 未确认项目调整，请同步对话后确认归属');
+    target()!.nativeProjectId = projectId;
+    applyThreadProject(hostId, id, projectId);
+    toast(`已移至项目「${target()!.name}」`);
+    return { id, hostId, projectId };
+  } catch (error: any) {
+    if (error.code === -32601 || /unknown variant `thread\/metadata\/update`|(?:unsupported|unknown|not found).*method/i.test(error.message || ''))
+      error.message = '目标主机的 Codex 不支持原生项目调整，请升级 Codex 后重试；对话归属未修改';
+    throw error;
+  } finally { movingThreadProjects.delete(key); }
 }
 function cleanupDeletedThread(id: string, hostId = state.hostId) {
   if (!id) return;
@@ -5417,13 +5524,17 @@ async function queryThreads(
   archived = false,
   cursor: string | null = null,
   hostId = state.hostId,
+  options: { cwd?: string[]; force?: boolean; projectId?: string | null } = {},
 ) {
+  if (options.force) invalidateThreadTitleSearch(hostId);
   const query = search.trim().normalize("NFKC").toLowerCase();
   const revision = navigationRevisions.get(hostId) ?? 0;
-  const key = JSON.stringify(hostId) + ":" + JSON.stringify([authenticationGeneration, revision, archived, query, cursor]);
+  const key = threadTitleQueryKey(hostId, [authenticationGeneration, revision, archived, query, cursor], options);
   return titleSearchPages.query(key, async () => {
     let result;
-    const params = { archived, cursor, limit: 60, modelProviders: [] };
+    const params = { archived, cursor, limit: 60, modelProviders: [],
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(Object.prototype.hasOwnProperty.call(options, 'projectId') ? { projectId: options.projectId } : {}) };
     try {
       result = await threadPage(hostId, "thread/list", {
         ...params,
@@ -5495,7 +5606,9 @@ async function queryNavigationThreads(
   return { data, nextCursors };
 }
 async function unarchiveThread(id: string, hostId = state.hostId) {
+  const authentication = authenticationGeneration;
   const result = await scopedRpc(hostId, "thread/unarchive", { threadId: id });
+  if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId)) return;
   invalidateThreadTitleSearch(hostId);
   if (hostId === state.hostId) {
     removedThreads.delete(id);
@@ -5667,6 +5780,9 @@ export function useCodex() {
     compact,
     setAutoCompact,
     renameThread,
+    moveThreadToProject,
+    loadNativeProjectBindings,
+    threadMatchesProject,
     deleteThread,
     archiveThread,
     setProject,

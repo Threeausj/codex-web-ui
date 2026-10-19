@@ -39,7 +39,56 @@ export function nativeProjectsUnsupported(cause: unknown, method?: string) {
  * against the selected host on every operation so desktop edits stay current. */
 export class NativeProjects {
   private pending = new Map<string, Promise<NativeProjectResolution>>()
+  private bindingRequests = new Map<string, Promise<{ supported: boolean; bindings: { path: string; projectId: string }[] }>>()
   constructor(private readonly dependencies: Dependencies) {}
+
+  /** Read-only identity discovery for project grouping. Browsing must never
+   * create a native project or change a thread's tool working directory. */
+  async bindings(hostId: string): Promise<{ supported: boolean; bindings: { path: string; projectId: string }[] }> {
+    if (!this.dependencies.storage.host(hostId)) throw Object.assign(new Error('主机不存在'), { status: 404 })
+    const saved = (await this.dependencies.storage.projects()).filter(project => project.hostId === hostId)
+    const key = JSON.stringify([hostId, saved.map(project => [project.id, project.path, project.name, project.rootPaths])])
+    const previous = this.bindingRequests.get(key)
+    if (previous) return previous
+    const operation = (async () => {
+      try {
+        const bridge = await this.dependencies.getBridge(hostId)
+        const projects = await this.readProjects(bridge)
+        const bindings: { path: string; projectId: string }[] = []
+        for (const project of saved) {
+          const expected = rootsKey([project.path, ...(project.rootPaths || [])])
+          const matches = projects.filter(entry => rootsKey(entry.roots.map(root => root.path)) === expected)
+          const named = matches.filter(entry => entry.name.trim() === project.name.trim())
+          const match = matches.length === 1 ? matches[0] : named.length === 1 ? named[0] : undefined
+          if (match) bindings.push({ path: project.path, projectId: match.id })
+        }
+        return { supported: true, bindings }
+      } catch (cause) {
+        if (nativeProjectsUnsupported(cause, 'project/list')) return { supported: false, bindings: [] }
+        if (cause instanceof z.ZodError) throw new Error('Codex 项目接口返回格式不兼容，请检查目标服务器的 Codex 版本')
+        throw cause
+      }
+    })().finally(() => { if (this.bindingRequests.get(key) === operation) this.bindingRequests.delete(key) })
+    this.bindingRequests.set(key, operation)
+    return operation
+  }
+
+  private async readProjects(bridge: Pick<Bridge, 'request'>): Promise<z.infer<typeof nativeProject>[]> {
+    const deadline = Date.now() + 15000
+    const projects = new Map<string, z.infer<typeof nativeProject>>()
+    const cursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error('读取 Codex 项目超时，请重试')
+      const response = projectPage.parse(await bridge.request('project/list', { limit: 100, ...(cursor ? { cursor } : {}) }, Math.min(15000, remaining)))
+      for (const entry of response.data) projects.set(entry.id, entry)
+      cursor = response.nextCursor
+      if (cursor && cursors.has(cursor)) throw new Error('Codex 项目分页游标重复，无法确认项目归属')
+      if (cursor) cursors.add(cursor)
+    } while (cursor)
+    return [...projects.values()]
+  }
 
   /** Automation cwd can be a saved secondary root. Prefer an explicit primary
    * project, and never guess when several projects share the secondary root. */

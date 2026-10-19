@@ -65,9 +65,9 @@ const threads = computed(() =>
 const current = computed(
   () =>
     hostId.value === props.state.hostId &&
-    [props.project.path, ...(props.project.rootPaths || [])].includes(
-      props.state.projectPath,
-    ),
+    (props.state.activeThread?.projectId
+      ? matchesProject(props.state.activeThread, props.project)
+      : [props.project.path, ...(props.project.rootPaths || [])].includes(props.state.projectPath)),
 );
 const visibleThreads = computed(() => {
   if (expandedThreads.value || threads.value.length <= threadLimit)

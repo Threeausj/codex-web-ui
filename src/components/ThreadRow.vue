@@ -2,6 +2,7 @@
 import { computed, inject, nextTick, ref, useId } from "vue";
 import Icon from "./Icon.vue";
 import ThreadCopyMenu from './ThreadCopyMenu.vue';
+import ThreadProjectMoveDialog from './ThreadProjectMoveDialog.vue';
 import { isPinned, threadActivityAt } from "../lib/navigation";
 import { searchableThreadTitle } from '../lib/thread-title-search';
 import { threadIndicatorsKey } from '../lib/thread-indicators';
@@ -18,8 +19,10 @@ const emit = defineEmits<{
   renamed: [thread: { id: string; hostId: string; name: string }];
   deleted: [thread: { id: string; hostId: string }];
   restored: [thread: { id: string; hostId: string }];
+  moved: [thread: { id: string; hostId: string; projectId: string }];
 }>();
 const menu = ref(false);
+const moveDialog = ref(false);
 const pending = ref(false);
 const menuButton = ref<HTMLButtonElement>();
 const dialogElement = ref<HTMLDialogElement>();
@@ -196,6 +199,9 @@ async function submitDialog() {
       <button :disabled="pending" @click="openDialog('rename')">
         <Icon name="Pencil" :size="14" />重命名对话
       </button>
+      <button :disabled="pending || running || !state.online" :title="running ? '请先停止或等待任务结束后调整项目' : undefined" @click="menu = false; moveDialog = true">
+        <Icon name="FolderInput" :size="14" />移动到项目
+      </button>
       <button
         v-if="!archived"
         @click="run(() => api.pin('thread', thread.id, label, hostId))"
@@ -244,6 +250,7 @@ async function submitDialog() {
       </button>
     </div>
   </div>
+  <ThreadProjectMoveDialog v-if="moveDialog" :thread="thread" :host-id="hostId" :state="state" :api="api" @moved="emit('moved', $event)" @close="moveDialog = false" />
   <Teleport to="body">
     <dialog
       v-if="dialogMode"

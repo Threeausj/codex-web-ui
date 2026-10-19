@@ -1,6 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache } from "../src/lib/thread-title-search";
+import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache, threadTitleQueryKey } from "../src/lib/thread-title-search";
+
+test('all-project, unassigned and assigned project filters never reuse each other cached pages', async () => {
+  const cache = new ThreadTitlePageCache<string[]>();
+  const scope = [1, 0, true, '', null];
+  let reads = 0;
+  const read = (filters: { projectId?: string | null }, data: string[]) => cache.query(threadTitleQueryKey('nas', scope, filters), async () => { ++reads; return data; });
+  assert.deepEqual(await read({}, ['assigned', 'unassigned']), ['assigned', 'unassigned']);
+  assert.deepEqual(await read({ projectId: null }, ['unassigned']), ['unassigned']);
+  assert.deepEqual(await read({ projectId: 'native-b' }, ['assigned']), ['assigned']);
+  assert.deepEqual(await read({}, ['must not refill cache']), ['assigned', 'unassigned']);
+  assert.equal(reads, 3);
+});
 
 test("title matching excludes preview, directory, session ID and history when a canonical title exists", () => {
   const thread = { name: "配置 SSH 服务器", title: "其他标题", preview: "正文含有 secret", cwd: "/secret", id: "secret-id", turns: [{ text: "secret" }] };
