@@ -7,6 +7,7 @@ import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./servic
 import { reactive, ref, shallowReactive, toRaw, watch } from "vue";
 import { randomUUID } from "./uuid";
 import { browserStorage } from "./browser-storage";
+import { projectBindingKey, retainProjectBindings } from './project-membership';
 import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache, threadTitleQueryKey } from "./thread-title-search";
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
@@ -682,7 +683,7 @@ function clearConversationCaches() {
   ++listGeneration;
   ++configGeneration;
   ++integrationGeneration;
-  for (const host of state.hosts) navigationRevisions.set(host.id, (navigationRevisions.get(host.id) || 0) + 1);
+  for (const host of state.hosts) advanceNavigationRevision(host.id);
   navigationRequests.clear();
   void conversationCache.clear();
   void privateState.clear();
@@ -1018,11 +1019,40 @@ function validateSession(): Promise<SessionStatus | null> {
 }
 const navigationRequests = new Map<string, Promise<void>>();
 const navigationRevisions = new Map<string, number>();
+// Renames change labels, not project membership or its pagination cursors.
+const projectPageRevisions = new Map<string, number>();
+function advanceNavigationRevision(hostId: string, projectPages = true) {
+  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  if (projectPages) projectPageRevisions.set(hostId, (projectPageRevisions.get(hostId) ?? 0) + 1);
+}
 const nativeProjectBindingRequests = new Map<string, Promise<void>>();
 const nativeProjectBindingTimes = new Map<string, number>();
 const nativeProjectBindingValues = new Map<string, { path: string; projectId: string }[]>();
 const threadProjectChanges = new Map<string, { revision: number; projectId: string | null }>();
 let projectChangeSequence = 0;
+function replaceProjects(projects: any[]) {
+  const location = (project: any) => JSON.stringify([project.hostId || 'local', project.path]);
+  const previous = new Map(state.projects.map(project => [location(project), project]));
+  const next = new Map(projects.map(project => [location(project), project]));
+  state.projects = retainProjectBindings(state.projects, projects);
+  const changedHosts = new Set<string>();
+  for (const key of new Set([...previous.keys(), ...next.keys()])) {
+    const before = previous.get(key), after = next.get(key);
+    if (before && after && projectBindingKey(before) === projectBindingKey(after)) continue;
+    const project = after || before;
+    const hostId = project.hostId || 'local';
+    changedHosts.add(hostId);
+    // A changed project needs new identity/pagination discovery; unrelated
+    // projects retain both their native membership and loaded conversations.
+    if (hostId === state.hostId) delete state.projectThreadPages[project.path];
+    if (state.navigation[hostId]) delete state.navigation[hostId].projectPages[project.path];
+  }
+  for (const hostId of changedHosts) {
+    advanceNavigationRevision(hostId);
+    navigationRequests.delete(hostId);
+    invalidateThreadTitleSearch(hostId);
+  }
+}
 async function loadNativeProjectBindings(hostId = state.hostId, force = false): Promise<void> {
   if (!hostId || !state.hosts.some(host => host.id === hostId)) return;
   const scopeKey = () => JSON.stringify([authenticationGeneration, hostId, state.projects.filter(project => (project.hostId || 'local') === hostId)
@@ -1279,10 +1309,7 @@ async function refreshNavigation(force = false) {
     state.projectThreadPages = {};
     state.threads = [];
     for (const host of state.hosts) {
-      navigationRevisions.set(
-        host.id,
-        (navigationRevisions.get(host.id) ?? 0) + 1,
-      );
+      advanceNavigationRevision(host.id);
       navigationRequests.delete(host.id);
       delete state.navigation[host.id];
     }
@@ -1347,14 +1374,15 @@ async function loadNavigationProject(
   const nav = hostNavigation(hostId);
   const current = nav.projectPages[projectPath];
   if ((!more && current?.loaded) || (more && !current?.cursor)) return;
-  const revision = navigationRevisions.get(hostId) ?? 0;
+  const revision = projectPageRevisions.get(hostId) ?? 0;
+  const nameRevisions = new Map(threadNameRevisions);
   const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
   if (
-    revision !== (navigationRevisions.get(hostId) ?? 0) ||
+    revision !== (projectPageRevisions.get(hostId) ?? 0) ||
     !state.hosts.some((host) => host.id === hostId)
   )
     return;
-  mergeNavigation(hostId, result.data);
+  mergeNavigation(hostId, result.data.map((thread: any) => ({ ...thread, ...listedThreadLabels(thread, hostId, nameRevisions) })));
   nav.loadedMore = true;
   nav.projectPages[projectPath] = result.page;
 }
@@ -1530,8 +1558,9 @@ function projectAcceptedThreadPreview(threadId: string, items: any[]) {
   scheduleConversationSnapshot(threadId);
 }
 function listedThreadLabels(thread: any, hostId: string, nameRevisions: Map<string, number>) {
-  const live = state.threads.find(current => current.id === thread.id)
-    ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined);
+  const live = hostId === state.hostId
+    ? state.threads.find(current => current.id === thread.id) ?? (state.activeThread?.id === thread.id ? state.activeThread : undefined)
+    : state.navigation[hostId]?.threads.find(current => current.id === thread.id);
   const key = recencyKey(hostId, thread.id);
   const renamed = (threadNameRevisions.get(key) ?? 0) !== (nameRevisions.get(key) ?? 0);
   const name = renamed ? live?.name : thread.name ?? live?.name;
@@ -2236,7 +2265,7 @@ async function bootstrap() {
   localCwd = data.cwd;
   state.hosts = data.hosts;
   state.localEnabled = data.localEnabled ?? state.hosts.some(host => host.id === 'local');
-  state.projects = data.projects;
+  replaceProjects(data.projects);
   state.connectionMode = data.connectionMode;
   // Bootstrap carries this small journal to avoid an extra navigation round trip.
   if (Array.isArray(data.asyncQuestionNoticeDismissals)) asyncQuestionNotices.hydrate(data.asyncQuestionNoticeDismissals);
@@ -2392,10 +2421,7 @@ async function logout() {
   state.threads = [];
   state.navigation = {};
   for (const host of state.hosts)
-    navigationRevisions.set(
-      host.id,
-      (navigationRevisions.get(host.id) ?? 0) + 1,
-    );
+    advanceNavigationRevision(host.id);
   state.activeThread = null;
   state.pendingRequests = [];
   state.agentActivity = {};
@@ -2546,13 +2572,16 @@ async function loadMoreThreads() {
 }
 async function loadProjectThreads(projectPath: string, more = false) {
   const hostId = state.hostId;
+  const authentication = authenticationGeneration;
+  const revision = projectPageRevisions.get(hostId) ?? 0;
   const current = state.projectThreadPages[projectPath];
   if (!more && current?.loaded) return;
   const cursor = more ? current?.cursor : undefined;
   if (more && !cursor) return;
   const nameRevisions = new Map(threadNameRevisions);
   const result = await projectThreadPage(hostId, projectPath, more ? current : undefined);
-  if (hostId !== state.hostId) return;
+  if (hostId !== state.hostId || authentication !== authenticationGeneration ||
+      !state.authenticated || revision !== (projectPageRevisions.get(hostId) ?? 0)) return;
   const known = new Set(state.threads.map((thread) => thread.id));
   state.threads.push(
     ...result.data.filter(
@@ -3899,7 +3928,7 @@ function applyThreadRename(id: string, name: string, hostId = state.hostId) {
   } else conversationCache.remove(hostId, id);
   const thread = state.navigation[hostId]?.threads.find(thread => thread.id === id);
   if (thread) thread.name = name;
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId, false);
 }
 async function renameThread(name: string, id = state.activeThread?.id, hostId = state.hostId) {
   const trimmed = name.trim();
@@ -3913,7 +3942,7 @@ async function renameThread(name: string, id = state.activeThread?.id, hostId = 
 function applyThreadProject(hostId: string, id: string, projectId: string | null) {
   threadProjectChanges.set(recencyKey(hostId, id), { revision: ++projectChangeSequence, projectId });
   invalidateThreadTitleSearch(hostId);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   if (hostId === state.hostId) {
     const thread = state.threads.find(thread => thread.id === id)
       ?? (state.activeThread?.id === id ? state.activeThread : undefined);
@@ -3985,7 +4014,7 @@ function cleanupDeletedThread(id: string, hostId = state.hostId) {
   }
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter(thread => thread.id !== id);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   conversationCache.remove(hostId, id);
   void conversationCache.flush().catch(() => {});
   for (const records of [goals, conversationModes, tokenUsages, compactions, permissionSelections, legacyRecency]) records.delete(key);
@@ -4031,7 +4060,7 @@ async function deleteThread(id: string, hostId = state.hostId) {
 }
 function cleanupArchivedThread(id: string) {
   invalidateThreadTitleSearch(state.hostId);
-  navigationRevisions.set(state.hostId, (navigationRevisions.get(state.hostId) ?? 0) + 1);
+  advanceNavigationRevision(state.hostId);
   forgetAsyncQuestions(id);
   removedThreads.add(id);
   threadRevisions.set(id, ++threadEventSequence);
@@ -4053,7 +4082,7 @@ async function archiveThread(id: string, hostId = state.hostId) {
   if (hostId === state.hostId) cleanupArchivedThread(id);
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter((thread) => thread.id !== id);
-  navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+  advanceNavigationRevision(hostId);
   if (
     state.preferences.pins.some(
       (pin) => pin.hostId === hostId && pin.kind === "thread" && pin.id === id,
@@ -4195,21 +4224,23 @@ async function addProject(
   hostId = state.hostId,
 ) {
   const generation = selectionGeneration;
+  const authentication = authenticationGeneration;
   if (!state.hosts.some((host) => host.id === hostId))
     throw new Error("主机不存在");
   const result = await http("/projects", {
     method: "POST",
     body: JSON.stringify({ path, name, rootPaths, hostId }),
   });
-  if (result.projects) state.projects = result.projects;
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  if (result.projects) replaceProjects(result.projects);
   else {
     const project = result.project ?? result;
-    state.projects = [
+    replaceProjects([
       ...state.projects.filter(
         (item) => item.path !== path || item.hostId !== hostId,
       ),
       project,
-    ];
+    ]);
   }
   if (hostId === state.hostId && generation === selectionGeneration)
     await setProject(path);
@@ -4290,6 +4321,7 @@ async function updateProject(
   project: any,
   fields: { name: string; rootPaths?: string[] },
 ) {
+  const authentication = authenticationGeneration;
   const result = await http("/projects", {
     method: "PATCH",
     body: JSON.stringify({
@@ -4298,16 +4330,19 @@ async function updateProject(
       ...fields,
     }),
   });
-  state.projects = result.projects;
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  replaceProjects(result.projects);
   toast("项目已更新");
 }
 async function removeProject(project: any) {
   const hostId = project.hostId || "local";
+  const authentication = authenticationGeneration;
   const result = await http("/projects", {
     method: "DELETE",
     body: JSON.stringify({ hostId, path: project.path }),
   });
-  state.projects = result.projects;
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  replaceProjects(result.projects);
   await updatePreferences({
     pins: state.preferences.pins.filter(
       (pin) =>
@@ -4320,20 +4355,55 @@ async function removeProject(project: any) {
 }
 async function archiveProject(project: any) {
   const hostId = project.hostId || "local";
+  const authentication = authenticationGeneration;
+  const hostConfiguration = JSON.stringify(state.hosts.find(host => host.id === hostId));
+  const configuration = (entry: any) => JSON.stringify([entry.id, entry.name, entry.path, entry.rootPaths || [], entry.source]);
+  const original = configuration(project);
+  const target = () => state.projects.find(entry => (entry.hostId || 'local') === hostId && entry.path === project.path);
+  const confirmScope = () => {
+    const current = target();
+    if (authentication !== authenticationGeneration || !state.authenticated ||
+        !state.hosts.some(host => host.id === hostId) || JSON.stringify(state.hosts.find(host => host.id === hostId)) !== hostConfiguration ||
+        !current || configuration(current) !== original)
+      throw new Error('登录状态、主机或项目配置已变化，请重新确认后归档');
+  };
+  confirmScope();
+  // Directory and project membership are independent after a desktop/Web move.
+  // Never use a cached (or failed) binding read for this bulk operation.
+  const bindings = await http(`/projects/native-bindings?hostId=${encodeURIComponent(hostId)}`, {}, false);
+  confirmScope();
+  if (typeof bindings.supported !== 'boolean' || !Array.isArray(bindings.bindings) ||
+      bindings.bindings.some((entry: any) => typeof entry?.path !== 'string' || typeof entry?.projectId !== 'string' || !entry.projectId.trim()) ||
+      !bindings.supported && bindings.bindings.length)
+    throw new Error('无法确认项目归属，对话未归档；请检查目标服务器的 Codex 版本');
+  const identities = new Set<string>(bindings.bindings.filter((entry: any) => entry.path === project.path).map((entry: any) => entry.projectId));
+  if (identities.size > 1) throw new Error('项目归属存在冲突，对话未归档；请刷新后重试');
+  const nativeProjectId = identities.values().next().value;
+  const membership = { ...project, hostId, nativeProjectId };
+  const roots = [...new Set<string>([project.path, ...(project.rootPaths || [])])];
   const ids = new Set<string>();
-  for (const cwd of [
-    ...new Set<string>([project.path, ...(project.rootPaths || [])]),
-  ]) {
+  const queries: Record<string, any>[] = [
+    ...(nativeProjectId ? [{ projectId: nativeProjectId }] : []),
+    ...roots.map(cwd => ({ cwd: [cwd], ...(bindings.supported ? { projectId: null } : {}) })),
+  ];
+  for (const query of queries) {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
       const page = await threadPage(hostId, "thread/list", {
-        cwd,
+        ...query,
         archived: false,
         limit: 100,
         cursor,
+        modelProviders: [],
       });
-      for (const thread of page.data) ids.add(thread.id);
+      confirmScope();
+      for (const thread of page.data) {
+        if (typeof thread?.id !== 'string' || !thread.id) throw new Error('项目对话列表格式不兼容，对话未归档');
+        if (threadMatchesProject(thread, membership)) ids.add(thread.id);
+      }
+      if (page.nextCursor != null && typeof page.nextCursor !== 'string')
+        throw new Error('项目历史分页格式不兼容，对话未归档');
       cursor = page.nextCursor || undefined;
       if (cursor && seen.has(cursor))
         throw new Error("项目历史分页重复，请刷新后重试");
@@ -4343,8 +4413,22 @@ async function archiveProject(project: any) {
   let archived = 0;
   try {
     for (const id of ids) {
+      confirmScope();
+      const revision = projectChangeSequence;
+      const result = await scopedRpc(hostId, 'thread/read', { threadId: id, includeTurns: false });
+      confirmScope();
+      if (result.thread?.id !== id || typeof result.thread.cwd !== 'string' ||
+          bindings.supported && result.thread.projectId !== null && typeof result.thread.projectId !== 'string' ||
+          !bindings.supported && result.thread.projectId != null && typeof result.thread.projectId !== 'string')
+        throw new Error('无法重新确认对话归属，请同步项目后重试');
+      const change = threadProjectChanges.get(recencyKey(hostId, id));
+      const thread = change && change.revision > revision ? { ...result.thread, projectId: change.projectId } : result.thread;
+      // Another client can move a conversation while the list is loading.
+      if (!threadMatchesProject(thread, membership)) continue;
+      if (thread.status?.type === 'active') throw new Error('此会话正在运行，请先停止或等待完成后再归档');
       await archiveThread(id, hostId);
       archived++;
+      confirmScope();
     }
   } catch (error: any) {
     throw new Error(`已归档 ${archived} 个对话，其余未完成：${error.message}`);
@@ -4533,7 +4617,7 @@ async function updateHost(id: string, host: any) {
     conversationCache.removeHost(id);
     for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
     if (state.hostId === id) { state.threadReady = false; itemCache.clear(); }
-    navigationRevisions.set(id, (navigationRevisions.get(id) ?? 0) + 1);
+    advanceNavigationRevision(id);
     navigationRequests.delete(id);
     delete state.navigation[id];
     if (state.hostId === id) {
@@ -4551,10 +4635,10 @@ async function removeHost(id: string) {
     method: "DELETE",
   });
   state.hosts = result.hosts ?? state.hosts.filter((host) => host.id !== id);
-  navigationRevisions.set(id, (navigationRevisions.get(id) ?? 0) + 1);
+  advanceNavigationRevision(id);
   navigationRequests.delete(id);
   delete state.navigation[id];
-  state.projects = state.projects.filter((project) => project.hostId !== id);
+  replaceProjects(state.projects.filter((project) => project.hostId !== id));
   if (state.hostId === id) await setHost(state.hosts[0]?.id || "");
   conversationCache.removeHost(id);
   for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
@@ -4568,7 +4652,7 @@ function refreshHostAvailability(): Promise<void> {
     if (authentication !== authenticationGeneration || !state.authenticated) return;
     state.hosts = result.hosts;
     state.localEnabled = result.localEnabled ?? result.hosts.some((host: any) => host.id === 'local');
-    if (Array.isArray(result.projects)) state.projects = result.projects;
+    if (Array.isArray(result.projects)) replaceProjects(result.projects);
     if (!state.hosts.some(host => host.id === state.hostId)) {
       await setHost(state.hosts[0]?.id || '').catch(() => toast('连接已更新；远程主机暂时无法连接'));
     }
@@ -4586,8 +4670,8 @@ async function setLocalEnabled(enabled: boolean) {
   if (authentication !== authenticationGeneration || !state.authenticated) return;
   state.localEnabled = result.localEnabled ?? enabled;
   state.hosts = result.hosts;
-  if (Array.isArray(result.projects)) state.projects = result.projects;
-  navigationRevisions.set('local', (navigationRevisions.get('local') ?? 0) + 1);
+  if (Array.isArray(result.projects)) replaceProjects(result.projects);
+  advanceNavigationRevision('local');
   navigationRequests.delete('local');
   invalidateThreadTitleSearch('local');
   settingsApi.invalidateHostSettings('local');
@@ -5615,7 +5699,7 @@ async function unarchiveThread(id: string, hostId = state.hostId) {
     if (result.thread) updateThread(result.thread);
     await refreshThreads();
   } else {
-    navigationRevisions.set(hostId, (navigationRevisions.get(hostId) ?? 0) + 1);
+    advanceNavigationRevision(hostId);
     if (result.thread) mergeNavigation(hostId, [result.thread]);
   }
   toast("对话已恢复");
