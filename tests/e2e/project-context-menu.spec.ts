@@ -391,7 +391,7 @@ test("project archive includes every page and root only on the chosen host while
       return receiver(socket, request);
     remote.requests.push(request);
     const candidates = remote.threads.filter(
-      (thread) => thread.cwd === request.params.cwd,
+      (thread) => request.params.cwd.includes(thread.cwd),
     );
     const offset = request.params.cursor ? 1 : 0;
     socket.send(
@@ -443,9 +443,9 @@ test("project archive includes every page and root only on the chosen host while
         cursor: request.params.cursor || null,
       })),
   ).toEqual([
-    { cwd: "/workspace/demo", cursor: null },
-    { cwd: "/workspace/demo", cursor: "project-next-page" },
-    { cwd: "/workspace/shared", cursor: null },
+    { cwd: ["/workspace/demo"], cursor: null },
+    { cwd: ["/workspace/demo"], cursor: "project-next-page" },
+    { cwd: ["/workspace/shared"], cursor: null },
   ]);
   expect(remote.threads.map((thread) => thread.id)).toEqual([
     "remote-unrelated",

@@ -239,6 +239,7 @@ watch(
     props.state.hostId,
     hostId.value,
     props.project.path,
+    props.project,
     props.api.navigationProjectPage(hostId.value, props.project.path)?.loaded,
   ],
   () => {
