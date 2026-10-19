@@ -553,6 +553,11 @@ export class Bridge {
         request.name = params.name
         changed = {}
         break
+      case 'thread/metadata/update':
+        if (!response?.thread || !Object.prototype.hasOwnProperty.call(params || {}, 'projectId')) return
+        changed = { thread: response.thread }
+        request.projectId = params?.projectId
+        break
       case 'thread/settings/update':
         for (const field of ['model', 'effort', 'cwd', 'sandboxPolicy', 'approvalPolicy', 'collaborationMode', 'serviceTier'])
           if (params && Object.prototype.hasOwnProperty.call(params, field)) request[field] = params[field]

@@ -96,6 +96,9 @@ test('navigation endpoint enforces auth/CSRF and limits methods/fields before co
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: '   ' } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: 'x'.repeat(1001) } },
       { method: 'thread/name/set', params: { threadId: 'same-thread-id', name: 'Name', hostId: 'other-host' } },
+      { method: 'thread/metadata/update', params: { threadId: 'same-thread-id', projectId: 'native-b', cwd: '/other' } },
+      { method: 'thread/metadata/update', params: { threadId: 'same-thread-id', projectId: 'native-b', hostId: 'other-host' } },
+      { method: 'thread/metadata/update', params: { threadId: 'same-thread-id', projectId: '' } },
       { method: 'thread/turns/list', params: { threadId: 'same-thread-id', sortDirection: 'asc', itemsView: 'full' } },
     ]
     for (const body of forbidden) assert.equal((await f.request('local', body)).status, 400, JSON.stringify(body))

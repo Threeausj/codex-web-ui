@@ -77,6 +77,7 @@ export class MockCodex {
   uploads: { body: Buffer; contentType: string }[] = [];
   nativeProjectResolutions: { hostId: string; path: string }[] = [];
   nativeProjectSupported = false;
+  failProjectMoveNext = false;
   nativeProjectIds = new Map<string, string>();
   sockets: WebSocketRoute[] = [];
   authenticated = false;
@@ -361,6 +362,14 @@ export class MockCodex {
             };
           }
           return respond({ preferences: this.preferences });
+        case "/api/projects/native-bindings": {
+          const hostId = url.searchParams.get('hostId');
+          const bindings = this.projects.filter(project => (project.hostId || 'local') === hostId).flatMap(project => {
+            const projectId = this.nativeProjectIds.get(JSON.stringify([hostId, project.path]));
+            return projectId ? [{ path: project.path, projectId }] : [];
+          });
+          return respond({ supported: this.nativeProjectSupported, bindings: this.nativeProjectSupported ? bindings : [] });
+        }
         case "/api/projects/resolve-native": {
           const fields = request.postDataJSON();
           this.nativeProjectResolutions.push(fields);
@@ -502,6 +511,7 @@ export class MockCodex {
           data: candidates.filter(
             (thread) =>
               (!roots || roots.includes(thread.cwd)) &&
+              (!Object.prototype.hasOwnProperty.call(p, 'projectId') || ((thread as any).projectId ?? null) === p.projectId) &&
               (!query ||
                 `${thread.name} ${thread.preview} ${request.method === "thread/search" ? JSON.stringify(this.turns.get(thread.id)) : ""}`
                   .toLowerCase()
@@ -824,6 +834,16 @@ export class MockCodex {
           status: "ok",
           configVersion: "test",
         });
+      case "thread/metadata/update": {
+        if (this.failProjectMoveNext) {
+          this.failProjectMoveNext = false;
+          return socket.send(JSON.stringify({ id: request.id, error: { code: -32601, message: 'Method not found' } }));
+        }
+        const thread = [...this.threads, ...this.archivedThreads].find(thread => thread.id === p.threadId);
+        if (thread) (thread as any).projectId = p.projectId;
+        this.emit('thread/project/updated', { threadId: p.threadId, projectId: p.projectId });
+        return this.reply(socket, request, { thread });
+      }
       case "thread/name/set": {
         const thread = [...this.threads, ...this.archivedThreads].find((t) => t.id === p.threadId);
         if (thread) thread.name = p.name;

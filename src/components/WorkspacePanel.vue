@@ -178,7 +178,7 @@ async function openFile(path: string, destination = "files", line?: number) {
   const scope = fileScope();
   error.value = "";
   try {
-    const result = await props.api.readFile(path);
+    const result = await props.api.readFile(path, { silentError: true });
     if (generation !== fileGeneration || scope !== fileScope()) return;
     const entry: EditorTab = { file: { ...result, path }, content: result.content || "", original: result.content || "", view: "preview", conflict: null, saving: false, line: null };
     if (existing) Object.assign(existing, entry); else editorTabs.value.push(entry);
@@ -420,6 +420,23 @@ watch(
     const scope = fileScope(); activeScope = "";
     const current = () => version === workspaceGeneration && scope === fileScope() && props.state.authenticated;
     editorTabs.value = []; activePath.value = ""; downloading.value = ""; previewDocument.value = false;
+    // Directory navigation belongs to this host and project, just like drafts.
+    // Reconnection must never replay a previous host's directory or preview.
+    directory.value = props.state.projectPath || "";
+    directoryInput.value = directory.value;
+    entries.value = [];
+    loading.value = false;
+    error.value = "";
+    draftWarning.value = "";
+    fileSearch.value = "";
+    changeSearch.value = "";
+    expandedChanges.value = new Set();
+    previewInput.value = "";
+    previewUrl.value = "";
+    previewSource.value = "file";
+    developmentTarget.value = undefined;
+    developmentMounted.value = false;
+    terminalCommand.value = "";
     workspaceReady = (async () => {
       await props.api.privateSessionReady?.();
       if (!current()) return;
@@ -442,7 +459,12 @@ watch(
   }, { immediate: true },
 );
 watch(() => props.state.connected, connected => {
-  if (connected && props.state.projectPath) void workspaceReady.then(() => readDirectory(directory.value || props.state.projectPath, false));
+  const version = workspaceGeneration;
+  const scope = fileScope();
+  if (connected && props.state.projectPath) void workspaceReady.then(() => {
+    if (version === workspaceGeneration && scope === fileScope() && props.state.connected && props.state.authenticated)
+      void readDirectory(directory.value || props.state.projectPath, false);
+  });
 });
 watch(() => [props.openPath, props.openLine, fileScope()] as const, ([value, line]) => {
   const version = workspaceGeneration;

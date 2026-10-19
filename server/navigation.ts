@@ -26,6 +26,7 @@ const request = z.discriminatedUnion("method", [
           ...paging,
           modelProviders: z.array(z.string().max(256)).max(20).optional(),
           cwd: z.array(z.string().min(1).max(4096)).max(12).optional(),
+          projectId: z.string().min(1).max(512).nullable().optional(),
           searchTerm: z.string().max(1000).optional(),
         })
         .strict(),
@@ -69,6 +70,12 @@ const request = z.discriminatedUnion("method", [
     .object({
       method: z.literal("thread/unarchive"),
       params: z.object({ threadId }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal('thread/metadata/update'),
+      params: z.object({ threadId, projectId: z.string().min(1).max(512) }).strict(),
     })
     .strict(),
   z

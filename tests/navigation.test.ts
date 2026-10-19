@@ -40,6 +40,16 @@ test("project and thread pins remain distinct and are scoped to the host", () =>
   assert.equal(pins[0].kind, "thread");
   assert.equal(pins[1].hostId, "ssh-other");
 });
+test('native project membership wins over the unchanged working directory after a move', () => {
+  const source = { hostId: 'nas', path: '/project/a', nativeProjectId: 'native-a' };
+  const destination = { hostId: 'nas', path: '/project/b', nativeProjectId: 'native-b' };
+  const moved = { hostId: 'nas', cwd: '/project/a', projectId: 'native-b' };
+  assert.equal(matchesProject(moved, source), false);
+  assert.equal(matchesProject(moved, destination), true);
+  assert.equal(matchesProject(moved, { ...destination, hostId: 'other' }), false);
+  assert.equal(matchesProject(moved, { hostId: 'nas', path: '/project/a' }), false);
+  assert.equal(matchesProject({ ...moved, projectId: null }, source), true, 'legacy unassigned chats retain cwd grouping');
+});
 test("recent history is sorted without changing source project lists", () => {
   const source = [
     { id: "first", recencyAt: 1, updatedAt: 100 },

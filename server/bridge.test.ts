@@ -904,6 +904,7 @@ test('steering, rename and revert sync only after success, and private reads nev
     const mutations = [
       { method: 'turn/steer', params: { threadId: 'same', input, clientUserMessageId: 'steered' }, result: { turnId: 'running' } },
       { method: 'thread/name/set', params: { threadId: 'same', name: '同步标题' }, result: {} },
+      { method: 'thread/metadata/update', params: { threadId: 'same', projectId: 'native-project-b' }, result: { thread: { id: 'same', cwd: '/project/a', projectId: 'native-project-b' } } },
       { method: 'thread/revert', params: { threadId: 'same', beforeTurnId: 'running' }, result: { thread: { id: 'same', turns: [] } } },
     ]
     for (const [index, mutation] of mutations.entries()) {

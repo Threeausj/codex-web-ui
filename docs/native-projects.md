@@ -11,9 +11,15 @@ Web 首次发送消息、创建审阅／工作树源会话及执行自动化时�
 
 项目查询失败、超时或返回不兼容格式时停止创建会话，保留消息和附件。只有明确不支持项目方法的旧 Codex 才继续使用目录模式。自动化在创建会话前完成项目解析，因此查询失败可以按照既有连接重试策略恢复，不会重复提交模型任务。
 
+## 手动移动对话
+
+在侧栏会话的 `… → 移动到项目` 中选择同一主机的目标项目。Web 解析目标项目的原生 ID，再通过 `thread/metadata/update` 保存归属；会话随后出现在目标项目下，其他已连接网页同步更新。
+
+移动只调整项目分类，保留消息、草稿和会话原有工作目录，不移动磁盘文件。需要在新目录执行任务时，应在该项目创建新会话。目标主机的 Codex 必须支持原生项目接口；不支持时会显示错误并保留原归属。
+
 ## 兼容边界
 
-这些接口和字段来自 `codex-cli 0.160.1` 的实验协议，Bridge 已启用 `experimentalApi`；使用其他版本时以目标主机的实际支持情况为准。类型定义见 `shared/protocol/v2/ProjectCreateParams.ts`、`ThreadStartParams.ts` 和 `ThreadMetadataUpdateParams.ts`。
+这些接口和字段已对照 `codex-cli 0.160.1` 与 `0.163.0` 生成的实验协议核对，Bridge 已启用 `experimentalApi`；使用其他版本时以目标主机的实际支持情况为准。类型定义见 `shared/protocol/v2/ProjectCreateParams.ts`、`ThreadStartParams.ts` 和 `ThreadMetadataUpdateParams.ts`。
 
 部分桌面版本仍将项目和手动移动的会话归类保存在桌面客户端的本地状态中。此时，远程主机 `project/list` 可能为空，即使桌面侧栏已经有项目；旧会话的 `projectId` 也可能为空。Web 无法通过远程主机的接口写入这套客户端本地分类。原生身份补全不会保证这些桌面版本自动将会话加入已有的同名项目，也不会修改其私有 `.codex-global-state.json`。
 

@@ -9,6 +9,14 @@ function normalize(value: string) {
 export function matchesThreadTitle(thread: Parameters<typeof searchableThreadTitle>[0], query: string) {
   return normalize(searchableThreadTitle(thread)).includes(normalize(query));
 }
+/** Missing projectId means all projects, whereas null means unassigned. Keep
+ * filters in an object so JSON never collapses those distinct query scopes. */
+export function threadTitleQueryKey(hostId: string, scope: unknown[], filters: { cwd?: string[]; projectId?: string | null } = {}) {
+  return JSON.stringify(hostId) + ':' + JSON.stringify([scope, {
+    cwd: filters.cwd,
+    ...(Object.prototype.hasOwnProperty.call(filters, 'projectId') ? { projectId: filters.projectId } : {}),
+  }]);
+}
 
 /** Short-lived metadata-only pages, shared by sidebar and command search.
  * In-flight requests survive no invalidation: their callers can finish, but
