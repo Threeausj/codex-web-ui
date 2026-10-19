@@ -10,6 +10,8 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 
 下图来自真实 Vue 界面，使用固定演示数据，未包含实际主机、账户或私人对话。资源数值及执行记录用于展示界面，不代表性能基准。
 
+界面采用白色与冷灰色层级、蓝色交互提示和清晰的深色主题。桌面顶部栏压缩为 42 px，工作区标题与视图导航合为一行；手机保留 48 px 顶栏和触控空间。
+
 <table>
   <tr>
     <td align="center"><strong>桌面对话与操作批次</strong><br><img src="docs/images/desktop-chat.png" alt="桌面对话，连续操作默认折叠并显示上下文比例" width="600"></td>
@@ -35,7 +37,7 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 <details>
 <summary>查看手机布局</summary>
 
-<p align="center"><img src="docs/images/mobile-chat.png" alt="430 像素手机布局中的对话和输入工具栏" width="320"></p>
+<p align="center"><img src="docs/images/mobile-chat.png" alt="390 像素手机布局中的对话和输入工具栏" width="320"></p>
 
 </details>
 
@@ -60,6 +62,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 ```
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，用网页密码登录，在“设置 → 连接”添加已安装 Codex 的 SSH 主机，选择该主机和项目。纯 SSH 部署无需在容器安装 CLI。Codex 模型账户登录与网页密码分别管理。
+
+部署机器只负责 Web 服务时，可在“设置 → 连接 → 本地主机”停用本机 Codex。Web 服务与 SSH 连接继续运行，本机项目和历史保留，之后可在同处重新启用；活动任务或终端需先结束。详见[主机设置](docs/host-settings.md#停用本机-codex)。
 
 Linux 本机执行可直接只读复用宿主已有安装。npm 安装在 `.env.docker` 设置 `HOST_CODEX_DIRECTORY` 为 `npm root -g` 下的整个 `@openai` 目录，并设置容器入口；例如：
 

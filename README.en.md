@@ -10,6 +10,8 @@ This is an evolving desktop-style workflow, with implemented features and remain
 
 These images show the real Vue application with fixed demonstration data. They contain no real account, workstation, or private conversation data. Resource values and execution records illustrate the interface, not benchmark results. The current interface uses Chinese labels.
 
+The interface uses white and cool gray surfaces, blue interaction accents, and a high contrast dark theme. Desktop headers are 42 px tall, with workspace navigation in the same row; mobile headers retain 48 px height and space for touch controls.
+
 <table>
   <tr>
     <td align="center"><strong>Desktop chat and grouped activity</strong><br><img src="docs/images/desktop-chat.png" alt="Desktop conversation with collapsed activity batches and context usage" width="600"></td>
@@ -35,7 +37,7 @@ These images show the real Vue application with fixed demonstration data. They c
 <details>
 <summary>Mobile layout</summary>
 
-<p align="center"><img src="docs/images/mobile-chat.png" alt="Conversation and composer in a 430 pixel mobile viewport" width="320"></p>
+<p align="center"><img src="docs/images/mobile-chat.png" alt="Conversation and composer in a 390 pixel mobile viewport" width="320"></p>
 
 </details>
 
@@ -60,6 +62,8 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml up -
 ```
 
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787), sign in, and add an SSH machine with Codex installed under Settings → Connections. Select that host and its project. SSH-only deployment needs no CLI inside the container. The web password and Codex account login are separate.
+
+If the deployment machine only hosts the web service, disable its Codex executor under **Settings → Connections → Local host**. The web service and SSH connections continue running. Local projects and history are retained and become available when you enable it again. Finish active tasks or terminals before disabling the executor. See [host settings](docs/host-settings.md#停用本机-codex).
 
 For local Linux execution, reuse the host installation read-only. With npm, set `HOST_CODEX_DIRECTORY` in `.env.docker` to the complete `@openai` scope beneath `npm root -g`, along with the container entrypoint. For example:
 

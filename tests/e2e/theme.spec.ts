@@ -49,7 +49,7 @@ test("system appearance updates the document canvas, login, native fields and PW
   await readableDark(page.locator(".login-caption"));
   await readableDark(page.locator('.login-password input'));
   expect((await renderedColors(page.locator("html"))).luminance).toBeLessThan(.1);
-  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#171717");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#11151c");
 
   await page.emulateMedia({ colorScheme: "light" });
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");

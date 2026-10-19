@@ -1087,10 +1087,10 @@ watch(() => [state.authenticated, state.loading], () => {
           </button>
           <div class="header-project">
             <button
-              @click="openSettings('projects')"
+              @click="openSettings(state.hosts.length ? 'projects' : 'hosts')"
               :title="state.projectPath"
             >
-              <Icon name="Folder" :size="15" /><span>{{ projectName }}</span
+              <Icon :name="state.hosts.length ? 'Folder' : 'Globe'" :size="15" /><span>{{ state.hosts.length ? projectName : '连接工作站' }}</span
               ><Icon name="ChevronDown" :size="12" /></button
             ><span class="header-breadcrumb">/</span>
             <h1 :title="threadTitle">{{ threadTitle }}</h1>
@@ -1098,6 +1098,7 @@ watch(() => [state.authenticated, state.loading], () => {
         </div>
         <div class="header-actions">
           <span
+            v-if="currentHost"
             class="host-badge header-host"
             :title="currentHost?.hostname || currentHost?.name"
             ><Icon
@@ -1116,6 +1117,7 @@ watch(() => [state.authenticated, state.loading], () => {
             <Icon name="MessagesSquare" :size="18" />
           </button><button
             class="icon-button"
+            :disabled="!currentHost"
             :class="{ selected: workspaceOpen && !sideChat.state.open }"
             @click="toggleWorkspace"
             title="工作区：文件、预览、终端"
@@ -1223,7 +1225,7 @@ watch(() => [state.authenticated, state.loading], () => {
       <div v-if="!state.online" class="connection-banner" role="status">
         <Icon name="WifiOff" :size="15" />目前离线，联网后将重新连接。操作不会自动提交。
       </div>
-      <div v-else-if="!state.connected && !state.error && !state.runtimePaused" class="connection-banner">
+      <div v-else-if="state.hosts.length && !state.connected && !state.error && !state.runtimePaused" class="connection-banner">
         <Icon
           :name="state.loading ? 'LoaderCircle' : 'WifiOff'"
           :size="15"
@@ -1256,7 +1258,13 @@ watch(() => [state.authenticated, state.loading], () => {
       </div>
       <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
         <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
-          <div v-if="welcome" class="welcome">
+          <div v-if="!state.hosts.length" class="welcome no-host-welcome">
+            <div class="welcome-mark"><Icon name="Network" :size="27" /></div>
+            <h2>连接你的工作站</h2>
+            <p>Web 服务已就绪。添加远程主机，或启用本机 Codex，开始你的工作。</p>
+            <button class="button button-primary" @click="openSettings('hosts')"><Icon name="Plus" :size="15" />管理连接</button>
+          </div>
+          <div v-else-if="welcome" class="welcome">
             <div class="welcome-mark">
               <CommandLogo />
             </div>
@@ -1380,7 +1388,7 @@ watch(() => [state.authenticated, state.loading], () => {
         >
           <Icon name="ArrowDown" :size="18" />
         </button>
-        <div class="composer-container">
+        <div v-if="currentHost" class="composer-container">
           <div v-if="state.compacting" class="compaction-progress compaction-status" role="status" aria-live="polite">
             <Icon name="LoaderCircle" :size="14" class="spin" />正在压缩上下文…
           </div>
@@ -1429,7 +1437,7 @@ watch(() => [state.authenticated, state.loading], () => {
     <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
-    <ResizableWorkspace v-if="workspaceOpen" v-show="!sideChat.state.open">
+    <ResizableWorkspace v-if="workspaceOpen && currentHost" v-show="!sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"
         ref="workspace"

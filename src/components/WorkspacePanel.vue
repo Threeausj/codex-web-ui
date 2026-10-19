@@ -490,10 +490,27 @@ defineExpose({
 </script>
 
 <template>
-  <aside class="workspace-panel">
-    <header class="workspace-header">
-      <strong>工作区</strong
-      ><button
+  <aside class="workspace-panel" aria-label="工作区">
+    <header class="workspace-header workspace-header-tabs">
+      <strong class="sr-only">工作区</strong>
+      <nav class="workspace-tabs" aria-label="工作区视图">
+        <button
+          v-for="entry in tabs"
+          :key="entry.id"
+          :class="{ active: tab === entry.id }"
+          :aria-pressed="tab === entry.id"
+          :aria-label="entry.name"
+          :title="entry.name"
+          @click="tab = entry.id"
+        >
+          <Icon :name="entry.icon" :size="15" /><span class="workspace-tab-label">{{ entry.name }}</span><span
+            v-if="entry.id === 'changes' && changes.length"
+            class="count-badge"
+            >{{ changes.length }}</span
+          >
+        </button>
+      </nav>
+      <button
         class="icon-button"
         @click="emit('close')"
         title="关闭工作区"
@@ -502,21 +519,6 @@ defineExpose({
         <Icon name="PanelRight" :size="17" />
       </button>
     </header>
-    <nav class="workspace-tabs" aria-label="工作区视图">
-      <button
-        v-for="entry in tabs"
-        :key="entry.id"
-        :class="{ active: tab === entry.id }"
-        @click="tab = entry.id"
-      >
-        <Icon :name="entry.icon" :size="15" />{{ entry.name
-        }}<span
-          v-if="entry.id === 'changes' && changes.length"
-          class="count-badge"
-          >{{ changes.length }}</span
-        >
-      </button>
-    </nav>
     <div v-if="error" class="panel-error">
       <Icon name="AlertCircle" :size="16" /><span>{{ error }}</span
       ><button class="icon-button" @click="error = ''" aria-label="关闭错误">

@@ -25,9 +25,10 @@ const html = computed(() => expanded.value ? conversationMarkdown(props.quote.te
 </template>
 
 <style scoped>
-.user-quote { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); white-space: normal; overflow: hidden; }
-.user-quote-heading { width: 100%; min-height: 35px; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 11px; line-height: 1.4; text-align: left; cursor: pointer; }
+.user-quote { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-left: 2px solid color-mix(in srgb, var(--accent-text) 65%, var(--border)); border-radius: 8px; background: var(--surface); white-space: normal; overflow: hidden; }
+.user-quote-heading { width: 100%; min-height: 32px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 11px; line-height: 1.4; text-align: left; cursor: pointer; }
 .user-quote-heading > svg { flex: none; }
+.user-quote-heading > svg:first-child { color: var(--accent-text); }
 .user-quote-heading:hover, .user-quote-preview:hover { background: var(--hover); }
 .user-quote-heading:focus-visible, .user-quote-preview:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
 .user-quote-source { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; }

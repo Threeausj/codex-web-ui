@@ -77,7 +77,7 @@ const browser = await chromium.launch();
 const failures: string[] = [];
 try {
   async function open(theme = 'light', mobile = false) {
-    const context = await browser.newContext({ baseURL: origin, locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: mobile ? { width: 430, height: 932 } : { width: 1440, height: 1000 }, deviceScaleFactor: 1, isMobile: mobile, hasTouch: mobile, colorScheme: theme === 'dark' ? 'dark' : 'light' });
+    const context = await browser.newContext({ baseURL: origin, locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: mobile ? { width: 390, height: 844 } : { width: 1440, height: 1000 }, deviceScaleFactor: 1, isMobile: mobile, hasTouch: mobile, colorScheme: theme === 'dark' ? 'dark' : 'light' });
     const page = await context.newPage();
     await page.clock.install({ time: at + 60000 });
     page.on('pageerror', error => failures.push(error.message));
