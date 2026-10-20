@@ -47,7 +47,7 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
   });
 }
 
-test('live batches stay collapsed during updates, preserve manual expansion and split only when a public summary arrives', async ({ page, mock }) => {
+test('live batches open automatically, respect temporary manual collapse and split only when a public summary arrives', async ({ page, mock }) => {
   await login(page);
   await page.locator('[data-section="recent"] .thread-row').first().click();
   const turnId = 'live-batch';
@@ -62,8 +62,10 @@ test('live batches stay collapsed during updates, preserve manual expansion and 
   const group = page.locator(`.conversation-turn[data-turn-id="${turnId}"]`);
   const batches = group.locator('.activity-batch');
   await expect(batches).toHaveCount(1);
-  await expect(batches.first()).not.toHaveAttribute('open', '');
+  await expect(batches.first()).toHaveAttribute('open', '');
   await expect(batches.first().locator(':scope > summary')).toContainText('1 项运行中');
+  await batches.first().locator(':scope > summary').click();
+  await expect(batches.first()).not.toHaveAttribute('open', '');
   mock.emit('item/commandExecution/outputDelta', { threadId: 'thread-existing', turnId, itemId: 'live-read', delta: ' + delta' });
   await expect(batches.first()).not.toHaveAttribute('open', '');
   await batches.first().locator(':scope > summary').click();
@@ -80,7 +82,7 @@ test('live batches stay collapsed during updates, preserve manual expansion and 
   await expect(group.locator('.reasoning-content')).toBeVisible();
   await expect(batches).toHaveCount(2);
   await expect(batches.first()).toHaveAttribute('open', '');
-  await expect(batches.nth(1)).not.toHaveAttribute('open', '');
+  await expect(batches.nth(1)).toHaveAttribute('open', '');
   const order = await group.locator('.turn-activity-content').evaluate(element => [...element.children].map(child => child.className));
   expect(order).toEqual(['activity-batch', 'reasoning-item', 'activity-batch']);
   emitItem({ ...first, status: 'completed', exitCode: 1 }, 'item/completed');
