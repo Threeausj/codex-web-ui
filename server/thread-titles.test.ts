@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ThreadTitleService } from './thread-titles.js';
 import type { Host, RpcMessage } from './types.js';
+import { PROJECTLESS_THREAD_SOURCE } from '../shared/project-context.js';
 
 type Call = { method: string; params: any; timeout?: number };
 type HelperTurn = { threadId: string; turnId: string };
@@ -149,6 +150,17 @@ test('only an accepted first input in a newly created Web conversation generates
     assert.equal(host.cleanup().length, 1);
     assert.ok(host.cleanup()[0]!.params.threadId.startsWith('title-helper-'));
     assert.ok(!host.calls.some(call => call.method === 'thread/resume'), 'title generation cannot take over the user writer');
+  } finally { await f.service.close(); }
+});
+
+test('a new projectless user conversation still receives a canonical title', async () => {
+  const f = fixture();
+  try {
+    const host = f.forHost();
+    f.webStart('projectless', local, { projectId: null, threadSource: PROJECTLESS_THREAD_SOURCE });
+    f.accepted('projectless');
+    await f.service.drain();
+    assert.deepEqual(host.named().map(call => call.params), [{ threadId: 'projectless', name: '邮件系统的部署方案' }]);
   } finally { await f.service.close(); }
 });
 

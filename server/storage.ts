@@ -6,6 +6,7 @@ import { isIP } from 'node:net'
 import { z } from 'zod'
 import type { Host, Project } from './types.js'
 import { orderHosts } from '../shared/host-order.js'
+import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../shared/project-order.js'
 
 const cleanText = z.string().trim().min(1).max(256).refine(s => !/[\x00-\x1f]/.test(s), 'Control characters are not allowed')
 const optionalField = <T extends z.ZodType>(schema: T) => z.preprocess(value => value === null || (typeof value === 'string' && !value.trim()) ? undefined : value, schema.optional())
@@ -45,6 +46,13 @@ const hostOrderDocument = (maximum: number) => z.object({
 export const hostOrderInput = hostOrderDocument(1000)
 // The journal also retains the disabled local host's slot, outside the request's visible-host limit.
 const savedHostOrderInput = hostOrderDocument(1001)
+const projectOrderEntry = z.object({
+  hostId: hostIdentifier,
+  path: z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value)),
+}).strict()
+export const projectOrderInput = z.object({
+  projects: z.array(projectOrderEntry).max(2000).refine(entries => new Set(entries.map(projectOrderKey)).size === entries.length, 'Project identities must be unique'),
+}).strict()
 const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'codexPath', 'cwd'] as const
 
 export async function writePrivateJson(file: string, value: unknown) {
@@ -72,6 +80,8 @@ export class Storage {
   private configuredHosts: Host[] = [{ id: 'local', name: '本机', kind: 'local' }]
   private hostOrder: string[] = []
   private hostOrderListeners = new Set<(hostIds: string[]) => void>()
+  private projectOrder: ProjectOrderEntry[] = []
+  private projectOrderListeners = new Set<(projects: ProjectOrderEntry[]) => void>()
   localEnabled = true
   get hosts() { return orderHosts(this.configuredHosts, this.hostOrder).filter(host => host.kind !== 'local' || this.localEnabled) }
   private webProjects: (Project & { hidden?: boolean })[] = []
@@ -97,6 +107,10 @@ export class Storage {
     if (storedOrder !== undefined) this.hostOrder = savedHostOrderInput.parse(JSON.parse(storedOrder)).hostIds.filter(id => this.configuredHosts.some(host => host.id === id))
     const projects = await readJson(path.join(this.dataDir, 'projects.json'))
     if (Array.isArray(projects)) this.webProjects = projects.filter(p => p && typeof p.id === 'string' && typeof p.path === 'string' && typeof p.name === 'string' && typeof p.hostId === 'string' && this.configuredHosts.some(host => host.id === p.hostId)).map(p => ({ ...p, source: 'web' }))
+    let projectOrder: string | undefined
+    try { projectOrder = await fs.readFile(path.join(this.dataDir, 'project-order.json'), 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    if (projectOrder !== undefined) this.projectOrder = projectOrderInput.parse(JSON.parse(projectOrder)).projects
   }
 
   host(id: string) { return this.hosts.find(h => h.id === id) }
@@ -104,6 +118,36 @@ export class Storage {
   subscribeHostOrder(listener: (hostIds: string[]) => void) {
     this.hostOrderListeners.add(listener)
     return () => { this.hostOrderListeners.delete(listener) }
+  }
+
+  subscribeProjectOrder(listener: (projects: ProjectOrderEntry[]) => void) {
+    this.projectOrderListeners.add(listener)
+    return () => { this.projectOrderListeners.delete(listener) }
+  }
+
+  /** Reorder presentation only. Validate the entire visible inventory inside
+   * the same queue as project additions/removals and preserve hidden slots. */
+  async reorderProjects(input: unknown) {
+    const { projects: requested } = projectOrderInput.parse(input)
+    return this.mutate(async () => {
+      const inventory = orderProjects(await this.readProjects(), this.projectOrder)
+      const visible = inventory.filter(project => !project.hidden && this.host(project.hostId))
+      const keys = new Set(visible.map(projectOrderKey))
+      if (requested.length !== keys.size || requested.some(project => !keys.has(projectOrderKey(project))))
+        throw Object.assign(new Error('项目列表已变化，请刷新后重新排序'), { status: 409 })
+      let next = 0
+      const order = inventory.map(project => keys.has(projectOrderKey(project)) ? requested[next++]! : { hostId: project.hostId, path: project.path })
+      // The same parser protects both wire input and the restart journal.
+      projectOrderInput.parse({ projects: order })
+      await writePrivateJson(path.join(this.dataDir, 'project-order.json'), { projects: order })
+      this.projectOrder = order
+      const projects = await this.projects()
+      const identities = projects.map(({ hostId, path }) => ({ hostId, path }))
+      for (const listener of this.projectOrderListeners) {
+        try { listener(structuredClone(identities)) } catch { /* A consumer cannot undo a durable order. */ }
+      }
+      return projects
+    })
   }
 
   /** Persist only presentation order; host configuration and runtimes stay intact. */
@@ -186,6 +230,10 @@ export class Storage {
   }
 
   async projects(): Promise<Project[]> {
+    return orderProjects(await this.readProjects(), this.projectOrder).filter(project => !project.hidden && this.host(project.hostId))
+  }
+
+  private async readProjects(): Promise<(Project & { hidden?: boolean })[]> {
     const projects: Project[] = []
     // Read only project metadata. Desktop prompt history, auth and other persisted atoms never enter the web API.
     try {
@@ -208,7 +256,7 @@ export class Storage {
     if (!projects.some(p => p.path === this.cwd && p.hostId === 'local')) projects.push({ id: 'web:cwd', name: path.basename(this.cwd), path: this.cwd, hostId: 'local', source: 'web' })
     const unique = new Map<string, Project & { hidden?: boolean }>()
     for (const p of [...projects, ...this.webProjects]) unique.set(`${p.hostId}:${p.path}`, p)
-    return [...unique.values()].filter(project => !project.hidden && this.host(project.hostId))
+    return [...unique.values()]
   }
 
   async addProject(hostId: string, projectPath: string, name?: string, rootPaths?: string[]) {

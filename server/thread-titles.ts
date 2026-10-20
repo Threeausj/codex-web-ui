@@ -1,4 +1,5 @@
 import type { Host, RpcMessage } from './types.js'
+import { PROJECTLESS_THREAD_SOURCE } from '../shared/project-context.js'
 
 /** The native TUI implements automatic names with these same public RPCs, not a
  * separate title endpoint. Keep helper turns isolated from the user's writer. */
@@ -143,7 +144,7 @@ export class ThreadTitleService {
       if (!created || created.ephemeral !== false || string(created.name) || string(created.preview) || this.jobs.has(id) || this.candidates.has(id) || this.seen.has(id)) return
       // Automatic jobs are only for new, empty user threads created by this Web
       // bridge. Never rename old lists, forks, child agents or feature helpers.
-      if (created.parentThreadId || (created.threadSource && created.threadSource !== 'user')) return
+      if (created.parentThreadId || (created.threadSource && created.threadSource !== 'user' && created.threadSource !== PROJECTLESS_THREAD_SOURCE)) return
       this.pruneCandidates()
       while (this.candidates.size >= this.maxCandidates) this.candidates.delete(this.candidates.keys().next().value!)
       while (this.seen.size >= this.maxCandidates) this.seen.delete(this.seen.keys().next().value!)

@@ -1,11 +1,14 @@
 import { privateState } from './private-state';
 
-export type ReadingPosition = { top: number; bottom: boolean };
+export type ReadingPosition = { top: number; bottom: boolean; anchor?: { historyId: string; offset: number } };
 type Entry = ReadingPosition & { key: string };
 const namespace = 'reading-positions';
 const identity = 'recent';
-const valid = (value: any): value is Entry => typeof value?.key === 'string' &&
-  Number.isFinite(value.top) && value.top >= 0 && typeof value.bottom === 'boolean';
+export const isReadingPosition = (value: any): value is ReadingPosition =>
+  Number.isFinite(value?.top) && value.top >= 0 && typeof value.bottom === 'boolean' &&
+  (value.anchor === undefined || typeof value.anchor?.historyId === 'string' && value.anchor.historyId.length <= 512 &&
+    Number.isFinite(value.anchor.offset));
+const valid = (value: any): value is Entry => typeof value?.key === 'string' && isReadingPosition(value);
 
 /** Small, bounded, session-scoped reading positions survive a discarded PWA window. */
 export class ReadingPositions {

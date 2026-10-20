@@ -8,6 +8,7 @@ import {
   projectKey,
   sortedThreads,
 } from "../lib/navigation";
+import { projectOrderKey } from '../../shared/project-order';
 const props = defineProps<{
   project: any;
   state: any;
@@ -28,6 +29,7 @@ const emit = defineEmits<{
 const menu = ref(false);
 const expandedThreads = ref(false);
 const loadingOlder = ref(false);
+const ordering = ref(false);
 const threadLimit = 4;
 const menuElement = ref<HTMLElement>();
 const menuReady = ref(false);
@@ -52,6 +54,24 @@ const starred = computed(() =>
     props.project.path,
   ),
 );
+const movableProjects = computed(() => props.state.projects.filter((project: any) =>
+  !isPinned(props.state.preferences.pins, project.hostId || 'local', 'project', project.path)));
+const orderIndex = computed(() => movableProjects.value.findIndex((project: any) => projectOrderKey(project) === projectOrderKey(props.project)));
+async function move(direction: -1 | 1) {
+  const index = orderIndex.value, other = movableProjects.value[index + direction];
+  if (ordering.value || starred.value || index < 0 || !other) return;
+  const projects = props.state.projects.map((project: any) => ({ hostId: project.hostId || 'local', path: project.path }));
+  const from = projects.findIndex((project: any) => projectOrderKey(project) === projectOrderKey(props.project));
+  const to = projects.findIndex((project: any) => projectOrderKey(project) === projectOrderKey(other));
+  if (from < 0 || to < 0) return;
+  [projects[from], projects[to]] = [projects[to], projects[from]];
+  ordering.value = true;
+  try {
+    await props.api.reorderProjects(projects);
+    closeMenu(true);
+  } catch (error: any) { emit('error', error.message); }
+  finally { ordering.value = false; }
+}
 const threads = computed(() =>
   sortedThreads<any>(
     props.api
@@ -67,7 +87,7 @@ const current = computed(
     hostId.value === props.state.hostId &&
     (props.state.activeThread?.projectId
       ? matchesProject(props.state.activeThread, props.project)
-      : [props.project.path, ...(props.project.rootPaths || [])].includes(props.state.projectPath)),
+      : !props.state.noProject && [props.project.path, ...(props.project.rootPaths || [])].includes(props.state.projectPath)),
 );
 const visibleThreads = computed(() => {
   if (expandedThreads.value || threads.value.length <= threadLimit)
@@ -135,7 +155,7 @@ async function openMenu(event: MouseEvent | KeyboardEvent) {
   await nextTick();
   if (menu.value)
     menuElement.value
-      ?.querySelector<HTMLButtonElement>("[role=menuitem]")
+      ?.querySelector<HTMLButtonElement>("[role=menuitem]:not(:disabled)")
       ?.focus();
 }
 function contextKey(event: KeyboardEvent) {
@@ -179,7 +199,7 @@ function menuKey(event: KeyboardEvent) {
     return;
   }
   const items = Array.from(
-    menuElement.value?.querySelectorAll<HTMLButtonElement>("[role=menuitem]") ||
+    menuElement.value?.querySelectorAll<HTMLButtonElement>("[role=menuitem]:not(:disabled)") ||
       [],
   );
   if (
@@ -318,7 +338,7 @@ async function pin() {
           :key="root"
           @click="emit('project', { ...project, path: root })"
           :class="{
-            active: state.hostId === hostId && state.projectPath === root,
+            active: state.hostId === hostId && !state.noProject && state.projectPath === root,
           }"
           :title="root"
         >
@@ -382,6 +402,17 @@ async function pin() {
       <button role="menuitem" tabindex="-1" @click="action('bookmarks')">
         <Icon name="Bookmark" :size="17" />收藏对话
       </button>
+      <template v-if="!starred">
+        <div role="separator" class="project-menu-separator" />
+        <button role="menuitem" tabindex="-1" :disabled="ordering || orderIndex <= 0"
+          :aria-label="`上移项目 ${project.name}`" @click="move(-1)">
+          <Icon name="ArrowUp" :size="17" />上移项目
+        </button>
+        <button role="menuitem" tabindex="-1" :disabled="ordering || orderIndex < 0 || orderIndex >= movableProjects.length - 1"
+          :aria-label="`下移项目 ${project.name}`" @click="move(1)">
+          <Icon name="ArrowDown" :size="17" />下移项目
+        </button>
+      </template>
       <div role="separator" class="project-menu-separator" />
       <button role="menuitem" tabindex="-1" @click="action('files')">
         <Icon name="FolderOpen" :size="17" />在工作区文件中显示
@@ -437,7 +468,8 @@ async function pin() {
 .project-context-menu button svg {
   flex-shrink: 0;
 }
-.project-context-menu button:hover,
+.project-context-menu button:disabled { opacity: .4; cursor: default; }
+.project-context-menu button:hover:not(:disabled),
 .project-context-menu button:focus-visible {
   background: var(--hover);
   outline: none;

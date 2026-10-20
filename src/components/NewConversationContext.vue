@@ -5,6 +5,7 @@ import Icon from "./Icon.vue";
 const props = defineProps<{ state: any; disabled?: boolean }>();
 const emit = defineEmits<{
   project: [project: any];
+  noProject: [];
   host: [hostId: string];
   manageProjects: [];
 }>();
@@ -14,14 +15,14 @@ const projects = computed(() =>
   ),
 );
 const activeProject = computed(() =>
-  projects.value.find(
+  props.state.noProject ? undefined : projects.value.find(
     (project: any) =>
       project.path === props.state.projectPath ||
       project.rootPaths?.includes(props.state.projectPath),
   ),
 );
 const projectValue = computed(
-  () => activeProject.value?.path || props.state.projectPath || "",
+  () => props.state.noProject ? "" : activeProject.value?.path || props.state.projectPath || "",
 );
 const directoryLabel = computed(
   () =>
@@ -37,6 +38,10 @@ function chooseProject(event: Event) {
   const chosen = select.value;
   select.value = projectValue.value;
   if (props.disabled || chosen === projectValue.value) return;
+  if (!chosen) {
+    emit("noProject");
+    return;
+  }
   const project = projects.value.find((entry: any) => entry.path === chosen);
   if (project) emit("project", project);
 }
@@ -52,22 +57,23 @@ function chooseHost(event: Event) {
 
 <template>
   <div class="new-context" role="group" aria-label="新对话位置">
-    <label class="context-choice project-choice" :title="state.projectPath">
-      <Icon name="Folder" :size="16" />
+    <label class="context-choice project-choice" :title="state.noProject ? '不在项目中工作' : state.projectPath">
+      <Icon :name="state.noProject ? 'MessagesSquare' : 'Folder'" :size="16" />
       <select
         :value="projectValue"
-        :disabled="disabled || !projects.length"
+        :disabled="disabled"
         aria-label="新对话项目"
         @change="chooseProject"
       >
-        <option v-if="!activeProject" :value="projectValue">
+        <option v-if="!activeProject && !state.noProject && projectValue" :value="projectValue">
           {{ directoryLabel }}{{ state.projectPath ? " · 当前目录" : "" }}
         </option>
         <option v-for="project in projects" :key="project.path" :value="project.path">
           {{ project.name || project.path.split("/").filter(Boolean).pop() || project.path }}
         </option>
+        <option value="">不在项目中工作</option>
       </select>
-      <Icon v-if="projects.length" name="ChevronDown" :size="12" />
+      <Icon name="ChevronDown" :size="12" />
     </label>
     <label class="context-choice host-choice" :title="host?.name || state.hostId">
       <Icon :name="host?.kind === 'local' ? 'Monitor' : 'Globe'" :size="16" />

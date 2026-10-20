@@ -214,6 +214,9 @@ export async function createApp(options: AppOptions = {}) {
   app.patch('/api/hosts/order', asyncRoute(async (req, res) => {
     res.json({ hosts: await storage.reorderHosts(req.body) })
   }))
+  app.patch('/api/projects/order', asyncRoute(async (req, res) => {
+    res.json({ projects: await storage.reorderProjects(req.body) })
+  }))
   app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
     const previousIdentityFile = storage.host(id)?.identityFile
@@ -307,8 +310,20 @@ export async function createServer(options: AppOptions = {}) {
       concurrencyLimit: 2, zlibDeflateOptions: { level: 3 } } })
   const sessionSockets = new Map<string, Set<WebSocket>>()
   const socketHeartbeat = new WebSocketHeartbeat()
+  let projectOrderEpoch = 0
   const stopListeningForHostOrder = context.storage.subscribeHostOrder(hostIds => {
     const frame = JSON.stringify({ method: 'bridge/host-order/changed', params: { hostIds } })
+    for (const [sessionId, sockets] of sessionSockets) {
+      if (!context.auth.isSessionActive(sessionId)) continue
+      for (const ws of sockets) {
+        if (ws.readyState !== 1 || ws.bufferedAmount > 256 * 1024) continue
+        try { ws.send(frame, error => { if (error) ws.terminate() }) } catch { ws.terminate() }
+      }
+    }
+  })
+  const stopListeningForProjectOrder = context.storage.subscribeProjectOrder(projects => {
+    ++projectOrderEpoch
+    const frame = JSON.stringify({ method: 'bridge/project-order/changed', params: { projects } })
     for (const [sessionId, sockets] of sessionSockets) {
       if (!context.auth.isSessionActive(sessionId)) continue
       for (const ws of sockets) {
@@ -351,6 +366,15 @@ export async function createServer(options: AppOptions = {}) {
       let sockets = sessionSockets.get(session.id)
       if (!sockets) { sockets = new Set(); sessionSockets.set(session.id, sockets) }
       sockets.add(ws)
+      // Global presentation events are not part of a host's native replay.
+      // A fresh browser transport also receives the current project order.
+      const projectOrderSnapshot = projectOrderEpoch
+      void context.storage.projects().then(projects => {
+        if (projectOrderSnapshot !== projectOrderEpoch || ws.readyState !== 1 || !context.auth.isSessionActive(session.id)) return
+        const frame = JSON.stringify({ method: 'bridge/project-order/changed',
+          params: { projects: projects.map(({ hostId, path }) => ({ hostId, path })) } })
+        try { ws.send(frame, error => { if (error) ws.terminate() }) } catch { ws.terminate() }
+      }).catch(() => { /* A subsequent reconnect or metadata refresh can retry. */ })
       const key = `${session.id}:${clientId}`
       void context.getBridge(hostId).then(bridge => bridge.attach(key, ws, clientId, () => context.auth.isSessionActive(session.id), { engineId: url.searchParams.get('engineId') || '', afterSequence: Number(url.searchParams.get('afterSequence') ?? -1) })).catch(() => ws.close(1011, 'Cannot connect to host'))
       const validateSession = setInterval(() => { if (!context.auth.getSession(req.headers.cookie)) ws.close(4003, 'Session expired') }, 15000)
@@ -367,6 +391,7 @@ export async function createServer(options: AppOptions = {}) {
     stopListeningForRevocation()
     stopListeningForReadReceipts()
     stopListeningForHostOrder()
+    stopListeningForProjectOrder()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
     let automationFailure: unknown

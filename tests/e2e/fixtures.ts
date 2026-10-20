@@ -580,6 +580,7 @@ export class MockCodex {
           ...makeThread(`thread-${++this.count}`, "新的测试对话"),
           cwd: p.cwd || workspace,
           projectId: p.projectId ?? null,
+          ...(p.threadSource ? { threadSource: p.threadSource } : {}),
         };
         this.threads.unshift(thread);
         this.turns.set(thread.id, []);
@@ -643,7 +644,7 @@ export class MockCodex {
         return;
       }
       case "thread/fork": {
-        const thread = makeThread(`fork-${++this.count}`, "分支测试对话");
+        const thread = { ...makeThread(`fork-${++this.count}`, "分支测试对话"), ...(p.threadSource ? { threadSource: p.threadSource } : {}) };
         const source = structuredClone(this.turns.get(p.threadId) || []);
         const index = source.findIndex((turn) => turn.id === p.lastTurnId);
         this.turns.set(

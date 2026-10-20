@@ -32,7 +32,7 @@ test("new-chat project choice keeps the draft and attachments, then sends the se
   remoteFixture(mock);
   await login(page);
   const project = page.getByRole("combobox", { name: "新对话项目", exact: true });
-  await expect(project.locator("option")).toHaveText(["Demo Project", "第二个本地项目"]);
+  await expect(project.locator("option")).toHaveText(["Demo Project", "第二个本地项目", "不在项目中工作"]);
   await page.getByRole("textbox", { name: "消息输入框" }).fill("保留项目草稿与附件");
   await page.locator('input[type="file"]').setInputFiles([
     image, { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("hello") },
@@ -76,7 +76,7 @@ test("new-chat host choice waits for remote config and separates same-path proje
   remote.releaseConfigReadResponse();
   await expect(host).toBeEnabled();
   await expect(host).toHaveValue("ssh-context");
-  await expect(project.locator("option")).toHaveText(["远端应用", "相同路径的远端项目"]);
+  await expect(project.locator("option")).toHaveText(["远端应用", "相同路径的远端项目", "不在项目中工作"]);
   await project.selectOption("/workspace/demo");
   await expect(project).toBeEnabled();
   await expect(project.locator("option:checked")).toHaveText("相同路径的远端项目");
@@ -176,8 +176,8 @@ test("a host without projects retains its current directory and offers project s
   mock.projects = [];
   await login(page);
   const project = page.getByRole("combobox", { name: "新对话项目", exact: true });
-  await expect(project).toBeDisabled();
-  await expect(project.locator("option")).toHaveText(["demo · 当前目录"]);
+  await expect(project).toBeEnabled();
+  await expect(project.locator("option")).toHaveText(["demo · 当前目录", "不在项目中工作"]);
   await page.getByRole("group", { name: "新对话位置" }).getByRole("button", { name: "添加项目", exact: true }).click();
   await expect(page.getByRole("dialog").getByRole("textbox", { name: "项目路径", exact: true })).toBeVisible();
 });

@@ -18,6 +18,7 @@ const emit = defineEmits<{
   command: [command: string];
   error: [message: string];
   project: [project: any];
+  noProject: [];
   host: [hostId: string];
 }>();
 const draft = ref("");
@@ -629,7 +630,7 @@ function closePicker() {
 }
 const draftKey = computed(
   () =>
-    `codex.draft.${props.state.hostId}.${props.state.activeThread?.id || props.state.projectPath || "new"}`,
+    `codex.draft.${props.state.hostId}.${props.state.activeThread?.id || (props.state.noProject ? "no-project" : props.state.projectPath || "new")}`,
 );
 function saveContexts(key: string, sources: ConversationSelectionSource[]) {
   if (sources.length) browserStorage.local.setItem(`${key}.quotes`, JSON.stringify(sources));
@@ -783,6 +784,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
       :state="state"
       :disabled="contextDisabled"
       @project="emit('project', $event)"
+      @no-project="emit('noProject')"
       @host="emit('host', $event)"
       @manage-projects="emit('command', 'settings-projects')"
     />

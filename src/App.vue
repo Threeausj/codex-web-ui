@@ -12,7 +12,8 @@ import { browserStorage } from "./lib/browser-storage";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
-import { ReadingPositions, type ReadingPosition } from "./lib/reading-positions";
+import { ReadingPositions, isReadingPosition, type ReadingPosition } from "./lib/reading-positions";
+import { captureConversationReading, nearConversationBottom, restoreConversationReading } from './lib/conversation-reading';
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
 import { bookmarkTextRange, matchesBookmark, useConversationBookmarks } from './lib/conversation-bookmarks';
 import { bookmarkProjectDetails } from './lib/bookmark-project';
@@ -107,6 +108,11 @@ const scopedWorkspacePath = computed(() => workspacePathScope.value === workspac
 const workspace = ref<InstanceType<typeof WorkspacePanel>>();
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
+const followLatest = ref(true);
+let lastScrollHeight = 0;
+let programmaticScrollTop: number | undefined;
+let scrollLayoutFrame = 0;
+let readingTouchStart: { x: number; y: number } | undefined;
 const settingsOpen = ref(false);
 const resourcesOpen = ref(false);
 const automationsOpen = ref(false);
@@ -157,7 +163,7 @@ const currentHost = computed(() =>
   state.hosts.find((host: any) => host.id === state.hostId),
 );
 const currentProject = computed(() =>
-  state.projects.find(
+  state.noProject ? undefined : state.projects.find(
     (project: any) =>
       (!project.hostId || project.hostId === state.hostId) &&
       (state.activeThread?.projectId
@@ -167,7 +173,7 @@ const currentProject = computed(() =>
 );
 const projectName = computed(
   () =>
-    currentProject.value?.name ||
+    state.noProject ? "聊天" : currentProject.value?.name ||
     state.projectPath.split("/").filter(Boolean).pop() ||
     "选择项目",
 );
@@ -375,7 +381,7 @@ function saveScroll() {
   if (!state.authenticated || !scroll.value || !state.activeThread?.id) return;
   const key = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
   if (key !== restoredScrollKey) return;
-  const position = { top: scroll.value.scrollTop, bottom: !showScrollBottom.value };
+  const position = captureConversationReading(scroll.value, followLatest.value || nearConversationBottom(scroll.value));
   try { sessionStorage.setItem(key, JSON.stringify(position)); } catch { /* Durable storage can still retain the position. */ }
   readingPositions.remember(state.hostId, state.activeThread.id, position);
 }
@@ -387,15 +393,19 @@ async function restoreScroll(id: string, generation = navigationSelection) {
   let position: ReadingPosition | null = null;
   try {
     const saved = JSON.parse(sessionStorage.getItem(key) || "null");
-    if (Number.isFinite(saved?.top) && saved.top >= 0 && typeof saved.bottom === 'boolean') position = saved;
+    if (isReadingPosition(saved)) position = saved;
   } catch { /* A new app window restores from private durable storage. */ }
   position ??= await readingPositions.read(hostId, id);
   if (!current()) return;
   restoredScrollKey = key;
+  followLatest.value = !position || position.bottom;
+  lastScrollHeight = scroll.value?.scrollHeight || 0;
   if (position && !position.bottom && scroll.value) {
-    scroll.value.scrollTop = position.top;
-    onScroll();
+    restoreConversationReading(scroll.value, position);
+    programmaticScrollTop = scroll.value.scrollTop;
+    showScrollBottom.value = !nearConversationBottom(scroll.value);
   } else scrollBottom();
+  queueReadingLayout();
 }
 async function selectThread(
   selection: string | { id: string; hostId: string },
@@ -452,7 +462,7 @@ async function selectProject(project: any) {
     }
   });
 }
-async function chooseNewContext(hostId: string, path?: string) {
+async function chooseNewContext(hostId: string, path?: string | null) {
   if (state.activeThread || state.changingContext || state.switchingHost ||
       state.selectingThread || state.busy) return;
   const generation = ++navigationSelection;
@@ -576,6 +586,7 @@ async function openBookmark(entry: ConversationBookmark) {
     const current = () => operation === bookmarkNavigation && authentication === api.runtimeIdentity().authenticationGeneration &&
       generation === navigationSelection && state.hostId === entry.hostId && state.activeThread?.id === entry.source.threadId;
     if (!current()) return;
+    pauseFollowing();
     showScrollBottom.value = true;
     await api.revealBookmarkSource(entry.source);
     if (!current()) return;
@@ -797,25 +808,80 @@ function onPageShow(event: PageTransitionEvent) {
 }
 function onScroll() {
   if (scroll.value) {
-    showScrollBottom.value =
-      scroll.value.scrollHeight -
-        scroll.value.scrollTop -
-        scroll.value.clientHeight >
-      140;
+    const element = scroll.value;
+    const changedLayout = element.scrollHeight !== lastScrollHeight;
+    lastScrollHeight = element.scrollHeight;
+    if (programmaticScrollTop !== undefined && Math.abs(element.scrollTop - programmaticScrollTop) <= 1) {
+      programmaticScrollTop = undefined;
+    } else if (followLatest.value && changedLayout && readingLayoutReady()) {
+      // Appended output and delayed process/image layout are not a request to
+      // stop following the answer. User scroll gestures explicitly pause it.
+      scrollBottom();
+    } else if (readingLayoutReady()) {
+      programmaticScrollTop = undefined;
+      followLatest.value = nearConversationBottom(element);
+    }
+    showScrollBottom.value = !nearConversationBottom(element);
     saveScroll();
   }
 }
+function pauseFollowing() {
+  followLatest.value = false;
+  programmaticScrollTop = undefined;
+}
+function onReadingWheel(event: WheelEvent) {
+  if (event.deltaY < 0 && Math.abs(event.deltaY) >= Math.abs(event.deltaX)) pauseFollowing();
+}
+function onReadingTouchStart(event: TouchEvent) {
+  const touch = event.touches[0];
+  readingTouchStart = touch ? { x: touch.clientX, y: touch.clientY } : undefined;
+}
+function onReadingTouchMove(event: TouchEvent) {
+  const touch = event.touches[0];
+  if (touch && readingTouchStart && touch.clientY - readingTouchStart.y > Math.abs(touch.clientX - readingTouchStart.x))
+    pauseFollowing();
+}
+function readingLayoutReady() {
+  return !!state.activeThread && restoredScrollKey === `codex.scroll.${state.hostId}.${state.activeThread.id}` &&
+    !state.loading && !state.selectingThread && state.threadReady;
+}
+function queueReadingLayout() {
+  cancelAnimationFrame(scrollLayoutFrame);
+  const generation = navigationSelection;
+  scrollLayoutFrame = requestAnimationFrame(() => {
+    scrollLayoutFrame = 0;
+    if (generation !== navigationSelection || !scroll.value || !readingLayoutReady()) return;
+    if (followLatest.value) scrollBottom();
+    else {
+      lastScrollHeight = scroll.value.scrollHeight;
+      showScrollBottom.value = !nearConversationBottom(scroll.value);
+    }
+  });
+}
 function scrollBottom() {
   if (scroll.value) {
+    if (state.activeThread && !state.loading && !state.selectingThread && state.threadReady)
+      restoredScrollKey = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
+    followLatest.value = true;
     scroll.value.scrollTop = scroll.value.scrollHeight;
+    lastScrollHeight = scroll.value.scrollHeight;
+    programmaticScrollTop = scroll.value.scrollTop;
     showScrollBottom.value = false;
+    saveScroll();
   }
 }
 async function loadOlder() {
-  const height = scroll.value?.scrollHeight || 0;
+  const element = scroll.value, generation = navigationSelection;
+  const position = element && captureConversationReading(element, false);
+  pauseFollowing();
   await action(() => api.loadOlderTurns());
   await nextTick();
-  if (scroll.value) scroll.value.scrollTop = scroll.value.scrollHeight - height;
+  if (generation !== navigationSelection || !position || !scroll.value) return;
+  restoreConversationReading(scroll.value, position);
+  lastScrollHeight = scroll.value.scrollHeight;
+  programmaticScrollTop = scroll.value.scrollTop;
+  showScrollBottom.value = !nearConversationBottom(scroll.value);
+  saveScroll();
 }
 async function pickPalette(result: any) {
   if (!result) return;
@@ -896,13 +962,29 @@ watch(
     state.busy,
   ],
   async () => {
-    if (!showScrollBottom.value && !state.loading && !state.selectingThread && state.threadReady) {
+    if (followLatest.value && readingLayoutReady()) {
       await nextTick();
-      if (!showScrollBottom.value && !state.loading && !state.selectingThread && state.threadReady)
-        scrollBottom();
+      queueReadingLayout();
     }
   },
 );
+watch(() => [scroll.value, state.hostId, state.activeThread?.id, welcome.value], async (_, __, onCleanup) => {
+  let disposed = false;
+  const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(queueReadingLayout);
+  onCleanup(() => { disposed = true; observer?.disconnect(); });
+  await nextTick();
+  if (disposed || !scroll.value) return;
+  observer?.observe(scroll.value);
+  if (scroll.value.firstElementChild) observer?.observe(scroll.value.firstElementChild);
+  queueReadingLayout();
+}, { flush: 'post' });
+watch(() => state.activeThread?.id, (id, previous) => {
+  // A brand-new thread is created by the first send rather than selectThread.
+  if (!id || previous || state.loading || state.selectingThread || state.switchingHost) return;
+  restoredScrollKey = `codex.scroll.${state.hostId}.${id}`;
+  followLatest.value = true;
+  queueReadingLayout();
+});
 onMounted(() => {
   applyTheme();
   updateViewport();
@@ -933,6 +1015,7 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  cancelAnimationFrame(scrollLayoutFrame);
   ++paletteSearchGeneration; clearTimeout(paletteSearchTimer);
   cancelDeferredPwaUpdate();
   setPwaUpdateGuard(() => true);
@@ -1098,9 +1181,9 @@ watch(() => [state.authenticated, state.loading], () => {
           <div class="header-project">
             <button
               @click="openSettings(state.hosts.length ? 'projects' : 'hosts')"
-              :title="state.projectPath"
+              :title="state.noProject ? '不在项目中工作' : state.projectPath"
             >
-              <Icon :name="state.hosts.length ? 'Folder' : 'Globe'" :size="15" /><span>{{ state.hosts.length ? projectName : '连接工作站' }}</span
+              <Icon :name="state.hosts.length ? (state.noProject ? 'MessagesSquare' : 'Folder') : 'Globe'" :size="15" /><span>{{ state.hosts.length ? projectName : '连接工作站' }}</span
               ><Icon name="ChevronDown" :size="12" /></button
             ><span class="header-breadcrumb">/</span>
             <h1 :title="threadTitle">{{ threadTitle }}</h1>
@@ -1272,7 +1355,7 @@ watch(() => [state.authenticated, state.loading], () => {
         <button class="icon-button dismiss-choice-reminder" aria-label="关闭问题提醒" title="关闭问题提醒" :disabled="api.asyncQuestionNoticesState.busy" @click="dismissChoiceReminder"><Icon :name="api.asyncQuestionNoticesState.busy ? 'LoaderCircle' : 'X'" :size="16" :class="{ spin: api.asyncQuestionNoticesState.busy }" /></button>
       </div>
       <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
-        <div ref="scroll" class="conversation-scroll" @scroll="onScroll">
+        <div ref="scroll" class="conversation-scroll" @scroll="onScroll" @wheel.passive="onReadingWheel" @touchstart.passive="onReadingTouchStart" @touchmove.passive="onReadingTouchMove">
           <div v-if="!state.hosts.length" class="welcome no-host-welcome">
             <div class="welcome-mark"><Icon name="Network" :size="27" /></div>
             <h2>连接你的工作站</h2>
@@ -1284,7 +1367,8 @@ watch(() => [state.authenticated, state.loading], () => {
               <CommandLogo />
             </div>
             <h2>今天，想构建什么？</h2>
-            <p>
+            <p v-if="state.noProject">与 Codex 一起探索想法，不关联项目。</p>
+            <p v-else>
               在
               {{ projectName === "选择项目" ? "你的项目" : projectName }} 中，与
               Codex 一起把想法变成现实。
@@ -1294,27 +1378,27 @@ watch(() => [state.authenticated, state.loading], () => {
                 :disabled="!state.connected || state.changingContext"
                 @click="
                   composer?.setDraft(
-                    '请阅读当前项目，介绍它的结构、主要功能和如何运行。',
+                    state.noProject ? '请和我一起梳理一个问题，先了解我的目标，再帮我理清思路。' : '请阅读当前项目，介绍它的结构、主要功能和如何运行。',
                   )
                 "
               >
-                <Icon name="FolderOpen" :size="17" /><span>了解这个项目</span
+                <Icon :name="state.noProject ? 'MessagesSquare' : 'FolderOpen'" :size="17" /><span>{{ state.noProject ? '梳理一个问题' : '了解这个项目' }}</span
                 ><Icon name="ArrowUpRight" :size="13" /></button
               ><button
                 :disabled="!state.connected || state.changingContext"
                 @click="
                   composer?.setDraft(
-                    '请审查当前项目的代码，找出最值得优先解决的问题，并说明原因。',
+                    state.noProject ? '请帮我分析一个问题，比较可选方案并给出建议。' : '请审查当前项目的代码，找出最值得优先解决的问题，并说明原因。',
                   )
                 "
               >
-                <Icon name="Eye" :size="17" /><span>一起审查代码</span
+                <Icon name="Eye" :size="17" /><span>{{ state.noProject ? '一起分析' : '一起审查代码' }}</span
                 ><Icon name="ArrowUpRight" :size="13" /></button
               ><button
                 :disabled="!state.connected || state.changingContext"
                 @click="
                   composer?.setDraft(
-                    '我想在这个项目中添加一个新功能。请先阅读项目，然后和我一起明确实现方案。',
+                    state.noProject ? '我有一个新想法。请和我一起明确目标与实现方案。' : '我想在这个项目中添加一个新功能。请先阅读项目，然后和我一起明确实现方案。',
                   )
                 "
               >
@@ -1441,6 +1525,7 @@ watch(() => [state.authenticated, state.loading], () => {
             :welcome="welcome"
             :context-busy="state.changingContext"
             @project="chooseNewContext($event.hostId || 'local', $event.path)"
+            @no-project="chooseNewContext(state.hostId, null)"
             @host="chooseNewContext($event)"
             @command="execute"
             @error="showError"

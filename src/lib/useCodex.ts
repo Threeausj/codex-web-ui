@@ -3,6 +3,8 @@ import { copyText } from './copy-text';
 import { useHostSettings } from './host-settings';
 import { interactiveShellCommand } from '../../shared/terminal-shell';
 import { orderHosts } from '../../shared/host-order';
+import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../../shared/project-order';
+import { isProjectlessThread, PROJECTLESS_THREAD_SOURCE } from '../../shared/project-context';
 import { waitForCompaction } from './compaction-send';
 import { modelServiceTiers, serviceTierParams, serviceTierScope } from "./service-tiers";
 import { reactive, ref, shallowReactive, toRaw, watch } from "vue";
@@ -114,6 +116,7 @@ const state = reactive({
   requirements: null as any,
   nativePermissionProfiles: [] as any[],
   projectPath: "",
+  noProject: false,
   projectThreadPages: {} as Record<string, ProjectThreadPage>,
   threads: [] as any[],
   activeThread: null as any,
@@ -301,6 +304,22 @@ let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; r
 const terminalListeners = new Set<(chunk: string) => void>();
 const protocolListeners = new Set<(hostId: string, message: any) => boolean | void>();
 let hostOrderRevision = 0;
+let projectOrderRevision = 0;
+let latestProjectOrder: ProjectOrderEntry[] = [];
+function validProjectOrder(value: unknown): value is ProjectOrderEntry[] {
+  return Array.isArray(value) && value.length <= 2000 && value.every(entry => entry &&
+    typeof entry.hostId === 'string' && entry.hostId.length > 0 && entry.hostId.length <= 256 &&
+    typeof entry.path === 'string' && entry.path.startsWith('/') && entry.path.length <= 4096 &&
+    !/[\x00-\x1f\x7f]/.test(entry.hostId + entry.path)) &&
+    new Set(value.map(projectOrderKey)).size === value.length;
+}
+function receiveProjectOrder(projects: unknown) {
+  if (!state.authenticated || !validProjectOrder(projects)) return;
+  ++projectOrderRevision;
+  latestProjectOrder = projects.map(({ hostId, path }) => ({ hostId, path }));
+  // Shared order events may reorder known records, never inject new projects.
+  state.projects = orderProjects(state.projects, latestProjectOrder);
+}
 function validHostOrder(value: unknown): value is string[] {
   return Array.isArray(value) && value.length <= 1000 && value.every(id => typeof id === 'string' && id.length > 0 && id.length <= 256 && !/[\x00-\x20\x7f]/.test(id))
     && new Set(value).size === value.length;
@@ -731,6 +750,7 @@ function flushConversationCache() {
 function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
   const metadata = state.threads.find(thread => thread.id === id);
   state.activeThread = { ...snapshot.thread, ...metadata, id };
+  state.noProject = isProjectlessThread(state.activeThread);
   state.items = itemCache.get(id) ?? snapshot.items;
   state.turns = snapshot.turns;
   settleLoadedToolItems(state.items, state.turns);
@@ -1046,7 +1066,9 @@ function replaceProjects(projects: any[]) {
   const location = (project: any) => JSON.stringify([project.hostId || 'local', project.path]);
   const previous = new Map(state.projects.map(project => [location(project), project]));
   const next = new Map(projects.map(project => [location(project), project]));
-  state.projects = retainProjectBindings(state.projects, projects);
+  // An older project edit/add response can arrive after a shared sort event.
+  // Refresh metadata independently while retaining that newer display order.
+  state.projects = orderProjects(retainProjectBindings(state.projects, projects), latestProjectOrder);
   const changedHosts = new Set<string>();
   for (const key of new Set([...previous.keys(), ...next.keys()])) {
     const before = previous.get(key), after = next.get(key);
@@ -1547,8 +1569,10 @@ function updateThread(thread: any, options: { authoritativePreview?: boolean } =
     invalidateThreadTitleSearch(state.hostId);
   threadRevisions.set(thread.id, ++threadEventSequence);
   removedThreads.delete(thread.id);
-  if (state.activeThread?.id === thread.id)
+  if (state.activeThread?.id === thread.id) {
     state.activeThread = { ...state.activeThread, ...thread };
+    state.noProject = isProjectlessThread(state.activeThread);
+  }
   const index = state.threads.findIndex((t) => t.id === thread.id);
   if (index < 0) state.threads.unshift(thread);
   else state.threads[index] = { ...state.threads[index], ...thread };
@@ -1682,6 +1706,10 @@ function receiveThreadChange(change: any) {
   }
 }
 function receive(message: any) {
+  if (message.method === 'bridge/project-order/changed') {
+    receiveProjectOrder(message.params?.projects);
+    return;
+  }
   if (message.method === 'bridge/host-order/changed') {
     receiveHostOrder(message.params?.hostIds);
     return;
@@ -2279,6 +2307,10 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   return promise;
 }
 async function bootstrap() {
+  // A fresh bootstrap owns its server's order; never carry another login's
+  // presentation journal into it. Events received during the fetch still win.
+  latestProjectOrder = [];
+  ++projectOrderRevision;
   const data = await http("/bootstrap");
   localCwd = data.cwd;
   state.hosts = data.hosts;
@@ -2328,6 +2360,7 @@ async function bootstrap() {
     preferred ??
     selectedHost?.cwd ??
     (selectedHost?.kind === "ssh" ? "/tmp" : localCwd);
+  state.noProject = saved<Record<string, boolean>>('codex.projectlessHosts', {})[state.hostId] === true;
   const preferredThread = saved<Record<string, string>>(
     "codex.selectedThreadIds",
     {},
@@ -2338,6 +2371,7 @@ async function bootstrap() {
   const hostId = state.hostId;
   if (preferredThread) {
     state.activeThread = state.threads.find(thread => thread.id === preferredThread) || { id: preferredThread };
+    state.noProject = isProjectlessThread(state.activeThread);
     state.threadReleased = releasedThreads.get(hostId)?.has(preferredThread) || false;
     state.threadReady = false;
     state.selectingThread = true;
@@ -2801,6 +2835,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
     ...(!threadMetadata.preview && (cached?.thread?.preview || previousPreview)
       ? { preview: cached?.thread?.preview || previousPreview } : {}),
   };
+  state.noProject = isProjectlessThread(state.activeThread);
   state.items = itemCache.get(id) ?? cached?.items ?? [];
   rememberAsyncQuestions(id, state.items);
   state.turns = loadedHistory?.turns ?? cached?.turns ?? (previousId === id ? state.turns : []);
@@ -3195,6 +3230,7 @@ function newThread(remember = true) {
   saveConversationSnapshot();
   if (state.activeThread) itemCache.set(state.activeThread.id, state.items);
   state.activeThread = null;
+  state.noProject = saved<Record<string, boolean>>('codex.projectlessHosts', {})[state.hostId] === true;
   state.threadReady = true;
   state.selectedSkills = [];
   state.goal = null;
@@ -3275,7 +3311,7 @@ function sandboxPolicy(
       requirements: state.requirements,
     }).sandboxPolicy;
     if (policy.type === "workspaceWrite")
-      policy.writableRoots = projectRoots(projectPath);
+      policy.writableRoots = executionRoots(projectPath);
     return policy;
   }
   if (
@@ -3289,7 +3325,7 @@ function sandboxPolicy(
   if (permission === "danger-full-access") return { type: "dangerFullAccess" };
   return {
     type: "workspaceWrite",
-    writableRoots: projectRoots(projectPath),
+    writableRoots: executionRoots(projectPath),
     networkAccess: false,
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false,
@@ -3349,6 +3385,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   const generation = selectionGeneration;
   const authentication = authenticationGeneration;
   const cwd = state.projectPath;
+  const noProject = state.noProject;
   const sendSocket = socket, sendEngine = engineId;
   const model = state.model;
   const serviceTier = serviceTierParams(state);
@@ -3387,7 +3424,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     resolvedProfile?.approvalPolicy ??
     resumed?.approvalPolicy ??
     resolveWebPermissionSelection(permission as any, { cwd, requirements: state.requirements }).approvalPolicy;
-  const workspaceRoots = projectRoots(cwd);
+  const workspaceRoots = executionRoots(cwd);
   if (policy.type === "workspaceWrite" && (!resumed || resolvedProfile))
     policy.writableRoots = workspaceRoots;
   const attachments = editedInput ? [] : [...state.attachments];
@@ -3467,14 +3504,14 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   }
   try {
     if (!id) {
-      const projectId = await resolveNativeProjectIdentity(hostId, cwd);
+      const projectId = noProject ? null : await resolveNativeProjectIdentity(hostId, cwd);
       if (hostId !== state.hostId || generation !== selectionGeneration ||
-          authentication !== authenticationGeneration || !state.authenticated || state.activeThread || cwd !== state.projectPath)
+          authentication !== authenticationGeneration || !state.authenticated || state.activeThread || cwd !== state.projectPath || noProject !== state.noProject)
         throw new Error('新对话位置已变化，消息尚未发送，请在目标项目重新确认');
       const result = await rpc("thread/start", {
         ...serviceTier,
         cwd,
-        ...(projectId ? { projectId } : {}),
+        ...(noProject ? { projectId: null, threadSource: PROJECTLESS_THREAD_SOURCE } : projectId ? { projectId } : {}),
         runtimeWorkspaceRoots: workspaceRoots,
         model: model || undefined,
         sandbox: permission as any,
@@ -3853,8 +3890,12 @@ async function interruptOnce() {
 async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string) {
   const authentication = authenticationGeneration;
   const selection = selectionGeneration, selectedHost = state.hostId, selectedThread = state.activeThread?.id;
+  const source = hostId === state.hostId
+    ? state.threads.find(thread => thread.id === id) ?? (state.activeThread?.id === id ? state.activeThread : undefined)
+    : state.navigation[hostId]?.threads.find(thread => thread.id === id);
   const result = await scopedRpc(hostId, "thread/fork", {
     threadId: id, lastTurnId, excludeTurns: true, deferGoalContinuation: true,
+    ...(isProjectlessThread(source) ? { threadSource: PROJECTLESS_THREAD_SOURCE } : {}),
   });
   if (authentication !== authenticationGeneration || !state.authenticated)
     throw new Error('登录状态已变化，请重新同步对话后确认已创建的分支');
@@ -4118,10 +4159,11 @@ async function archiveThread(id: string, hostId = state.hostId) {
     }
   }
 }
-async function setProject(path: string) {
+async function setProject(path: string, noProject = false) {
   state.projectPath = path;
+  state.noProject = noProject;
+  rememberProject(true);
   newThread();
-  rememberProject();
   await Promise.allSettled([refreshThreads(), readConfig(), loadModeCapabilities(), loadSkills()]);
 }
 /** Native thread configuration for explicitly started review workflows. */
@@ -4130,7 +4172,7 @@ function workflowThreadOptions() {
   const resolved = resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
   return {
     cwd: state.projectPath,
-    runtimeWorkspaceRoots: projectRoots(),
+    runtimeWorkspaceRoots: executionRoots(),
     model: state.model || undefined,
     ...serviceTierParams(state),
     sandbox: resolved.sandbox,
@@ -4139,7 +4181,7 @@ function workflowThreadOptions() {
       'features.default_mode_request_user_input': true,
       'model_reasoning_effort': state.effort,
       ...(resolved.sandboxPolicy.type === 'workspaceWrite' ? { sandbox_workspace_write: {
-        writable_roots: projectRoots(), network_access: resolved.sandboxPolicy.networkAccess,
+        writable_roots: executionRoots(), network_access: resolved.sandboxPolicy.networkAccess,
         exclude_tmpdir_env_var: resolved.sandboxPolicy.excludeTmpdirEnvVar,
         exclude_slash_tmp: resolved.sandboxPolicy.excludeSlashTmp,
       } } : {}),
@@ -4152,13 +4194,14 @@ async function startWorkflowThread() {
   const generation = selectionGeneration;
   const authentication = authenticationGeneration;
   const options = workflowThreadOptions();
-  const projectId = await resolveNativeProjectIdentity(hostId, options.cwd);
+  const noProject = state.noProject;
+  const projectId = noProject ? null : await resolveNativeProjectIdentity(hostId, options.cwd);
   if (hostId !== state.hostId || generation !== selectionGeneration ||
-      authentication !== authenticationGeneration || !state.authenticated || state.activeThread || options.cwd !== state.projectPath)
+      authentication !== authenticationGeneration || !state.authenticated || state.activeThread || options.cwd !== state.projectPath || noProject !== state.noProject)
     throw new Error('工作区已切换，新会话尚未创建；请在目标项目重新确认。');
   const result = await rpc('thread/start', {
     ...options,
-    ...(projectId ? { projectId } : {}),
+    ...(noProject ? { projectId: null, threadSource: PROJECTLESS_THREAD_SOURCE } : projectId ? { projectId } : {}),
     historyMode: 'paginated',
   });
   if (hostId !== state.hostId || generation !== selectionGeneration || authentication !== authenticationGeneration)
@@ -4204,7 +4247,7 @@ async function startReview(target: ReviewTarget) {
     const profile = availablePermissionProfiles(state.preferences.permissionProfiles).find(entry => entry.id === state.activePermissionProfileId);
     const permission = resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
     const policy = permission.sandboxPolicy;
-    if (policy.type === 'workspaceWrite') policy.writableRoots = projectRoots();
+    if (policy.type === 'workspaceWrite') policy.writableRoots = executionRoots();
     // Resume ignores overrides for an already loaded thread. Update future
     // settings in place, so review retains the existing connection and writer.
     try {
@@ -4230,10 +4273,15 @@ async function startReview(target: ReviewTarget) {
     return result;
   } finally { sendInFlight = false; }
 }
-function rememberProject() {
+function rememberProject(rememberSelection = false) {
   const paths = saved<Record<string, string>>("codex.projectPaths", {});
   paths[state.hostId] = state.projectPath;
   browserStorage.local.setItem("codex.projectPaths", JSON.stringify(paths));
+  if (rememberSelection) {
+    const projectless = saved<Record<string, boolean>>('codex.projectlessHosts', {});
+    projectless[state.hostId] = state.noProject;
+    browserStorage.local.setItem('codex.projectlessHosts', JSON.stringify(projectless));
+  }
 }
 async function addProject(
   path: string,
@@ -4270,19 +4318,21 @@ async function browseDirectory(hostId: string, path?: string) {
 /** Choosing the destination of an unsent chat must never reuse file paths from
  * another machine. Keep local project attachments, and upload original files
  * again when the selected host changes. */
-async function chooseNewContext(hostId: string, projectPath?: string) {
+async function chooseNewContext(hostId: string, projectPath?: string | null) {
   if (state.activeThread || state.busy || state.selectingThread ||
       state.switchingHost || state.changingContext || sendInFlight)
     throw new Error("请等待当前操作完成后选择新对话位置");
   if (!state.hosts.some((host) => host.id === hostId))
     throw new Error("主机不存在");
-  if (projectPath !== undefined && !state.projects.some((project) =>
+  if (projectPath != null && !state.projects.some((project) =>
       (project.hostId || "local") === hostId &&
       [project.path, ...(project.rootPaths || [])].includes(projectPath)) &&
       !(hostId === state.hostId && projectPath === state.projectPath))
     throw new Error("所选项目不属于这台主机");
-  if (hostId === state.hostId &&
-      (projectPath === undefined || projectPath === state.projectPath)) return true;
+  const noProject = projectPath === null || projectPath === undefined &&
+    (hostId === state.hostId ? state.noProject : saved<Record<string, boolean>>('codex.projectlessHosts', {})[hostId] === true);
+  if (hostId === state.hostId && noProject === state.noProject &&
+      (projectPath == null || projectPath === state.projectPath)) return true;
   const previousHost = state.hostId;
   const attachments = state.attachments;
   const originals = attachments.map((file) => attachmentOriginals.get(toRaw(file)));
@@ -4304,12 +4354,12 @@ async function chooseNewContext(hostId: string, projectPath?: string) {
       if (!current()) return false;
     }
     // A new host without a remembered path starts at its first known project.
-    const preferredPath = projectPath ?? state.projects.find((project) =>
+    const preferredPath = noProject ? state.projectPath : projectPath ?? state.projects.find((project) =>
       (project.hostId || "local") === hostId &&
       [project.path, ...(project.rootPaths || [])].includes(state.projectPath))?.path ??
       state.projects.find((project) => (project.hostId || "local") === hostId)?.path;
-    if (preferredPath && preferredPath !== state.projectPath) {
-      const changingProject = setProject(preferredPath);
+    if (preferredPath && (preferredPath !== state.projectPath || noProject !== state.noProject)) {
+      const changingProject = setProject(preferredPath, noProject);
       expectedSelection = selectionGeneration;
       await changingProject;
       if (!current()) return false;
@@ -4540,6 +4590,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     saved<Record<string, string>>("codex.projectPaths", {})[id] ??
     state.hosts.find((host) => host.id === id)?.cwd ??
     (id === "local" ? localCwd : "/tmp") : "";
+  state.noProject = !!id && saved<Record<string, boolean>>('codex.projectlessHosts', {})[id] === true;
   if (!id) {
     state.threadReady = false;
     state.switchingHost = false;
@@ -4557,6 +4608,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     // present a new-chat welcome screen or the previous host's conversation.
     const cached = conversationCache.peek(id, target);
     state.activeThread = state.threads.find(thread => thread.id === target) ?? cached?.thread ?? { id: target };
+    state.noProject = isProjectlessThread(state.activeThread);
     if (state.activeThread.cwd) state.projectPath = state.activeThread.cwd;
     state.threadReady = false;
     state.selectingThread = true;
@@ -4684,6 +4736,22 @@ async function reorderHosts(hostIds: string[]) {
   // A shared event may arrive before this ACK, including a later change from
   // another device. Preserve that newer order and any hosts added or removed.
   if (revision === hostOrderRevision) state.hosts = orderHosts(state.hosts, savedIds);
+  return result;
+}
+async function reorderProjects(projects: ProjectOrderEntry[]) {
+  const known = new Set(state.projects.map(projectOrderKey));
+  if (!validProjectOrder(projects) || projects.length !== known.size || projects.some(project => !known.has(projectOrderKey(project))))
+    throw new Error('项目列表已变化，请重新调整顺序');
+  const authentication = authenticationGeneration;
+  const revision = projectOrderRevision;
+  const result = await http('/projects/order', { method: 'PATCH', body: JSON.stringify({ projects }) }, false);
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  const savedOrder = Array.isArray(result.projects) ? result.projects.map((project: any) => ({ hostId: project?.hostId || 'local', path: project?.path })) : null;
+  if (!validProjectOrder(savedOrder)) throw new Error('项目顺序响应无效，请重新加载项目列表');
+  if (revision === projectOrderRevision) {
+    latestProjectOrder = savedOrder;
+    state.projects = orderProjects(state.projects, latestProjectOrder);
+  }
   return result;
 }
 let hostAvailabilityRequest: Promise<void> | null = null;
@@ -5581,6 +5649,10 @@ async function rememberSideBranch(hostId: string, id: string, label: string) {
 function setCollapsed(key: string, collapsed: boolean) {
   return updatePreferences({ collapsed: { [key]: collapsed } });
 }
+function executionRoots(cwd = state.projectPath, hostId = state.hostId) {
+  if (hostId === state.hostId && state.noProject && cwd === state.projectPath) return [cwd];
+  return projectRoots(cwd, hostId);
+}
 function projectRoots(cwd = state.projectPath, hostId = state.hostId) {
   const project = state.projects.find(
     (project) =>
@@ -5929,6 +6001,7 @@ export function useCodex() {
     updateHost,
     removeHost,
     reorderHosts,
+    reorderProjects,
     setLocalEnabled,
     uploadFiles,
     uploadEditFiles,
