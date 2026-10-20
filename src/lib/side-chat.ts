@@ -7,6 +7,7 @@ import { mergeTurnSnapshot, settleInterruptedTurnItems } from './thread-sync';
 import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from './conversation-selection';
 import { randomUUID } from './uuid';
 import { interruptConflictCandidate } from './turn-interrupt';
+import { isProjectlessThread, PROJECTLESS_THREAD_SOURCE } from '../../shared/project-context';
 
 export type SelectedConversationText = ConversationSelectionSource;
 export type ConversationSideChatSource = {
@@ -71,7 +72,7 @@ export function useSideChat(api: any, mainState: any) {
   let sideGoalCleared = false;
   // Main conversation selection is independent of the retained side branch.
   // Keep only the parent's settings and turn metadata, never copy its transcript.
-  let sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, turns: [] as { id: string; status?: string }[] };
+  let sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, noProject: false, turns: [] as { id: string; status?: string }[] };
   const visibleMessages = () => state.items.filter(item => item.type === 'userMessage' || item.type === 'agentMessage').map(item => ({
     key: `${item.type}:${item.clientId || item.id}`,
     text: `${item.type === 'userMessage' ? '用户' : '助手'}：${item.text || (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n')}`,
@@ -94,6 +95,7 @@ export function useSideChat(api: any, mainState: any) {
       model: mainState.model || mainState.activeThread?.model || '',
       effort: mainState.effort || 'medium', plan: !!mainState.modeCapabilities?.plan,
       busy: !!mainState.busy,
+      noProject: isProjectlessThread(mainState.activeThread),
       turns: (mainState.turns || []).map((turn: any) => ({ id: turn.id, status: turn.status })),
     };
     state.sourceCwd = sourceContext.cwd;
@@ -129,7 +131,7 @@ export function useSideChat(api: any, mainState: any) {
     state.draft = '';
     state.source = null;
     state.sourceCwd = '';
-    sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, turns: [] };
+    sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, noProject: false, turns: [] };
     state.threadId = '';
     state.anchor = null;
     state.boundary = {};
@@ -337,6 +339,7 @@ export function useSideChat(api: any, mainState: any) {
           threadId: source.threadId, ...boundary, excludeTurns: true, ephemeral: true,
           sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy,
           model: model || undefined, cwd,
+          ...(context.noProject ? { threadSource: PROJECTLESS_THREAD_SOURCE } : {}),
         });
         id = result?.thread?.id;
         if (typeof id !== 'string' || id === source.threadId) throw new Error('服务器未创建独立的侧边聊天');
@@ -492,6 +495,7 @@ export function useSideChat(api: any, mainState: any) {
         const result = await call(source.hostId, 'thread/fork', {
           threadId: source.threadId, ...state.boundary, ephemeral: false, excludeTurns: true, deferGoalContinuation: true,
           sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy, cwd: sourceContext.cwd,
+          ...(sourceContext.noProject ? { threadSource: PROJECTLESS_THREAD_SOURCE } : {}),
         });
         saved = result?.thread?.id;
         if (!saved || saved === source.threadId || result.thread.ephemeral) { saved = ''; throw Object.assign(new Error('服务器未返回可核对的正式分支 ID'), { uncertain: true }); }

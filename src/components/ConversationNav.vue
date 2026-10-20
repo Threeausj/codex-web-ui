@@ -4,6 +4,7 @@ import Icon from "./Icon.vue";
 import ProjectGroup from "./ProjectGroup.vue";
 import ThreadRow from "./ThreadRow.vue";
 import { isPinned, sortedThreads } from "../lib/navigation";
+import { pinnedNavigation } from '../lib/pinned-navigation';
 import { browserStorage } from "../lib/browser-storage";
 import { matchesThreadTitle } from "../lib/thread-title-search";
 import { matchesBookmark, type useConversationBookmarks } from "../lib/conversation-bookmarks";
@@ -35,6 +36,7 @@ const recentLimit = ref(20);
 const recentHost = ref(browserStorage.local.getItem("codex.recentHostFilter") || "");
 const expandedProjects = ref({ pinned: false, projects: false });
 const projectLimit = 4;
+const pinnedLimit = 6;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 let generation = 0;
 const searchMode = computed(() => !!search.value.trim() || archived.value);
@@ -80,23 +82,19 @@ document.addEventListener('visibilitychange', markVisibleConversation);
 window.addEventListener('focus', markVisibleConversation);
 window.addEventListener('blur', markVisibleConversation);
 window.addEventListener('storage', mergeReadReceipts);
-const pinnedProjects = computed(() =>
-  hostProjects.value.filter((project: any) =>
-    isPinned(pins.value, project.hostId || "local", "project", project.path),
-  ),
-);
 const otherProjects = computed(() =>
   hostProjects.value.filter(
     (project: any) =>
       !isPinned(pins.value, project.hostId || "local", "project", project.path),
   ),
 );
-function visibleProjects(projects: any[], section: "pinned" | "projects") {
+function visibleProjects(projects: any[], section: "projects") {
   if (expandedProjects.value[section] || projects.length <= projectLimit)
     return projects;
   const activeIndex = projects.findIndex(
     (project) =>
       (project.hostId || "local") === props.state.hostId &&
+      !props.state.noProject &&
       [project.path, ...(project.rootPaths || [])].includes(props.state.projectPath),
   );
   const visible = projects.slice(0, projectLimit);
@@ -104,18 +102,9 @@ function visibleProjects(projects: any[], section: "pinned" | "projects") {
     visible[projectLimit - 1] = projects[activeIndex];
   return visible;
 }
-const visiblePinnedProjects = computed(() => visibleProjects(pinnedProjects.value, "pinned"));
 const visibleOtherProjects = computed(() => visibleProjects(otherProjects.value, "projects"));
-const pinnedThreads = computed(() =>
-  pins.value
-    .filter((pin: any) => pin.kind === "thread")
-    .map((pin: any) =>
-      allThreads.value.find(
-        (thread: any) => thread.id === pin.id && thread.hostId === pin.hostId,
-      ),
-    )
-    .filter(Boolean),
-);
+const pinnedEntries = computed(() => pinnedNavigation<any, any>(hostProjects.value, allThreads.value, pins.value));
+const visiblePinnedEntries = computed(() => expandedProjects.value.pinned ? pinnedEntries.value : pinnedEntries.value.slice(0, pinnedLimit));
 const filteredRecentThreads = computed(() =>
   sortedThreads<any>(
     allThreads.value.filter(
@@ -379,38 +368,38 @@ onBeforeUnmount(() => {
           ><Icon name="Pin" :size="12" />
         </div>
         <div v-if="!collapsed('pinned')">
-          <ProjectGroup
-            v-for="project in visiblePinnedProjects"
-            :key="`${project.hostId}:${project.path}`"
-            :project="project"
-            :state="state"
-            :api="api"
-            pinned
-            @project="emit('project', $event)"
-            @project-action="emit('projectAction', $event)"
-            @select="emit('select', $event)"
-            @error="emit('error', $event)"
-          />
+          <template v-for="entry in visiblePinnedEntries" :key="entry.key">
+            <ProjectGroup
+              v-if="entry.kind === 'project'"
+              :project="entry.project"
+              :state="state"
+              :api="api"
+              pinned
+              @project="emit('project', $event)"
+              @project-action="emit('projectAction', $event)"
+              @select="emit('select', $event)"
+              @error="emit('error', $event)"
+            />
+            <ThreadRow
+              v-else
+              :thread="entry.thread"
+              :state="state"
+              :api="api"
+              @select="emit('select', $event)"
+              @error="emit('error', $event)"
+            />
+          </template>
           <button
-            v-if="pinnedProjects.length > projectLimit"
+            v-if="pinnedEntries.length > pinnedLimit"
             class="nav-load-more nav-overflow-toggle"
             :aria-expanded="expandedProjects.pinned"
             @click="expandedProjects.pinned = !expandedProjects.pinned"
           >
             <Icon :name="expandedProjects.pinned ? 'ChevronUp' : 'ChevronDown'" :size="12" />
-            {{ expandedProjects.pinned ? "收起置顶项目" : `显示另外 ${pinnedProjects.length - projectLimit} 个置顶项目` }}
+            {{ expandedProjects.pinned ? "收起置顶" : `显示另外 ${pinnedEntries.length - pinnedLimit} 个置顶项` }}
           </button>
-          <ThreadRow
-            v-for="thread in pinnedThreads"
-            :key="`${thread.hostId}:${thread.id}`"
-            :thread="thread"
-            :state="state"
-            :api="api"
-            @select="emit('select', $event)"
-            @error="emit('error', $event)"
-          />
           <p
-            v-if="!pinnedProjects.length && !pinnedThreads.length"
+            v-if="!pinnedEntries.length"
             class="nav-empty"
           >
             置顶常用项目或对话

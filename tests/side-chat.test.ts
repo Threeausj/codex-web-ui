@@ -3,8 +3,26 @@ import assert from 'node:assert/strict';
 import { nextTick, reactive } from 'vue';
 import { PrivateState } from '../src/lib/private-state';
 import { useSideChat } from '../src/lib/side-chat';
+import { PROJECTLESS_THREAD_SOURCE } from '../shared/project-context';
 
 const selected = { hostId: 'local', threadId: 'parent', turnId: 'parent-turn', itemId: 'parent-answer', text: 'NAS Git 读取不再依赖 bwrap；$dangerous', threadName: '部署项目' };
+
+test('projectless parent keeps its native source classification in temporary and saved side branches', async () => {
+  const value = fixture();
+  try {
+    Object.assign(value.main.activeThread, { projectId: null, threadSource: PROJECTLESS_THREAD_SOURCE });
+    value.controller.prepare(selected);
+    await value.controller.send('解释');
+    assert.equal(value.calls.find(call => call.method === 'thread/fork')!.params.threadSource, PROJECTLESS_THREAD_SOURCE);
+    value.emit('turn/completed', { threadId: 'side', turn: { id: 'side-turn', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', text: '可见回答' }] } });
+    value.overrides.set('thread/fork', input => ({ thread: { id: input.ephemeral ? 'another-side' : 'saved-sidebar', ephemeral: input.ephemeral, forkedFromId: 'parent' } }));
+    await value.controller.saveBranch('保存的问答');
+    const saved = value.calls.filter(call => call.method === 'thread/fork').at(-1)!.params;
+    assert.equal(saved.threadSource, PROJECTLESS_THREAD_SOURCE);
+    assert.equal(saved.ephemeral, false);
+    assert.equal(value.main.activeThread.projectId, null);
+  } finally { value.controller.dispose(); }
+});
 
 test('sidebar retains its first history anchor, can explicitly restart, and saves visible answers in a separate persistent branch', async () => {
   const value = fixture();

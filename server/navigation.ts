@@ -1,6 +1,7 @@
 import type { Express, RequestHandler } from "express";
 import { z } from "zod";
 import { RpcFailure, type Bridge } from "./bridge.js";
+import { PROJECTLESS_THREAD_SOURCE } from '../shared/project-context.js';
 
 const cursor = z.string().max(8192).nullable().optional();
 const threadId = z.string().min(1).max(256);
@@ -16,6 +17,7 @@ const request = z.discriminatedUnion("method", [
     params: z.object({
       threadId, lastTurnId: threadId.optional(),
       excludeTurns: z.literal(true), deferGoalContinuation: z.literal(true),
+      threadSource: z.literal(PROJECTLESS_THREAD_SOURCE).optional(),
     }).strict(),
   }).strict(),
   z

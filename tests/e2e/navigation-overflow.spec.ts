@@ -39,7 +39,7 @@ function addRemote(mock: MockCodex, count = 6) {
   return remote;
 }
 
-test("pinned and ordinary project lists each show four, expand independently, and keep pinned chats", async ({ page, mock }) => {
+test("pinned items show the six most active entries while ordinary projects keep four and expand independently", async ({ page, mock }) => {
   mock.projects = projectList(mock, 12);
   mock.preferences.pins = [
     ...mock.projects.slice(0, 6).map((project) => ({ hostId: "local", kind: "project", id: project.path })),
@@ -48,10 +48,10 @@ test("pinned and ordinary project lists each show four, expand independently, an
   await login(page);
   const pinned = section(page, "pinned");
   const ordinary = section(page, "projects");
-  await expect(pinned.locator(".nav-project-group")).toHaveCount(4);
+  await expect(pinned.locator(".nav-project-group")).toHaveCount(5);
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(4);
   await expect(pinned.locator(".nav-thread:not(.nested)")).toHaveCount(1);
-  await pinned.getByRole("button", { name: "显示另外 2 个置顶项目", exact: true }).click();
+  await pinned.getByRole("button", { name: "显示另外 1 个置顶项", exact: true }).click();
   await expect(pinned.locator(".nav-project-group")).toHaveCount(6);
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(4);
   await ordinary.getByRole("button", { name: "显示另外 2 个项目", exact: true }).click();
@@ -59,21 +59,21 @@ test("pinned and ordinary project lists each show four, expand independently, an
   await page.getByRole("button", { name: "刷新对话", exact: true }).click();
   await expect(pinned.locator(".nav-project-group")).toHaveCount(6);
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(6);
-  await pinned.getByRole("button", { name: "收起置顶项目", exact: true }).click();
+  await pinned.getByRole("button", { name: "收起置顶", exact: true }).click();
   await ordinary.getByRole("button", { name: "收起项目", exact: true }).click();
-  await expect(pinned.locator(".nav-project-group")).toHaveCount(4);
+  await expect(pinned.locator(".nav-project-group")).toHaveCount(5);
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(4);
   expect(mock.preferences.collapsed).toEqual({});
   await page.getByRole("combobox", { name: "新对话项目", exact: true }).selectOption("/workspace/project-6");
-  await expect(pinned.locator(".nav-project-group")).toHaveCount(4);
-  await expect(pinned.locator('.nav-project-group[data-project-path="/workspace/project-6"]')).toBeVisible();
+  await expect(pinned.locator(".nav-project-group")).toHaveCount(5);
+  await expect(pinned.locator('.nav-project-group[data-project-path="/workspace/project-6"]')).toHaveCount(0);
   await page.getByRole("button", { name: "折叠项目", exact: true }).click();
   await page.reload();
   await expect(page.getByRole("button", { name: "展开项目", exact: true })).toBeVisible();
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(0);
   await page.getByRole("button", { name: "展开项目", exact: true }).click();
   await expect(ordinary.locator(".nav-project-group")).toHaveCount(4);
-  await expect(pinned.locator(".nav-project-group")).toHaveCount(4);
+  await expect(pinned.locator(".nav-project-group")).toHaveCount(5);
 });
 
 test("each project's four-chat limit keeps the active chat and separates matching IDs on different hosts", async ({ page, mock }) => {
