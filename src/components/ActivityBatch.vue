@@ -11,12 +11,28 @@ const emit = defineEmits<{ openFile: [path: string, line?: number]; error: [mess
 const disclosures = historyDisclosures();
 const identity = props.items[0]?.id || '';
 const expanded = ref(disclosures?.batches.has(identity) || false);
-watch(expanded, value => { if (value) disclosures?.batches.add(identity); else disclosures?.batches.delete(identity); });
+watch(() => props.busy, (busy, wasBusy) => {
+  if (busy || wasBusy) {
+    expanded.value = !!busy;
+    // Live expansion ends with the turn. Do not restore it as a manually
+    // expanded historical batch when its parent is opened again afterward.
+    disclosures?.batches.delete(identity);
+  }
+}, { immediate: true, flush: 'sync' });
+function toggle(event: Event) {
+  const open = (event.currentTarget as HTMLDetailsElement).open;
+  if (expanded.value === open) return;
+  expanded.value = open;
+  if (!props.busy) {
+    if (open) disclosures?.batches.add(identity);
+    else disclosures?.batches.delete(identity);
+  }
+}
 const summary = computed(() => activityBatchSummary(props.items));
 </script>
 
 <template>
-  <details class="activity-batch" :open="expanded" @toggle="expanded = ($event.currentTarget as HTMLDetailsElement).open" :class="{ 'activity-batch-failed': summary.failed }">
+  <details class="activity-batch" :open="expanded" @toggle="toggle" :class="{ 'activity-batch-failed': summary.failed }">
     <summary>
       <Icon :name="summary.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: summary.running }" />
       <span class="activity-batch-label">{{ summary.label }}</span>

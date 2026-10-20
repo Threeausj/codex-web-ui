@@ -1238,13 +1238,15 @@ watch(() => [state.authenticated, state.loading], () => {
       <div v-if="!state.online" class="connection-banner" role="status">
         <Icon name="WifiOff" :size="15" />目前离线，联网后将重新连接。操作不会自动提交。
       </div>
-      <div v-else-if="state.hosts.length && !state.connected && !state.error && !state.runtimePaused" class="connection-banner">
+      <div v-else-if="state.hosts.length && !state.connected && !state.error && !state.runtimePaused" class="connection-banner" role="status">
         <Icon
-          :name="state.loading ? 'LoaderCircle' : 'WifiOff'"
+          :name="state.loading || state.switchingHost ? 'LoaderCircle' : 'WifiOff'"
           :size="15"
-          :class="{ spin: state.loading }"
+          :class="{ spin: state.loading || state.switchingHost }"
         />{{
-          state.loading
+          state.switchingHost
+            ? "正在连接目标主机…"
+            : state.loading
             ? "正在连接 App Server…"
             : "App Server 已断开，正在尝试重连…"
         }}

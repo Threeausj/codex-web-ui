@@ -7,6 +7,7 @@ import ModelServiceOptions from "./ModelServiceOptions.vue";
 import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
+import { composerMarkdownPreview } from "../lib/composer-markdown";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
 import {
   availablePermissionProfiles,
@@ -20,6 +21,12 @@ const emit = defineEmits<{
   host: [hostId: string];
 }>();
 const draft = ref("");
+const markdownPreview = ref(false);
+const previewElement = ref<HTMLElement>();
+let editingSelection = { start: 0, end: 0 };
+const renderedDraft = computed(() => markdownPreview.value
+  ? composerMarkdownPreview(draft.value, props.state.hostId, props.state.activeThread?.cwd || props.state.projectPath || '/')
+  : null);
 const draftStorageWarning = ref(false);
 const quotedContexts = ref<ConversationSelectionSource[]>([]);
 const input = ref<HTMLTextAreaElement>();
@@ -361,6 +368,33 @@ function resize() {
     input.value.style.height = `${Math.min(input.value.scrollHeight, 210)}px`;
   }
 }
+function editDraft() {
+  markdownPreview.value = false;
+  void nextTick(() => {
+    resize();
+    input.value?.focus({ preventScroll: true });
+    input.value?.setSelectionRange(Math.min(editingSelection.start, draft.value.length), Math.min(editingSelection.end, draft.value.length));
+  });
+}
+function focusInput() {
+  markdownPreview.value = false;
+  void nextTick(() => { resize(); input.value?.focus({ preventScroll: true }); });
+}
+function toggleMarkdownPreview() {
+  if (markdownPreview.value) { editDraft(); return; }
+  if (!draft.value.trim()) return;
+  editingSelection = { start: input.value?.selectionStart ?? draft.value.length, end: input.value?.selectionEnd ?? draft.value.length };
+  picker.value = "";
+  pickerError.value = "";
+  searchPending.value = false;
+  ++pickerGeneration;
+  if (searchTimer) clearTimeout(searchTimer);
+  closeContextMenu();
+  markdownPreview.value = true;
+  void nextTick(() => previewElement.value?.focus({ preventScroll: true }));
+}
+watch(() => [props.state.hostId, props.state.projectPath, props.state.activeThread?.id,
+  props.state.authenticationGeneration, props.state.authenticated], () => { markdownPreview.value = false; }, { flush: 'sync' });
 function fitPicker() {
   const viewportHeight = window.visualViewport?.height || window.innerHeight;
   const space = (area.value?.getBoundingClientRect().top ?? viewportHeight) - 12;
@@ -578,6 +612,7 @@ function drop(event: DragEvent) {
   if (event.dataTransfer?.files.length) void upload(event.dataTransfer.files);
 }
 function insertAt() {
+  markdownPreview.value = false;
   draft.value += draft.value && !draft.value.endsWith(" ") ? " @" : "@";
   void nextTick(() => {
     input.value?.focus();
@@ -633,7 +668,7 @@ function addContext(value: ConversationSelectionSource) {
     }
     quotedContexts.value.push(source);
   }
-  void nextTick(() => input.value?.focus());
+  focusInput();
   return true;
 }
 function removeContext(index: number) { quotedContexts.value.splice(index, 1); }
@@ -651,6 +686,7 @@ function clearSubmittedDraft(key: string, submitted: string) {
 watch(
   draftKey,
   (key, previous) => {
+    markdownPreview.value = false;
     if (pendingDraftSubmission && !pendingDraftSubmission.threadId &&
       previous === pendingDraftSubmission.key && props.state.activeThread?.id &&
       !props.state.selectingThread && !props.state.switchingHost &&
@@ -688,9 +724,13 @@ watch(selected, () => {
       container.scrollTop = option.offsetTop + option.offsetHeight - container.clientHeight;
   });
 });
-watch(draft, (value) => saveDraft(draftKey.value, value), { flush: "sync" });
+watch(draft, (value) => {
+  if (!value.trim()) markdownPreview.value = false;
+  saveDraft(draftKey.value, value);
+}, { flush: "sync" });
 watch(quotedContexts, value => saveContexts(draftKey.value, value), { deep: true, flush: 'sync' });
 function setDraft(text: string) {
+  markdownPreview.value = false;
   draft.value = text;
   void nextTick(() => {
     input.value?.focus();
@@ -732,7 +772,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', contextOutside, true);
   document.removeEventListener('keydown', contextKey, true);
 });
-defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, setDraft, addContext, contextMenuOpen, closeContextMenu,
+defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addContext, contextMenuOpen, closeContextMenu,
   working: computed(() => uploading.value || submitting.value) });
 </script>
 
@@ -902,6 +942,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         </div>
       </div>
       <textarea
+        v-show="!markdownPreview"
         ref="input"
         v-model="draft"
         :placeholder="
@@ -926,6 +967,11 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
         @paste="paste"
         :disabled="!state.connected || contextBusy"
       ></textarea>
+      <section v-if="markdownPreview" ref="previewElement" class="composer-markdown-preview" tabindex="0"
+        role="region" aria-label="Markdown 草稿预览" @keydown.esc.prevent="editDraft" @paste="paste">
+        <div class="markdown" v-html="renderedDraft?.html"></div>
+        <p v-if="renderedDraft?.truncated" class="composer-preview-note" role="status">仅预览前 100,000 个字符，完整原文仍会发送；切回编辑可查看全部内容。</p>
+      </section>
       <div class="composer-toolbar">
         <div class="composer-tools">
           <input
@@ -957,7 +1003,13 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
             aria-haspopup="listbox"
           >
             @</button
-          ><span class="toolbar-separator"></span
+          ><button type="button" class="icon-button markdown-preview-toggle"
+            :disabled="!draft.trim() || contextBusy"
+            :aria-label="markdownPreview ? '编辑 Markdown' : '预览 Markdown'"
+            :title="markdownPreview ? '切回 Markdown 源码编辑' : '预览 Markdown'"
+            :aria-pressed="markdownPreview" @pointerdown.prevent @click="toggleMarkdownPreview">
+            <Icon :name="markdownPreview ? 'Pencil' : 'Eye'" :size="16" />
+          </button><span class="toolbar-separator"></span
           ><label
             class="composer-select model-select"
             :title="selectedModel?.description || '选择模型'"
@@ -1162,6 +1214,14 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   box-shadow: none;
 }
 .composer:focus-within { box-shadow: none; }
+.markdown-preview-toggle[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
+.composer-markdown-preview { min-height: 51px; max-height: 210px; overflow: auto; overscroll-behavior: contain; padding: 0 2px 8px; outline: none; }
+.composer-markdown-preview .markdown { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.composer-markdown-preview :deep(h1), .composer-markdown-preview :deep(h2), .composer-markdown-preview :deep(h3) { margin-top: 8px; font-size: 1.1em; }
+.composer-markdown-preview :deep(h1:first-child), .composer-markdown-preview :deep(h2:first-child), .composer-markdown-preview :deep(h3:first-child) { margin-top: 0; }
+.composer-markdown-preview :deep(pre), .composer-markdown-preview :deep(table) { max-width: 100%; }
+.composer-markdown-preview :deep(img) { max-height: 140px; object-fit: contain; }
+.composer-preview-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .composer-area :deep(.new-context) {
   margin: 0;
   padding: 6px 15px;
@@ -1253,6 +1313,7 @@ defineExpose({ focus: () => input.value?.focus(), getDraft: () => draft.value, s
   .context-compact-action { min-height: 44px; font-size: 13px; }
 }
 @media (max-width: 600px) {
+  .composer-markdown-preview { max-height: min(210px, 35dvh); }
   .composer-area { border-radius: 12px; }
   .composer { padding: 12px 12px 10px; }
   .composer-area :deep(.new-context) {

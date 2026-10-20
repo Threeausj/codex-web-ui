@@ -2197,10 +2197,12 @@ function resumeConnection(options: { explicit?: boolean } = {}): Promise<void> {
   if (!state.online || !state.authenticated || state.loading || state.switchingHost)
     return Promise.resolve();
   const generation = hostSelectionGeneration;
+  const selection = selectionGeneration;
   const hostId = state.hostId;
   if (connectionRecovery?.generation === generation) return connectionRecovery.promise;
   const current = () => state.online && state.authenticated && !state.loading &&
-    !state.switchingHost && hostId === state.hostId && generation === hostSelectionGeneration;
+    !state.switchingHost && hostId === state.hostId && generation === hostSelectionGeneration &&
+    selection === selectionGeneration;
   clearTimeout(reconnectTimer);
   const recovery = (async () => {
     try {
@@ -4454,7 +4456,17 @@ async function archiveProject(project: any) {
 async function setHost(id: string, options: { threadId?: string } = {}) {
   if (id ? !state.hosts.some((host) => host.id === id) : state.hosts.length > 0)
     throw fail(new Error("主机不存在"));
-  if (id === state.hostId && state.connected && !state.switchingHost) {
+  if (id === state.hostId && (state.connected || connecting)) {
+    // Another conversation on the destination host can be selected while its
+    // first handshake/configuration is still pending. Keep that transport and
+    // invalidate the older selection before awaiting it; restarting setHost
+    // would repeatedly close the same connection and reject its native reads.
+    const hostGeneration = hostSelectionGeneration;
+    const authentication = authenticationGeneration;
+    const selection = ++selectionGeneration;
+    if (!state.connected) await connect();
+    if (hostGeneration !== hostSelectionGeneration || authentication !== authenticationGeneration ||
+        selection !== selectionGeneration || id !== state.hostId || state.runtimePaused) return;
     if (options.threadId) await selectThread(options.threadId);
     return;
   }

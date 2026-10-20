@@ -152,7 +152,14 @@ watch(runningTurnId, (current, previous) => {
     // open. Explicitly opened older turns still survive virtual unmounts.
     expandedTurns.delete(previous);
   }
-}, { flush: "sync" });
+  // A restored/cached turn may already be running when this component mounts.
+  // Populate the same state used to render its content, rather than waiting for
+  // the browser's asynchronous details toggle event to reveal it.
+  if (current) {
+    expandedTurns.add(current);
+    ensureDetails(current);
+  }
+}, { flush: "sync", immediate: true });
 function running(block: any) {
   return block.id === runningTurnId.value;
 }
@@ -233,7 +240,7 @@ function hasPendingQuestion(block: any) {
         ) : segment.activity.length || (segment.dividers.length && expandedTurns.has(block.id))"
         :class="segmentIndex === 0 ? 'turn-activity' : 'turn-segment-activity'"
         @toggle="segmentIndex === 0 && toggleTurn($event, block.id)"
-        :open="running(block) || expandedTurns.has(block.id)"
+        :open="expandedTurns.has(block.id)"
       >
         <summary
           v-if="segmentIndex === 0"
