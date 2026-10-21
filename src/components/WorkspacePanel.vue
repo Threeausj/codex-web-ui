@@ -48,6 +48,7 @@ const changeSearch = ref("");
 const directory = ref("");
 const directoryInput = ref("");
 const entries = ref<any[]>([]);
+const revealedFile = ref("");
 type EditorTab = { file: any; content: string; original: string; view: "preview" | "source"; conflict: any; saving: boolean; line?: number | null };
 const editorTabs = ref<EditorTab[]>([]);
 const activePath = ref("");
@@ -135,7 +136,7 @@ function join(base: string, name: string) {
 }
 async function readDirectory(path: string, interruptReveal = true) {
   if (!path) return;
-  if (interruptReveal) ++revealGeneration;
+  if (interruptReveal) { ++revealGeneration; ++fileGeneration; revealedFile.value = ""; activePath.value = ""; }
   const generation = ++directoryGeneration;
   const scope = fileScope();
   loading.value = true;
@@ -154,7 +155,7 @@ async function readDirectory(path: string, interruptReveal = true) {
       loading.value = false;
   }
 }
-async function openFile(path: string, destination = "files", line?: number) {
+async function openFile(path: string, destination = "files", line?: number, parentDirectory?: Promise<void>) {
   if (!path) return;
   if (file.value?.path === path && (!file.value.binary && !/^image\//.test(file.value.mime) || file.value.dataUrl || file.value.dataBase64)) {
     ++fileGeneration;
@@ -168,7 +169,11 @@ async function openFile(path: string, destination = "files", line?: number) {
   ++revealGeneration;
   const existing = editorTabs.value.find(entry => entry.file.path === path);
   if (existing) {
+    ++fileGeneration;
+    loading.value = false;
+    error.value = "";
     activePath.value = path; tab.value = destination; previewDocument.value = destination === "preview";
+    if (destination === "preview") previewInput.value = path;
     if (!existing.file.binary && !/^image\//.test(existing.file.mime)) { if (line) await focusLine(line); return; }
     if (existing.file.dataUrl || existing.file.dataBase64) return;
   }
@@ -188,8 +193,20 @@ async function openFile(path: string, destination = "files", line?: number) {
     tab.value = destination;
     if (line) await focusLine(line);
   } catch (cause: any) {
-    if (generation === fileGeneration && scope === fileScope())
-      error.value = cause.message || "读取文件失败";
+    if (generation === fileGeneration && scope === fileScope()) {
+      // A preview limit or unsupported file must not strand the user in an
+      // unrelated editor. The parent folder retains its download controls.
+      activePath.value = "";
+      tab.value = "files";
+      previewDocument.value = false;
+      fileSearch.value = "";
+      revealedFile.value = path;
+      const message = cause.message || "读取文件失败";
+      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      if (parentDirectory) await parentDirectory;
+      else if (directory.value !== parent) await readDirectory(parent, false);
+      if (generation === fileGeneration && scope === fileScope()) error.value = message;
+    }
   } finally {
     if (generation === fileGeneration && scope === fileScope())
       loading.value = false;
@@ -215,7 +232,18 @@ async function revealPath(path: string, line?: number) {
       activePath.value = "";
       tab.value = "files";
       await readDirectory(path, false);
-    } else await openFile(path, "files", line);
+    } else {
+      // Directory browsing is independent from previewing file bytes. Load it
+      // even if the preview is rejected, and expose the matching download row.
+      activePath.value = "";
+      tab.value = "files";
+      previewDocument.value = false;
+      fileSearch.value = "";
+      revealedFile.value = path;
+      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      const directoryLoad = readDirectory(parent, false);
+      await Promise.all([directoryLoad, openFile(path, "files", line, directoryLoad)]);
+    }
   } catch (cause: any) {
     if (scope === fileScope() && generation === revealGeneration)
       error.value = cause.message || "无法打开路径";
@@ -419,7 +447,7 @@ watch(
     const version = ++workspaceGeneration;
     const scope = fileScope(); activeScope = "";
     const current = () => version === workspaceGeneration && scope === fileScope() && props.state.authenticated;
-    editorTabs.value = []; activePath.value = ""; downloading.value = ""; previewDocument.value = false;
+    editorTabs.value = []; activePath.value = ""; revealedFile.value = ""; downloading.value = ""; previewDocument.value = false;
     // Directory navigation belongs to this host and project, just like drafts.
     // Reconnection must never replay a previous host's directory or preview.
     directory.value = props.state.projectPath || "";
@@ -686,6 +714,7 @@ defineExpose({
           v-for="entry in sortedEntries"
           :key="entry.fileName || entry.name"
           class="file-tree-entry"
+          :class="{ 'revealed-file': (entry.path || join(directory, entry.fileName || entry.name)) === revealedFile }"
         >
           <button class="file-tree-row" @click="openEntry(entry)">
             <Icon
@@ -1005,6 +1034,8 @@ defineExpose({
   flex: 1;
   min-width: 0;
 }
+.file-tree-entry.revealed-file { background: var(--accent-soft); border-radius: 6px; }
+.file-tree-entry.revealed-file .file-tree-row, .file-tree-entry.revealed-file .file-download { color: var(--accent-text); }
 .file-download {
   flex: 0 0 32px;
   color: var(--muted);

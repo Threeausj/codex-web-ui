@@ -11,7 +11,7 @@ const maximum = 8 * 1024 * 1024;
 
 /** Serialize web saves on a host/path. Codex fs/writeFile has no CAS parameter:
  * this detects existing external edits, but cannot lock an unrelated CLI writer. */
-export function registerFiles(app: Express, getBridge: (hostId: string) => Promise<Bridge>) {
+export function registerFiles(app: Express, getBridge: (hostId: string) => Promise<Bridge>, boundedReader?: (hostId: string, path: string, maximum: number) => Promise<Buffer>) {
   const pending = new Map<string, Promise<void>>();
   async function exclusive<T>(key: string, action: () => Promise<T>): Promise<T> {
     const previous = pending.get(key) || Promise.resolve();
@@ -22,7 +22,12 @@ export function registerFiles(app: Express, getBridge: (hostId: string) => Promi
     try { return await action(); }
     finally { release(); if (pending.get(key) === current) pending.delete(key); }
   }
-  async function read(bridge: Bridge, path: string) {
+  async function read(hostId: string, path: string) {
+    if (boundedReader) {
+      const bytes = await boundedReader(hostId, path, maximum);
+      return { dataBase64: bytes.toString('base64'), version: fileVersion(bytes) };
+    }
+    const bridge = await getBridge(hostId);
     const result = await bridge.request('fs/readFile', { path }, 45000) as { dataBase64: string };
     if (result.dataBase64.length > Math.ceil(maximum * 4 / 3)) throw Object.assign(new Error('文件超过 8 MB，请使用终端读取'), { status: 413 });
     const bytes = Buffer.from(result.dataBase64, 'base64');
@@ -32,8 +37,7 @@ export function registerFiles(app: Express, getBridge: (hostId: string) => Promi
   app.get('/api/hosts/:id/files', (req, res, next) => {
     void (async () => {
       const path = filePath.parse(req.query.path);
-      const bridge = await getBridge(String(req.params.id));
-      res.set('Cache-Control', 'no-store').json(await read(bridge, path));
+      res.set('Cache-Control', 'no-store').json(await read(String(req.params.id), path));
     })().catch(next);
   });
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maximum, files: 1, fields: 2, fieldSize: 4096 } }).single('file');
@@ -43,13 +47,13 @@ export function registerFiles(app: Express, getBridge: (hostId: string) => Promi
       if (!req.file) { res.status(400).json({ error: '缺少文件内容' }); return; }
       const id = String(req.params.id);
       await exclusive(`${id}\0${input.path}`, async () => {
-        const bridge = await getBridge(id);
-        const original = await read(bridge, input.path);
+        const original = await read(id, input.path);
         if (original.version !== input.expectedVersion) {
           res.status(409).json({ code: 'FILE_CONFLICT', error: '文件已被其他程序修改；你的草稿已保留，请先比较或重新载入。' });
           return;
         }
         const bytes = req.file!.buffer;
+        const bridge = await getBridge(id);
         await bridge.request('fs/writeFile', { path: input.path, dataBase64: bytes.toString('base64') }, 45000);
         res.json({ version: fileVersion(bytes) });
       });

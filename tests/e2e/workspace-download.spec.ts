@@ -1,7 +1,9 @@
-import fs from "node:fs/promises";
 import { test, expect, login, slash, editSource } from "./fixtures";
 
-test("workspace list and editor download the saved file bytes without changing it", async ({
+// Browser-managed downloads bypass Playwright's HTTP route mocks. These checks
+// verify the real download handoff; backend transfer tests cover exact bytes.
+
+test("workspace list and editor hand the saved file path to the browser download manager", async ({
   page,
   mock,
 }) => {
@@ -14,26 +16,30 @@ test("workspace list and editor download the saved file bytes without changing i
     .click();
   let downloaded = await pending;
   expect(downloaded.suggestedFilename()).toBe("README.md");
-  expect(await fs.readFile((await downloaded.path())!, "utf8")).toBe(
-    "# Demo Project\n文件读取正常",
-  );
+  let url = new URL(downloaded.url());
+  expect(url.pathname).toBe("/api/hosts/local/download");
+  expect(url.searchParams.get("path")).toBe("/workspace/demo/README.md");
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
   await page.getByRole("button", { name: "源码", exact: true }).click();
   await editSource(page, "README.md 文件内容", "还未保存的新内容");
   pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
   downloaded = await pending;
-  expect(await fs.readFile((await downloaded.path())!, "utf8")).toBe(
-    "# Demo Project\n文件读取正常",
-  );
+  url = new URL(downloaded.url());
+  expect(url.pathname).toBe("/api/hosts/local/download");
+  expect(url.searchParams.get("path")).toBe("/workspace/demo/README.md");
   expect(mock.request("fs/writeFile")).toBeUndefined();
   await page.getByLabel("选择权限", { exact: true }).selectOption("read-only");
   pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
-  expect((await pending).suggestedFilename()).toBe("README.md");
+  downloaded = await pending;
+  expect(downloaded.suggestedFilename()).toBe("README.md");
+  expect(new URL(downloaded.url()).searchParams.get("path")).toBe("/workspace/demo/README.md");
+  // The actual transfer bypasses fs/readFile and never sends the unsaved draft.
+  expect(mock.requests.filter(request => request.method === "fs/readFile")).toHaveLength(1);
 });
 
-test("binary download preserves every byte and is not exposed as an editable text file on a phone", async ({
+test("binary files remain downloadable through the host endpoint without a second preview read on a phone", async ({
   page,
   mock,
 }) => {
@@ -41,6 +47,7 @@ test("binary download preserves every byte and is not exposed as an editable tex
     0x25, 0x50, 0x44, 0x46, 0x2d, 0xff, 0x00, 0xc3, 0x28, 0x0d, 0x0a,
   ]);
   const receive = mock.receive.bind(mock);
+  let fileReads = 0;
   mock.receive = (socket, request) => {
     if (request.method === "fs/readDirectory")
       return socket.send(
@@ -51,13 +58,15 @@ test("binary download preserves every byte and is not exposed as an editable tex
           },
         }),
       );
-    if (request.method === "fs/readFile")
+    if (request.method === "fs/readFile") {
+      ++fileReads;
       return socket.send(
         JSON.stringify({
           id: request.id,
           result: { dataBase64: bytes.toString("base64") },
         }),
       );
+    }
     return receive(socket, request);
   };
   await page.setViewportSize({ width: 390, height: 844 });
@@ -74,7 +83,10 @@ test("binary download preserves every byte and is not exposed as an editable tex
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
   const downloaded = await pending;
   expect(downloaded.suggestedFilename()).toBe("数据 报告.pdf");
-  expect(await fs.readFile((await downloaded.path())!)).toEqual(bytes);
+  const url = new URL(downloaded.url());
+  expect(url.pathname).toBe("/api/hosts/local/download");
+  expect(url.searchParams.get("path")).toBe("/workspace/demo/数据 报告.pdf");
+  expect(fileReads).toBe(1);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,

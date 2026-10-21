@@ -30,6 +30,7 @@ import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
+import { readBoundedHostFile, registerFileDownloads } from './file-download.js'
 import { registerUploads } from './uploads.js'
 import { registerDiagnostics } from './diagnostics.js'
 import { registerThreadContext } from './thread-context.js'
@@ -163,7 +164,12 @@ export async function createApp(options: AppOptions = {}) {
   registerThreadTakeover(app, { getBridge, getHost: id => storage.host(id) })
   registerThreadContext(app, { getBridge, getHost: id => storage.host(id), bridgeOptions })
   registerConversationImages(app, getBridge)
-  registerFiles(app, getBridge)
+  registerFiles(app, getBridge, async (id, file, maximum) => {
+    const host = storage.host(id)
+    if (!host) throw Object.assign(new Error('主机不存在或已停用'), { status: 404 })
+    return readBoundedHostFile(host, file, maximum, { bridgeOptions })
+  })
+  registerFileDownloads(app, { getHost: id => storage.host(id), bridgeOptions })
   registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions,
     withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),

@@ -6,9 +6,10 @@ import path from 'node:path';
 import http from 'node:http';
 import express from 'express';
 import { registerFiles, fileVersion } from './files.js';
+import { readBoundedHostFile } from './file-download.js';
 import type { Bridge } from './bridge.js';
 
-async function fixture() {
+async function fixture(bounded = false) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-file-conflict-'));
   const file = path.join(directory, 'document.md');
   await fs.writeFile(file, '# Original\n');
@@ -20,7 +21,7 @@ async function fixture() {
     writes++;
     await fs.writeFile(input.path, Buffer.from(input.dataBase64, 'base64'));
     return {};
-  } } as unknown as Bridge));
+  } } as unknown as Bridge), bounded ? (_hostId, file, maximum) => readBoundedHostFile({ id: 'local', kind: 'local', name: 'Local' }, file, maximum) : undefined);
   app.use((error: any, _req: any, res: any, _next: any) => res.status(error.status || 400).json({ error: error.message }));
   const server = http.createServer(app);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -65,4 +66,19 @@ test('a missing version is rejected rather than silently performing an unconditi
   const f = await fixture();
   try { assert.equal((await f.save('', 'unsafe')).status, 400); assert.equal(f.writes(), 0); }
   finally { await f.close(); }
+});
+test('descriptor-based bounded reads retain conflict protection and only approved saves reach native writes', async () => {
+  const f = await fixture(true);
+  try {
+    const original = await f.read();
+    await fs.writeFile(f.file, '# Changed outside the browser\n');
+    assert.equal((await f.save(original.version, '# stale')).status, 409);
+    assert.equal(f.writes(), 0);
+    const current = await f.read();
+    const saved = await f.save(current.version, '# Current and saved\n');
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json() as any).version, fileVersion(Buffer.from('# Current and saved\n')));
+    assert.equal(f.writes(), 1);
+    assert.equal(await fs.readFile(f.file, 'utf8'), '# Current and saved\n');
+  } finally { await f.close(); }
 });
