@@ -1,6 +1,8 @@
 # app-server 协议与同步约束
 
-本项目的 Codex 对话、模型、配置、文件和终端操作使用 Codex app-server RPC。Node 层提供浏览器鉴权、WebSocket 桥接、上传和项目/SSH 元数据；不直接调用模型 API，不建立第二套聊天历史数据库。
+本项目的 Codex 对话、模型、配置、目录浏览、文件写入和终端操作使用 Codex app-server RPC。Node 层提供浏览器鉴权、WebSocket 桥接、文件读取/下载、上传和项目/SSH 元数据；不直接调用模型 API，不建立第二套聊天历史数据库。
+
+工作区预览通过 `GET /api/hosts/:id/files?path=...` 检查普通文件大小后限量读取，预览/编辑上限为 8 MiB。`GET/HEAD /api/hosts/:id/download?path=...` 使用相同登录鉴权，直接将原文件以附件流交给浏览器，支持单段 HTTP Range，不受预览大小上限限制。本机使用文件描述符，SSH 使用受信任主机指纹与 Python 3 读取；取消仅结束本次传输，不停止 Codex。下载无需启动或接管 Codex 进程。
 
 官方协议为双向 JSON-RPC，线上省略 `jsonrpc` 字段。请求带 `id/method/params`，响应使用相同 `id`，通知没有 `id`。stdio 每行一个 JSON；每个连接先完成 `initialize`，再发 `initialized`，然后才能使用其他 RPC。[OpenAI app-server 文档](https://learn.chatgpt.com/docs/app-server)。
 

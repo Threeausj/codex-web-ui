@@ -4924,22 +4924,17 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
   };
 }
 async function downloadFile(path: string) {
-  const result = await rpc("fs/readFile", { path });
-  if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024 * 4) / 3))
-    throw new Error("单文件下载目前支持最多 8 MB，请使用终端传输更大的文件");
-  const bytes = Uint8Array.from(atob(result.dataBase64), (character) =>
-    character.charCodeAt(0),
-  );
-  const url = URL.createObjectURL(
-    new Blob([bytes], { type: "application/octet-stream" }),
-  );
+  if (!state.authenticated || !state.hosts.some(host => host.id === state.hostId))
+    throw new Error('请先登录并选择文件所在主机');
+  if (!path.startsWith('/') || /[\x00-\x1f\x7f\\]/.test(path)) throw new Error('需要绝对文件路径');
+  // Hand the transfer to the browser's download manager. Large files never
+  // enter the WebSocket, a Base64 string, or a browser-sized in-memory Blob.
   const link = document.createElement("a");
-  link.href = url;
+  link.href = `/api/hosts/${encodeURIComponent(state.hostId)}/download?path=${encodeURIComponent(path)}`;
   link.download = path.split("/").pop() || "download";
   document.body.appendChild(link);
   link.click();
   link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function writeFile(path: string, content: string, expectedVersion: string, hostId = state.hostId) {
   const bytes = new TextEncoder().encode(content);
