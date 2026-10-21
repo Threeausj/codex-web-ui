@@ -13,6 +13,7 @@ import FileMarkdownPreview from "./FileMarkdownPreview.vue";
 import { privateState } from "../lib/private-state";
 import type { ConversationSelectionSource } from "../lib/conversation-selection";
 import { isImagePath, isMarkdownPath } from "../lib/file-preview";
+import { isJsonPath, jsonUnicodePreview } from "../lib/json-preview";
 const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
 const PdfPreview = defineAsyncComponent(() => import("./PdfPreview.vue"));
 const InteractiveTerminal = defineAsyncComponent(
@@ -131,6 +132,9 @@ const isImage = computed(
     /^data:image\//.test(file.value?.dataUrl || ""),
 );
 const isMarkdown = computed(() => !file.value?.binary && isMarkdownPath(file.value?.path || ""));
+const isJson = computed(() => !file.value?.binary && isJsonPath(file.value?.path || ""));
+const isJsonPreview = computed(() => isJson.value && fileView.value === "preview");
+const jsonPreviewContent = computed(() => isJsonPreview.value ? jsonUnicodePreview(content.value) : "");
 function join(base: string, name: string) {
   return `${base.replace(/\/$/, "")}/${name}`;
 }
@@ -215,7 +219,7 @@ async function openFile(path: string, destination = "files", line?: number, pare
 async function focusLine(line: number) {
   if (!file.value || file.value.binary || isImage.value) return;
   selectedLine.value = Math.max(1, Math.min(Math.floor(line), content.value.split("\n").length));
-  fileView.value = "source";
+  if (isMarkdown.value) fileView.value = "source";
   await nextTick();
   const editor = fileEditor.value;
   if (!editor) return;
@@ -379,7 +383,7 @@ async function preview(path?: string) {
     const filePath = input.startsWith("/")
       ? input
       : join(props.state.projectPath, input);
-    if (isMarkdownPath(filePath) || isImagePath(filePath) || /\.pdf$/i.test(filePath)) {
+    if (isMarkdownPath(filePath) || isJsonPath(filePath) || isImagePath(filePath) || /\.pdf$/i.test(filePath)) {
       previewInput.value = filePath;
       await openFile(filePath, "preview");
       return;
@@ -635,7 +639,7 @@ defineExpose({
             <Icon name="ArrowLeft" :size="15" /></button
           ><span :title="file.path"
             >{{ displayName }}<i v-if="dirty" class="dirty-dot"></i></span
-          ><div v-if="isMarkdown" class="segmented-control file-view-switch" aria-label="Markdown 显示方式">
+          ><div v-if="isMarkdown || isJson" class="segmented-control file-view-switch" :aria-label="isJson ? 'JSON 显示方式' : 'Markdown 显示方式'">
             <button :class="{ active: fileView === 'preview' }" :aria-pressed="fileView === 'preview'" @click="fileView = 'preview'">预览</button>
             <button :class="{ active: fileView === 'source' }" :aria-pressed="fileView === 'source'" @click="fileView = 'source'">源码</button>
           </div><button
@@ -659,7 +663,7 @@ defineExpose({
           >
             <Icon name="Eye" :size="15" /></button
           ><button
-            v-if="!isImage && !file.binary"
+            v-if="!isImage && !file.binary && !isJsonPreview"
             class="button button-small button-secondary"
             :disabled="!dirty || saving || loading || state.permission === 'read-only'"
             @click="save"
@@ -692,12 +696,17 @@ defineExpose({
           @open-file="openFile($event, tab)"
         />
         <CodeEditor
+          v-else-if="isJsonPreview" :key="file.path + ':json-preview'" ref="fileEditor" :model-value="jsonPreviewContent" :path="file.path"
+          :line="selectedLine || undefined" readonly :allow-question="!!state.activeThread?.id"
+          @selection="codeSelection"
+        />
+        <CodeEditor
           v-else :key="file.path" ref="fileEditor" v-model="content" :path="file.path"
           :line="selectedLine || undefined" :readonly="state.permission === 'read-only'" :allow-question="!!state.activeThread?.id"
           @save="save" @selection="codeSelection"
         />
         <div class="file-editor-footer">
-          <span>{{ isImage ? '图片预览' : content.split("\n").length + ' 行' }}{{ selectedLine && !isImage ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
+          <span>{{ isImage ? '图片预览' : (isJsonPreview ? 'JSON 只读预览 · ' : '') + content.split("\n").length + ' 行' }}{{ selectedLine && !isImage ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
           ><span>{{
             state.permission === "read-only"
               ? "只读"
