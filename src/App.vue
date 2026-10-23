@@ -264,6 +264,7 @@ const editableItemId = computed(() => {
 });
 const paletteActions = [
   { id: "bookmarks", name: "收藏对话", detail: "按项目查看收藏", icon: "Bookmark" },
+  { id: "presets", name: "提示词预设", detail: "/presets · 10 个编号槽位", icon: "ListChecks" },
   {
     id: "new",
     name: "新建对话",
@@ -685,6 +686,7 @@ async function execute(command: string) {
   threadMenu.value = false;
   paletteOpen.value = false;
   if (command === "new") await newThread();
+  else if (command === "presets") composer.value?.openPresets();
   else if (command === "bookmarks") openAllBookmarks();
   else if (command === "side-chat") openSideChat();
   else if (command === "compact") {
@@ -907,6 +909,8 @@ function paletteKey(event: KeyboardEvent) {
   }
 }
 function onKeydown(event: KeyboardEvent) {
+  // Native dialogs own their focus and Escape handling, including unsaved edits.
+  if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
   if (conversationImages.image.value) return;
   const modifier = event.metaKey || event.ctrlKey;
   const editable = (event.target as HTMLElement)?.closest(

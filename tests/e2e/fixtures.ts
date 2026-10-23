@@ -3,6 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionReplyText } from '../../shared/async-question-reply';
 import { asyncQuestionAnswered } from '../../shared/async-question-reply';
+import { emptyPromptPresets } from '../../shared/prompt-presets';
 import type { ConversationBookmark } from '../../shared/bookmarks';
 import { asyncQuestionNoticeKey, type AsyncQuestionNotice } from '../../shared/async-question-notices';
 import {
@@ -69,6 +70,9 @@ export class MockCodex {
   asyncQuestionNoticeDismissals: AsyncQuestionNotice[] = [];
   noticeDismissRequests: AsyncQuestionNotice[][] = [];
   failNoticeDismissNext = false;
+  promptPresets = emptyPromptPresets();
+  presetRequests: { method: string; slot: number | null; body?: any }[] = [];
+  failPresetSaveNext = false;
   bookmarks: ConversationBookmark[] = [];
   bookmarkRequests: { method: string; path: string; hostId: string | null; projectPath: string | null; body?: any }[] = [];
   failBookmarkSaveNext = false;
@@ -182,6 +186,28 @@ export class MockCodex {
         }
         if (operation === "codex-settings") return respond({ provider: "official", baseUrl: "", hasApiKey: false, model: target.config.model, connected: target.runtimeConnected, canChange: target.runtimeConnected && !target.runtimePaused, disabledReason: !target.runtimeConnected ? "请先连接此主机" : null, account: { type: "chatgpt", email: "test@example.invalid", planType: "plus" } });
         return respond({ error: `Unimplemented settings fixture mutation: ${operation}` }, 404);
+      }
+      const presetRoute = /^\/api\/prompt-presets(?:\/(\d+))?$/.exec(url.pathname);
+      if (presetRoute) {
+        const method = request.method(), slot = presetRoute[1] ? Number(presetRoute[1]) : null;
+        const body = ['PUT', 'DELETE'].includes(method) ? request.postDataJSON() : undefined;
+        this.presetRequests.push({ method, slot, ...(body ? { body } : {}) });
+        if (method === 'GET' && slot === null) return respond(this.promptPresets);
+        if (!slot || slot < 1 || slot > 10 || !['PUT', 'DELETE'].includes(method)) return respond({ error: 'Invalid preset request' }, 400);
+        if (this.failPresetSaveNext) {
+          this.failPresetSaveNext = false;
+          return respond({ error: '模拟预设保存失败，请重试' }, 503);
+        }
+        const previous = this.promptPresets.presets[slot - 1]!;
+        if (body.expectedVersion !== previous.version) return respond({ error: '预设已在其他设备修改，请刷新后重试', code: 'PRESET_CONFLICT' }, 409);
+        const preset = method === 'DELETE'
+          ? { slot, name: '', content: '', kind: 'prompt' as const, version: previous.version + 1 }
+          : { slot, name: body.name, content: body.content, kind: body.kind, version: previous.version + 1 };
+        this.promptPresets = { revision: this.promptPresets.revision + 1,
+          presets: this.promptPresets.presets.map(entry => entry.slot === slot ? preset : entry) };
+        this.emit('bridge/prompt-presets/changed', this.promptPresets);
+        for (const remote of this.hostMocks.values()) remote.emit('bridge/prompt-presets/changed', this.promptPresets);
+        return respond(this.promptPresets);
       }
       if (url.pathname === '/api/async-question-notices') return respond({ dismissals: this.asyncQuestionNoticeDismissals });
       if (url.pathname === '/api/async-question-notices/dismiss') {
@@ -344,6 +370,7 @@ export class MockCodex {
         case "/api/bootstrap":
           return respond({
             hosts: this.hosts,
+            promptPresets: this.promptPresets,
             asyncQuestionNoticeDismissals: this.asyncQuestionNoticeDismissals,
             runtimeReleasedThreads: this.runtimeReleasedThreads,
             projects: this.projects,

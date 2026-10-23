@@ -213,6 +213,37 @@ test('a queued worker update preserves an open message editor and its uploaded a
   } finally { workerRevision = ''; }
 });
 
+test('a queued worker update preserves an open preset editor until the user explicitly finishes editing', async ({ page, mock }) => {
+  mock.holdFinalMessage = true;
+  await loginBuilt(page);
+  await send(page, '等待更新期间运行的任务');
+  await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('更新前的主对话草稿');
+  let navigations = 0;
+  page.on('domcontentloaded', () => { navigations++; });
+  workerRevision = '\n// preset-editor-deferred-update-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await page.getByRole('button', { name: '完成后更新', exact: true }).click();
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: '提示词预设', exact: true }).click();
+    const presets = page.getByRole('dialog', { name: '提示词预设', exact: true });
+    await presets.getByRole('textbox', { name: '预设名称', exact: true }).fill('等待更新的预设');
+    await presets.getByRole('textbox', { name: '预设内容', exact: true }).fill('保留尚未保存的预设内容');
+    mock.finishStream();
+    await expect(page.locator('.composer').getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0);
+    await expect(presets.getByRole('textbox', { name: '预设内容', exact: true })).toHaveValue('保留尚未保存的预设内容');
+    expect(navigations).toBe(0);
+    // Native dialogs isolate the background. Accepting discard is deliberate,
+    // and only closing this editor permits the already queued update.
+    page.once('dialog', dialog => dialog.accept());
+    await Promise.all([page.waitForEvent('domcontentloaded'), presets.getByRole('button', { name: '关闭提示词预设', exact: true }).click()]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('更新前的主对话草稿');
+    expect(mock.presetRequests.filter(request => request.method !== 'GET')).toHaveLength(0);
+    expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+  } finally { workerRevision = ''; }
+});
+
 test('a pending workspace file save postpones a worker update until its write is acknowledged', async ({ page, mock }) => {
   mock.turns.get('thread-existing')![0].items[1].text = '[打开文件](/workspace/demo/README.md)';
   const receive = (mock as any).receive.bind(mock);
