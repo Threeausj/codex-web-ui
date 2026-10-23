@@ -53,7 +53,10 @@ test('Stop still interrupts a Goal when its pause request fails', async ({ page,
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect(page.getByRole('button', { name: '暂停目标', exact: true })).toBeEnabled();
   control.failPause = true;
-  await page.getByRole('button', { name: '停止生成', exact: true }).click();
+  const stop = page.getByRole('button', { name: '停止生成', exact: true });
+  // Wait for the deliberate double-tap protection after Send to finish.
+  await expect(stop).not.toHaveAttribute('data-stop-protected', 'true');
+  await stop.click();
   await expect.poll(() => mock.request('turn/interrupt')?.params.turnId).toBeTruthy();
   await expect(page.locator('.composer-goal')).toContainText('已暂停');
   await expect(page.locator('.composer-mode-error')).toContainText('Synthetic pause failure');

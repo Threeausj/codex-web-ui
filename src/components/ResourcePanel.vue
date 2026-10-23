@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import Icon from './Icon.vue';
 import ResourceMetricChart from './ResourceMetricChart.vue';
+const TmuxMonitorPanel = defineAsyncComponent(() => import('./TmuxMonitorPanel.vue'));
 
 const props = defineProps<{ api: any; state: any }>();
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{ close: []; openTmux: [target: { hostId: string; sessionId: string; paneId: string; threadId?: string; cwd: string }] }>();
+const section = ref<'resources' | 'tmux'>('resources');
 const hostId = ref(props.state.hostId);
 const host = computed(() => props.state.hosts.find((entry: any) => entry.id === hostId.value));
 const snapshot = ref<any>(null);
@@ -26,6 +28,14 @@ function bytes(value: unknown, suffix = '') {
   if (size >= 1024) return (size / 1024).toFixed(1) + ' KiB' + suffix;
   return Math.round(size) + ' B' + suffix;
 }
+function elapsed(value: unknown) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  const seconds = Math.floor(value);
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)} 天 ${Math.floor(seconds % 86400 / 3600)} 小时`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds % 3600 / 60)} 分`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${seconds} 秒`;
+}
 const charts = computed(() => [
   { key: 'cpu', title: 'CPU', value: number(snapshot.value?.cpu?.usagePercent, '%'), detail: `负载 ${snapshot.value?.cpu?.load?.map((value: number) => number(value)).join(' / ') || '—'} · ${snapshot.value?.cpu?.cores || '—'} 核`, labels: ['CPU'], percent: true,
     points: samples.value.map(sample => ({ at: sample.sampledAt, values: [sample.cpu?.usagePercent ?? null] })) },
@@ -38,7 +48,7 @@ const charts = computed(() => [
 ]);
 function stopPolling() { clearTimeout(timer); controller?.abort(); controller = undefined; }
 async function refresh() {
-  if (disposed || pending.value || loading.value || !props.state.online || document.hidden) return;
+  if (disposed || section.value !== 'resources' || pending.value || loading.value || !props.state.online || document.hidden) return;
   clearTimeout(timer);
   const selected = hostId.value;
   const operation = generation;
@@ -110,6 +120,7 @@ watch(hostId, () => {
   snapshot.value = null; samples.value = []; error.value = ''; notice.value = ''; void refresh();
 });
 watch(() => props.state.online, online => { if (online) void refresh(); else stopPolling(); });
+watch(section, value => { ++generation; stopPolling(); loading.value = false; if (value === 'resources') void refresh(); });
 onMounted(() => { document.addEventListener('visibilitychange', visibilityChanged); void refresh(); });
 onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.removeEventListener('visibilitychange', visibilityChanged); });
 </script>
@@ -117,8 +128,9 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
 <template>
   <div class="modal-backdrop resource-backdrop" @click.self="emit('close')">
     <section class="resource-panel" role="dialog" aria-modal="true" aria-label="资源管理">
-      <header class="modal-header"><h2>资源管理</h2><button class="icon-button" aria-label="关闭资源管理" @click="emit('close')"><Icon name="X" /></button></header>
-      <div class="resource-layout">
+      <header class="modal-header"><h2>资源管理</h2><div class="resource-section-tabs" aria-label="资源页面"><button :class="{ active: section === 'resources' }" @click="section = 'resources'">主机资源</button><button :class="{ active: section === 'tmux' }" @click="section = 'tmux'">Tmux 任务监控</button></div><button class="icon-button" aria-label="关闭资源管理" @click="emit('close')"><Icon name="X" /></button></header>
+      <div v-if="section === 'tmux'" class="resource-monitor-content"><TmuxMonitorPanel :api="api" :state="state" @open="emit('openTmux', $event)" /></div>
+      <div v-else class="resource-layout">
         <nav class="resource-hosts" aria-label="资源管理主机">
           <span class="resource-nav-label">主机</span>
           <button v-for="entry in state.hosts" :key="entry.id" :class="{ active: hostId === entry.id }" :aria-pressed="hostId === entry.id" @click="hostId = entry.id">
@@ -147,6 +159,17 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
               <div class="gpu-meter"><span :style="{ width: `${gpu.utilizationPercent || 0}%` }" /></div>
             </div>
           </section>
+          <section v-if="snapshot?.gpus?.available" class="resource-card gpu-process-card" aria-label="GPU 进程归属">
+            <header><div><h4>GPU 进程</h4><p>用户、显存和运行时间来自目标主机；权限不足时保留已知数据。</p></div><span class="muted">{{ snapshot.gpus.processes?.length || 0 }} 项</span></header>
+            <p v-if="snapshot.gpus.processReason" class="resource-message muted">{{ snapshot.gpus.processReason }}</p>
+            <p v-else-if="!snapshot.gpus.processes?.length" class="resource-message muted">当前没有可读取的计算进程。</p>
+            <div v-if="snapshot.gpus.processes?.length" class="gpu-process-table-wrap">
+              <table class="gpu-process-table"><thead><tr><th>GPU</th><th>用户 / PID</th><th>显存</th><th>运行时间</th><th>命令</th></tr></thead>
+                <tbody><tr v-for="process in snapshot.gpus.processes" :key="`${process.gpuUuid}:${process.pid}`"><td :title="process.gpuUuid">{{ process.gpuIndex ?? process.gpuUuid.slice(0, 12) }}</td><td>{{ process.user || '—' }}<code>PID {{ process.pid }}</code></td><td>{{ bytes(process.memoryUsedBytes) }}</td><td>{{ elapsed(process.elapsedSeconds) }}</td><td class="gpu-process-command" :title="process.command || process.name">{{ process.command || process.name }}</td></tr></tbody>
+              </table>
+            </div>
+            <p v-if="snapshot.gpus.processesTruncated" class="resource-message muted">进程较多，当前显示前 128 项。</p>
+          </section>
           <section v-if="snapshot" class="resource-card runtime-card" aria-label="Web Codex 进程">
             <header><div><h4>Web Codex 进程</h4><p>{{ snapshot.runtime.paused ? '已暂停 · 会话已释放' : snapshot.runtime.connected ? '已连接' : '尚未启动' }}</p></div>
               <button v-if="snapshot.runtime.paused || !snapshot.runtime.connected" :disabled="pending || !state.online" @click="runtimeAction(true)">{{ pending ? '处理中…' : '重新连接 Web Codex' }}</button>
@@ -174,6 +197,10 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
 <style scoped>
 .resource-panel { width: 1060px; height: min(850px, calc(100dvh - 60px)); max-width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; overflow: hidden; }
 .resource-layout { display: flex; flex: 1; min-height: 0; }
+.resource-section-tabs { display: flex; align-items: center; gap: 3px; margin-left: auto; margin-right: 10px; }
+.resource-section-tabs button { padding: 7px 10px; border-radius: 6px; color: var(--muted); font-size: 12px; }
+.resource-section-tabs button.active { color: var(--accent-text); background: var(--accent-soft); }
+.resource-monitor-content { min-height: 0; overflow-y: auto; padding: 20px; }
 .resource-hosts { flex: 0 0 170px; padding: 16px 10px; background: var(--sidebar); border-right: 1px solid var(--border); overflow-y: auto; }
 .resource-nav-label { display: block; color: var(--muted); font-size: 11px; padding: 0 10px 8px; }
 .resource-hosts button { display: flex; gap: 10px; align-items: center; width: 100%; padding: 10px; text-align: left; border-radius: 8px; color: var(--muted); }
@@ -192,7 +219,14 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
 .resource-card header > strong { font-size: 19px; white-space: nowrap; }
 .resource-message { font-size: 12px; line-height: 1.6; margin: 8px 0 12px; }
 .muted { color: var(--muted); }
-.gpu-card, .runtime-card { margin-top: 16px; }
+.gpu-card, .gpu-process-card, .runtime-card { margin-top: 16px; }
+.gpu-process-table-wrap { overflow-x: auto; margin-top: 14px; }
+.gpu-process-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+.gpu-process-table th, .gpu-process-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.gpu-process-table th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+.gpu-process-table td { white-space: nowrap; }
+.gpu-process-table code { display: block; margin-top: 4px; font-size: 11px; color: var(--muted); }
+.gpu-process-table .gpu-process-command { max-width: 400px; min-width: 180px; white-space: normal; overflow-wrap: anywhere; }
 .gpu-device { padding-top: 16px; }
 .gpu-device h5 { font-size: 13px; font-weight: 500; margin-bottom: 10px; overflow-wrap: anywhere; }
 .gpu-metrics, .runtime-summary { display: flex; flex-wrap: wrap; gap: 10px 20px; font-size: 12px; color: var(--muted); }

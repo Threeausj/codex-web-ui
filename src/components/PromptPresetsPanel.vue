@@ -9,13 +9,14 @@ import Icon from './Icon.vue';
 
 const props = withDefaults(defineProps<{
   snapshot: PromptPresetsSnapshot;
+  embedded?: boolean;
   loading?: boolean;
   error?: string;
   busy?: boolean;
   initialContent?: string;
   currentDraft?: string;
   supportedCommands?: Array<{ name: string; description: string; id: string }>;
-}>(), { loading: false, error: '', busy: false, initialContent: '', currentDraft: '', supportedCommands: () => [] });
+}>(), { embedded: false, loading: false, error: '', busy: false, initialContent: '', currentDraft: '', supportedCommands: () => [] });
 const emit = defineEmits<{
   close: [];
   refresh: [];
@@ -148,27 +149,28 @@ watch([() => props.snapshot, () => props.loading, () => props.busy, () => props.
 }, { immediate: true });
 onMounted(async () => {
   previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  dialog.value?.showModal();
+  if (!props.embedded) dialog.value?.showModal();
   await nextTick();
   slotList.value?.querySelector<HTMLButtonElement>(`[data-preset-slot="${selectedSlot.value}"]`)?.focus();
 });
 onBeforeUnmount(() => {
-  dialog.value?.close();
+  if (!props.embedded) dialog.value?.close();
   if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
 });
+defineExpose({ canLeave: () => !props.busy && discardChanges(), working: computed(() => props.busy || dirty.value) });
 </script>
 
 <template>
-  <Teleport to="body">
-    <dialog ref="dialog" class="prompt-presets-dialog" :aria-labelledby="titleId" :aria-describedby="descriptionId" @keydown.stop @cancel.prevent="close">
+  <Teleport to="body" :disabled="embedded">
+    <component :is="embedded ? 'section' : 'dialog'" ref="dialog" class="prompt-presets-dialog" :class="{ 'presets-embedded': embedded }" :aria-labelledby="titleId" :aria-describedby="descriptionId" @keydown="!embedded && $event.stopPropagation()" @cancel.prevent="close">
       <header class="presets-header">
         <h2 :id="titleId"><Icon name="Command" :size="19" />提示词预设</h2>
         <div class="presets-header-actions">
           <button type="button" class="icon-button" aria-label="刷新预设" title="刷新预设" :disabled="blocked" @click="refresh"><Icon name="RefreshCw" :size="17" /></button>
-          <button type="button" class="icon-button" aria-label="关闭提示词预设" :disabled="busy" @click="close"><Icon name="X" :size="19" /></button>
+          <button type="button" class="icon-button" v-if="!embedded" aria-label="关闭提示词预设" :disabled="busy" @click="close"><Icon name="X" :size="19" /></button>
         </div>
       </header>
-      <p :id="descriptionId" class="presets-description">10 个编号槽位，保存常用提示词和命令。提示词填入草稿后可继续编辑。</p>
+      <p :id="descriptionId" class="presets-description">10 个编号槽位，保存常用提示词和命令。在对话输入 /、编号或名称快速调用。</p>
       <p v-if="loading" class="presets-loading" role="status">正在读取预设…</p>
       <div class="presets-layout" :aria-busy="busy || loading">
         <nav ref="slotList" class="presets-slots" aria-label="预设槽位" @keydown="listKey">
@@ -195,12 +197,12 @@ onBeforeUnmount(() => {
             <button type="button" class="button preset-delete" :disabled="blocked || !saved" @click="remove"><Icon name="Trash2" :size="15" />清空预设</button>
             <div class="preset-save-actions">
               <button type="submit" class="button button-secondary" :disabled="blocked || !valid || !dirty">{{ busy ? '保存中…' : '保存预设' }}</button>
-              <button type="button" class="button button-primary" :disabled="useDisabled" :title="dirty ? '请先保存预设' : undefined" @click="usePreset">{{ current.kind === 'command' ? '执行命令' : '填入输入框' }}</button>
+              <button v-if="!embedded" type="button" class="button button-primary" :disabled="useDisabled" :title="dirty ? '请先保存预设' : undefined" @click="usePreset">{{ current.kind === 'command' ? '执行命令' : '填入输入框' }}</button>
             </div>
           </footer>
         </form>
       </div>
-    </dialog>
+    </component>
   </Teleport>
 </template>
 
@@ -272,4 +274,11 @@ onBeforeUnmount(() => {
   .preset-save-actions { gap: 5px; }
   .preset-slot-title { font-size: 12px; }
 }
+.prompt-presets-dialog.presets-embedded { width:100%; max-height:none; margin:0; border:0; border-radius:0; box-shadow:none; overflow:visible; }
+.presets-embedded .presets-header { padding:0; }
+.presets-embedded .presets-description { margin-left:0; margin-right:0; }
+.presets-embedded .presets-layout { border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.presets-embedded .presets-header-actions { margin-left:auto; }
+.presets-embedded .presets-slots { max-height:570px; }
+@media (max-width:580px) { .presets-embedded .presets-slots { max-height:164px; } }
 </style>

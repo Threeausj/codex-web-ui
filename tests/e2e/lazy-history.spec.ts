@@ -28,7 +28,8 @@ function lazyWire(mock: MockCodex, count = 64) {
     if (control.unsupported) return socket.send(JSON.stringify({ id: request.id, error: { code: -32601, message: 'unsupported method' } }));
     if (control.failNext) { control.failNext = false; return socket.send(JSON.stringify({ id: request.id, error: { code: -32000, message: 'temporary detail failure' } })); }
     const source = (mock.turns.get(request.params.threadId) || []).find(entry => entry.id === request.params.turnId);
-    const offset = Number(request.params.cursor || 0);
+    const offset = request.params.cursor && typeof request.params.cursor === 'object'
+      ? (source?.items || []).findIndex((item: any) => item.id === request.params.cursor.itemId) + 1 : Number(request.params.cursor || 0);
     const response = JSON.stringify({ id: request.id, result: { data: (source?.items || []).slice(offset, offset + request.params.limit)
       .map((item: any) => ({ turnId: source.id, item })), nextCursor: offset + request.params.limit < (source?.items.length || 0) ? String(offset + request.params.limit) : null } });
     const send = () => socket.send(response);
@@ -65,6 +66,8 @@ test('16 MiB operation history opens with messages only, then loads the selected
   await expect(page.getByText('历史保持可读', { exact: true })).toHaveCount(1);
   await turn.locator('.activity-batch > summary').click();
   await turn.locator('.tool-item').last().locator(':scope > summary').click();
+  await expect(turn.locator('.tool-item').last()).toContainText('当前显示末尾');
+  await turn.locator('.tool-item').last().getByRole('button', { name: '读取完整输出', exact: true }).click();
   await expect(turn.locator('.tool-item').last()).toContainText('detail output 63');
 });
 
@@ -100,8 +103,11 @@ test('completed detail cache is reused across conversation switches without re-r
   await group(page).locator('.turn-activity > summary').click();
   await group(page).locator('.activity-batch > summary').click();
   await group(page).locator('.tool-item > summary').click();
-  await expect(group(page).locator('.tool-item')).toContainText('detail output 0');
+  await expect(group(page).locator('.tool-item')).toContainText('当前显示末尾');
   expect(itemReads(mock)).toHaveLength(1);
+  await group(page).getByRole('button', { name: '读取完整输出', exact: true }).click();
+  await expect(group(page).locator('.tool-item')).toContainText('detail output 0');
+  expect(itemReads(mock)).toHaveLength(2);
 });
 
 test('a late item response never paints the conversation selected afterward', async ({ page, mock }) => {

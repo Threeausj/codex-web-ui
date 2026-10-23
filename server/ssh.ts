@@ -1,6 +1,9 @@
 import type { Host } from './types.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 
+/** Only the server-owned pool may supply an application-private control socket. */
+export type SSHConnectionControl = { socketPath: string }
+
 export function shellQuote(value: string) { return `'${value.replace(/'/g, `'"'"'`)}'` }
 
 /** Process-only override: allow structured questions in regular conversations. */
@@ -34,22 +37,35 @@ export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn'
 }
 
 /** Once an endpoint is pinned in the app, older external keys cannot also pass. */
-export function sshKnownHostsArgs(pin?: SSHHostKeyPin) {
-  if (!pin) return []
+export function sshKnownHostsArgs(pin?: SSHHostKeyPin, control?: SSHConnectionControl) {
+  const multiplex = control
+    ? ['-o', `ControlPath=${control.socketPath}`, '-o', 'ControlMaster=no', '-o', 'ControlPersist=no']
+    : ['-o', 'ControlPath=none', '-o', 'ControlMaster=no', '-o', 'ControlPersist=no']
+  if (!pin) return multiplex
   const file = pin.file
   const quoted = `"${file.replace(/%/g, '%%').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
   return ['-o', `UserKnownHostsFile=${quoted}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'KnownHostsCommand=none',
     '-o', 'VerifyHostKeyDNS=no', '-o', 'NoHostAuthenticationForLocalhost=no', '-o', 'UpdateHostKeys=no',
-    '-o', 'ControlPath=none', '-o', 'ControlMaster=no', '-o', 'ControlPersist=no',
+    ...multiplex,
     '-o', `HostKeyAlias=${pin.hostKeyAlias}`]
 }
 
-export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, knownHostsFile?: SSHHostKeyPin) {
+export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, knownHostsFile?: SSHHostKeyPin, control?: SSHConnectionControl) {
   const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-o', 'LogLevel=ERROR']
-  args.push(...sshKnownHostsArgs(knownHostsFile))
+  args.push(...sshKnownHostsArgs(knownHostsFile, control))
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)
   const destination = `${host.username ? `${host.username}@` : ''}${host.hostname}`
   args.push('--', destination, remoteCodexCommand(host, mode, probeVersion))
+  return args
+}
+
+/** Fixed server-owned readers use stdin and the same authenticated transport. */
+export function sshPythonArgs(host: Host, pin?: SSHHostKeyPin, control?: SSHConnectionControl) {
+  const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8',
+    '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'LogLevel=ERROR', ...sshKnownHostsArgs(pin, control)]
+  if (host.port) args.push('-p', String(host.port))
+  if (host.identityFile) args.push('-i', host.identityFile)
+  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, `exec /bin/sh -c ${shellQuote('exec python3 -')}`)
   return args
 }

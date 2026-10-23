@@ -178,6 +178,11 @@ test("dragging across a preview iframe, cancelling with Escape and closing mid-d
   expect(await storedWidth(page)).toBeNull();
   await drag(page, -80, false);
   await page.keyboard.press("Tab");
+  const tabs = page.locator(".workspace-tabs button");
+  // The compact header puts its view tabs before the close button. Preserve
+  // real keyboard navigation while testing a close during pointer capture.
+  await expect(tabs.first()).toBeFocused();
+  for (let index = 0; index < await tabs.count(); index++) await page.keyboard.press("Tab");
   await expect(
     page.getByRole("button", { name: "关闭工作区", exact: true }),
   ).toBeFocused();

@@ -133,7 +133,9 @@ test('late process-detail layout stays at the latest answer after the thread its
   await expect.poll(() => !!release).toBe(true);
   await expect.poll(() => gap(page)).toBeLessThanOrEqual(2);
   release!();
-  await expect(page.locator('.tool-item')).toHaveCount(60);
+  await expect(page.locator('[data-virtual-timeline]')).toBeVisible();
+  await expect.poll(() => page.locator('.tool-item').count()).toBeGreaterThan(0);
+  expect(await page.locator('.tool-item').count()).toBeLessThan(60);
   await expect.poll(() => gap(page)).toBeLessThanOrEqual(2);
 });
 

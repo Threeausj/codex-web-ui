@@ -114,7 +114,7 @@ export class PushService {
   private pending = new Set<Promise<void>>()
   private outbox = new Map<string, OutboxDelivery>()
   private uncommitted = new Set<string>()
-  private pendingEvents = new Set<string>()
+  private pendingEvents = new Map<string, Promise<void>>()
   private active = new Map<string, Promise<void>>()
   private outcomes = new Map<string, (outcome: DeliveryOutcome) => void>()
   private retryTimer?: ReturnType<typeof setTimeout>
@@ -124,6 +124,7 @@ export class PushService {
   private keys!: { publicKey: string; privateKey: string; subject: string }
   private readonly send: NonNullable<PushOptions['sendNotification']>
   private credentialVersion?: string
+  private subscriptionListeners = new Set<() => void>()
   private constructor(private readonly dataDir: string, private readonly options: PushOptions, private readonly origins: Set<string>) {
     this.file = path.join(dataDir, 'push-subscriptions.json')
     this.now = options.now || Date.now
@@ -207,6 +208,16 @@ export class PushService {
 
   config() { return { enabled: true, publicKey: this.keys.publicKey } }
   get hasActiveSubscriptions() { return [...this.devices.values()].some(device => this.authorized(device)) }
+  /** Background observation belongs to the durable grant, not an open browser. */
+  onSubscriptionChange(listener: () => void) {
+    this.subscriptionListeners.add(listener)
+    return () => { this.subscriptionListeners.delete(listener) }
+  }
+  private subscriptionChanged() {
+    for (const listener of this.subscriptionListeners) {
+      try { listener() } catch { /* A background observer cannot fail a saved device grant. */ }
+    }
+  }
   private get maxOutbox() { return Math.max(1, Math.min(MAX_OUTBOX, this.options.maxQueuedDeliveries || MAX_OUTBOX)) }
   private get deliveryTtl() { return Math.max(1000, Math.min(DELIVERY_TTL, this.options.deliveryTtlMs || DELIVERY_TTL)) }
   private authorized(device: Device) { return device.expiresAt > this.now() && (!this.credentialVersion || device.credentialVersion === this.credentialVersion) && !this.options.isSessionRevoked?.(device.sessionHash) }
@@ -244,6 +255,7 @@ export class PushService {
     this.prune()
     await this.save()
     this.runDeliveries()
+    this.subscriptionChanged()
     return { ok: true, expiresAt }
   }
 
@@ -499,16 +511,41 @@ export class PushService {
     if (!kind || !identity || !body) return
     const key = JSON.stringify([host.id, threadId, identity])
     for (const [key, expiry] of this.events) if (expiry <= this.now()) this.events.delete(key)
-    if (this.events.has(key) || this.pendingEvents.has(key)) return
-    this.pendingEvents.add(key)
+    const pending = this.pendingEvents.get(key)
+    if (pending) return pending
+    if (this.events.has(key)) return Promise.resolve()
     const notice: PushNotice = { title: 'Codex', body, tag: `codex-${hash(key).slice(0, 24)}`, data: { hostId: host.id, threadId, url: `/?host=${encodeURIComponent(host.id)}&thread=${encodeURIComponent(threadId)}`, kind } }
-    const task = this.notify(key, host, threadId, kind, notice, request).catch(() => {}).finally(() => this.pendingEvents.delete(key))
-    this.pending.add(task)
-    void task.finally(() => this.pending.delete(task))
+    const acknowledgement = this.notify(key, host, threadId, kind, notice, request).finally(() => this.pendingEvents.delete(key))
+    this.pendingEvents.set(key, acknowledgement)
+    // Protocol dispatch stays fire-and-forget, but recovery must await the
+    // actual enqueue commit. Draining swallowed failures is not a durable ACK.
+    const observed = acknowledgement.catch(() => {})
+    this.pending.add(observed)
+    void observed.finally(() => this.pending.delete(observed))
+    return acknowledgement
   }
 
-  private async notify(key: string, host: Host, threadId: string, kind: keyof PushPreferences, notice: PushNotice, request?: PendingNotice) {
-    const auxiliary = () => { const metadata = this.threadTitles.get(JSON.stringify([host.id, threadId])); return metadata?.subagent || metadata?.ephemeral }
+  /** Trusted server jobs use the same grants, preferences, deduplication and retry journal. */
+  async notifyExternal(host: Host, input: { id: string; title: string; body: string; kind: 'completed' | 'errors'; url: string; threadId?: string }) {
+    if (this.closed || !this.hasActiveSubscriptions) return
+    if (!id(host.id) || !id(input.id) || !['completed', 'errors'].includes(input.kind) ||
+        !input.url.startsWith('/?') || input.url.length > 4096 || /[\x00-\x1f\x7f]/.test(input.url) ||
+        input.threadId !== undefined && !id(input.threadId)) throw new Error('Invalid background notification')
+    const key = JSON.stringify([host.id, 'external', input.id])
+    this.prune()
+    const pending = this.pendingEvents.get(key)
+    if (pending) return pending
+    if (this.events.has(key)) return
+    const notice: PushNotice = { title: titleText(input.title) || host.name.slice(0, 100), body: titleText(input.body) || '任务运行完成',
+      tag: `codex-${hash(key).slice(0, 24)}`, data: { hostId: host.id, ...(input.threadId ? { threadId: input.threadId } : {}), url: input.url, kind: input.kind } }
+    const task = this.notify(key, undefined, undefined, input.kind, notice).finally(() => this.pendingEvents.delete(key))
+    this.pendingEvents.set(key, task)
+    this.pending.add(task)
+    try { await task } finally { this.pending.delete(task) }
+  }
+
+  private async notify(key: string, host: Host | undefined, threadId: string | undefined, kind: keyof PushPreferences, notice: PushNotice, request?: PendingNotice) {
+    const auxiliary = () => { const metadata = host && threadId ? this.threadTitles.get(JSON.stringify([host.id, threadId])) : undefined; return metadata?.subagent || metadata?.ephemeral }
     this.prune()
     const jobs = kind !== 'approval' && auxiliary() ? [] : [...this.devices.values()].filter(device => this.authorized(device) && device.preferences[kind]).map(device => {
       const job = this.newDelivery(device, notice, host)
@@ -661,14 +698,14 @@ export class PushService {
     while (this.active.size) await Promise.allSettled([...this.active.values()])
     await this.writes
   }
-  async close() { this.closed = true; clearTimeout(this.retryTimer); await this.flush() }
+  async close() { this.closed = true; clearTimeout(this.retryTimer); this.subscriptionListeners.clear(); await this.flush() }
 }
 
-export function registerPush(app: Express, push: PushService) {
+export function registerPush(app: Express, push: PushService, observerStatus?: () => unknown) {
   const route = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
   const endpointBody = z.object({ endpoint: z.string().min(1).max(4096) }).strict()
   app.get('/api/push/config', (_req, res) => res.json(push.config()))
-  app.get('/api/push/status', (req: AuthenticatedRequest, res) => res.json(push.status(req.session!.id)))
+  app.get('/api/push/status', (req: AuthenticatedRequest, res) => res.json({ ...push.status(req.session!.id), ...(observerStatus ? { observers: observerStatus() } : {}) }))
   app.post('/api/push/subscription', route(async (req: AuthenticatedRequest, res) => {
     const body = z.object({ subscription: subscriptionSchema, preferences: preferencesSchema.optional() }).strict().parse(req.body)
     res.json(await push.subscribe(req.session!.id, body.subscription, body.preferences))

@@ -15,7 +15,47 @@ function unsupported(error: any, feature: 'summary' | 'items') {
 export class LazyHistoryReader {
   private summaryUnavailable = new Set<string>();
   private itemsUnavailable = new Set<string>();
-  clear() { this.summaryUnavailable.clear(); this.itemsUnavailable.clear(); }
+  private itemsAvailable = new Set<string>();
+  clear() { this.summaryUnavailable.clear(); this.itemsUnavailable.clear(); this.itemsAvailable.clear(); }
+  canReloadItems(scope: string, threadId: string) { return this.itemsAvailable.has(JSON.stringify([scope, threadId])); }
+  async probeItems(scope: string, request: Request, threadId: string, turnId: string) {
+    const key = JSON.stringify([scope, threadId]);
+    if (this.itemsUnavailable.has(key)) return false;
+    if (this.itemsAvailable.has(key)) return true;
+    try {
+      const page = await request('thread/items/list', { threadId, turnId, cursor: null, limit: 1, sortDirection: 'asc' });
+      if (!Array.isArray(page?.data) || !page.data.length || page.data.some((entry: any) => entry.turnId !== turnId || typeof entry.item?.id !== 'string')) return false;
+      this.itemsAvailable.add(key); return true;
+    } catch (error) {
+      if (unsupported(error, 'items')) this.itemsUnavailable.add(key);
+      return false;
+    }
+  }
+  async readItem(request: Request, threadId: string, turnId: string, itemId: string, previousItemId?: string | null) {
+    const requestPage = async (cursor: any, limit: number) => {
+      const page = await request('thread/items/list', { threadId, turnId, cursor, limit, sortDirection: 'asc' });
+      if (!Array.isArray(page?.data) || page.data.some((entry: any) => entry.turnId !== turnId || typeof entry.item?.id !== 'string'))
+        throw new Error('工具记录与当前轮次不匹配，请同步后重试');
+      return page;
+    };
+    try {
+      const page = await requestPage(previousItemId ? { type: 'item', itemId: previousItemId } : null, 1);
+      const found = page.data.find((entry: any) => entry.item.id === itemId);
+      if (found) return found.item as DisplayItem;
+    } catch (error: any) { if ((error?.code ?? error?.rpc?.code) !== -32602) throw error; }
+    // Older paginated stores may not understand exclusive item anchors.
+    let cursor: string | null = null;
+    const seen = new Set<string>();
+    for (let pageIndex = 0; pageIndex < 250; pageIndex++) {
+      const page = await requestPage(cursor, historyItemPageSize);
+      const found = page.data.find((entry: any) => entry.item.id === itemId);
+      if (found) return found.item as DisplayItem;
+      if (!page.nextCursor) break;
+      if (typeof page.nextCursor !== 'string' || seen.has(page.nextCursor)) throw new Error('工具记录分页无效，请同步后重试');
+      cursor = page.nextCursor; seen.add(page.nextCursor);
+    }
+    throw new Error('未找到原始工具输出，记录可能已被回退或清理');
+  }
   async turns(scope: string, request: Request, params: PageParams, full = false): Promise<any> {
     let page: any;
     if (full || this.summaryUnavailable.has(scope)) page = await request('thread/turns/list', { ...params, itemsView: 'full' });
@@ -46,10 +86,12 @@ export class LazyHistoryReader {
           throw new Error('过程记录与当前轮次不匹配，请同步对话后重试。');
         if (page.nextCursor != null && typeof page.nextCursor !== 'string') throw new Error('过程记录分页无效，请同步对话后重试。');
         if (page.nextCursor && (page.nextCursor === turn.historyItemsCursor || turn.historyItemCursors?.includes(page.nextCursor))) throw new Error('过程记录分页游标重复，请同步对话后重试。');
+        this.itemsAvailable.add(key);
         return page;
       } catch (error) {
         if (!unsupported(error, 'items')) throw error;
         this.itemsUnavailable.add(key);
+        this.itemsAvailable.delete(key);
       }
     }
     // Older stores can read turns but cannot page their items. Re-read only the
@@ -132,6 +174,7 @@ export function mergeHistoryDetails(items: DisplayItem[], turns: any[], turn: an
   const insertion = before < 0 ? remaining.length : items.slice(0, before).filter(item => item.turnId !== turn.id).length;
   remaining.splice(insertion, 0, ...ordered);
   return { items: remaining, turn: { ...turn, items: ordered, historyItemsStarted: true,
+    historyDetailsEvicted: false,
     historySummary: !!page.nextCursor, historyItemsCursor: page.nextCursor ?? null, historyItemIds: prefix,
     historyItemCursors: [...(turn.historyItemCursors || []), ...(turn.historyItemsCursor ? [turn.historyItemsCursor] : [])] } };
 }

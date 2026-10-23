@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+const TmuxMonitorPanel = defineAsyncComponent(() => import('./TmuxMonitorPanel.vue'));
 
 type Session = {
   id: string;
@@ -20,7 +21,7 @@ type Pane = {
   active: boolean;
   windowActive: boolean;
 };
-const props = defineProps<{ api: any; state: any }>();
+const props = defineProps<{ api: any; state: any; target?: { sessionId: string; paneId?: string } }>();
 const emit = defineEmits<{ attach: [prepared: any] }>();
 const sessions = ref<Session[]>([]);
 const selectedId = ref("");
@@ -39,6 +40,11 @@ const showCreate = ref(false);
 const sessionName = ref("");
 const deleteId = ref("");
 const lastRead = ref("");
+const showMonitors = ref(false);
+const monitorBusy = ref(false);
+const monitorNotice = ref('');
+const monitorMode = ref<'once' | 'permanent'>('once');
+let pendingTarget = props.target;
 let scopeGeneration = 0;
 let listGeneration = 0;
 let readGeneration = 0;
@@ -149,6 +155,17 @@ async function refresh() {
     reason.value = result.reason || "目标主机未检测到 tmux";
     sessions.value = result.sessions || [];
     error.value = "";
+    const desired = pendingTarget;
+    if (desired) {
+      pendingTarget = undefined;
+      selectedId.value = desired.sessionId;
+      paneId.value = desired.paneId || '';
+      if (!sessions.value.some(session => session.id === desired.sessionId)) {
+        error.value = '通知对应的 tmux 会话已结束，监控执行记录仍可查看。';
+        panes.value = []; snapshot.value = ''; lastRead.value = '';
+        return;
+      }
+    }
     if (!sessions.value.some((session) => session.id === selectedId.value)) {
       selectedId.value = sessions.value[0]?.id || "";
       paneId.value = "";
@@ -290,6 +307,26 @@ async function remove() {
     }
   }
 }
+async function monitor() {
+  if (monitorBusy.value || !selected.value || !paneId.value) return;
+  const generation = scopeGeneration;
+  const input = { hostId: props.state.hostId, sessionId: selectedId.value, paneId: paneId.value,
+    mode: monitorMode.value, ...(props.state.activeThread?.id ? { threadId: props.state.activeThread.id } : {}) };
+  monitorBusy.value = true; monitorNotice.value = ''; error.value = '';
+  try {
+    await props.api.requestHttp('/tmux-monitors', { method: 'POST', body: JSON.stringify(input), signal: AbortSignal.timeout(20000) }, false);
+    if (current(generation)) monitorNotice.value = '监控已保存，任务结束后通知；关闭网页仍继续。';
+  } catch (cause: any) { if (current(generation)) error.value = cause.message || '添加任务监控失败'; }
+  finally { if (current(generation)) monitorBusy.value = false; }
+}
+function openMonitored(target: { hostId: string; sessionId: string; paneId: string; threadId?: string; cwd: string }) {
+  if (target.hostId !== props.state.hostId) {
+    window.dispatchEvent(new CustomEvent('codex:open-tmux', { detail: target }));
+    return;
+  }
+  pendingTarget = target; showMonitors.value = false; void refresh();
+}
+watch(() => props.target, target => { if (target) { pendingTarget = target; showMonitors.value = false; void refresh(); } });
 watch(
   () => [scope.value, canRead.value],
   () => {
@@ -312,6 +349,7 @@ watch(
     deleteId.value = "";
     showCreate.value = false;
     sessionName.value = "";
+    monitorBusy.value = false; monitorNotice.value = '';
     void refresh();
   },
   { immediate: true },
@@ -344,6 +382,7 @@ onBeforeUnmount(() => {
         ><span class="tmux-host" :title="hostName">{{ hostName }}</span>
       </div>
       <div class="tmux-actions">
+        <button class="tmux-button" :aria-pressed="showMonitors" @click="showMonitors = !showMonitors">{{ showMonitors ? '会话列表' : '任务监控' }}</button>
         <button
           class="icon-button"
           aria-label="刷新 Tmux 会话"
@@ -365,6 +404,8 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
+    <TmuxMonitorPanel v-if="showMonitors" :api="api" :state="state" @open="openMonitored" />
+    <template v-else>
     <p v-if="readonly" class="tmux-note">
       只读模式可查看会话与输出。切换写入权限后可管理会话。
     </p>
@@ -372,6 +413,7 @@ onBeforeUnmount(() => {
     <div v-if="error" class="tmux-error" role="alert">
       <Icon name="AlertCircle" :size="15" /><span>{{ error }}</span>
     </div>
+    <p v-if="monitorNotice" class="tmux-note" role="status">{{ monitorNotice }}</p>
     <form v-if="showCreate" class="tmux-create" @submit.prevent="create">
       <label for="tmux-session-name">会话名称 <span>可选</span></label>
       <input
@@ -457,6 +499,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </header>
+        <div v-if="paneId" class="tmux-monitor-actions"><select v-model="monitorMode" aria-label="当前窗格监控方式" :disabled="monitorBusy"><option value="once">本次任务结束后停止</option><option value="permanent">持续监控后续任务</option></select><button class="tmux-button" :disabled="monitorBusy || !state.online" @click="monitor"><Icon name="Bell" :size="14" />{{ monitorBusy ? '保存中…' : '监控当前窗格' }}</button></div>
         <div
           v-if="deleting"
           class="tmux-confirm"
@@ -514,10 +557,13 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </template>
+    </template>
   </section>
 </template>
 
 <style scoped>
+.tmux-monitor-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+.tmux-monitor-actions select { max-width: 100%; min-height: 34px; padding: 6px 8px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
 .tmux-panel {
   display: flex;
   flex-direction: column;

@@ -7,6 +7,7 @@ import type { Express } from 'express'
 import { z } from 'zod'
 import type { BridgeOptions } from './bridge.js'
 import { resourceSshArgs } from './host-resources.js'
+import { sharedSshPool } from './ssh-pool.js'
 import type { Host } from './types.js'
 
 const absolutePath = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f\\]/.test(value), '需要绝对文件路径').transform(value => path.posix.normalize(value))
@@ -124,8 +125,14 @@ async function localFile(file: string, range: ByteRange | undefined, head: boole
 async function remoteFile(host: Host, file: string, range: ByteRange | undefined, head: boolean, maximum: number | undefined, options: FileOptions, signal?: AbortSignal): Promise<Transfer> {
   const pin = await options.bridgeOptions?.resolveSshHostKeyPin?.(host) ?? options.bridgeOptions?.sshHostKeyPin
   if (signal?.aborted) throw cancelled()
-  const args = ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', ...resourceSshArgs(host, pin)]
-  const child = options.spawnSSH?.(args) ?? spawn('ssh', args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] })
+  const lease = options.spawnSSH ? undefined : await (options.bridgeOptions?.sshPool || sharedSshPool).acquire(host, pin)
+  if (signal?.aborted) { lease?.release(); throw cancelled() }
+  const args = resourceSshArgs(host, pin, lease?.control)
+  let child: ChildProcessWithoutNullStreams
+  try { child = options.spawnSSH?.(args) ?? spawn('ssh', args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] }) }
+  catch (error) { lease?.release(); throw error }
+  child.once('close', () => lease?.release())
+  child.once('error', () => lease?.release())
   const stop = () => { child.stdout.destroy(); child.stdin.destroy(); child.kill('SIGKILL') }
   signal?.addEventListener('abort', stop, { once: true })
   let stderr = ''

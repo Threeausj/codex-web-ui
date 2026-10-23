@@ -67,7 +67,26 @@ async function open(page: Page) {
 }
 
 test('a busy composer explicitly chooses native next-turn delivery; accepted input and attachment move into the queue', async ({ page, mock }) => {
-  const queue = await install(page, mock); await login(page); await open(page);
+  const queue = await install(page, mock);
+  const nativePolicy = { type: 'workspaceWrite', writableRoots: ['/workspace/demo', '/native-extra'],
+    networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true };
+  const nativeSettings: Record<string, any> = { cwd: '/workspace/demo', model: mock.config.model, effort: 'medium',
+    sandboxPolicy: nativePolicy, approvalPolicy: 'untrusted' };
+  let queuedSettings: Record<string, any> | undefined;
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: WebSocketRoute, request: any) => {
+    if (request.method === 'thread/resume') {
+      mock.requests.push(request);
+      return socket.send(JSON.stringify({ id: request.id, result: { thread: mock.threads.find(thread => thread.id === request.params.threadId),
+        model: nativeSettings.model, reasoningEffort: nativeSettings.effort, sandbox: nativePolicy, approvalPolicy: nativeSettings.approvalPolicy } }));
+    }
+    if (request.method === 'thread/settings/update') Object.assign(nativeSettings, request.params);
+    if (request.method === 'thread/queue/add') queuedSettings = structuredClone(nativeSettings);
+    return receive(socket, request);
+  };
+  await login(page); await open(page);
+  const selectedModel = await page.getByRole('combobox', { name: '选择模型', exact: true }).inputValue();
+  const selectedEffort = await page.getByRole('combobox', { name: '推理强度', exact: true }).inputValue();
   await expect(page.getByRole('combobox', { name: '消息发送方式' })).toHaveValue('immediate');
   await expect.poll(() => mock.requests.some(request => request.method === 'thread/queue/list')).toBe(true);
   await expect(page.getByRole('region', { name: '原生消息队列' })).toHaveCount(0);
@@ -80,7 +99,11 @@ test('a busy composer explicitly chooses native next-turn delivery; accepted inp
   const settingsIndex = mock.requests.findIndex(request => request.method === 'thread/settings/update');
   expect(settingsIndex).toBeGreaterThanOrEqual(0);
   expect(settingsIndex).toBeLessThan(mock.requests.findIndex(request => request.method === 'thread/queue/add'));
-  expect(mock.requests[settingsIndex].params).toEqual(expect.objectContaining({ threadId, sandboxPolicy: expect.any(Object), approvalPolicy: expect.any(String), model: expect.any(String), effort: expect.any(String) }));
+  expect(mock.requests[settingsIndex].params).toEqual(expect.objectContaining({ threadId, cwd: '/workspace/demo', model: selectedModel, effort: selectedEffort }));
+  expect(mock.requests[settingsIndex].params).not.toHaveProperty('sandboxPolicy');
+  expect(mock.requests[settingsIndex].params).not.toHaveProperty('approvalPolicy');
+  expect(queuedSettings).toEqual(expect.objectContaining({ cwd: '/workspace/demo', model: selectedModel, effort: selectedEffort,
+    sandboxPolicy: nativePolicy, approvalPolicy: 'untrusted' }));
   expect(queue.items[0].input.map((input: any) => input.type)).toEqual(['text', 'localImage', 'text']);
   expect(mock.requests.some(request => request.method === 'turn/start' || request.method === 'turn/steer')).toBe(false);
   await page.getByRole('button', { name: /运行中 · 下一轮队列 1/ }).click();

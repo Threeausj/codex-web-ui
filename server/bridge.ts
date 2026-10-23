@@ -11,12 +11,13 @@ import { webSocketProxyTransport } from './proxy-transport.js'
 import { BrowserChannel } from './browser-channel.js'
 import { JsonLineReader } from './json-lines.js'
 import { isInteractiveServerRequest } from '../shared/server-requests.js'
-import { codexAppServerArgs, sshAppServerArgs } from './ssh.js'
+import { codexAppServerArgs, sshAppServerArgs, type SSHConnectionControl } from './ssh.js'
+import { sharedSshPool, type SshConnectionPool } from './ssh-pool.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
-export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
+export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; sshPool?: SshConnectionPool; sshControl?: SSHConnectionControl; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Compaction = { requests: Set<string>; items: Map<string, string | undefined>; revision: number }
 type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
@@ -37,7 +38,7 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   const executable = host.kind === 'ssh' ? 'ssh' : options.codexBin || 'codex'
   let args: string[]
   if (host.kind === 'ssh') {
-    args = sshAppServerArgs(host, options.mode, options.connectionProbe, options.sshHostKeyPin)
+    args = sshAppServerArgs(host, options.mode, options.connectionProbe, options.sshHostKeyPin, options.sshControl)
   } else args = codexAppServerArgs(options.mode, options.socketPath)
   const child: ChildProcessWithoutNullStreams = spawn(executable, args, {
     cwd: options.cwd || process.cwd(),
@@ -249,8 +250,13 @@ export class Bridge {
       const knownHostsFile = this.host.kind === 'ssh' && this.options.resolveSshHostKeyPin
         ? await this.options.resolveSshHostKeyPin(this.host) : this.options.sshHostKeyPin
       if (generation !== this.generation || this.disposed || this.paused) throw new Error('Host connection was closed')
-      transport = this.options.transportFactory ? this.options.transportFactory(this.host)
-        : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile })
+      const lease = this.host.kind === 'ssh' && !this.options.transportFactory ? await (this.options.sshPool || sharedSshPool).acquire(this.host, knownHostsFile) : undefined
+      if (generation !== this.generation || this.disposed || this.paused) { lease?.release(); throw new Error('Host connection was closed') }
+      try {
+        transport = this.options.transportFactory ? this.options.transportFactory(this.host)
+          : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile, sshControl: lease?.control })
+        void transport.closed?.then(() => lease?.release())
+      } catch (error) { lease?.release(); throw error }
     } catch (error) {
       if (generation === this.generation) this.disconnect(error as Error, 'initializeFailure')
       throw error

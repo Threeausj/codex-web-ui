@@ -36,9 +36,12 @@ test('reselecting a loaded 360-round conversation retains its oldest history and
   await expect(page.getByText('历史轮次 359', { exact: true })).toBeVisible();
   for (let index = 0; index < 11; index++) {
     await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
-    await expect(page.locator(`.virtual-history-block[data-history-id="history-${330 - 30 * (index + 1)}"]`)).toHaveCount(1);
     await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
     await expect(page.getByText(`历史轮次 ${330 - 30 * (index + 1)}`, { exact: true })).toHaveCount(1);
+    if (index >= 1) {
+      await expect(page.locator('[data-virtual-timeline]')).toHaveAttribute('data-row-count', String(60 + index * 30));
+      expect(await page.locator('[data-timeline-row]').count()).toBeLessThan(65);
+    }
   }
   await expect(page.getByText('历史轮次 0', { exact: true })).toHaveCount(1);
   await expect(page.getByRole('button', { name: '加载更早的消息', exact: true })).toHaveCount(0);
@@ -68,7 +71,7 @@ test('an invalid cached anchor confirms the latest writer before older revalidat
   await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeEnabled();
   await expect.poll(() => control.held.length).toBe(1);
   release();
-  await expect(page.locator('.virtual-history-block[data-history-id="history-30"]')).toHaveCount(1);
+  await expect(page.locator('[data-virtual-timeline]')).toHaveAttribute('data-row-count', '90');
   await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
   await expect(page.getByText('历史轮次 30', { exact: true })).toHaveCount(1);
   await expect(page.getByText('历史轮次 359', { exact: true })).toHaveCount(0);
@@ -82,27 +85,32 @@ test('long history bounds mounted bodies while preserving selections and expande
   await login(page); await open(page);
   for (let index = 0; index < 3; index++) {
     await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
-    await expect(page.locator(`.virtual-history-block[data-history-id="history-${60 - index * 30}"]`)).toHaveCount(1);
+    await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
+    await expect(page.getByText(`历史轮次 ${60 - index * 30}`, { exact: true })).toHaveCount(1);
   }
   const scroll = page.locator('.conversation-scroll'); await scroll.evaluate(element => { element.scrollTop = 0; });
-  const old = page.locator('.conversation-turn[data-turn-id="history-0"]'); await expect(old).toBeVisible();
-  await old.locator('.turn-activity > summary').click(); await old.locator('.activity-batch > summary').click();
-  await old.locator('.tool-item > summary').click(); await expect(old).toContainText('Original command output');
-  await old.locator('.reasoning-item > summary').click();
-  await expect(old.getByText('Retained public summary', { exact: true })).toBeVisible();
-  await old.locator('[data-selection-item-id="answer-0"]').evaluate(element => {
+  const turn = page.locator('[data-timeline-row="turn:history-0"] .virtual-turn-toggle');
+  const command = page.locator('[data-timeline-row="item:old-command"]');
+  const reasoning = page.locator('[data-timeline-row="item:old-summary"]');
+  const answer = page.locator('[data-timeline-row="item:answer-0"]');
+  await expect(turn).toBeVisible();
+  await turn.click(); await page.locator('[data-timeline-row="activity:old-command"] .virtual-batch-toggle').click();
+  await command.locator('.tool-item > summary').click(); await expect(command).toContainText('Original command output');
+  await reasoning.locator('.reasoning-item > summary').click();
+  await expect(reasoning.getByText('Retained public summary', { exact: true })).toBeVisible();
+  await answer.locator('[data-selection-item-id="answer-0"]').evaluate(element => {
     const range = document.createRange(); range.selectNodeContents(element); const selection = window.getSelection()!;
     selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event('selectionchange'));
   });
   await scroll.evaluate(element => { element.scrollTop = element.scrollHeight; });
-  await expect.poll(() => page.locator('.conversation-turn').count()).toBeLessThan(100);
-  await expect(old).toHaveCount(1); expect(await page.evaluate(() => window.getSelection()?.toString())).toContain('历史轮次 0');
+  await expect.poll(() => page.locator('[data-timeline-row]').count()).toBeLessThan(65);
+  await expect(answer).toHaveCount(1); expect(await page.evaluate(() => window.getSelection()?.toString())).toContain('历史轮次 0');
   await page.evaluate(() => { window.getSelection()?.removeAllRanges(); document.dispatchEvent(new Event('selectionchange')); });
-  await expect(old).toHaveCount(0);
+  await expect(answer).toHaveCount(0);
   await scroll.evaluate(element => { element.scrollTop = 0; });
-  await expect(old).toContainText('Original command output');
-  await expect(old.getByText('Retained public summary', { exact: true })).toBeVisible();
-  await expect(old.locator('.turn-activity')).toHaveAttribute('open', '');
+  await expect(command).toContainText('Original command output');
+  await expect(reasoning.getByText('Retained public summary', { exact: true })).toBeVisible();
+  await expect(turn).toHaveAttribute('aria-expanded', 'true');
 });
 
 test('an app-server engine change refreshes mode and skill capabilities without requiring logout or host switching', async ({ page, mock }) => {

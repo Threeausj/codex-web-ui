@@ -11,6 +11,7 @@ import { EventEmitter } from 'node:events'
 import WebSocket from 'ws'
 import webPush, { type PushSubscription, type RequestOptions } from 'web-push'
 import { PushService, validatePushEndpoint, type PushOptions } from './push.js'
+import { PushObservers } from './push-observers.js'
 import { createServer } from './app.js'
 import type { Transport } from './bridge.js'
 import type { RpcMessage } from './types.js'
@@ -42,12 +43,12 @@ function protocolFixture(response?: (message: RpcMessage) => unknown) {
   const transport: Transport = { input, output, events: new EventEmitter(), dispose: () => { disposed = true; input.destroy(); output.destroy() } }
   return { transport, messages, get disposed() { return disposed }, receive: (message: RpcMessage) => output.write(`${JSON.stringify(message)}\n`) }
 }
-async function application(options: PushOptions = {}, dataDir?: string, observer?: (message: RpcMessage, responseMethod?: string) => void, response?: (message: RpcMessage) => unknown) {
+async function application(options: PushOptions = {}, dataDir?: string, observer?: (message: RpcMessage, responseMethod?: string) => void, response?: (message: RpcMessage) => unknown, pushObserverOptions?: { intervalMs?: number; retryBaseMs?: number }) {
   const directory = dataDir || await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-http-'))
   const transports: ReturnType<typeof protocolFixture>[] = []
   const sent: { subscription: PushSubscription; payload: Record<string, unknown>; options: RequestOptions }[] = []
   const context = await createServer({ dataDir: directory, codexHome: path.join(directory, 'codex'), cwd: directory, password, secureCookie: false, serveStatic: false,
-    pushOptions: { sendNotification: async (subscription, payload, options) => { sent.push({ subscription, payload: JSON.parse(payload), options }) }, ...options },
+    pushOptions: { sendNotification: async (subscription, payload, options) => { sent.push({ subscription, payload: JSON.parse(payload), options }) }, ...options }, pushObserverOptions,
     bridgeOptions: { transportFactory: () => { const fixture = protocolFixture(response || (message => message.method === 'thread/read' ? { thread: { id: (message.params as { threadId: string }).threadId, source: 'cli', ephemeral: false } } : {})); transports.push(fixture); return fixture.transport }, onProtocolMessage: (_host, message, responseMethod) => observer?.(message, responseMethod) },
   })
   await new Promise<void>(resolve => context.server.listen(0, '127.0.0.1', resolve))
@@ -507,7 +508,7 @@ test('server restarts restore VAPID, device grants and host monitoring while ded
     assert.equal(first.sent.length, 1)
     await first.cleanup(false)
     second = await application({}, first.directory)
-    await tick(); await tick()
+    await second.notificationObservers.poll(); await second.notificationObservers.flush()
     assert.equal(second.push.config().publicKey, publicKey)
     assert.equal(second.push.hasActiveSubscriptions, true)
     assert.equal(second.transports.length, 1)
@@ -1324,5 +1325,175 @@ test('ephemeral side chat completion and failures do not notify; metadata races 
     await service.flush(); assert.equal(sent.length, 2)
     service.observe(host, { id: 'side-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'side', turnId: 'approval-turn' } })
     await service.flush(); assert.equal(sent.length, 3); assert.equal(sent[2].data.kind, 'approval')
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('first notification grant starts observation without a browser and reconnects after transport failure to recover a missed completion', async () => {
+  let completed = false
+  const app = await application({}, undefined, undefined, message => {
+    if (message.method === 'thread/loaded/list') return { data: [], nextCursor: null }
+    if (message.method === 'thread/read') return { thread: { id: 'background', name: '后台任务', source: 'cli', status: { type: completed ? 'idle' : 'active' } } }
+    if (message.method === 'thread/turns/list') return { data: [{ id: 'running-before-disconnect', status: completed ? 'completed' : 'inProgress' }], nextCursor: null }
+    return {}
+  }, { intervalMs: 20, retryBaseMs: 10 })
+  const eventually = async (condition: () => boolean) => {
+    const deadline = Date.now() + 3000
+    while (!condition() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(condition(), 'Background observation must progress without a foreground WebSocket')
+  }
+  try {
+    assert.equal(app.transports.length, 0)
+    const session = await app.login()
+    assert.equal((await fetch(app.base + '/api/push/subscription', { method: 'POST', headers: session.headers, body: JSON.stringify({ subscription: subscription('background-reconnect'), preferences }) })).status, 200)
+    await eventually(() => app.transports.length === 1 && !!app.bridges.get('local')?.connected)
+    assert.equal(app.bridges.get('local')!.diagnostics().browsers.connected, 0)
+    app.transports[0]!.receive({ method: 'thread/started', params: { thread: { id: 'background', name: '后台任务', source: 'cli' } } })
+    app.transports[0]!.receive({ method: 'turn/started', params: { threadId: 'background', turn: { id: 'running-before-disconnect', status: 'inProgress' } } })
+    await app.notificationObservers.flush()
+    completed = true
+    app.transports[0]!.transport.events.emit('transportClose', new Error('SSH link disconnected'))
+    await eventually(() => app.transports.length === 2 && app.sent.length === 1)
+    assert.equal(app.bridges.get('local')!.diagnostics().browsers.connected, 0)
+    await app.push.flush(); await app.notificationObservers.flush()
+    assert.equal(app.sent[0]!.payload.title, '后台任务')
+    assert.equal((app.sent[0]!.payload.data as any).kind, 'completed')
+    const recoveryRequests = app.transports[1]!.messages.map(message => message.method)
+    assert.ok(recoveryRequests.includes('thread/loaded/list') && recoveryRequests.includes('thread/turns/list'))
+    assert.ok(!recoveryRequests.some(method => ['thread/resume', 'turn/start', 'turn/steer'].includes(method!)), 'Background recovery must never acquire a writer or replay input')
+    app.transports[1]!.receive({ method: 'turn/completed', params: { threadId: 'background', turn: { id: 'running-before-disconnect', status: 'completed' } } })
+    await app.push.flush(); assert.equal(app.sent.length, 1)
+    const status = await fetch(app.base + '/api/push/observers', { headers: session.headers })
+    assert.equal(status.status, 200); assert.equal((await status.json() as any).enabled, true)
+    assert.equal((await fetch(app.base + '/api/push/observers')).status, 401)
+  } finally { await app.cleanup() }
+})
+
+test('cold server restart reads the last active turn and delivers its missed completion without waiting for PWA startup', async () => {
+  const first = await application({}, undefined, undefined, () => ({ data: [], nextCursor: null }), { intervalMs: 20, retryBaseMs: 10 })
+  let second: Awaited<ReturnType<typeof application>> | undefined
+  try {
+    await first.push.subscribe('persisted-session', subscription('observer-cold-start'))
+    const bridge = await first.getBridge('local'); await bridge.connect()
+    const protocol = first.transports[0]!
+    protocol.receive({ method: 'thread/started', params: { thread: { id: 'cold-thread', name: '跨重启任务', source: 'cli' } } })
+    protocol.receive({ method: 'turn/started', params: { threadId: 'cold-thread', turn: { id: 'cold-turn', status: 'inProgress' } } })
+    await first.notificationObservers.flush()
+    await first.cleanup(false)
+    second = await application({}, first.directory, undefined, message => {
+      if (message.method === 'thread/read') return { thread: { id: 'cold-thread', name: '跨重启任务', source: 'cli', status: { type: 'idle' } } }
+      if (message.method === 'thread/turns/list') return { data: [{ id: 'cold-turn', status: 'completed' }, { id: 'old-turn', status: 'completed' }], nextCursor: null }
+      return { data: [], nextCursor: null }
+    }, { intervalMs: 20, retryBaseMs: 10 })
+    const deadline = Date.now() + 3000
+    while (!second.sent.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(second.sent.length, 1)
+    assert.equal(second.bridges.get('local')!.diagnostics().browsers.connected, 0)
+    await second.notificationObservers.flush()
+    assert.equal(JSON.parse(await fs.readFile(path.join(first.directory, 'push-observers.json'), 'utf8')).threads.length, 0)
+  } finally { if (second) await second.cleanup(); else { await first.close(); await fs.rm(first.directory, { recursive: true, force: true }) } }
+})
+
+test('new hosts are observed after grants exist, while explicitly paused hosts stay released', async () => {
+  const app = await application({}, undefined, undefined, () => ({ data: [], nextCursor: null }), { intervalMs: 20, retryBaseMs: 10 })
+  try {
+    await app.push.subscribe('session', subscription('new-host-observer'))
+    const localBridge = await app.getBridge('local'); await localBridge.connect(); await localBridge.pause()
+    const localAttempts = localBridge.diagnostics().reconnectCount
+    const remote = await app.storage.addHost({ name: '新加入的主机', hostname: 'remote.example.invalid' })
+    const deadline = Date.now() + 3000
+    while (!app.bridges.get(remote.id)?.connected && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(app.bridges.get(remote.id)?.connected, true)
+    assert.equal(localBridge.paused, true); assert.equal(localBridge.connected, false)
+    assert.equal(localBridge.diagnostics().reconnectCount, localAttempts)
+  } finally { await app.cleanup() }
+})
+
+test('tmux notifications reuse durable delivery, category preferences and event deduplication without thread metadata', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-external-'))
+  let now = Date.now(), failing = true, lookups = 0
+  const sent: any[] = []
+  let service = await PushService.create(directory, new Set([origin]), { now: () => now,
+    resolveThread: async () => { lookups++; throw new Error('Must not load Codex history for an external job') },
+    sendNotification: async (device, payload) => { if (failing) throw Object.assign(new Error('unavailable'), { statusCode: 503 }); sent.push({ endpoint: device.endpoint, payload: JSON.parse(payload) }) },
+  })
+  const event = { id: 'tmux:once:run-1', title: '训练结束', body: '训练任务已返回 Shell', kind: 'completed' as const, url: '/?host=local&tmuxSession=%240&tmuxPane=%251' }
+  try {
+    await service.subscribe('phone', subscription('tmux-phone'))
+    await service.subscribe('disabled', subscription('tmux-disabled'), { ...preferences, completed: false })
+    await Promise.all([service.notifyExternal(host, event), service.notifyExternal(host, event)])
+    await service.flush()
+    assert.equal(service.status('phone').queued, 1)
+    assert.equal(service.status('disabled').queued, 0)
+    assert.equal(lookups, 0)
+    failing = false; now += 5000; await service.flush()
+    assert.equal(sent.length, 1); assert.equal(sent[0].payload.title, '训练结束')
+    assert.equal(sent[0].payload.data.url, event.url)
+    await service.close()
+    service = await PushService.create(directory, new Set([origin]), { now: () => now, sendNotification: async () => { sent.push('duplicate') } })
+    await service.notifyExternal(host, event); await service.flush(); assert.equal(sent.length, 1)
+    await assert.rejects(service.notifyExternal(host, { ...event, id: 'bad-url', url: 'https://evil.example.invalid/' }), /Invalid background notification/)
+  } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('failed completion enqueue preserves its observer marker across restart, then recovers exactly once', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-enqueue-ack-'))
+  const sent: any[] = []
+  const bridge = { connected: true, paused: true, async connect() {}, async request(method: string) {
+    if (method === 'thread/loaded/list') return { data: ['tracked'], nextCursor: null }
+    if (method === 'thread/read') return { thread: { id: 'tracked', name: '恢复中的完成通知', source: 'cli', ephemeral: false, status: { type: 'idle' } } }
+    if (method === 'thread/turns/list') return { data: [{ id: 'tracked-work', status: 'completed' }], nextCursor: null }
+    throw new Error('Unexpected method')
+  } }
+  let push = await PushService.create(directory, new Set([origin]), { sendNotification: async (_device, payload) => { sent.push(JSON.parse(payload)) } })
+  const createObservers = () => new PushObservers(directory, { getHosts: () => [host], getBridge: async () => bridge,
+    hasSubscriptions: () => push.hasActiveSubscriptions, observe: (host, message, method) => push.observe(host, message, method), flushPush: () => push.flush(), intervalMs: 60_000 })
+  let observers = createObservers()
+  const file = path.join(directory, 'push-subscriptions.json'), backup = path.join(directory, 'push-before-failure.json')
+  try {
+    await push.subscribe('phone', subscription('completion-commit-ack'))
+    await observers.init()
+    observers.observe(host, { method: 'turn/started', params: { threadId: 'tracked', turn: { id: 'tracked-work', status: 'inProgress' } } })
+    await observers.flush()
+    await fs.rename(file, backup); await fs.mkdir(file)
+    const completed: RpcMessage = { method: 'turn/completed', params: { threadId: 'tracked', turn: { id: 'tracked-work', status: 'completed' } } }
+    const failedAck = push.observe(host, completed)
+    observers.observe(host, completed)
+    await assert.rejects(failedAck!, /directory|EISDIR|ENOTEMPTY/)
+    await push.flush(); await observers.flush()
+    assert.equal(sent.length, 0)
+    assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'push-observers.json'), 'utf8')).threads[0].turnId, 'tracked-work')
+    await observers.close(); await push.close()
+    await fs.rmdir(file); await fs.rename(backup, file)
+    push = await PushService.create(directory, new Set([origin]), { sendNotification: async (_device, payload) => { sent.push(JSON.parse(payload)) } })
+    bridge.paused = false
+    observers = createObservers(); await observers.init(); await observers.poll(); await observers.flush(); await push.flush()
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].title, '恢复中的完成通知')
+    assert.equal(JSON.parse(await fs.readFile(path.join(directory, 'push-observers.json'), 'utf8')).threads.length, 0)
+    await push.observe(host, completed); await push.flush()
+    assert.equal(sent.length, 1)
+  } finally { await observers.close(); await push.close(); await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('concurrent external notifications await the same durable enqueue failure instead of returning a false success', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-push-concurrent-ack-'))
+  let sends = 0
+  const service = await PushService.create(directory, new Set([origin]), { sendNotification: async () => { sends++ } })
+  try {
+    await service.subscribe('phone', subscription('external-durable-ack'))
+    const realSave = (service as any).save.bind(service)
+    let reject!: (cause: Error) => void
+    ;(service as any).save = () => new Promise<void>((_resolve, no) => { reject = no })
+    const event = { id: 'tmux:concurrent:1', title: '任务结束', body: '任务返回 Shell', kind: 'completed' as const, url: '/?host=local&tmuxSession=%241' }
+    const first = service.notifyExternal(host, event), second = service.notifyExternal(host, event)
+    let settled = false
+    void second.then(() => { settled = true }, () => { settled = true })
+    const failure = Promise.all([assert.rejects(first, /disk unavailable/), assert.rejects(second, /disk unavailable/)])
+    await tick(); assert.equal(settled, false, 'A duplicate event must wait for the original commit')
+    reject(new Error('disk unavailable')); await failure
+    assert.equal(sends, 0)
+    ;(service as any).save = realSave
+    await service.notifyExternal(host, event); await service.flush()
+    assert.equal(sends, 1)
   } finally { await service.close(); await fs.rm(directory, { recursive: true, force: true }) }
 })

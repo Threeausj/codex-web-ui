@@ -1,14 +1,18 @@
 import { spawn } from 'node:child_process'
 import type { BridgeOptions } from './bridge.js'
-import { resourceSshArgs } from './host-resources.js'
+import { sshPythonArgs } from './ssh.js'
+import { sharedSshPool } from './ssh-pool.js'
 import type { Host } from './types.js'
 
 /** Execute a server-owned Python reader; request text never becomes shell code. */
-export async function runHostPython(host: Host, source: string, options: BridgeOptions = {}, limits: { timeoutMs?: number; maxOutputBytes?: number } = {}): Promise<string> {
+export async function runHostPython(host: Host, source: string, options: BridgeOptions = {}, limits: { timeoutMs?: number; maxOutputBytes?: number; background?: boolean } = {}): Promise<string> {
+  const pool = options.sshPool || sharedSshPool
+  if (limits.background) return pool.runBackground(host, () => runHostPython(host, source, options, { ...limits, background: false }))
   const pin = host.kind === 'ssh' ? await options.resolveSshHostKeyPin?.(host) ?? options.sshHostKeyPin : undefined
+  const lease = host.kind === 'ssh' ? await pool.acquire(host, pin) : undefined
   const executable = host.kind === 'ssh' ? 'ssh' : 'python3'
-  const args = host.kind === 'ssh' ? resourceSshArgs(host, pin) : ['-']
-  return new Promise((resolve, reject) => {
+  const args = host.kind === 'ssh' ? sshPythonArgs(host, pin, lease?.control) : ['-']
+  try { return await new Promise<string>((resolve, reject) => {
     const child = spawn(executable, args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] })
     const chunks: Buffer[] = []
     let bytes = 0; let stderr = ''; let finished = false; let timedOut = false
@@ -32,5 +36,5 @@ export async function runHostPython(host: Host, source: string, options: BridgeO
       else finish(new Error(timedOut ? '主机读取超时' : /host key|identification has changed/i.test(stderr) ? '请确认并信任 SSH 主机指纹' : /python3.*not found/i.test(stderr) ? '目标主机需要 Python 3' : '无法读取主机数据，请检查 SSH 连接及账户权限'))
     })
     child.stdin.end(source)
-  })
+  }) } finally { lease?.release() }
 }

@@ -93,7 +93,8 @@ test('list metadata updates the active heading without reloading history or chan
   await page.getByRole('button', { name: '刷新对话', exact: true }).click();
   await expect(heading(page)).toHaveText('原生记录中已经存在的新标题');
   await expect(titleRow(page)).toHaveText('原生记录中已经存在的新标题');
-  await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+  await expect(page.getByLabel('工作过程（运行中）', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeVisible();
   await expect(draft).toHaveValue('刷新标题时保留我的草稿');
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   expect(mock.requests.filter(request => request.method === 'thread/resume')).toHaveLength(resumes);
@@ -258,7 +259,7 @@ test('a generated concise name replaces the long input preview in every Web clie
   await login(page);
   await send(page, longPrompt);
   await expect(heading(page)).toHaveText(longPrompt.slice(0, 70));
-  await expect(titleRow(page)).toHaveText(longPrompt);
+  await expect(titleRow(page)).toHaveText(longPrompt.slice(0, 70));
   // Native preview and generated name are different persisted metadata fields.
   const thread = mock.threads.find(thread => thread.id === newId)!;
   thread.preview = longPrompt;
@@ -293,7 +294,8 @@ test('a generated concise name replaces the long input preview in every Web clie
   for (const target of [page, other]) {
     await expect(heading(target)).toHaveText(generatedName);
     await expect(titleRow(target)).toHaveText(generatedName);
-    await expect(target.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
+    await expect(target.getByLabel('工作过程（运行中）', { exact: true })).toBeVisible();
+    await expect(target.getByRole('button', { name: '追加指令', exact: true })).toBeVisible();
   }
   await expect(firstDraft).toHaveValue('主窗口还未发送的补充');
   await expect(otherDraft).toHaveValue('观察窗口还未发送的补充');
