@@ -17,6 +17,7 @@ import { Storage, hostInput, writePrivateJson } from './storage.js'
 import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
 import { registerBookmarks } from './bookmarks.js'
+import { registerPromptPresets } from './prompt-presets.js'
 import { registerGit } from './git.js'
 import { registerNavigation } from './navigation.js'
 import { registerThreadGoals } from './thread-goals.js'
@@ -140,6 +141,7 @@ export async function createApp(options: AppOptions = {}) {
   registerTmux(app, { getBridge })
   const preferences = await registerPreferences(app, dataDir)
   await registerBookmarks(app, dataDir, id => !!storage.host(id))
+  const promptPresets = await registerPromptPresets(app, dataDir)
   registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions,
     busyWorktreeThreads: async (hostId, directory) => {
       const bridge = await getBridge(hostId)
@@ -179,7 +181,7 @@ export async function createApp(options: AppOptions = {}) {
   })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
-    res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
+    res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), promptPresets: promptPresets.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
   }))
   app.get('/api/hosts', asyncRoute(async (_req, res) => res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects() })))
   app.patch('/api/hosts/local/enabled', asyncRoute(async (req, res) => {
@@ -305,7 +307,7 @@ export async function createApp(options: AppOptions = {}) {
   // Subscription grants survive server restarts. Restore host observers independently
   // of a phone being online; unavailable SSH hosts must not prevent server startup.
   if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, threadReadReceipts, stopPushLogoutListener, stopPushPasswordListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, threadReadReceipts, promptPresets, stopPushLogoutListener, stopPushPasswordListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -317,6 +319,19 @@ export async function createServer(options: AppOptions = {}) {
   const sessionSockets = new Map<string, Set<WebSocket>>()
   const socketHeartbeat = new WebSocketHeartbeat()
   let projectOrderEpoch = 0
+  const stopListeningForPromptPresets = context.promptPresets.subscribe(snapshot => {
+    const frame = JSON.stringify({ method: 'bridge/prompt-presets/changed', params: snapshot })
+    for (const [sessionId, sockets] of sessionSockets) {
+      if (!context.auth.isSessionActive(sessionId)) continue
+      for (const ws of sockets) {
+        if (ws.readyState !== 1) continue
+        // Missing a global edit is worse than reconnecting a slow transport:
+        // reconnect sends a fresh snapshot before any native replay.
+        if (ws.bufferedAmount > 256 * 1024) { ws.terminate(); continue }
+        try { ws.send(frame, error => { if (error) ws.terminate() }) } catch { ws.terminate() }
+      }
+    }
+  })
   const stopListeningForHostOrder = context.storage.subscribeHostOrder(hostIds => {
     const frame = JSON.stringify({ method: 'bridge/host-order/changed', params: { hostIds } })
     for (const [sessionId, sockets] of sessionSockets) {
@@ -372,6 +387,9 @@ export async function createServer(options: AppOptions = {}) {
       let sockets = sessionSockets.get(session.id)
       if (!sockets) { sockets = new Set(); sessionSockets.set(session.id, sockets) }
       sockets.add(ws)
+      try {
+        ws.send(JSON.stringify({ method: 'bridge/prompt-presets/changed', params: context.promptPresets.get() }), error => { if (error) ws.terminate() })
+      } catch { ws.terminate() }
       // Global presentation events are not part of a host's native replay.
       // A fresh browser transport also receives the current project order.
       const projectOrderSnapshot = projectOrderEpoch
@@ -398,6 +416,7 @@ export async function createServer(options: AppOptions = {}) {
     stopListeningForReadReceipts()
     stopListeningForHostOrder()
     stopListeningForProjectOrder()
+    stopListeningForPromptPresets()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
     let automationFailure: unknown

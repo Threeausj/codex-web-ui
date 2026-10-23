@@ -1,6 +1,7 @@
 import { methodAccepts } from "./integration-capabilities";
 import { copyText } from './copy-text';
 import { useHostSettings } from './host-settings';
+import { usePromptPresets } from './prompt-presets';
 import { interactiveShellCommand } from '../../shared/terminal-shell';
 import { orderHosts } from '../../shared/host-order';
 import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../../shared/project-order';
@@ -362,6 +363,9 @@ const settingsApi = useHostSettings(state, http, runtimeIdentity, hostId => {
   configurationRequest = null;
   invalidateRuntimeCapabilities();
 });
+const promptPresets = usePromptPresets((path, options) => http(path, options, false),
+  () => state.authenticated ? authenticationGeneration : null);
+watch(() => [state.authenticated, state.authenticationGeneration], () => promptPresets.reset(), { flush: 'sync' });
 async function refreshCurrentRuntimeMetadata() {
   const authentication = authenticationGeneration, hostId = state.hostId, selectedEngine = engineId;
   const hostGeneration = hostSelectionGeneration;
@@ -1706,6 +1710,10 @@ function receiveThreadChange(change: any) {
   }
 }
 function receive(message: any) {
+  if (message.method === 'bridge/prompt-presets/changed') {
+    promptPresets.hydrate(message.params);
+    return;
+  }
   if (message.method === 'bridge/project-order/changed') {
     receiveProjectOrder(message.params?.projects);
     return;
@@ -2312,6 +2320,7 @@ async function bootstrap() {
   latestProjectOrder = [];
   ++projectOrderRevision;
   const data = await http("/bootstrap");
+  promptPresets.hydrate(data.promptPresets);
   localCwd = data.cwd;
   state.hosts = data.hosts;
   state.localEnabled = data.localEnabled ?? state.hosts.some(host => host.id === 'local');
@@ -6010,6 +6019,7 @@ export function useCodex() {
     requestHttp: http,
     setServiceTier,
     updatePreferences,
+    promptPresets,
     rememberSideBranch,
     pin,
     setCollapsed,

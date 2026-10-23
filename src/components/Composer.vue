@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
 import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
 import MessageQueuePanel from "./MessageQueuePanel.vue";
@@ -8,6 +8,9 @@ import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
 import { composerMarkdownPreview } from "../lib/composer-markdown";
+import { insertPromptPreset, type PromptPresetInput } from "../lib/prompt-presets";
+import type { PromptPreset } from "../../shared/prompt-presets";
+const PromptPresetsPanel = defineAsyncComponent(() => import("./PromptPresetsPanel.vue"));
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
 import {
   availablePermissionProfiles,
@@ -118,7 +121,67 @@ const commands = [
     description: "管理配置、项目和主机",
     icon: "Settings2",
   },
+  { id: "presets", name: "/presets", description: "管理 10 个提示词和命令预设", icon: "ListChecks" },
 ];
+const presetsOpen = ref(false);
+const presetInitialContent = ref("");
+const presetUseError = ref("");
+const presetsState = computed(() => props.api.promptPresets.state);
+const presetCommands = commands.filter(command => command.id !== "presets");
+let presetTarget: { key: string; authentication: number; draft: string; position: number } | undefined;
+function openPresets() {
+  if (!props.state.authenticated || pickerDisabled.value) return;
+  presetTarget = { key: draftKey.value, authentication: props.state.authenticationGeneration,
+    draft: draft.value, position: input.value?.selectionEnd ?? draft.value.length };
+  presetInitialContent.value = draft.value;
+  presetUseError.value = "";
+  closeContextMenu();
+  picker.value = ""; ++pickerGeneration;
+  searchPending.value = false; clearTimeout(searchTimer);
+  presetsOpen.value = true;
+  void props.api.promptPresets.refresh();
+}
+function closePresets() {
+  presetsOpen.value = false;
+  presetTarget = undefined;
+  focusInput();
+}
+async function savePreset(value: PromptPresetInput) {
+  presetUseError.value = "";
+  try { await props.api.promptPresets.save(value); } catch { /* The dialog keeps its edit and displays the service error. */ }
+}
+async function removePreset(value: { slot: number; expectedVersion: number }) {
+  presetUseError.value = "";
+  try { await props.api.promptPresets.remove(value); } catch { /* Retry stays in the dialog. */ }
+}
+function usePreset(preset: PromptPreset) {
+  if (pickerDisabled.value || !preset.content.trim()) return;
+  if (!presetTarget || presetTarget.key !== draftKey.value || presetTarget.authentication !== props.state.authenticationGeneration) {
+    presetUseError.value = "对话已切换，请关闭预设后重新打开，再选择要使用的内容。";
+    return;
+  }
+  if (preset.kind === "command") {
+    const command = presetCommands.find(command => command.name === preset.content.trim());
+    if (!command) { presetUseError.value = "当前网页尚不支持此命令，请编辑后选择支持的命令。"; return; }
+    if (!props.state.connected) { presetUseError.value = "请连接主机后执行命令。"; return; }
+    if (["compact", "fork"].includes(command.id) && (!props.state.activeThread || props.state.busy)) {
+      presetUseError.value = props.state.busy ? "请等待当前任务完成后执行此命令。" : "请先选择一个对话。";
+      return;
+    }
+    closePresets();
+    emit("command", command.id);
+    return;
+  }
+  const position = draft.value === presetTarget.draft ? presetTarget.position : draft.value.length;
+  const inserted = insertPromptPreset(draft.value, preset.content, position);
+  draft.value = inserted.text;
+  markdownPreview.value = false;
+  closePresets();
+  void nextTick(() => input.value?.setSelectionRange(inserted.position, inserted.position));
+}
+watch(() => [props.state.authenticated, props.state.authenticationGeneration], () => {
+  presetsOpen.value = false; presetTarget = undefined; presetInitialContent.value = ""; presetUseError.value = "";
+}, { flush: "sync" });
 const matchingCommands = computed(() => commands
   .filter((command) => commandScope.value && command.name.includes(query.value.toLowerCase()))
   .map((command) => ({ ...command, kind: "command" })));
@@ -469,6 +532,12 @@ async function pick(result: any) {
       pickerError.value = cause.message || "切换失败";
     } finally { choosing.value = false; }
   } else if (result.kind === "command") {
+    if (result.id === "presets") {
+      removePickerToken("/");
+      await nextTick();
+      openPresets();
+      return;
+    }
     draft.value = "";
     picker.value = "";
     emit("command", result.id);
@@ -534,6 +603,12 @@ async function send() {
   const submittedContexts = [...quotedContexts.value];
   const command = commands.find((command) => command.name === text);
   if (command) {
+    if (command.id === "presets") {
+      draft.value = "";
+      resize();
+      openPresets();
+      return;
+    }
     protectStop();
     emit("command", command.id);
     draft.value = "";
@@ -773,12 +848,17 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', contextOutside, true);
   document.removeEventListener('keydown', contextKey, true);
 });
-defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addContext, contextMenuOpen, closeContextMenu,
-  working: computed(() => uploading.value || submitting.value) });
+defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addContext, openPresets, contextMenuOpen, closeContextMenu,
+  working: computed(() => uploading.value || submitting.value || presetsOpen.value) });
 </script>
 
 <template>
   <div ref="area" class="composer-area" :class="{ 'welcome-composer': welcome }">
+    <PromptPresetsPanel v-if="presetsOpen && state.authenticated" :snapshot="presetsState.snapshot"
+      :loading="presetsState.loading" :busy="presetsState.busy" :error="presetUseError || presetsState.error"
+      :initial-content="presetInitialContent" :current-draft="draft" :supported-commands="presetCommands"
+      @close="closePresets" @refresh="presetUseError = ''; api.promptPresets.refresh(true)"
+      @save="savePreset" @remove="removePreset" @use="usePreset" />
     <NewConversationContext
       v-if="!state.activeThread"
       :state="state"
@@ -1011,6 +1091,10 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             :title="markdownPreview ? '切回 Markdown 源码编辑' : '预览 Markdown'"
             :aria-pressed="markdownPreview" @pointerdown.prevent @click="toggleMarkdownPreview">
             <Icon :name="markdownPreview ? 'Pencil' : 'Eye'" :size="16" />
+          </button><button type="button" class="icon-button prompt-presets-toggle" aria-label="提示词预设"
+            title="提示词预设 /presets" aria-haspopup="dialog" :aria-expanded="presetsOpen"
+            :disabled="!state.authenticated || pickerDisabled" @pointerdown.prevent @click="openPresets">
+            <Icon name="ListChecks" :size="16" />
           </button><span class="toolbar-separator"></span
           ><label
             class="composer-select model-select"

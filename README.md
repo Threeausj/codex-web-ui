@@ -129,6 +129,7 @@ npm start
 
 | 功能 | 当前实现 | 限制/说明 |
 | --- | --- | --- |
+| 提示词预设 | `/presets` 或输入框按钮管理 10 个编号槽位；保存当前草稿、多行提示词和命令，跨设备同步 | 调用保留草稿和附件，不自动发送；支持现有 Web 命令，替换/清空需确认；独立于 CLI `tui.presets`；[说明](docs/prompt-presets.md) |
 | 自动/手动上下文压缩 | 显示 token 使用比例，历史用量只读补齐；压缩期间显示提醒，完成分隔线保留原位置；可设置自动触发阈值 | 原生响应仅表示开始，等待实际完成事件；Codex 自身自动压缩继续由模型/配置管理（[恢复机制](docs/runtime-stability.md)） |
 | 对话引用与侧边提问 | 引用显示来源卡片，长内容可展开并渲染 Markdown；右上角基于完整上下文新建侧边聊天，也可选择正文引用提问；独立只读分支，收起或切换主会话保留问答与草稿，内部确认后结束 | 临时侧边会话不跨网页刷新持久保存，不触发完成推送；协议支持与重连限制见[说明](docs/selection-side-chat.md) |
 | 对话收藏 | 选择消息正文后收藏并命名；左上角“收藏对话”按项目汇总收藏，支持搜索、重命名、取消收藏，点击跳回原消息；侧栏与 `Ctrl/⌘ + K` 同时搜索标题和收藏 | 按主机和项目隔离，旧历史按需读取；不更改会话标题或草稿，原消息被回退/删除时保留摘录并提示定位失败；[说明](docs/selection-side-chat.md) |
@@ -185,6 +186,7 @@ Web bridge 不提供跨机器云同步。把 Node 服务部署到另一台服务
 
 - `Cmd/Ctrl + K`：页面内命令面板；`Cmd/Ctrl + Shift + O`：新会话；`Cmd/Ctrl + J`：终端。
 - `Enter`：发送；`Shift + Enter`：换行；`Esc`：关闭面板。
+- `/presets` 或输入框工具栏的“提示词预设”：管理 10 个常用提示词／命令槽位，保存当前草稿，调用后继续编辑；跨设备同步，冲突时保留本地修改。[详细说明](docs/prompt-presets.md)。
 - 输入 `/` 搜索指令和当前主机的 Skills，选中技能后显示引用标签，发送时携带 `$技能名` 和原生技能路径；输入或点击 `@` 搜索项目文件或选择默认、Plan、Goal 模式。手机可直接点选，菜单提供关闭按钮；选择模式保留未发送草稿。附件按钮上传文件/图片。
 - Plan 使用 Codex 内建规划模式；Goal 把填写的目标保存到当前对话，可指定正整数 token 预算，省略预算则不设置上限。目标卡显示状态和累计用量，可暂停、继续或清除；切换模式需等待当前轮结束或先点击停止；切到 Plan 会暂停活动目标。目标与聊天权限分开管理，切换模式不会提高权限。
 - Goal 由对应主机的 Codex 在对话空闲时继续，网页关闭后仍取决于服务器和 app-server 是否持续运行；规划轮、待回答问题、活动任务或预算限制会阻止继续。暂停目标会停止后续自动推进，当前执行的轮次请使用“停止”按钮中断。当前已用隔离模拟服务验证 `0.159.2` 和 `0.160.0` 的原生模式与目标协议；不支持或关闭 Goals 的主机会显示能力提示。[官方目标说明](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex)、[app-server 协议](https://learn.chatgpt.com/docs/app-server)。
@@ -247,7 +249,7 @@ npm run doctor:preview
 
 更新 CLI 后运行 `npm run protocol:generate`，检查 `shared/protocol/` 差异，再运行类型、单元和浏览器检查。
 
-目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。已关闭的异步问题提醒独立保存在私人 `DATA_DIR/async-question-notices.json`，同样应纳入备份。主机排序保存在私有 `DATA_DIR/host-order.json`，同样随 `webdata` 卷持久保存。跨设备已读回执保存于私有 `DATA_DIR/thread-read-receipts.json`，仅包含主机、会话、已读轮次及内容活动时间，不保存对话正文；同样随 `webdata` 卷持久保存。
+目录说明：`src/` 为 Vue UI，`server/` 为鉴权/桥接/工作站服务，`shared/protocol/` 为 CLI 生成类型，`tests/` 为验证，`docs/` 和 `deploy/` 为协议与部署说明。`DATA_DIR` 保存网页主机、项目、上传元数据以及私有推送密钥和设备订阅，对话历史保存在 Codex 中。10 个提示词／命令槽位保存在私有 `DATA_DIR/prompt-presets.json`，同样随持久卷备份；内容不写入 CLI 配置。收藏名称、摘录和消息位置保存在私人文件 `DATA_DIR/bookmarks.json`，随 Docker 的 `webdata` 卷持久保存。已关闭的异步问题提醒独立保存在私人 `DATA_DIR/async-question-notices.json`，同样应纳入备份。主机排序保存在私有 `DATA_DIR/host-order.json`，同样随 `webdata` 卷持久保存。跨设备已读回执保存于私有 `DATA_DIR/thread-read-receipts.json`，仅包含主机、会话、已读轮次及内容活动时间，不保存对话正文；同样随 `webdata` 卷持久保存。
 
 最新类型、单元／协议、浏览器、依赖审计与生产构建结果见 [验证清单](docs/validation.md)，代码审查与后续优先级见 [项目审查](docs/project-audit.md)。既往实际环境检查覆盖模型推理、跨进程历史、PTY、隔离 daemon、Git/worktree、Vite HMR、Tmux 与 Docker 数据卷；浏览器尺寸测试不等同于真实手机后台推送验收。早期含本机信息的截图保留在本地，上方公开截图使用独立演示数据。
 
