@@ -37,8 +37,11 @@ test('assistant absolute and relative images stay bound to the source host and s
   mock.turns.get('thread-existing')![0].items[1].text = '![Absolute](/workspace/demo/result.png)\n\n![Relative](assets/result%20two.png)\n\n![Unsafe](//evil.invalid/image.png)';
   await login(page); await page.locator('[data-section="recent"] .thread-row').first().click();
   for (const name of ['Absolute', 'Relative']) {
-    const image = page.getByRole('img', { name, exact: true });
+    // Safe conversation images expose a button role because clicking zooms.
+    const image = page.locator(`img[alt="${name}"]`);
+    await image.scrollIntoViewIfNeeded();
     await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(1);
+    await expect(image).toHaveAttribute('role', 'button');
   }
   expect(requests.map(value => new URL(value).pathname)).toEqual(['/api/hosts/local/images', '/api/hosts/local/images']);
   expect(requests.map(value => new URL(value).searchParams.get('path'))).toEqual(['/workspace/demo/result.png', '/workspace/demo/assets/result two.png']);
@@ -60,7 +63,12 @@ test('closed activity does not mount large tool output and every repeated file p
   await expect(page.locator('.activity-batch')).toHaveCount(1);
   await expect(page.locator('.tool-item')).toHaveCount(0);
   await page.locator('.activity-batch > summary').click();
-  await expect(page.locator('.tool-item')).toHaveCount(102);
+  await expect(page.locator('[data-virtual-timeline]')).toBeVisible();
+  // Opening a giant batch exposes all logical records without mounting all of
+  // them at once. Actual tool rows remain bounded by the viewport and overscan.
+  await expect(page.locator('[data-virtual-timeline]')).toHaveAttribute('data-row-count', '106');
+  await expect.poll(() => page.locator('.tool-item').count()).toBeGreaterThan(0);
+  expect(await page.locator('[data-timeline-row]').count()).toBeLessThan(65);
   await expect(page.locator('.diff-code')).toHaveCount(0);
   await page.getByRole('button', { name: '切换工作区', exact: true }).click();
   await page.locator('.workspace-tabs').getByRole('button', { name: /^变更/ }).click();

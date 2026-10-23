@@ -95,6 +95,8 @@ export function mergeSnapshotItems(snapshot: DisplayItem[], live: DisplayItem[],
 export function applyItemEvent(items: DisplayItem[], method: string, params: any): void {
   if (method === 'item/started' || method === 'item/completed') {
     upsertItem(items, { ...params.item, turnId: params.turnId,
+      ...(params.item?.type === 'commandExecution' && typeof params.item.aggregatedOutput === 'string'
+        ? { outputTotalLength: undefined, outputWindowLength: undefined, outputPreviousItemId: undefined } : {}),
       ...(params.item?.type === 'contextCompaction' ? { status: method === 'item/started' ? 'inProgress' : 'completed' } : {}) });
     return;
   }

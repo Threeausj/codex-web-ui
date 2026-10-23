@@ -22,7 +22,7 @@ const notice = ref('');
 const localError = ref('');
 const testing = ref<'push' | 'system' | ''>('');
 const systemNotice = ref('');
-type DeliveryStatus = { devices: number; queued: number; overflow?: number; backlog?: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastCompletedAcceptedAt?: number | null; lastFailureAt: number | null; lastFailure: string | null };
+type DeliveryStatus = { devices: number; queued: number; overflow?: number; backlog?: number; retrying: number; delivered: number; failed: number; expired: number; nextRetryAt: number | null; lastDeliveredAt: number | null; lastCompletedAcceptedAt?: number | null; lastFailureAt: number | null; lastFailure: string | null; observers?: { enabled: boolean; journalAvailable?: boolean; hosts: { hostId: string; state: string; watchedThreads: number; nextRetryAt: number | null }[] } };
 const deliveryStatus = ref<DeliveryStatus | null>(null);
 const deliveryError = ref('');
 let statusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -32,6 +32,8 @@ let statusRefreshPending = false;
 let statusController: AbortController | undefined;
 const failures: Record<string, string> = { provider_unavailable: '推送服务暂时不可用', rate_limited: '推送服务限流', timeout: '推送连接超时', rejected: '推送服务拒绝请求', metadata_pending: '正在确认对话类型', expired: '通知已超过有效期', queue_full: '推送队列已满' };
 const retryTime = computed(() => deliveryStatus.value?.nextRetryAt ? new Date(deliveryStatus.value.nextRetryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
+const observerHosts = computed(() => deliveryStatus.value?.observers?.hosts || []);
+const observerRetries = computed(() => observerHosts.value.filter(host => host.state === 'retrying').length);
 const authentication = () => props.state.authenticationGeneration ?? props.api.runtimeIdentity?.().authenticationGeneration;
 const authenticated = () => props.state.authenticated !== false;
 async function refreshDeliveryStatus() {
@@ -52,7 +54,7 @@ async function refreshDeliveryStatus() {
     statusReading = false;
     if (statusController === controller) statusController = undefined;
     if (!disposed && authenticated() && statusRefreshPending) { statusRefreshPending = false; void refreshDeliveryStatus(); }
-    else if (current() && deliveryStatus.value?.queued) statusTimer = setTimeout(() => { void refreshDeliveryStatus(); }, 5000);
+    else if (current() && (deliveryStatus.value?.queued || observerRetries.value)) statusTimer = setTimeout(() => { void refreshDeliveryStatus(); }, 5000);
   }
 }
 const testId = ref('');
@@ -303,6 +305,11 @@ onBeforeUnmount(() => { disposed = true; ++testGeneration; stopTestPolling(); cl
           <div><strong>{{ category.label }}</strong><span>{{ category.description }}</span></div>
           <input type="checkbox" :aria-label="category.label" :checked="pwaState.pushPreferences[category.key]" :disabled="pwaState.pushBusy || pwaState.offline" @change="preferenceChanged(category.key, $event)" />
         </label>
+      </div>
+      <div v-if="deliveryStatus?.observers?.enabled" class="pwa-delivery-status" aria-live="polite" aria-label="后台通知观察状态">
+        <span>后台观察：{{ observerHosts.filter(host => host.state === 'observing').length }} 个主机已连接<span v-if="observerRetries"> · {{ observerRetries }} 个主机正在自动重连</span><span v-if="observerHosts.some(host => host.state === 'paused')"> · {{ observerHosts.filter(host => host.state === 'paused').length }} 个主机已暂停</span></span>
+        <span>通知观察由服务器保持，关闭全部网页后仍会继续；恢复连接后会核对运行任务的完成状态。</span>
+        <span v-if="deliveryStatus.observers.journalAvailable === false">后台恢复记录暂时无法保存，请检查服务器存储空间和目录权限。</span>
       </div>
       <div v-if="deliveryStatus && pwaState.pushSubscribed" class="pwa-delivery-status" aria-live="polite" aria-label="推送投递状态">
         <span>推送服务已接收 {{ deliveryStatus.delivered }} 条</span>

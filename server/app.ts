@@ -29,6 +29,8 @@ import { registerPreview } from './preview.js'
 import { registerDevelopmentPreview } from './dev-preview.js'
 import { registerPersistentTerminal } from './persistent-terminal.js'
 import { registerTmux } from './tmux.js'
+import { registerTmuxMonitors } from './tmux-monitors.js'
+import { SshConnectionPool } from './ssh-pool.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
 import { readBoundedHostFile, registerFileDownloads } from './file-download.js'
@@ -42,12 +44,14 @@ import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
 import { registerProjectDirectories } from './project-directories.js'
 import { PushService, registerPush, type PushOptions } from './push.js'
+import { PushObservers, type PushObserverOptions } from './push-observers.js'
 import type { AuthenticatedRequest } from './types.js'
 
 export type AppOptions = {
   cwd?: string; dataDir?: string; codexHome?: string; password?: string; origins?: string[]; port?: number
   secureCookie?: boolean; trustProxy?: boolean; bridgeOptions?: BridgeOptions; serveStatic?: boolean; staticDir?: string
   pushOptions?: PushOptions
+  pushObserverOptions?: Pick<PushObserverOptions, 'intervalMs' | 'retryBaseMs' | 'now' | 'autoStart'>
   sshHostKeyOptions?: Omit<SSHHostKeyServiceOptions, 'dataDir'>
 }
 
@@ -86,13 +90,17 @@ export async function createApp(options: AppOptions = {}) {
   const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
   const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
+  const sshPool = options.bridgeOptions?.sshPool || new SshConnectionPool()
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
+  bridgeOptions.sshPool ??= sshPool
   bridgeOptions.resolveSshHostKeyPin ??= async host => (await sshHostKeys.connectionKnownHosts(host)) ?? bridgeOptions.sshHostKeyPin
   let automations: AutomationService | undefined;
   let threadTitles: ThreadTitleService | undefined
+  let pushObservers: PushObservers | undefined
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
     push.observe(host, message, responseMethod)
+    pushObservers?.observe(host, message, responseMethod)
     automations?.observe(host, message)
     threadTitles?.observe(host, message, responseMethod)
     return externalProtocolObserver?.(host, message, responseMethod)
@@ -113,6 +121,16 @@ export async function createApp(options: AppOptions = {}) {
     return bridge
   }
   const app = express()
+  const notificationObservers = pushObservers = new PushObservers(dataDir, {
+    ...options.pushObserverOptions, autoStart: false,
+    getHosts: () => storage.hosts,
+    getBridge,
+    hasSubscriptions: () => push.hasActiveSubscriptions,
+    observe: (host, message, responseMethod) => push.observe(host, message, responseMethod),
+    flushPush: () => push.flush(),
+  })
+  await notificationObservers.init()
+  const stopPushSubscriptionListener = push.onSubscriptionChange(() => notificationObservers.wake())
   const titleService = threadTitles = new ThreadTitleService({ getBridge })
   const nativeProjects = new NativeProjects({ storage, getBridge })
   app.disable('x-powered-by')
@@ -129,16 +147,19 @@ export async function createApp(options: AppOptions = {}) {
   app.post('/api/auth/logout', auth.requireAuth, auth.requireCsrf, auth.logout)
   app.post('/api/auth/password', auth.requireAuth, auth.requireCsrf, auth.changePassword)
   registerPreview(app, { getBridge, getHost: (id: string) => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, allowedOrigins: origins, isSessionActive: (sessionId: string) => auth.isSessionActive(sessionId) })
-  const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener), resolveSshHostKeyPin: bridgeOptions.resolveSshHostKeyPin })
+  const developmentPreview = registerDevelopmentPreview(app, { getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf, isSessionActive: id => auth.isSessionActive(id), onSessionRevoked: listener => auth.onSessionRevoked(listener), resolveSshHostKeyPin: bridgeOptions.resolveSshHostKeyPin, sshPool: bridgeOptions.sshPool })
   registerPersistentTerminal(app, { getBridge, getHost: id => storage.host(id), requireAuth: auth.requireAuth, requireCsrf: auth.requireCsrf })
   app.use('/api', auth.requireAuth, auth.requireCsrf)
-  registerPush(app, push)
+  registerPush(app, push, () => notificationObservers.status())
+  app.get('/api/push/observers', (_req, res) => res.json(notificationObservers.status()))
   automations = new AutomationService(dataDir, { getBridge, getHost: id => storage.host(id),
     resolveProject: async (hostId, directory) => (await nativeProjects.resolveForCwd(hostId, directory))?.projectId ?? null,
   })
   await automations.initialize()
   registerAutomations(app, automations)
   registerTmux(app, { getBridge })
+  const tmuxMonitors = await registerTmuxMonitors(app, dataDir, { getHost: id => storage.host(id), bridgeOptions, autoStart: false,
+    notify: (host, notice) => push.notifyExternal(host, notice) })
   const preferences = await registerPreferences(app, dataDir)
   await registerBookmarks(app, dataDir, id => !!storage.host(id))
   const promptPresets = await registerPromptPresets(app, dataDir)
@@ -232,6 +253,7 @@ export async function createApp(options: AppOptions = {}) {
     if (result.connectionReset) {
       titleService.cancelHost(id)
       developmentPreview.deleteHost(id)
+      bridgeOptions.sshPool!.closeHost(id)
       bridges.get(id)?.close('Host settings changed', 4001)
       bridges.delete(id)
     }
@@ -245,6 +267,7 @@ export async function createApp(options: AppOptions = {}) {
     titleService.cancelHost(id)
     await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
     developmentPreview.deleteHost(id)
+    bridgeOptions.sshPool!.closeHost(id)
     bridges.get(id)?.close(); bridges.delete(id)
     res.json({ ok: true })
   })))
@@ -304,10 +327,9 @@ export async function createApp(options: AppOptions = {}) {
     res.status(error.status || 500).json({ error: error.message || 'Request failed' })
   }
   app.use(errorHandler)
-  // Subscription grants survive server restarts. Restore host observers independently
-  // of a phone being online; unavailable SSH hosts must not prevent server startup.
-  if (push.hasActiveSubscriptions) for (const host of storage.hosts) void getBridge(host.id).then(bridge => bridge.connect()).catch(() => {})
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, sshHostKeys, threadReadReceipts, promptPresets, stopPushLogoutListener, stopPushPasswordListener }
+  if (options.pushObserverOptions?.autoStart !== false) notificationObservers.start()
+  tmuxMonitors.start()
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, notificationObservers, sshHostKeys, threadReadReceipts, promptPresets, tmuxMonitors, sshPool, stopPushLogoutListener, stopPushPasswordListener, stopPushSubscriptionListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -419,11 +441,16 @@ export async function createServer(options: AppOptions = {}) {
     stopListeningForPromptPresets()
     context.stopPushLogoutListener()
     context.stopPushPasswordListener()
+    context.stopPushSubscriptionListener()
+    const closingPushObservers = context.notificationObservers.close()
     let automationFailure: unknown
     try { await context.automations.close() } catch (cause) { automationFailure = cause }
     await context.threadTitles.close()
+    await context.tmuxMonitors.close()
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
+    await context.sshPool.close()
+    await closingPushObservers
     for (const ws of wss.clients) ws.terminate()
     wss.close()
     await context.push.close()

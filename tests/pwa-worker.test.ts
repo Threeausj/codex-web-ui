@@ -102,6 +102,21 @@ test('notification click focuses an app window and messages it without reloading
   assert.deepEqual(target.opened, []);
 });
 
+test('tmux notifications retain a safe pane destination through background display and new-window clicks', async () => {
+  const target = worker();
+  await target.fire('push', { data: { json: () => ({ data: { hostId: 'nas', url: '/?host=nas&tmuxSession=%242&tmuxPane=%255' } }) } });
+  const data = target.notifications[0]!.options.data;
+  assert.equal(data.tmuxSession, '$2'); assert.equal(data.tmuxPane, '%5');
+  await target.fire('notificationclick', { notification: { close() {}, data } });
+  assert.equal(target.opened[0], 'https://codex.example/?host=nas&tmuxSession=%242&tmuxPane=%255');
+});
+
+test('external URLs cannot smuggle tmux destinations into a system notification', async () => {
+  const target = worker();
+  await target.fire('push', { data: { json: () => ({ data: { hostId: 'nas', url: 'https://attacker.invalid/?tmuxSession=%241&tmuxPane=%251' } }) } });
+  assert.equal(target.notifications[0]!.options.data.tmuxSession, undefined);
+});
+
 test('notification click opens only the app root and ignores unsafe identifiers and preview clients', async () => {
   const target = worker();
   target.setClients([{ frameType: 'nested', url: 'https://codex.example/api/preview/private', async focus() { throw new Error('Preview must not be focused'); } }]);

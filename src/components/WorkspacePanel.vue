@@ -12,10 +12,11 @@ import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
 import { privateState } from "../lib/private-state";
 import type { ConversationSelectionSource } from "../lib/conversation-selection";
-import { isImagePath, isMarkdownPath } from "../lib/file-preview";
+import { isImagePath, isMarkdownPath, officeFileKind } from "../lib/file-preview";
 import { isJsonPath, jsonUnicodePreview } from "../lib/json-preview";
 const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
 const PdfPreview = defineAsyncComponent(() => import("./PdfPreview.vue"));
+const OfficePreview = defineAsyncComponent(() => import("./OfficePreview.vue"));
 const InteractiveTerminal = defineAsyncComponent(
   () => import("./InteractiveTerminal.vue"),
 );
@@ -32,6 +33,7 @@ const props = defineProps<{
   initialTab?: string;
   openPath?: string;
   openLine?: number;
+  tmuxTarget?: { sessionId: string; paneId?: string };
 }>();
 const emit = defineEmits<{ close: []; error: [message: string]; add: [source: ConversationSelectionSource]; ask: [source: ConversationSelectionSource] }>();
 const tab = ref(props.initialTab || "files");
@@ -98,6 +100,14 @@ function persistDrafts() {
 }
 function scheduleDrafts() { clearTimeout(draftTimer); draftTimer = setTimeout(persistDrafts, 180); }
 watch([editorTabs, activePath], scheduleDrafts, { deep: true });
+// Keep inactive Office tabs as metadata only. Each preview is up to 8 MiB;
+// retaining all sixteen Base64 packages would waste mobile memory. A selected
+// binary tab without bytes is already re-read by openFile below.
+watch(activePath, selected => {
+  for (const entry of editorTabs.value) {
+    if (entry.file.path !== selected && officeFileKind(entry.file.path)) entry.file.dataBase64 = undefined;
+  }
+}, { flush: 'sync' });
 const dirty = computed(() => content.value !== originalContent.value);
 const changeScope = ref("loaded");
 // Keep every patch in execution order. These are operation counts, not a net
@@ -132,6 +142,7 @@ const isImage = computed(
     /^data:image\//.test(file.value?.dataUrl || ""),
 );
 const isMarkdown = computed(() => !file.value?.binary && isMarkdownPath(file.value?.path || ""));
+const isOffice = computed(() => !!officeFileKind(file.value?.path || ""));
 const isJson = computed(() => !file.value?.binary && isJsonPath(file.value?.path || ""));
 const isJsonPreview = computed(() => isJson.value && fileView.value === "preview");
 const jsonPreviewContent = computed(() => isJsonPreview.value ? jsonUnicodePreview(content.value) : "");
@@ -335,7 +346,10 @@ function closeEditor(path: string) {
   if (!entry || entry.saving) return;
   if (entry.content !== entry.original && !window.confirm("关闭标签会丢弃此文件的未保存草稿，是否继续？")) return;
   editorTabs.value = editorTabs.value.filter(candidate => candidate !== entry);
-  if (activePath.value === path) activePath.value = editorTabs.value.at(-1)?.file.path || "";
+  if (activePath.value === path) {
+    activePath.value = editorTabs.value.at(-1)?.file.path || "";
+    if (file.value && officeFileKind(file.value.path) && !file.value.dataBase64) void openFile(activePath.value, tab.value);
+  }
   persistDrafts();
 }
 function codeSelection(value: { text: string; startLine: number; endLine: number }, action: 'add' | 'ask') {
@@ -383,7 +397,7 @@ async function preview(path?: string) {
     const filePath = input.startsWith("/")
       ? input
       : join(props.state.projectPath, input);
-    if (isMarkdownPath(filePath) || isJsonPath(filePath) || isImagePath(filePath) || /\.pdf$/i.test(filePath)) {
+    if (isMarkdownPath(filePath) || isJsonPath(filePath) || isImagePath(filePath) || officeFileKind(filePath) || /\.pdf$/i.test(filePath)) {
       previewInput.value = filePath;
       await openFile(filePath, "preview");
       return;
@@ -681,6 +695,7 @@ defineExpose({
           <img :src="file.dataUrl" :alt="displayName" />
         </div>
         <PdfPreview v-else-if="file.mime === 'application/pdf' && file.dataBase64" :key="file.path" :data-base64="file.dataBase64" :name="displayName" />
+        <OfficePreview v-else-if="isOffice && file.dataBase64" :key="state.hostId + ':' + file.path + ':' + file.version" :data-base64="file.dataBase64" :name="displayName" @download="download(file.path)" />
         <div v-else-if="file.binary" class="panel-empty">
           <Icon name="File" :size="32" />
           <p>此文件可下载后查看</p>
@@ -706,7 +721,7 @@ defineExpose({
           @save="save" @selection="codeSelection"
         />
         <div class="file-editor-footer">
-          <span>{{ isImage ? '图片预览' : (isJsonPreview ? 'JSON 只读预览 · ' : '') + content.split("\n").length + ' 行' }}{{ selectedLine && !isImage ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
+          <span>{{ isImage ? '图片预览' : isOffice ? 'Office 只读预览' : (isJsonPreview ? 'JSON 只读预览 · ' : '') + content.split("\n").length + ' 行' }}{{ selectedLine && !isImage && !isOffice ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
           ><span>{{
             state.permission === "read-only"
               ? "只读"
@@ -781,7 +796,7 @@ defineExpose({
       <SubagentsPanel :api="api" :state="state" />
     </div>
     <div v-else-if="tab === 'tmux'" class="workspace-body tmux-view">
-      <TmuxPanel :api="api" :state="state" @attach="attachTmux" />
+      <TmuxPanel :target="tmuxTarget" :api="api" :state="state" @attach="attachTmux" />
     </div>
     <div v-else-if="tab === 'git'" class="workspace-body git-view">
       <GitPanel

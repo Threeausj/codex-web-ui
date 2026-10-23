@@ -1,4 +1,5 @@
 import { methodAccepts } from "./integration-capabilities";
+import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
 import { useHostSettings } from './host-settings';
 import { usePromptPresets } from './prompt-presets';
@@ -30,6 +31,7 @@ import { useMessageQueue } from "./message-queue";
 import { clearConversationMarkdownCache } from "./conversation-markdown";
 import { privateState } from "./private-state";
 import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './lazy-history';
+import { boundConversationOutputs, COMMAND_OUTPUT_WINDOW, retainConversationHistory } from './conversation-retention';
 import { isInteractiveServerRequest } from '../../shared/server-requests';
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { asyncQuestionAnswered, asyncQuestionAnswerDisplayText, asyncQuestionFingerprint, asyncQuestionReplyText } from '../../shared/async-question-reply';
@@ -288,6 +290,8 @@ const threadBusy = new Map<string, boolean>();
 const itemRevisions = new Map<string, Map<string, number>>();
 const historyReader = new LazyHistoryReader();
 const historyDetailRequests = new Map<string, Promise<void>>();
+const retainedHistoryTurns = new Map<string, Set<string>>();
+const retentionProbes = new Map<string, number>();
 const threadRevisions = new Map<string, number>();
 // Both an explicit name and a confirmed preview can change the displayed title.
 const threadNameRevisions = new Map<string, number>();
@@ -703,6 +707,7 @@ function clearConversationCaches() {
   itemRevisions.clear();
   historyReader.clear();
   historyDetailRequests.clear();
+  retainedHistoryTurns.clear(); retentionProbes.clear();
   threadRevisions.clear();
   threadNameRevisions.clear();
   removedThreads.clear();
@@ -726,6 +731,30 @@ function clearConversationCaches() {
 function saveConversationSnapshot() {
   const thread = state.activeThread;
   if (!state.authenticated || !thread?.id || !state.threadReady || state.threadConflict || revertedTurnCandidates.has(thread.id)) return;
+  const historyScope = JSON.stringify([authenticationGeneration, state.hostId, engineId]);
+  if (!thread.ephemeral && historyReader.canReloadItems(historyScope, thread.id)) {
+    const bounded = boundConversationOutputs(state.items);
+    if (bounded !== state.items) {
+      state.items = bounded;
+      const byId = new Map(bounded.map(item => [item.id, item]));
+      state.turns = state.turns.map(turn => ({ ...turn, items: (turn.items || []).map((item: DisplayItem) => byId.get(item.id) || item) }));
+    }
+    const retained = retainConversationHistory(state.items, state.turns, retainedHistoryTurns.get(recencyKey(state.hostId, thread.id)));
+    if (retained.evicted.size) { state.items = retained.items; state.turns = retained.turns; }
+  } else if (!thread.ephemeral && (state.items.some(item => item.type === 'commandExecution' && item.aggregatedOutput?.length > COMMAND_OUTPUT_WINDOW) ||
+      state.turns.length > 3 && state.items.some(item => !['userMessage', 'agentMessage', 'contextCompaction'].includes(item.type)))) {
+    const key = JSON.stringify([historyScope, thread.id]);
+    if (Date.now() - (retentionProbes.get(key) || 0) > 30000) {
+      retentionProbes.set(key, Date.now());
+      const hostId = state.hostId, threadId = thread.id, nativeEngine = engineId, authentication = authenticationGeneration;
+      const turnId = state.turns.find(turn => turn.status !== 'inProgress')?.id || state.turns.at(-1)?.id;
+      if (turnId) void historyReader.probeItems(historyScope,
+        (method, params) => rpc(method, params, 15000, { silentError: true }), threadId, turnId).then(supported => {
+        if (supported && authentication === authenticationGeneration && hostId === state.hostId && nativeEngine === engineId && threadId === state.activeThread?.id)
+          scheduleConversationSnapshot(threadId);
+      });
+    }
+  }
   itemCache.set(thread.id, state.items);
   itemCache.rememberHistory(thread.id, { turns: state.turns, cursor: turnCursor, engineId,
     eventGapRevision, historyTruncated: historyWindowTruncated });
@@ -736,6 +765,23 @@ function saveConversationSnapshot() {
     tokenUsage: state.tokenUsage, cursor: turnCursor,
     ...(historyWindowTruncated ? { historyTruncated: true } : {}),
   });
+}
+function retainHistoryTurns(threadId: string | undefined, turnIds: string[], hostId = state.hostId) {
+  if (!threadId) return;
+  const key = recencyKey(hostId, threadId);
+  if (turnIds.length) retainedHistoryTurns.set(key, new Set(turnIds)); else retainedHistoryTurns.delete(key);
+  if (hostId === state.hostId && threadId === state.activeThread?.id) scheduleConversationSnapshot(threadId);
+}
+async function loadToolOutput(item: DisplayItem) {
+  const hostId = state.hostId, threadId = state.activeThread?.id, turnId = item.turnId, generation = selectionGeneration, auth = authenticationGeneration;
+  const targetEngine = engineId;
+  if (!threadId || !turnId || !state.connected || !state.threadReady) throw new Error('请先恢复连接并同步对话');
+  const current = () => auth === authenticationGeneration && generation === selectionGeneration && hostId === state.hostId && threadId === state.activeThread?.id && targetEngine === engineId;
+  const result = await historyReader.readItem((method, params) => rpc(method, params, 45000, { silentError: true }), threadId, turnId, item.id, item.outputPreviousItemId);
+  if (!current()) throw new Error('对话已切换，已取消读取输出');
+  if (typeof result.aggregatedOutput !== 'string') throw new Error('此工具尚无可读取的原始输出');
+  if (result.aggregatedOutput.length > 8 * 1024 * 1024) throw new Error('完整输出超过 8 MiB，请在目标主机的终端或日志文件中查看');
+  return result.aggregatedOutput;
 }
 function scheduleConversationSnapshot(threadId?: string) {
   if (!threadId) return;
@@ -3736,7 +3782,10 @@ function refreshRevertedThread(threadId: string) {
   if (state.activeThread?.id !== threadId) return;
   // Replayed notifications precede connected status. Defer their read until
   // recovery; an old in-flight snapshot must never confirm a reverted head.
-  ++selectionGeneration;
+  // Closing the old socket already invalidates its pending reads. Advancing
+  // this generation again during replay would invalidate resumeConnection's
+  // own scope and prevent it from fetching the reverted history at all.
+  if (state.connected) ++selectionGeneration;
   state.threadReady = false;
   state.selectingThread = false;
   if (state.connected) void selectThread(threadId, { preserveWriter: true });
@@ -4886,7 +4935,7 @@ async function readDirectory(path: string) {
 }
 async function readFile(path: string, options: { silentError?: boolean; hostId?: string } = {}) {
   const result = await http(`/hosts/${encodeURIComponent(options.hostId || state.hostId)}/files?path=${encodeURIComponent(path)}`, {}, !options.silentError);
-  if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024 * 4) / 3))
+  if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024) / 3) * 4)
     throw (options.silentError ? new Error("文件超过 8 MB，请使用终端读取") : fail(new Error("文件超过 8 MB，请使用终端读取")));
   const extensions: Record<string, string> = {
     png: "image/png",
@@ -4901,10 +4950,11 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
     pdf: "application/pdf",
   };
   const mime =
-    extensions[path.split(".").pop()?.toLowerCase() ?? ""] ?? "text/plain";
+    extensions[path.split(".").pop()?.toLowerCase() ?? ""] ?? officeMime(path) ?? "text/plain";
   let content = "";
   let binary = false;
-  if (!mime.startsWith("image/")) {
+  if (officeMime(path)) binary = true;
+  else if (!mime.startsWith("image/")) {
     const bytes = Uint8Array.from(atob(result.dataBase64), (character) =>
       character.charCodeAt(0),
     );
@@ -4926,7 +4976,7 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
     mime,
     content,
     binary,
-    dataBase64: mime === 'application/pdf' ? result.dataBase64 : undefined,
+    dataBase64: mime === 'application/pdf' || officeMime(path) ? result.dataBase64 : undefined,
     dataUrl: mime.startsWith("image/")
       ? `data:${mime};base64,${result.dataBase64}`
       : undefined,
@@ -5963,6 +6013,8 @@ export function useCodex() {
     takeoverThread,
     loadOlderTurns,
     loadTurnDetails,
+    retainHistoryTurns,
+    loadToolOutput,
     revealBookmarkSource,
     newThread,
     newThreadInWorktree,

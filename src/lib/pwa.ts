@@ -1,8 +1,8 @@
 import { reactive } from 'vue';
-import { pushTargetFromUrl } from './push-navigation';
+import { pushTarget, pushTargetFromUrl, type PushTarget } from './push-navigation';
 
 export type PushPreferences = { completed: boolean; approval: boolean; errors: boolean };
-export type PushDestination = { hostId: string; threadId: string };
+export type PushDestination = PushTarget;
 export type PushTestReceipt = {
   id: string;
   state: 'queued' | 'sending' | 'retrying' | 'accepted' | 'failed' | 'expired';
@@ -300,9 +300,8 @@ function installListeners() {
     });
     navigator.serviceWorker.addEventListener('message', (event) => {
       if (event.data?.type !== 'PUSH_NAVIGATE') return;
-      const { hostId, threadId } = event.data;
-      if (typeof hostId !== 'string' || typeof threadId !== 'string' || (hostId && !/^[a-zA-Z0-9_-]{1,128}$/.test(hostId)) || (threadId && !/^[a-zA-Z0-9_-]{1,128}$/.test(threadId))) return;
-      window.dispatchEvent(new CustomEvent('codex:push-navigate', { detail: { hostId, threadId } }));
+      const target = pushTarget(event.data);
+      if (target) window.dispatchEvent(new CustomEvent('codex:push-navigate', { detail: target }));
     });
   }
 }

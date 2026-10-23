@@ -36,6 +36,8 @@ function appServiceWorker(): Plugin {
 export default defineConfig({
   define: { 'import.meta.env.VITE_BUILD_ID': JSON.stringify(Date.now().toString(36)) },
   plugins: [vue(), appServiceWorker()],
+  // Office parsers are loaded only by the preview worker that needs them.
+  worker: { format: 'es' },
   server: {
     port: 5173,
     proxy: { '/api': { target: 'http://127.0.0.1:8787', ws: true } },

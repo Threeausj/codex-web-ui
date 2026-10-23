@@ -74,10 +74,19 @@ self.addEventListener("fetch", (event) => {
 });
 
 function navigationData(value) {
-  return {
+  const data = {
     hostId: typeof value?.hostId === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value.hostId) ? value.hostId : "",
     threadId: typeof value?.threadId === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value.threadId) ? value.threadId : "",
   };
+  let link;
+  try { const url = new URL(value?.url, self.location.origin); if (url.origin === self.location.origin && url.pathname === "/") link = url; } catch {}
+  const session = value?.tmuxSession || link?.searchParams.get("tmuxSession");
+  const pane = value?.tmuxPane || link?.searchParams.get("tmuxPane");
+  if (data.hostId && typeof session === "string" && /^\$\d{1,13}$/.test(session)) {
+    data.tmuxSession = session;
+    if (typeof pane === "string" && /^%\d{1,13}$/.test(pane)) data.tmuxPane = pane;
+  }
+  return data;
 }
 
 self.addEventListener("push", (event) => {
@@ -104,6 +113,8 @@ self.addEventListener("notificationclick", (event) => {
   const target = new URL("/", self.location.origin);
   if (data.hostId) target.searchParams.set("host", data.hostId);
   if (data.threadId) target.searchParams.set("thread", data.threadId);
+  if (data.tmuxSession) target.searchParams.set("tmuxSession", data.tmuxSession);
+  if (data.tmuxPane) target.searchParams.set("tmuxPane", data.tmuxPane);
   event.waitUntil((async () => {
     const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const appClient = clients.find((client) => {

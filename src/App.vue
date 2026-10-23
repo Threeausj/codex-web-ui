@@ -78,6 +78,7 @@ watch(() => [state.authenticated, JSON.stringify(state.hosts.map(host => host.id
 const sideChat = useSideChat(api, state);
 const sideChatPanel = ref<InstanceType<typeof SideChatPanel>>();
 useSubagentPrefetch(api, state);
+const workspaceTmuxTarget = ref<{ hostId: string; sessionId: string; paneId?: string }>();
 let pendingPushTarget: PushTarget | null = pushTargetFromUrl(new URL(location.href));
 let openingPushTarget = false;
 let stopPushNavigation: (() => void) | undefined;
@@ -88,6 +89,8 @@ const workspaceOpen = ref(false);
 const composer = ref<InstanceType<typeof Composer>>();
 const movingProject = ref<{ thread: any; hostId: string } | null>(null);
 watch(() => state.authenticated, authenticated => { if (!authenticated) movingProject.value = null; });
+const settingsOpen = ref(false);
+const settingsPanel = ref<InstanceType<typeof SettingsPanel>>();
 useMobilePanelBack(() => state.authenticated, [
   { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
@@ -97,6 +100,7 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
   { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
   { id: 'image-preview', visible: () => !!conversationImages.image.value, close: () => conversationImages.close() },
+  { id: 'settings', visible: () => settingsOpen.value, close: () => settingsPanel.value?.close() },
   { id: 'context-usage', visible: () => !!composer.value?.contextMenuOpen, close: () => composer.value?.closeContextMenu(true) },
 ]);
 const workspaceTab = ref("files");
@@ -113,7 +117,6 @@ let lastScrollHeight = 0;
 let programmaticScrollTop: number | undefined;
 let scrollLayoutFrame = 0;
 let readingTouchStart: { x: number; y: number } | undefined;
-const settingsOpen = ref(false);
 const resourcesOpen = ref(false);
 const automationsOpen = ref(false);
 const reviewOpen = ref(false);
@@ -141,7 +144,7 @@ const messageEditOpen = ref(false);
 const updateCanReload = computed(() => !(
   state.busy || state.compacting || actionBusy.value || state.loading ||
   state.selectingThread || state.switchingHost || state.changingContext ||
-  state.modeBusy || messageEditOpen.value || composer.value?.working || workspace.value?.working ||
+  state.modeBusy || messageEditOpen.value || composer.value?.working || workspace.value?.working || settingsPanel.value?.working ||
   sideChat.state.busy || sideChat.state.loading || sideChat.state.saving
 ));
 setPwaUpdateGuard(() => updateCanReload.value);
@@ -239,8 +242,16 @@ async function dismissChoiceReminder() {
     dismissedLegacyChoices.value = new Set([...dismissedLegacyChoices.value, ...legacyKeys]);
   } catch (cause: any) { if (authentication === api.runtimeIdentity().authenticationGeneration) showError(cause.message || '关闭提醒失败，请重试'); }
 }
-function showChoices() {
-  scroll.value?.querySelector('.question-card, .async-question-card[data-question-pending="true"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+async function showChoices() {
+  const question = scroll.value?.querySelector<HTMLElement>('.question-card, .async-question-card[data-question-pending="true"]');
+  const itemId = question?.dataset.asyncQuestionId;
+  const item = itemId && state.items.find(item => item.id === itemId);
+  followLatest.value = false;
+  if (conversationOutput.value?.isVirtual && item && item.turnId) {
+    // Native smooth scrolling has a stale target while newly visible virtual
+    // rows are being measured. Let the virtualizer resolve its stable key.
+    await conversationOutput.value.revealItem(item.id, item.turnId);
+  } else question?.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 watch(() => [state.authenticated, choiceRequests.value.length, asyncChoices.value.length, threadTitle.value], () => {
   const count = choiceRequests.value.length + asyncChoices.value.length;
@@ -402,7 +413,9 @@ async function restoreScroll(id: string, generation = navigationSelection) {
   followLatest.value = !position || position.bottom;
   lastScrollHeight = scroll.value?.scrollHeight || 0;
   if (position && !position.bottom && scroll.value) {
-    restoreConversationReading(scroll.value, position);
+    if (conversationOutput.value?.isVirtual) await conversationOutput.value.restoreReading(position);
+    else restoreConversationReading(scroll.value, position);
+    if (!current() || !scroll.value) return;
     programmaticScrollTop = scroll.value.scrollTop;
     showScrollBottom.value = !nearConversationBottom(scroll.value);
   } else scrollBottom();
@@ -500,6 +513,15 @@ function openWorkspace(tab = "files", path = "", line?: number) {
     if (workspaceScope() === targetScope && workspacePath.value === path) void workspace.value?.revealPath(path, line);
   });
   else if (!path) void nextTick(() => workspace.value?.setTab(tab));
+}
+async function openTmuxTarget(target: { hostId: string; sessionId: string; paneId?: string; threadId?: string }) {
+  if (!state.authenticated || !state.hosts.some(host => host.id === target.hostId)) return;
+  if (target.threadId) await selectThread({ id: target.threadId, hostId: target.hostId });
+  else if (target.hostId !== state.hostId) await api.setHost(target.hostId);
+  if (state.hostId !== target.hostId) return;
+  resourcesOpen.value = false;
+  workspaceTmuxTarget.value = { hostId: target.hostId, sessionId: target.sessionId, paneId: target.paneId };
+  openWorkspace("tmux");
 }
 function toggleWorkspace() {
   if (sideChat.state.open) {
@@ -686,7 +708,7 @@ async function execute(command: string) {
   threadMenu.value = false;
   paletteOpen.value = false;
   if (command === "new") await newThread();
-  else if (command === "presets") composer.value?.openPresets();
+  else if (command === "presets") openSettings("presets");
   else if (command === "bookmarks") openAllBookmarks();
   else if (command === "side-chat") openSideChat();
   else if (command === "compact") {
@@ -750,7 +772,7 @@ async function login() {
 async function openPendingPushTarget() {
   if (openingPushTarget || !pendingPushTarget || !state.authenticated ||
       !state.online || state.loading || state.switchingHost ||
-      state.selectingThread) return;
+      state.selectingThread || settingsPanel.value?.working) return;
   openingPushTarget = true;
   try {
     while (pendingPushTarget && state.authenticated && state.online) {
@@ -760,6 +782,14 @@ async function openPendingPushTarget() {
         showError("通知对应的主机已被移除。");
         continue;
       }
+      if (target.tmuxSession) {
+        await openTmuxTarget({ hostId: target.hostId, sessionId: target.tmuxSession, paneId: target.tmuxPane, threadId: target.threadId });
+        const url = new URL(location.href);
+        for (const key of ["host", "thread", "tmuxSession", "tmuxPane"]) url.searchParams.delete(key);
+        history.replaceState(history.state, "", url);
+        continue;
+      }
+      if (!target.threadId) continue;
       await selectThread({ id: target.threadId, hostId: target.hostId });
       if (state.hostId === target.hostId && state.activeThread?.id === target.threadId) {
         settingsOpen.value = false;
@@ -778,6 +808,7 @@ async function openPendingPushTarget() {
     openingPushTarget = false;
   }
 }
+watch(() => settingsPanel.value?.working, working => { if (!working) void openPendingPushTarget(); });
 function onNetworkChange() {
   api.setOnline(navigator.onLine);
   if (state.online && !state.loading) {
@@ -813,7 +844,11 @@ function onScroll() {
     const element = scroll.value;
     const changedLayout = element.scrollHeight !== lastScrollHeight;
     lastScrollHeight = element.scrollHeight;
-    if (programmaticScrollTop !== undefined && Math.abs(element.scrollTop - programmaticScrollTop) <= 1) {
+    if (conversationOutput.value?.isVirtual) {
+      // The virtualizer owns prepend/streaming compensation. This handler only
+      // records reading intent; a second scroll writer would fight its anchor.
+      followLatest.value = nearConversationBottom(element);
+    } else if (programmaticScrollTop !== undefined && Math.abs(element.scrollTop - programmaticScrollTop) <= 1) {
       programmaticScrollTop = undefined;
     } else if (followLatest.value && changedLayout && readingLayoutReady()) {
       // Appended output and delayed process/image layout are not a request to
@@ -853,6 +888,12 @@ function queueReadingLayout() {
   scrollLayoutFrame = requestAnimationFrame(() => {
     scrollLayoutFrame = 0;
     if (generation !== navigationSelection || !scroll.value || !readingLayoutReady()) return;
+    if (conversationOutput.value?.isVirtual) {
+      conversationOutput.value.refreshVirtual();
+      lastScrollHeight = scroll.value.scrollHeight;
+      showScrollBottom.value = !nearConversationBottom(scroll.value);
+      return;
+    }
     if (followLatest.value) scrollBottom();
     else {
       lastScrollHeight = scroll.value.scrollHeight;
@@ -865,7 +906,8 @@ function scrollBottom() {
     if (state.activeThread && !state.loading && !state.selectingThread && state.threadReady)
       restoredScrollKey = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
     followLatest.value = true;
-    scroll.value.scrollTop = scroll.value.scrollHeight;
+    if (conversationOutput.value?.isVirtual) conversationOutput.value.scrollToLatest();
+    else scroll.value.scrollTop = scroll.value.scrollHeight;
     lastScrollHeight = scroll.value.scrollHeight;
     programmaticScrollTop = scroll.value.scrollTop;
     showScrollBottom.value = false;
@@ -879,7 +921,9 @@ async function loadOlder() {
   await action(() => api.loadOlderTurns());
   await nextTick();
   if (generation !== navigationSelection || !position || !scroll.value) return;
-  restoreConversationReading(scroll.value, position);
+  if (conversationOutput.value?.isVirtual) await conversationOutput.value.restoreReading(position);
+  else restoreConversationReading(scroll.value, position);
+  if (generation !== navigationSelection || !scroll.value) return;
   lastScrollHeight = scroll.value.scrollHeight;
   programmaticScrollTop = scroll.value.scrollTop;
   showScrollBottom.value = !nearConversationBottom(scroll.value);
@@ -912,6 +956,10 @@ function onKeydown(event: KeyboardEvent) {
   // Native dialogs own their focus and Escape handling, including unsaved edits.
   if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
   if (conversationImages.image.value) return;
+  if (settingsOpen.value) {
+    if (event.key === "Escape") { event.preventDefault(); settingsPanel.value?.close(); }
+    return;
+  }
   const modifier = event.metaKey || event.ctrlKey;
   const editable = (event.target as HTMLElement)?.closest(
     'input, textarea, [contenteditable="true"]',
@@ -1451,6 +1499,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :upload-edit-files="api.uploadEditFiles"
               :cancel-message-edit="api.cancelMessageEdit"
               :load-turn-details="api.loadTurnDetails"
+              :load-tool-output="api.loadToolOutput"
               :async-question-status="api.asyncQuestionStatus"
               :answer-async-question="api.answerAsyncQuestion"
               :async-questions-disabled="asyncQuestionsDisabled"
@@ -1458,6 +1507,7 @@ watch(() => [state.authenticated, state.loading], () => {
               @open-file="(path, line) => openWorkspace('files', path, line)"
               @error="showError"
               @edit-session-active="messageEditOpen = $event"
+              @retain-turns="api.retainHistoryTurns($event.threadId, $event.turnIds, $event.hostId)"
             />
             <ApprovalCard
               v-for="request in activeRequests"
@@ -1551,6 +1601,7 @@ watch(() => [state.authenticated, state.loading], () => {
         :initial-tab="workspaceTab"
         :open-path="scopedWorkspacePath"
         :open-line="scopedWorkspacePath ? workspaceLine : undefined"
+        :tmux-target="workspaceTmuxTarget?.hostId === state.hostId ? workspaceTmuxTarget : undefined"
         @close="workspaceOpen = false"
         @error="showError"
         @add="addToConversation"
@@ -1573,7 +1624,7 @@ watch(() => [state.authenticated, state.loading], () => {
       v-if="resourcesOpen"
       :api="api"
       :state="state"
-      @close="resourcesOpen = false"
+      @close="resourcesOpen = false" @open-tmux="openTmuxTarget"
     />
     <ReviewPanel
       v-if="reviewOpen"
@@ -1583,11 +1634,12 @@ watch(() => [state.authenticated, state.loading], () => {
       @file="reviewOpen = false; openWorkspace('files', $event.path, $event.line)"
     />
     <SettingsPanel
-      v-if="settingsOpen"
+      v-if="settingsOpen" ref="settingsPanel"
       :api="api"
       :state="state"
       :theme="theme"
       :initial-tab="settingsTab"
+      :current-draft="composer?.getDraft() || ''"
       @close="settingsOpen = false"
       @theme="theme = $event"
     />

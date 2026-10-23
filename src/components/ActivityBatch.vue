@@ -6,7 +6,7 @@ import Icon from './Icon.vue';
 import { activityBatchSummary } from '../lib/activity-presentation';
 import type { DisplayItem } from '../lib/events';
 
-const props = defineProps<{ items: DisplayItem[]; hostId?: string; threadId?: string; cwd?: string; busy?: boolean }>();
+const props = defineProps<{ items: DisplayItem[]; hostId?: string; threadId?: string; cwd?: string; busy?: boolean; loadToolOutput?: (item: any) => Promise<string> }>();
 const emit = defineEmits<{ openFile: [path: string, line?: number]; error: [message: string] }>();
 const disclosures = historyDisclosures();
 const identity = props.items[0]?.id || '';
@@ -40,7 +40,7 @@ const summary = computed(() => activityBatchSummary(props.items));
       <Icon name="ChevronDown" :size="13" />
     </summary>
     <div v-if="expanded" class="activity-batch-items">
-      <ChatItem v-for="item in items" :key="item.id" :item="item" :host-id="hostId" :thread-id="threadId" :cwd="cwd" :busy="busy" collapse-tools @open-file="(path, line) => emit('openFile', path, line)" @error="emit('error', $event)" />
+      <ChatItem v-for="item in items" :key="item.id" :item="item" :host-id="hostId" :thread-id="threadId" :cwd="cwd" :busy="busy" :load-tool-output="loadToolOutput" collapse-tools @open-file="(path, line) => emit('openFile', path, line)" @error="emit('error', $event)" />
     </div>
   </details>
 </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
-import VirtualHistoryBlock from "./VirtualHistoryBlock.vue";
+import VirtualTimeline from "./VirtualTimeline.vue";
 import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
 import ActivityBatch from './ActivityBatch.vue';
@@ -14,6 +14,9 @@ import type { DisplayItem } from "../lib/events";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { messageEditDraft, releaseEditAttachments, uploadedEditAttachments, type MessageEditAttachment, type MessageEditSession } from '../lib/message-edit';
 import { uniqueClipboardFiles } from '../lib/clipboard';
+import { conversationTimelineRows, type ConversationTimelineRow } from '../lib/conversation-timeline';
+import type { ReadingPosition } from '../lib/reading-positions';
+import { captureConversationReading, nearConversationBottom } from '../lib/conversation-reading';
 
 const props = defineProps<{
   items: DisplayItem[];
@@ -33,12 +36,14 @@ const props = defineProps<{
   asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain';
   answerAsyncQuestion?: (item: any, answers: string[], threadId?: string, hostId?: string) => Promise<void>;
   asyncQuestionsDisabled?: boolean;
+  loadToolOutput?: (item: DisplayItem) => Promise<string>;
 }>();
 const emit = defineEmits<{
   fork: [turnId?: string];
   openFile: [path: string, line?: number];
   error: [message: string];
   editSessionActive: [active: boolean];
+  retainTurns: [value: { hostId?: string; threadId?: string; turnIds: string[] }];
 }>();
 const editSession = ref<MessageEditSession | null>(null);
 const editingItem = ref<DisplayItem | null>(null);
@@ -104,7 +109,7 @@ const blocks = computed(() =>
       : { ...block, ...turnPresentation(block.items) },
   ),
 );
-provideHistoryDisclosures();
+const disclosures = provideHistoryDisclosures();
 const expandedTurns = reactive(new Set<string>());
 const revealedItemId = ref('');
 let bookmarkRevealTurn = '';
@@ -113,8 +118,16 @@ async function revealItem(itemId: string, turnId: string) {
   bookmarkRevealTurn = turnId;
   expandedTurns.add(turnId);
   await nextTick();
+  if (virtualActivated.value) await timeline.value?.revealItem(itemId);
 }
-defineExpose({ revealItem });
+const timeline = ref<InstanceType<typeof VirtualTimeline>>();
+const location = ref<HTMLElement>();
+const initialReading = ref<ReadingPosition | null>(null);
+const virtualActivated = ref(false);
+async function restoreReading(position: ReadingPosition) { if (virtualActivated.value) await timeline.value?.restoreReading(position); }
+function scrollToLatest() { if (virtualActivated.value) timeline.value?.scrollToLatest(); }
+function refreshVirtual() { if (virtualActivated.value) timeline.value?.refresh(); }
+defineExpose({ revealItem, restoreReading, scrollToLatest, refreshVirtual, isVirtual: virtualActivated });
 const detailLoads = reactive(new Map<string, { loading: boolean; error: string }>());
 async function loadDetails(id: string) {
   if (!props.loadTurnDetails || detailLoads.get(id)?.loading) return;
@@ -175,20 +188,86 @@ function activityLabel(block: any) {
         : "";
   return prefix + elapsedLabel(block.turn);
 }
-function hasPendingQuestion(block: any) {
-  const items = block.kind === 'message' ? [block.item] : block.items;
-  return !!props.answerAsyncQuestion && items.some((item: any) => asyncUserInputQuestions(item).length > 0 &&
-    props.asyncQuestionStatus?.(item, props.threadId, props.hostId) !== 'answered');
+const manuallyClosedBatches = reactive(new Set<string>());
+function batchExpanded(entry: any, running: boolean) {
+  return running ? !manuallyClosedBatches.has(entry.id) : disclosures.batches.has(entry.items[0]?.id || '');
 }
+const rows = computed(() => conversationTimelineRows(blocks.value, {
+  runningTurnId: runningTurnId.value, expanded: expandedTurns, batchExpanded,
+  detailState: id => detailLoads.get(id),
+}));
+watch(() => rows.value.length, count => {
+  if (count > 80 && !virtualActivated.value) {
+    const viewport = location.value?.closest<HTMLElement>('.conversation-scroll, .side-chat-transcript');
+    if (viewport) initialReading.value = captureConversationReading(viewport, nearConversationBottom(viewport));
+    virtualActivated.value = true;
+  }
+}, { immediate: true, flush: 'sync' });
+const pinnedRows = computed(() => rows.value.filter(row => row.item && (row.item.id === revealedItemId.value || row.item.id === editSession.value?.itemId ||
+  !!props.answerAsyncQuestion && asyncUserInputQuestions(row.item).length > 0 && props.asyncQuestionStatus?.(row.item, props.threadId, props.hostId) !== 'answered')).map(row => row.id));
+function toggleVirtualTurn(row: ConversationTimelineRow) {
+  if (!row.turnId) return;
+  if (expandedTurns.has(row.turnId)) { expandedTurns.delete(row.turnId); if (bookmarkRevealTurn === row.turnId) bookmarkRevealTurn = ''; }
+  else { expandedTurns.add(row.turnId); ensureDetails(row.turnId); }
+}
+function toggleVirtualBatch(row: ConversationTimelineRow) {
+  if (row.running) {
+    if (manuallyClosedBatches.has(row.id)) manuallyClosedBatches.delete(row.id);
+    else manuallyClosedBatches.add(row.id);
+  } else {
+    const id = row.items?.[0]?.id || '';
+    if (disclosures.batches.has(id)) disclosures.batches.delete(id); else disclosures.batches.add(id);
+  }
+}
+function itemBindings(row: ConversationTimelineRow) {
+  const item = row.item!;
+  return { item, hostId: props.hostId, threadId: props.threadId, cwd: props.cwd,
+    busy: row.running ?? props.busy, collapseTools: row.nested,
+    asyncQuestionStatus: props.asyncQuestionStatus, answerAsyncQuestion: props.answerAsyncQuestion, asyncQuestionsDisabled: props.asyncQuestionsDisabled, loadToolOutput: props.loadToolOutput,
+    canFork: !props.hideFork && !props.busy && !props.editing && !!item.turnId && (item.type === 'userMessage' || item.type === 'agentMessage' && row.output),
+    canEdit: !editSession.value && item.id === props.editableItemId, editing: props.editing, editDisabled: props.editDisabled,
+    editSession: editSession.value, beginEdit, cancelEdit, saveEdit, uploadEdit, removeEditAttachment };
+}
+watch(() => [[...expandedTurns], editSession.value?.itemId, revealedItemId.value], () => {
+  const protectedIds = new Set(expandedTurns);
+  if (editSession.value?.itemId) { const turn = props.items.find(item => item.id === editSession.value!.itemId)?.turnId; if (turn) protectedIds.add(turn); }
+  if (bookmarkRevealTurn) protectedIds.add(bookmarkRevealTurn);
+  emit('retainTurns', { hostId: props.hostId, threadId: props.threadId, turnIds: [...protectedIds] });
+}, { immediate: true, flush: 'sync' });
+const retainedThreadId = props.threadId;
+const retainedHostId = props.hostId;
+onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: retainedThreadId, turnIds: [] }));
 </script>
 
 <template>
-  <VirtualHistoryBlock v-for="(block, index) in blocks" :key="block.id" :data-history-id="block.id" :enabled="blocks.length > 80" :pinned="index >= blocks.length - 2 || running(block) || hasPendingQuestion(block) || (block.kind === 'message' ? block.item.id === revealedItemId : block.items.some(item => item.id === revealedItemId)) || !!editSession && (block.kind === 'message' ? block.item.id === editSession.itemId : block.items.some(item => item.id === editSession?.itemId))">
+  <span ref="location" class="timeline-location" aria-hidden="true"></span>
+  <VirtualTimeline v-if="virtualActivated" ref="timeline" :rows="rows" :pinned-ids="pinnedRows" :initial-reading="initialReading" v-slot="{ row }">
+    <ChatItem v-if="row.kind === 'item'" v-bind="itemBindings(row)"
+      :class="{ 'virtual-activity-item': row.activity, 'virtual-nested-item': row.nested, 'timeline-output': row.output }"
+      @fork="emit('fork', $event)" @open-file="(path, line) => emit('openFile', path, line)" @error="emit('error', $event)" />
+    <button v-else-if="row.kind === 'turn'" type="button" class="virtual-turn-toggle"
+      :aria-label="row.running ? '工作过程（运行中）' : '工作过程与用时'" :aria-expanded="row.expanded" @click="toggleVirtualTurn(row)">
+      <span v-if="row.running" class="thinking-dot"></span><span>{{ row.label }}</span><Icon name="ChevronRight" :size="14" :class="{ 'virtual-expanded': row.expanded }" />
+    </button>
+    <button v-else-if="row.kind === 'batch'" type="button" class="virtual-batch-toggle" :class="{ 'activity-batch-failed': row.failed }" :aria-expanded="row.expanded" @click="toggleVirtualBatch(row)">
+      <Icon :name="row.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: row.running }" /><span>{{ row.label }}</span>
+      <small v-if="row.status">{{ row.status }}</small><Icon name="ChevronDown" :size="13" :class="{ 'virtual-expanded': row.expanded }" />
+    </button>
+    <div v-else-if="row.kind === 'load'" class="virtual-load-state">
+      <p v-if="row.loading" class="activity-loading" role="status"><Icon name="LoaderCircle" :size="14" class="spin" />正在加载过程记录…</p>
+      <div v-if="row.error" class="activity-load-error" role="alert"><span>{{ row.error }}</span><button class="button button-small button-secondary" @click="loadDetails(row.turnId!)">重试加载过程</button></div>
+      <button v-if="row.hasMore && props.loadTurnDetails" class="button button-small button-secondary activity-load-more" @click="loadDetails(row.turnId!)">{{ row.label }}</button>
+    </div>
+    <p v-else-if="row.kind === 'error'" class="turn-error" role="alert">{{ row.text }}</p>
+    <p v-else :class="row.kind === 'note' ? 'bookmark-fragment-label' : 'activity-empty'">{{ row.text }}</p>
+  </VirtualTimeline>
+  <template v-else>
+  <div v-for="block in blocks" :key="block.id" :data-history-id="block.id">
     <p v-if="block.kind === 'turn' && block.turn?.historyBookmarkTarget" class="bookmark-fragment-label">收藏所在历史片段</p>
     <ChatItem
       v-if="block.kind === 'message'"
       :host-id="hostId" :cwd="cwd" :thread-id="threadId"
-      :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
+      :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
       :item="block.item"
       :busy="busy"
       :can-fork="!hideFork && !busy && !editing && !!block.item.turnId"
@@ -211,7 +290,7 @@ function hasPendingQuestion(block: any) {
         v-for="item in segment.users"
         :key="item.id"
         :host-id="hostId" :cwd="cwd" :thread-id="threadId"
-        :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
+        :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && !busy && !editing && !!item.turnId"
@@ -266,6 +345,7 @@ function hasPendingQuestion(block: any) {
               v-if="entry.kind === 'batch'"
               :host-id="hostId" :thread-id="threadId" :cwd="cwd"
               :items="entry.items"
+              :load-tool-output="loadToolOutput"
               :busy="running(block)"
               @open-file="(path, line) => emit('openFile', path, line)"
               @error="emit('error', $event)"
@@ -273,7 +353,7 @@ function hasPendingQuestion(block: any) {
             <ChatItem
               v-else
               :host-id="hostId" :cwd="cwd" :thread-id="threadId"
-              :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
+              :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
               :item="entry.item"
               :class="{ 'timeline-output': segment.outputs.some(item => item.id === entry.id) }"
               :busy="running(block)"
@@ -291,7 +371,7 @@ function hasPendingQuestion(block: any) {
         v-for="item in segment.dividers.length && expandedTurns.has(block.id) ? [] : segment.outputs"
         :key="item.id"
         :host-id="hostId" :cwd="cwd" :thread-id="threadId"
-        :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
+        :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
         :can-fork="!hideFork && item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
@@ -304,13 +384,14 @@ function hasPendingQuestion(block: any) {
         {{ block.turn.error.message }}
       </p>
     </section>
-  </VirtualHistoryBlock>
+  </div>
+  </template>
   <!-- Revert removes the original turn before the replacement starts. Keep
        the editor mounted at the history tail so failures retain the draft. -->
   <ChatItem
     v-if="editSession && editingItem && !items.some((item) => item.id === editSession?.itemId)"
     :host-id="hostId" :cwd="cwd" :thread-id="threadId"
-    :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
+    :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
     :item="editingItem"
     :editing="editing"
     :edit-disabled="editDisabled"
@@ -336,6 +417,21 @@ function hasPendingQuestion(block: any) {
 </template>
 
 <style scoped>
+.timeline-location { display: none; }
+.virtual-turn-toggle, .virtual-batch-toggle { display: flex; align-items: center; gap: 7px; width: fit-content; max-width: 100%; min-height: 40px; margin: 4px 0 12px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; line-height: 1.6; cursor: pointer; text-align: left; }
+.virtual-turn-toggle:hover, .virtual-batch-toggle:hover { color: var(--text); }
+.virtual-turn-toggle .virtual-expanded { transform: rotate(90deg); }
+.virtual-batch-toggle { width: 100%; margin: 4px 0; gap: 8px; }
+.virtual-batch-toggle > span { flex: 1; }
+.virtual-batch-toggle > small { font-size: 10px; white-space: nowrap; }
+.virtual-batch-toggle > svg:last-child { transform: rotate(-90deg); }
+.virtual-batch-toggle > svg.virtual-expanded:last-child { transform: rotate(0); }
+.virtual-batch-toggle.activity-batch-failed > small { color: var(--red); }
+.virtual-nested-item { margin-left: 24px; }
+.virtual-activity-item:deep(.agent-message), .virtual-activity-item.agent-message { color: var(--muted); font-size: 13px; }
+.virtual-activity-item.timeline-output { color: var(--text); font-size: 14px; }
+.virtual-load-state { margin: 4px 0; }
+@media (max-width: 760px) { .virtual-nested-item { margin-left: 12px; } }
 .bookmark-fragment-label { margin: 12px 0; color: var(--muted); font-size: 12px; }
 .activity-loading { display: flex; align-items: center; gap: 7px; font-size: 12px; }
 .activity-load-error { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--danger); font-size: 12px; }

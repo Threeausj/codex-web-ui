@@ -1,13 +1,14 @@
 import http from 'node:http'
 import net from 'node:net'
-import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import type { Duplex } from 'node:stream'
 import type { Express, RequestHandler } from 'express'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { hostInput } from './storage.js'
-import { sshKnownHostsArgs } from './ssh.js'
+import { sshKnownHostsArgs, type SSHConnectionControl } from './ssh.js'
+import type { SshConnectionPool } from './ssh-pool.js'
+import { openSshForward, type SSHForward } from './ssh-forward.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import type { AuthenticatedRequest, Host } from './types.js'
 import { rewriteDevelopmentAssets } from './dev-preview-rewrite.js'
@@ -15,6 +16,7 @@ import { developmentBootstrap } from './dev-preview-runtime.js'
 import { PreviewCookies } from './dev-preview-cookies.js'
 
 type Dependencies = {
+  sshPool?: SshConnectionPool
   getHost: (id: string) => Host | undefined
   requireAuth: RequestHandler
   requireCsrf: RequestHandler
@@ -24,8 +26,8 @@ type Dependencies = {
 }
 type Ticket = {
   id: string; sessionId: string; hostId: string; port: number; localPort: number
-  origin: string; expiresAt: number; tunnel?: ChildProcess; sockets: Set<WebSocket>; requests: Set<http.ClientRequest>
-  cookies: PreviewCookies
+  origin: string; expiresAt: number; sockets: Set<WebSocket>; requests: Set<http.ClientRequest>
+  cookies: PreviewCookies; forward?: SSHForward
 }
 const input = z.object({
   hostId: z.string().default('local'), port: z.number().int().min(1024).max(65535),
@@ -34,11 +36,11 @@ const input = z.object({
 const PREFIX = '/api/dev-preview/'
 const TTL = 60 * 60 * 1000
 
-export function sshForwardArgs(host: Host, localPort: number, targetPort: number, knownHostsFile?: SSHHostKeyPin) {
+export function sshForwardArgs(host: Host, localPort: number, targetPort: number, knownHostsFile?: SSHHostKeyPin, control?: SSHConnectionControl) {
   const fields = hostInput.parse(Object.fromEntries(Object.entries(host).filter(([key]) => key !== 'id' && key !== 'kind')))
   for (const port of [localPort, targetPort]) if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid forward port')
   const args = ['-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-L', `127.0.0.1:${localPort}:127.0.0.1:${targetPort}`]
-  args.push(...sshKnownHostsArgs(knownHostsFile))
+  if (knownHostsFile || control) args.push(...sshKnownHostsArgs(knownHostsFile, control))
   if (fields.port) args.push('-p', String(fields.port))
   if (fields.identityFile) args.push('-i', fields.identityFile)
   args.push('--', `${fields.username ? `${fields.username}@` : ''}${fields.hostname}`)
@@ -81,32 +83,13 @@ async function freePort() {
   await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()))
   return port
 }
-async function waitForTunnel(child: ChildProcess, port: number) {
-  let failure: Error | undefined
-  child.once('error', error => { failure = error })
-  child.once('exit', () => { failure = new Error('SSH port forwarding failed; verify the host and existing SSH authentication') })
-  const deadline = Date.now() + 16000
-  while (Date.now() < deadline) {
-    if (failure) throw failure
-    const connected = await new Promise<boolean>(resolve => {
-      const socket = net.connect({ host: '127.0.0.1', port })
-      socket.setTimeout(200)
-      const finish = (value: boolean) => { socket.destroy(); resolve(value) }
-      socket.once('connect', () => finish(true)); socket.once('error', () => finish(false)); socket.once('timeout', () => finish(false))
-    })
-    if (connected) return
-    await new Promise(resolve => setTimeout(resolve, 80))
-  }
-  throw new Error('SSH port forwarding timed out')
-}
-
 export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
   const tickets = new Map<string, Ticket>()
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false })
   const dispose = (id: string) => {
     const ticket = tickets.get(id)
     if (!ticket) return
-    tickets.delete(id); ticket.tunnel?.kill('SIGTERM')
+    tickets.delete(id); if (ticket.forward) void ticket.forward.release()
     for (const socket of ticket.sockets) socket.close(4003, 'Preview closed')
     for (const request of ticket.requests) request.destroy(new Error('Preview closed'))
   }
@@ -137,11 +120,10 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
         ticket.localPort = await freePort()
         if (!get(id)) { dispose(id); res.status(401).json({ error: 'Session expired' }); return }
         if (deps.getHost(host.id) !== host) { dispose(id); res.status(409).json({ error: 'Host settings changed; open the preview again' }); return }
-        ticket.tunnel = spawn('ssh', sshForwardArgs(host, ticket.localPort, parsed.port, knownHostsFile), { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
-        ticket.tunnel.stderr?.on('data', () => {})
-        try { await waitForTunnel(ticket.tunnel, ticket.localPort) }
-        catch (error) { ticket.tunnel.kill('SIGTERM'); throw error }
-        ticket.tunnel.once('exit', () => dispose(id))
+        const forward = await openSshForward(host, knownHostsFile, ticket.localPort, parsed.port, { pool: deps.sshPool })
+        if (!get(id) || deps.getHost(host.id) !== host) { await forward.release(); dispose(id); if (!res.destroyed) res.status(409).json({ error: '连接状态已变化，请重新打开预览' }); return }
+        ticket.forward = forward
+        void ticket.forward.closed?.then(() => dispose(id))
       }
       await probeDevelopmentServer(ticket, parsed.path.split('#')[0]!)
       if (!get(id) || deps.getHost(host.id) !== host || res.destroyed) { dispose(id); if (!res.destroyed) res.status(409).json({ error: '连接状态已变化，请重新打开预览' }); return }
@@ -239,12 +221,17 @@ export function registerDevelopmentPreview(app: Express, deps: Dependencies) {
       client.on('message', (data, binary) => {
         const bytes = Buffer.from(data as Buffer)
         if (!get(ticket.id)) { client.close(4003, 'Preview expired'); return }
-        if (ready) upstream.send(bytes, { binary })
+        if (ready && upstream.bufferedAmount + bytes.length > 4 * 1024 * 1024) { client.close(1013, 'Preview upstream is too slow'); upstream.terminate() }
+        else if (ready) upstream.send(bytes, { binary }, error => { if (error) client.close(1011, 'Preview forwarding failed') })
         else if ((queuedBytes += bytes.length) <= 1024 * 1024) queued.push({ data: bytes, binary })
         else client.close(1009, 'Too much pending preview data')
       })
       upstream.on('open', () => { ready = true; for (const message of queued) upstream.send(message.data, { binary: message.binary }); queued.length = 0 })
-      upstream.on('message', (data, binary) => { if (client.readyState === WebSocket.OPEN && get(ticket.id)) client.send(data, { binary }) })
+      upstream.on('message', (data, binary) => {
+        if (client.readyState !== WebSocket.OPEN || !get(ticket.id)) return
+        if (client.bufferedAmount + (data as Buffer).byteLength > 4 * 1024 * 1024) { client.close(1013, 'Preview browser is too slow'); upstream.terminate(); return }
+        client.send(data, { binary }, error => { if (error) upstream.terminate() })
+      })
       upstream.on('error', () => { client.close(1011, 'Development WebSocket unavailable') })
       upstream.on('close', () => { if (client.readyState === WebSocket.OPEN) client.close(1000, 'Development WebSocket closed') })
       client.on('error', () => upstream.terminate())

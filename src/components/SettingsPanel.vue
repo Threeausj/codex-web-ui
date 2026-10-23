@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, defineAsyncComponent, reactive, ref, watch } from "vue";
 import { randomUUID } from "../lib/uuid";
 import Icon from "./Icon.vue";
 import ConnectionDialog from "./ConnectionDialog.vue";
@@ -11,6 +11,8 @@ import IntegrationsSettings from "./IntegrationsSettings.vue";
 import PerformanceSettings from "./PerformanceSettings.vue";
 import CodexSettings from "./CodexSettings.vue";
 import ArchivedChatsPanel from "./ArchivedChatsPanel.vue";
+import type { PromptPresetInput } from "../lib/prompt-presets";
+const PromptPresetsPanel = defineAsyncComponent(() => import("./PromptPresetsPanel.vue"));
 import {
   availablePermissionProfiles,
   configEditRestriction,
@@ -27,11 +29,29 @@ const props = defineProps<{
   state: any;
   theme: string;
   initialTab?: string;
+  currentDraft?: string;
 }>();
 const emit = defineEmits<{ close: []; theme: [value: string] }>();
 const section = ref(props.initialTab || (props.state.hosts?.length ? "general" : "hosts"));
 const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "");
 const codexSettingsBusy = ref(false);
+const presetsEditor = ref<InstanceType<typeof PromptPresetsPanel>>();
+const presetsState = computed(() => props.api.promptPresets.state);
+const presetCommands = [
+  { id: "new", name: "/new", description: "新建对话" },
+  { id: "compact", name: "/compact", description: "压缩上下文" },
+  { id: "fork", name: "/fork", description: "创建分支" },
+  { id: "review", name: "/review", description: "代码审查" },
+  { id: "terminal", name: "/terminal", description: "打开终端" },
+  { id: "settings", name: "/settings", description: "打开设置" },
+];
+function canLeave() { return section.value !== "presets" || presetsEditor.value?.canLeave() !== false; }
+function closeSettings() { if (canLeave()) emit("close"); }
+function changeSection(value: string) { if (value !== section.value && canLeave()) section.value = value; }
+async function savePreset(value: PromptPresetInput) { try { await props.api.promptPresets.save(value); } catch {} }
+async function removePreset(value: { slot: number; expectedVersion: number }) { try { await props.api.promptPresets.remove(value); } catch {} }
+watch(section, value => { if (value === "presets") void props.api.promptPresets.refresh(); }, { immediate: true });
+defineExpose({ close: closeSettings, working: computed(() => presetsEditor.value?.working || presetsState.value.busy) });
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
   { id: "performance", label: "性能", icon: "Zap" },
@@ -39,6 +59,7 @@ const sections = [
   { id: "projects", label: "项目", icon: "Folder" },
   { id: "archived", label: "已归档的聊天", icon: "Archive" },
   { id: "hosts", label: "连接", icon: "Globe" },
+  { id: "presets", label: "提示词预设", icon: "ListChecks" },
   { id: "permissions", label: "权限预设", icon: "Shield" },
   { id: "codex", label: "Codex", icon: "Bot" },
   { id: "account", label: "账户", icon: "Lock" },
@@ -123,7 +144,7 @@ const config = computed(
 );
 const currentHosts = computed(() => props.state.hosts || []);
 const settingsHost = computed(() => currentHosts.value.find((host: any) => host.id === settingsHostId.value));
-const globalSection = computed(() => ["general", "pwa", "account", "shortcuts", "hosts"].includes(section.value));
+const globalSection = computed(() => ["general", "pwa", "account", "shortcuts", "hosts", "presets"].includes(section.value));
 const projectHost = computed(() =>
   currentHosts.value.find((host: any) => host.id === projectHostId.value),
 );
@@ -346,7 +367,7 @@ watch(() => [settingsHostId.value, section.value], () => {
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
+  <div class="modal-backdrop" @click.self="closeSettings">
     <section
       class="settings-modal"
       role="dialog"
@@ -357,7 +378,7 @@ watch(() => [settingsHostId.value, section.value], () => {
         <h2>设置</h2>
         <button
           class="icon-button"
-          @click="emit('close')"
+          @click="closeSettings"
           aria-label="关闭设置"
         >
           <Icon name="X" />
@@ -377,7 +398,7 @@ watch(() => [settingsHostId.value, section.value], () => {
             v-for="entry in sections"
             :key="entry.id"
             :class="{ active: section === entry.id }"
-            @click="section = entry.id"
+            @click="changeSection(entry.id)"
           >
             <Icon :name="entry.icon" :size="16" /><span>{{ entry.label }}</span>
           </button>
@@ -393,6 +414,10 @@ watch(() => [settingsHostId.value, section.value], () => {
             <p>先添加 SSH 连接，或在连接设置中启用本机 Codex。</p>
             <button class="button button-secondary" @click="section = 'hosts'">打开连接设置</button>
           </div>
+          <PromptPresetsPanel v-else-if="section === 'presets'" ref="presetsEditor" embedded
+            :snapshot="presetsState.snapshot" :loading="presetsState.loading" :busy="presetsState.busy"
+            :error="presetsState.error" :current-draft="currentDraft || ''" :supported-commands="presetCommands"
+            @refresh="api.promptPresets.refresh(true)" @save="savePreset" @remove="removePreset" />
           <template v-else-if="section === 'general'">
             <h3>按你的方式工作</h3>
             <p class="settings-description">

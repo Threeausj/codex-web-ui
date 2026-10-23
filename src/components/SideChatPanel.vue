@@ -11,6 +11,7 @@ const state = computed(() => props.controller.state);
 const question = computed({ get: () => state.value.draft || '', set: value => { state.value.draft = value; } });
 const questionField = ref<HTMLTextAreaElement>();
 const transcript = ref<HTMLElement>();
+const output = ref<InstanceType<typeof ConversationOutput>>();
 const closeDialog = ref<HTMLDialogElement>();
 const closePrompt = ref(false);
 const localError = ref('');
@@ -60,6 +61,7 @@ function onScroll() {
   if (element) followTail.value = element.scrollHeight - element.clientHeight - element.scrollTop < 80;
 }
 watch(() => [state.value.items, state.value.turns, state.value.busy, requests.value.length], () => {
+  if (output.value?.isVirtual) return;
   if (!followTail.value) return;
   void nextTick(() => { if (transcript.value) transcript.value.scrollTop = transcript.value.scrollHeight; });
 }, { deep: true });
@@ -72,6 +74,8 @@ async function send() {
     const accepted = await props.controller.send(draft.trim());
     if (accepted !== false && sourceKey.value === key && question.value === draft) question.value = '';
     followTail.value = true;
+    await nextTick();
+    output.value?.scrollToLatest();
     focusQuestion();
   } catch (cause: any) {
     if (sourceKey.value === key) localError.value = cause?.message || '发送失败，请重试。';
@@ -160,7 +164,7 @@ function quoteAnswer() {
       <summary><Icon name="CornerDownLeft" :size="14" /><span>引用 {{ quoteSource.threadName || '原对话' }}</span><Icon name="ChevronDown" :size="13" /></summary>
       <blockquote>{{ quoteSource.text }}</blockquote>
     </details>
-      <ConversationOutput :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :thread-id="state.threadId" :cwd="state.sourceCwd" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
+      <ConversationOutput ref="output" :items="state.items || []" :turns="state.turns || []" :busy="state.busy" :host-id="state.source?.hostId" :thread-id="state.threadId" :cwd="state.sourceCwd" :hide-fork="true" @open-file="(path, line) => emit('openFile', path, line)" @error="localError = $event" />
       <ApprovalCard v-for="request in requests" :key="request.id" :request="request" :items="state.items" :api="api" />
       <p v-if="state.loading" class="side-chat-status" role="status"><Icon name="LoaderCircle" :size="15" class="spin" />正在准备侧边对话…</p>
       <div v-if="!state.items?.length && !state.loading && !state.busy" class="side-chat-empty"><Icon name="CircleHelp" :size="24" /><p>{{ conversationContext ? '基于当前对话，继续提问' : '想了解这段内容的哪一部分？' }}</p></div>

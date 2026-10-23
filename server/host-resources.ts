@@ -1,14 +1,15 @@
-import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { Express } from 'express'
 import { z } from 'zod'
 import { Bridge, type ReleasedThread, type BridgeOptions } from './bridge.js'
-import { shellQuote, sshKnownHostsArgs } from './ssh.js'
+import { sshKnownHostsArgs, sshPythonArgs, type SSHConnectionControl } from './ssh.js'
+import { runHostPython } from './host-helper.js'
 import { writePrivateJson } from './storage.js'
 import type { Host } from './types.js'
 
-export type GpuResources = { available: boolean; reason?: string; devices: { index: number; name: string; utilizationPercent: number | null; memoryUsedBytes: number | null; memoryTotalBytes: number | null; temperatureC: number | null; powerWatts: number | null }[] }
+export type GpuProcess = { gpuIndex: number | null; gpuUuid: string; pid: number; name: string; user: string | null; memoryUsedBytes: number | null; elapsedSeconds: number | null; command: string | null }
+export type GpuResources = { available: boolean; reason?: string; processes?: GpuProcess[]; processReason?: string; processesTruncated?: boolean; devices: { index: number; name: string; utilizationPercent: number | null; memoryUsedBytes: number | null; memoryTotalBytes: number | null; temperatureC: number | null; powerWatts: number | null }[] }
 export type RawHostResources = {
   sampledAt: number; scope: 'host' | 'container'; cpu: { total: number | null; idle: number | null; load: number[]; cores: number | null }
   memory: { usedBytes: number | null; totalBytes: number | null }; network: { rxBytes: number | null; txBytes: number | null; interfaces: string[] }
@@ -87,6 +88,49 @@ if shutil.which('nvidia-smi'):
             else: gpus['reason']='未检测到可读取的 NVIDIA 显卡'
     except subprocess.TimeoutExpired: gpus['reason']='显卡状态读取超时'
     except (OSError,ValueError,csv.Error): gpus['reason']='显卡状态返回格式不可识别'
+# A process query is independent from board telemetry: an old driver or
+# inaccessible /proc must never hide otherwise valid GPU utilization.
+if gpus['available']:
+    gpus['processes']=[]
+    try:
+        import pwd
+        def text_limit(value,limit): return value.encode('utf-16-le','surrogatepass')[:limit*2].decode('utf-16-le','ignore')
+        mapping={}
+        index_result=subprocess.run(['nvidia-smi','--query-gpu=uuid,index','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=1.5)
+        if index_result.returncode==0 and len(index_result.stdout)<=32768:
+            for row in csv.reader(io.StringIO(index_result.stdout)):
+                if len(row)==2 and row[1].strip().isdigit(): mapping[row[0].strip()]=int(row[1])
+        processes=subprocess.run(['nvidia-smi','--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=1.5)
+        if processes.returncode: gpus['processReason']='驱动不支持进程查询或当前用户无读取权限'
+        elif len(processes.stdout)>262144: gpus['processReason']='GPU 进程列表超出读取上限'
+        else:
+            boot=None
+            try: boot=int(next(line.split()[1] for line in read('stat').splitlines() if line.startswith('btime ')))
+            except (ValueError,IndexError,StopIteration): pass
+            clock=float(os.sysconf('SC_CLK_TCK'))
+            seen=set()
+            for row in csv.reader(io.StringIO(processes.stdout)):
+                if len(row)!=4 or not row[1].strip().isdigit(): raise ValueError('Invalid GPU process')
+                gpu=text_limit(row[0].strip(),120); pid=int(row[1].strip())
+                if pid<=0 or (gpu,pid) in seen: continue
+                seen.add((gpu,pid))
+                if len(gpus['processes'])>=128:
+                    gpus['processesTruncated']=True; break
+                process={'gpuIndex':mapping.get(gpu),'gpuUuid':gpu,'pid':pid,'name':text_limit(row[2].strip(),256),'user':None,'memoryUsedBytes':None,'elapsedSeconds':None,'command':None}
+                used=number(row[3]); process['memoryUsedBytes']=None if used is None else used*1048576
+                proc=P/str(pid)
+                try:
+                    uid=proc.stat().st_uid
+                    try: process['user']=text_limit(pwd.getpwuid(uid).pw_name,100)
+                    except KeyError: process['user']=str(uid)
+                    with proc.joinpath('cmdline').open('rb') as command_file: command=command_file.read(2048)
+                    process['command']=text_limit(' '.join(command.decode('utf-8','replace').split('\0')).strip(),512) or None
+                    stat=proc.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                    if boot is not None: process['elapsedSeconds']=max(0,time.time()-boot-float(stat[19])/clock)
+                except (OSError,ValueError,IndexError): pass
+                gpus['processes'].append(process)
+    except subprocess.TimeoutExpired: gpus['processReason']='GPU 进程查询超时，显卡汇总仍然有效'
+    except (OSError,ValueError,csv.Error): gpus['processReason']='GPU 进程数据格式不可识别，显卡汇总仍然有效'
 scope='container' if pathlib.Path('/.dockerenv').exists() or any(x in read('1/cgroup') for x in ['docker','kubepods','containerd','lxc']) else 'host'
 if scope=='container':
     # /proc CPU/RAM/disk counters may describe the whole host. Prefer the
@@ -139,33 +183,18 @@ print(json.dumps(result))
 `
 
 /** Reuse the pinned-host policy; stdin carries code rather than shell expansion. */
-export function resourceSshArgs(host: Host, pin?: Parameters<typeof sshKnownHostsArgs>[0]) {
-  const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8', '-o', 'LogLevel=ERROR', ...sshKnownHostsArgs(pin)]
-  if (host.port) args.push('-p', String(host.port))
-  if (host.identityFile) args.push('-i', host.identityFile)
-  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, `exec /bin/sh -c ${shellQuote('exec python3 -')}`)
-  return args
+export function resourceSshArgs(host: Host, pin?: Parameters<typeof sshKnownHostsArgs>[0], control?: SSHConnectionControl) {
+  return sshPythonArgs(host, pin, control)
 }
 
 export async function collectHostResources(host: Host, options: BridgeOptions = {}): Promise<RawHostResources> {
-  const pin = host.kind === 'ssh' ? await options.resolveSshHostKeyPin?.(host) ?? options.sshHostKeyPin : undefined
-  const executable = host.kind === 'ssh' ? 'ssh' : 'python3'
-  const args = host.kind === 'ssh' ? resourceSshArgs(host, pin) : ['-']
-  return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, { shell: false, stdio: ['pipe', 'pipe', 'pipe'] })
-    let stdout = ''; let stderr = ''; let finished = false; let timedOut = false
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, 11_000); timer.unref()
-    const finish = (error?: Error) => { if (finished) return; finished = true; clearTimeout(timer); if (error) reject(error); else { try { resolve(parseRawResources(JSON.parse(stdout))) } catch { reject(new Error('主机资源返回格式不可识别')) } } }
-    child.on('error', () => finish(new Error(host.kind === 'ssh' ? '无法启动资源采集 SSH，请检查服务端 SSH 安装' : '资源采集需要 Linux 和 Python 3')))
-    child.stdin.on('error', () => {})
-    child.stdout.on('data', data => { stdout += data.toString(); if (stdout.length > 96 * 1024) { child.kill('SIGKILL'); finish(new Error('主机资源返回数据超出限制')) } })
-    child.stderr.on('data', data => { stderr = (stderr + data.toString()).slice(-2048) })
-    child.on('close', code => {
-      if (code !== 0) finish(new Error(timedOut ? '主机资源采集超时' : /host key|identification has changed/i.test(stderr) ? '请在服务器设置中确认并信任 SSH 主机指纹' : /python3.*not found/i.test(stderr) ? '资源采集需要目标主机安装 Python 3' : '无法读取主机资源，请检查 Linux、SSH 连接及账户权限'))
-      else finish()
-    })
-    child.stdin.end(HOST_RESOURCE_HELPER)
-  })
+  try {
+    return parseRawResources(JSON.parse(await runHostPython(host, HOST_RESOURCE_HELPER, options,
+      { timeoutMs: 11000, maxOutputBytes: 256 * 1024, background: true })))
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error('主机资源返回格式不可识别')
+    throw error
+  }
 }
 
 const nullableCounter = z.number().finite().nonnegative().nullable()
@@ -175,7 +204,9 @@ const rawSchema = z.object({
   memory: z.object({ usedBytes: nullableCounter, totalBytes: nullableCounter }),
   network: z.object({ rxBytes: nullableCounter, txBytes: nullableCounter, interfaces: z.array(z.string().max(100)).max(1000) }),
   disk: z.object({ readBytes: nullableCounter, writeBytes: nullableCounter }),
-  gpus: z.object({ available: z.boolean(), reason: z.string().max(300).optional(), devices: z.array(z.object({ index: z.number().int().nonnegative(), name: z.string().max(200), utilizationPercent: nullableCounter, memoryUsedBytes: nullableCounter, memoryTotalBytes: nullableCounter, temperatureC: nullableCounter, powerWatts: nullableCounter })).max(64) }),
+  gpus: z.object({ available: z.boolean(), reason: z.string().max(300).optional(),
+    processes: z.array(z.object({ gpuIndex: z.number().int().nonnegative().nullable(), gpuUuid: z.string().max(120), pid: z.number().int().positive().safe(), name: z.string().max(256), user: z.string().max(100).nullable(), memoryUsedBytes: nullableCounter, elapsedSeconds: nullableCounter, command: z.string().max(512).nullable() })).max(128).optional(),
+    processReason: z.string().max(300).optional(), processesTruncated: z.boolean().optional(), devices: z.array(z.object({ index: z.number().int().nonnegative(), name: z.string().max(200), utilizationPercent: nullableCounter, memoryUsedBytes: nullableCounter, memoryTotalBytes: nullableCounter, temperatureC: nullableCounter, powerWatts: nullableCounter })).max(64) }),
 })
 export const parseRawResources = (value: unknown): RawHostResources => rawSchema.parse(value)
 

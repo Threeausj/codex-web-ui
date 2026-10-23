@@ -157,11 +157,13 @@ test('an old bookmark reads only its native turn in bounded item pages and pins 
     { id: 'old-target', type: 'agentMessage', phase: 'commentary', text: '最早一轮需要回看的具体说明' });
   mock.bookmarks = [bookmark({ source: { ...source, turnId: oldest.id, itemId: 'old-target', text: '需要回看的具体说明' } })];
   await login(page); await openHistory(page);
-  // More than 80 blocks activates the actual IntersectionObserver unmounting.
+  // History is a flat virtual list; mounted rows stay bounded as pages grow.
   await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
-  await expect.poll(() => page.locator('.virtual-history-block').count()).toBe(60);
+  const timeline = page.locator('[data-virtual-timeline]');
+  await expect(timeline).toBeVisible();
+  await expect.poll(async () => Number(await timeline.getAttribute('data-row-count'))).toBeGreaterThanOrEqual(120);
   await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
-  await expect.poll(() => page.locator('.virtual-history-block').count()).toBeGreaterThan(80);
+  await expect.poll(async () => Number(await timeline.getAttribute('data-row-count'))).toBeGreaterThanOrEqual(180);
   const summaryReads = mock.requests.filter(request => request.method === 'thread/turns/list').length;
   await openPanel(page); await page.getByRole('button', { name: '跳转到收藏 重点结论', exact: true }).click();
   const target = page.locator('[data-selection-item-id="old-target"]');
@@ -177,9 +179,10 @@ test('an old bookmark reads only its native turn in bounded item pages and pins 
   // The normal pager later reaches this detached turn. It must merge the
   // bookmark message once and restore the original chronological position.
   await page.getByRole('button', { name: '加载更早的消息', exact: true }).click();
-  await expect.poll(() => page.locator('.virtual-history-block').count()).toBe(100);
-  const chronology = await page.locator('.virtual-history-block').evaluateAll(elements => elements.map(element => element.getAttribute('data-history-id')));
-  expect(chronology.slice(0, 3)).toEqual(['long-turn-0', 'long-turn-1', 'long-turn-2']);
+  await expect.poll(async () => Number(await timeline.getAttribute('data-row-count'))).toBeGreaterThanOrEqual(200);
+  expect(await page.locator('[data-timeline-row]').count()).toBeLessThan(65);
+  await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
+  await expect(page.locator('[data-timeline-row="item:long-user-0"]')).toBeVisible();
   await expect(target).toHaveCount(1); expectNoModelMutation(mock);
 });
 

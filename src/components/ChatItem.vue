@@ -36,6 +36,7 @@ const props = defineProps<{
   asyncQuestionStatus?: (item: any, threadId?: string, hostId?: string) => 'pending' | 'sending' | 'answered' | 'uncertain'
   answerAsyncQuestion?: (item: any, answers: string[], threadId?: string, hostId?: string) => Promise<void>
   asyncQuestionsDisabled?: boolean
+  loadToolOutput?: (item: any) => Promise<string>
 }>()
 const emit = defineEmits<{ fork: [turnId?: string]; openFile: [path: string, line?: number]; error: [message: string] }>()
 const copied = ref(false)
@@ -96,7 +97,18 @@ const totalChanges = computed(() => (props.item.changes || []).reduce((sum: any,
 const toolIcon = computed(() => readActions.value.length ? 'BookOpen' : ({ commandExecution: 'Terminal', fileChange: 'GitCompareArrows', mcpToolCall: 'Package', dynamicToolCall: 'Zap', collabAgentToolCall: 'Bot', webSearch: 'Globe', imageView: 'Image', imageGeneration: 'Image', enteredReviewMode: 'Eye', exitedReviewMode: 'CheckCircle2' } as Record<string, string>)[props.item.type] || 'Code2')
 const toolOpenByDefault = computed(() => !props.collapseTools && !!props.busy && !['commandExecution', 'fileChange'].includes(props.item.type))
 const status = computed(() => props.item.status === 'inProgress' || props.item.status === 'running' ? '处理中' : props.item.status === 'failed' ? '失败' : props.item.exitCode != null ? `退出 ${props.item.exitCode}` : '')
-const detailsText = computed(() => props.item.aggregatedOutput || props.item.review || props.item.prompt || (props.item.result ? JSON.stringify(props.item.result, null, 2) : props.item.arguments ? JSON.stringify(props.item.arguments, null, 2) : props.item.output ? JSON.stringify(props.item.output, null, 2) : JSON.stringify(props.item, null, 2)))
+const completeOutput = ref<string | null>(null)
+const outputLoading = ref(false), outputError = ref('')
+watch(() => props.item.id, () => { completeOutput.value = null; outputError.value = ''; })
+const detailsText = computed(() => completeOutput.value ?? (props.item.type === 'commandExecution' && typeof props.item.aggregatedOutput === 'string' ? props.item.aggregatedOutput : props.item.aggregatedOutput || props.item.review || props.item.prompt || (props.item.result ? JSON.stringify(props.item.result, null, 2) : props.item.arguments ? JSON.stringify(props.item.arguments, null, 2) : props.item.output ? JSON.stringify(props.item.output, null, 2) : JSON.stringify(props.item, null, 2))))
+async function readCompleteOutput() {
+  if (!props.loadToolOutput || outputLoading.value) return
+  const id = props.item.id
+  outputLoading.value = true; outputError.value = ''
+  try { const output = await props.loadToolOutput(props.item); if (props.item.id === id) completeOutput.value = output }
+  catch (error: any) { if (props.item.id === id) outputError.value = error?.message || '无法读取完整输出，请重试' }
+  finally { outputLoading.value = false }
+}
 async function copy() {
   try { await navigator.clipboard.writeText(text.value); copied.value = true; setTimeout(() => { copied.value = false }, 1600) }
   catch { emit('error', '无法复制到剪贴板，请检查浏览器权限。') }
@@ -212,12 +224,15 @@ function onLink(event: MouseEvent) {
     <div v-else-if="item.type === 'imageGeneration' && item.savedPath" class="tool-content"><ConversationImage :path="item.savedPath" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
     <div v-else-if="item.type === 'imageView' && item.path" class="tool-content"><ConversationImage :path="item.path" :host-id="hostId || 'local'" :thread-id="threadId" /></div>
     <div v-else-if="findings.length" class="review-findings"><article v-for="(finding, index) in findings" :key="index" class="review-finding"><strong>{{ finding.title }}</strong><p>{{ finding.body }}</p><button class="button button-small button-secondary" @click="emit('openFile', finding.file, finding.start)">{{ finding.file }}{{ finding.start ? ':' + finding.start : '' }}</button></article></div>
-    <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre><pre>{{ detailsText }}</pre></div>
+    <div v-else class="tool-content"><div v-if="item.cwd" class="tool-cwd">{{ item.cwd }}</div><pre v-if="item.command" class="command-code">$ {{ item.command }}</pre>
+      <div v-if="item.outputTotalLength && completeOutput === null" class="output-window-note"><span>{{ item.outputWindowLength ? `当前显示末尾 ${(item.outputWindowLength / 1024).toFixed(0)} Ki 字符，共 ${item.outputTotalLength.toLocaleString()} 字符。` : `输出已从内存释放，共 ${item.outputTotalLength.toLocaleString()} 字符，可按需重新读取。` }}</span><button v-if="loadToolOutput" type="button" class="button button-small button-secondary" :disabled="outputLoading" @click="readCompleteOutput">{{ outputLoading ? '正在读取…' : '读取完整输出' }}</button></div>
+      <p v-if="outputError" role="alert" class="message-edit-error">{{ outputError }}</p><pre>{{ detailsText }}</pre></div>
     </template>
   </details>
 </template>
 
 <style scoped>
+.output-window-note { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 5px 0; font-size: 11px; color: var(--muted); }
 .message-image-preview { display: block; max-width: 100%; padding: 0; border: 0; border-radius: 10px; background: transparent; cursor: zoom-in; overflow: hidden; }
 .message-image-preview:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
 .markdown :deep(img[data-conversation-image]) { cursor: zoom-in; }

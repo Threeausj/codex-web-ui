@@ -77,6 +77,38 @@ test('Linux resource sampling survives unavailable, malformed and timed-out GPU 
   assert.ok(['host', 'container'].includes(real.scope))
 })
 
+test('GPU process attribution maps board identities and isolates inaccessible processes or unsupported driver queries', { skip: !canRunHelper }, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-gpu-processes-'))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const binary = path.join(directory, 'nvidia-smi')
+  const run = () => {
+    const result = spawnSync(python.stdout.trim(), ['-c', HOST_RESOURCE_HELPER], { encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: `${directory}:/usr/bin:/bin` } })
+    assert.equal(result.status, 0, result.stderr)
+    return parseRawResources(JSON.parse(result.stdout))
+  }
+  const script = `#!/bin/sh\ncase "$1" in\n--query-gpu=uuid,index) printf '%s\\n' 'GPU-fixture, 2';;\n--query-compute-apps=*) printf '%s\\n' 'GPU-fixture, ${process.pid}, python train.py, 1536' 'GPU-fixture, 2147483647, inaccessible, [N/A]';;\n*) printf '%s\\n' '2, NVIDIA fixture, 70, 2048, 24576, 62, 140';;\nesac\n`
+  await fs.writeFile(binary, script, { mode: 0o700 })
+  const result = run()
+  assert.equal(result.gpus.available, true)
+  assert.equal(result.gpus.processes?.length, 2)
+  assert.equal(result.gpus.processes![0]!.gpuIndex, 2)
+  assert.equal(result.gpus.processes![0]!.pid, process.pid)
+  assert.equal(result.gpus.processes![0]!.memoryUsedBytes, 1536 * 1048576)
+  assert.ok(result.gpus.processes![0]!.user)
+  assert.ok(result.gpus.processes![0]!.command)
+  assert.ok(result.gpus.processes![0]!.elapsedSeconds! >= 0)
+  assert.equal(result.gpus.processes![1]!.user, null)
+  assert.equal(result.gpus.processes![1]!.memoryUsedBytes, null)
+  await fs.writeFile(binary, script.replace("printf '%s\\n' 'GPU-fixture, ${process.pid}, python train.py, 1536' 'GPU-fixture, 2147483647, inaccessible, [N/A]'", 'exit 1'))
+  // The process query may fail independently; the device meter still survives.
+  await fs.writeFile(binary, `#!/bin/sh\ncase "$1" in\n--query-compute-apps=*) exit 1;;\n--query-gpu=uuid,index) printf '%s\\n' 'GPU-fixture, 2';;\n*) printf '%s\\n' '2, NVIDIA fixture, 70, 2048, 24576, 62, 140';;\nesac\n`)
+  const unavailable = run()
+  assert.equal(unavailable.gpus.available, true)
+  assert.equal(unavailable.gpus.devices[0]!.index, 2)
+  assert.match(unavailable.gpus.processReason!, /不支持|权限/)
+  assert.deepEqual(unavailable.gpus.processes, [])
+})
+
 function peer(acceptInitialize = true) {
   const input = new PassThrough(); const output = new PassThrough(); const events = new EventEmitter(); const sent: RpcMessage[] = []
   let disposed = false; let buffer = ''
