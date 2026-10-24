@@ -738,10 +738,12 @@ async function execute(command: string) {
 }
 async function fork(turnId?: string) {
   if (forkActionsDisabled.value) return;
-  const result = await action(() => api.forkThread(state.activeThread!.id, state.hostId, turnId));
-  // A pending fork must not navigate or scroll a conversation selected later.
-  // Reuse normal navigation so the source reading position is saved as well.
-  if (result?.canSelect) await selectThread(result);
+  await action(async () => {
+    const result = await api.forkThread(state.activeThread!.id, state.hostId, turnId);
+    // A pending fork must not navigate or scroll a conversation selected later.
+    // Reuse normal navigation so the source reading position is saved as well.
+    if (result.canSelect) await selectThread(result);
+  });
 }
 function openRename() {
   renameValue.value = state.activeThread?.name || "";
