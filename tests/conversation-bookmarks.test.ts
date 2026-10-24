@@ -23,6 +23,8 @@ test('a late project response cannot replace bookmarks for another host with the
   const f = fixture();
   const old = f.store.open(project, 'Local project');
   const current = f.store.open(remote, 'Remote project');
+  assert.equal(new Headers(f.requests[0]!.options?.headers).get('Accept'), 'application/vnd.codex-web.bookmarks.v2+json');
+  assert.equal(new Headers(f.requests[1]!.options?.headers).get('Accept'), 'application/vnd.codex-web.bookmarks.v2+json');
   f.requests[0]!.resolve({ bookmarks: [bookmark()] });
   await old;
   assert.deepEqual(f.store.state.entries, []);
@@ -122,6 +124,7 @@ test('the global catalog is lazy, coalesces concurrent consumers and remains cac
   const opening = f.store.openAll();
   assert.equal(f.requests.length, 1);
   assert.equal(f.requests[0]!.path, '/bookmarks?all=true');
+  assert.equal(new Headers(f.requests[0]!.options?.headers).get('Accept'), 'application/vnd.codex-web.bookmarks.v2+json');
   assert.equal(f.store.state.indexLoading, true);
   assert.equal(f.store.state.loading, true);
   assert.equal(f.store.state.allProjects, true);

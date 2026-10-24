@@ -672,7 +672,8 @@ test('recovered worker activation waits for work that started after updating was
     expect(navigations).toBe(0);
     // With a nonempty draft the running composer shows its steer action.
     await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeEnabled();
-    await expect(page.getByRole('combobox', { name: '选择模型', exact: true })).toBeDisabled();
+    // Running work still defers activation while its model remains editable.
+    await expect(page.getByRole('combobox', { name: '选择模型', exact: true })).toBeEnabled();
     await expect(input).toHaveValue('任务完成后更新仍保留的草稿');
     await Promise.all([page.waitForEvent('domcontentloaded', { timeout: 6000 }), Promise.resolve().then(() => mock.finishStream())]);
     await expect(input).toHaveValue('任务完成后更新仍保留的草稿');

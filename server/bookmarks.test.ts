@@ -6,12 +6,18 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { Bookmarks, MAX_BOOKMARKS, MAX_BOOKMARK_BYTES, bookmarkInput } from './bookmarks.js';
 import { createServer } from './app.js';
-import type { BookmarkScope, ConversationBookmark, ConversationBookmarkInput } from '../shared/bookmarks.js';
+import type { BookmarkScope, ConversationBookmark, MessageBookmarkInput, ThreadBookmarkInput } from '../shared/bookmarks.js';
 
 const scope: BookmarkScope = { hostId: 'local', projectPath: '/project' };
-const input = (overrides: Partial<ConversationBookmarkInput> = {}): ConversationBookmarkInput => ({
+const typedBookmarksAccept = 'application/vnd.codex-web.bookmarks.v2+json';
+const input = (overrides: Partial<MessageBookmarkInput> = {}): MessageBookmarkInput => ({
   ...scope, name: 'Important answer',
   source: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', text: 'A selected paragraph.\nWith another line.', threadName: 'Original conversation' },
+  ...overrides,
+});
+const threadInput = (overrides: Partial<ThreadBookmarkInput> = {}): ThreadBookmarkInput => ({
+  ...scope, name: 'Saved conversation', kind: 'thread',
+  source: { threadId: 'thread-1', threadName: 'Original conversation' },
   ...overrides,
 });
 const directory = () => fs.mkdtemp(path.join(os.tmpdir(), 'codex-bookmarks-'));
@@ -102,6 +108,79 @@ test('identical selections are idempotent across concurrent requests and do not 
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('whole-chat favorites coexist with legacy selections and survive restart without changing their source anchors', async () => {
+  const root = await directory();
+  try {
+    const file = path.join(root, 'bookmarks.json');
+    const legacy = savedBookmark(1);
+    await fs.writeFile(file, JSON.stringify({ version: 1, bookmarks: [legacy] }));
+    const store = new Bookmarks(file);
+    await store.init();
+    const chat = await store.add(threadInput());
+    assert.equal(chat.kind, 'thread');
+    assert.deepEqual(chat.source, { threadId: 'thread-1', threadName: 'Original conversation' });
+    assert.deepEqual(store.list(scope).find(value => value.id === legacy.id), legacy);
+    assert.equal(store.list(scope).length, 2);
+    const explicitMessage = await store.add(input({ kind: 'message', source: legacy.source }));
+    assert.equal(explicitMessage.id, legacy.id);
+    assert.equal(Object.hasOwn(explicitMessage, 'kind'), false);
+    const restored = new Bookmarks(file);
+    await restored.init();
+    assert.deepEqual(restored.listAll(), store.listAll());
+    assert.deepEqual(restored.listAll().find(value => value.id === legacy.id), legacy);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')).bookmarks.find((value: ConversationBookmark) => value.id === chat.id).source,
+      { threadId: 'thread-1', threadName: 'Original conversation' });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('whole-chat favorites are idempotent per host and chat across concurrent requests and project moves', async () => {
+  const root = await directory();
+  try {
+    const store = new Bookmarks(path.join(root, 'bookmarks.json'));
+    await store.init();
+    const repeated = await Promise.all(Array.from({ length: 8 }, (_, index) => store.add(threadInput({ name: `Attempt ${index}` }))));
+    assert.equal(new Set(repeated.map(value => value.id)).size, 1);
+    const first = repeated[0]!;
+    assert.equal(first.name, 'Attempt 0');
+    const renamed = await store.rename(first.id, scope, { name: 'My saved chat name' });
+    const moved = await store.add(threadInput({ projectPath: '/new-project', name: 'Do not overwrite the name' }));
+    assert.equal(moved.id, first.id);
+    assert.equal(moved.name, renamed.name);
+    assert.equal(moved.projectPath, scope.projectPath);
+    assert.equal(store.list({ ...scope, projectPath: '/new-project' }).length, 0);
+    assert.equal(store.list(scope).length, 1);
+    const remote = await store.add(threadInput({ hostId: 'remote' }));
+    const otherChat = await store.add(threadInput({ source: { threadId: 'thread-2', threadName: 'Second chat' } }));
+    assert.notEqual(remote.id, first.id);
+    assert.notEqual(otherChat.id, first.id);
+    await assert.rejects(store.rename(first.id, { ...scope, hostId: 'remote' }, { name: 'Wrong host' }), { status: 404 });
+    await assert.rejects(store.remove(first.id, { ...scope, projectPath: '/new-project' }), { status: 404 });
+    moved.source.threadName = 'Mutated client copy';
+    assert.equal(store.list(scope).find(value => value.id === first.id)!.source.threadName, 'Original conversation');
+    await store.remove(first.id, scope);
+    assert.equal(store.listAll().length, 2);
+    assert.ok(store.listAll().some(value => value.id === remote.id));
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('whole-chat input requires an explicit kind and accepts no invented message positions or selected text', () => {
+  const chat = threadInput();
+  assert.deepEqual(bookmarkInput.parse(chat), chat);
+  const invalid = [
+    { ...chat, kind: undefined }, { ...chat, kind: 'chat' }, { ...chat, kind: 'message' },
+    { ...chat, source: { ...chat.source, threadId: '' } },
+    { ...chat, source: { ...chat.source, threadName: 'Bad\nname' } },
+    { ...chat, source: { ...chat.source, turnId: 'turn-1' } },
+    { ...chat, source: { ...chat.source, itemId: 'item-1' } },
+    { ...chat, source: { ...chat.source, text: 'An excerpt' } },
+    { ...input(), kind: 'thread' },
+    { ...chat, source: { ...chat.source, file: '/etc/passwd' } },
+  ];
+  for (const value of invalid) assert.equal(bookmarkInput.safeParse(value).success, false);
+  assert.equal(bookmarkInput.safeParse({ ...input(), kind: 'message' }).success, true);
+});
+
 test('bookmarks require native conversation positions and reject oversized or unexpected input', () => {
   const valid = input();
   const invalid = [
@@ -130,9 +209,10 @@ test('bookmark capacity limits reject additions without corrupting the store or 
     const store = new Bookmarks(file);
     await store.init();
     await assert.rejects(store.add(input({ source: { ...input().source, itemId: 'new-selection' } })), { status: 409 });
+    await assert.rejects(store.add(threadInput()), { status: 409 });
     assert.equal(store.list(scope).length, MAX_BOOKMARKS);
     await store.remove(existing[0]!.id, scope);
-    await store.add(input({ source: { ...input().source, itemId: 'new-selection' } }));
+    await store.add(threadInput());
     assert.equal(store.list(scope).length, MAX_BOOKMARKS);
     const restored = new Bookmarks(file);
     await restored.init();
@@ -259,6 +339,83 @@ test('bookmark API keeps identical native IDs on different configured hosts sepa
     assert.deepEqual((await (await f.request(`/api/bookmarks?${remoteScope}`)).json() as { bookmarks: ConversationBookmark[] }).bookmarks, [remote]);
     assert.equal((await f.request(`/api/bookmarks/${local.id}?${remoteScope}`, 'DELETE')).status, 404);
     assert.equal((await f.request(`/api/bookmarks/${local.id}?${remoteScope}`, 'PATCH', { name: 'Cross-host edit' })).status, 404);
+    assert.equal(f.application.bridges.size, 0);
+  } finally { await f.close(); }
+});
+
+test('whole-chat HTTP favorites use the same private scoped API and cannot change kind or source while renaming', async () => {
+  const f = await apiFixture();
+  try {
+    const value = threadInput();
+    assert.equal((await f.request('/api/bookmarks', 'POST', value, { 'content-type': 'application/json' })).status, 401);
+    assert.equal((await f.request('/api/bookmarks', 'POST', value, { 'content-type': 'application/json', cookie: f.cookie })).status, 403);
+    const response = await f.request('/api/bookmarks', 'POST', value);
+    assert.equal(response.status, 201);
+    const { bookmark } = await response.json() as { bookmark: ConversationBookmark };
+    assert.equal(bookmark.kind, 'thread');
+    assert.deepEqual(bookmark.source, value.source);
+    const repeated = await f.request('/api/bookmarks', 'POST', { ...value, projectPath: '/new-project', name: 'Another browser suggestion' });
+    assert.equal(repeated.status, 201);
+    assert.deepEqual(await repeated.json(), { bookmark });
+    const url = `/api/bookmarks/${bookmark.id}?${f.scoped()}`;
+    for (const patch of [{ name: 'Changed', kind: 'message' }, { name: 'Changed', source: input().source }])
+      assert.equal((await f.request(url, 'PATCH', patch)).status, 400);
+    const renamed = await f.request(url, 'PATCH', { name: '  Named chat  ' });
+    assert.equal(renamed.status, 200);
+    const updated = (await renamed.json() as { bookmark: ConversationBookmark }).bookmark;
+    assert.equal(updated.name, 'Named chat');
+    assert.equal(updated.kind, 'thread');
+    assert.deepEqual(updated.source, value.source);
+    const messageResponse = await f.request('/api/bookmarks', 'POST', input());
+    const message = (await messageResponse.json() as { bookmark: ConversationBookmark }).bookmark;
+    const all = await f.request('/api/bookmarks?all=true', 'GET', undefined, { ...f.headers, accept: typedBookmarksAccept });
+    assert.equal(all.headers.get('cache-control'), 'no-store');
+    const entries = (await all.json() as { bookmarks: ConversationBookmark[] }).bookmarks;
+    assert.equal(entries.length, 2);
+    assert.ok(entries.some(entry => entry.id === updated.id && entry.kind === 'thread'));
+    assert.ok(entries.some(entry => entry.id === message.id && entry.kind !== 'thread'));
+    assert.equal((await f.request(url, 'DELETE')).status, 200);
+    assert.deepEqual((await (await f.request(`/api/bookmarks?${f.scoped()}`)).json() as { bookmarks: ConversationBookmark[] }).bookmarks, [message]);
+    assert.equal((await fs.stat(path.join(f.root, 'bookmarks.json'))).mode & 0o777, 0o600);
+    assert.equal(f.application.bridges.size, 0);
+  } finally { await f.close(); }
+});
+
+test('bookmark result negotiation keeps old clients on message anchors and typed clients receive both kinds with host isolation', async () => {
+  const f = await apiFixture();
+  try {
+    const remote = await f.application.storage.addHost({ name: 'Remote favorites', hostname: 'remote.invalid' });
+    const removed = await f.application.storage.addHost({ name: 'Removed favorites', hostname: 'removed.invalid' });
+    const created: ConversationBookmark[] = [];
+    for (const value of [input(), threadInput(), threadInput({ hostId: remote.id }), threadInput({ hostId: removed.id })]) {
+      const response = await f.request('/api/bookmarks', 'POST', value);
+      assert.equal(response.status, 201);
+      created.push((await response.json() as { bookmark: ConversationBookmark }).bookmark);
+    }
+    const sorted = (values: ConversationBookmark[]) => [...values].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+    const urls = ['/api/bookmarks?all=true', `/api/bookmarks?${f.scoped()}`];
+    for (const accept of [undefined, '*/*', 'application/json', `${typedBookmarksAccept}-legacy`, `${typedBookmarksAccept};q=0`]) {
+      const headers = { ...f.headers, ...(accept ? { accept } : {}) };
+      for (const url of urls) {
+        const response = await f.request(url, 'GET', undefined, headers);
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { bookmarks: [created[0]] });
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+        assert.match(response.headers.get('vary') || '', /\bAccept\b/i);
+      }
+    }
+    for (const accept of [typedBookmarksAccept, `application/json, ${typedBookmarksAccept}; q=0.8`]) {
+      const headers = { ...f.headers, accept };
+      assert.deepEqual(await (await f.request(urls[0]!, 'GET', undefined, headers)).json(), { bookmarks: sorted(created) });
+      assert.deepEqual(await (await f.request(urls[1]!, 'GET', undefined, headers)).json(), { bookmarks: sorted(created.slice(0, 2)) });
+      const remoteScope = f.scoped({ hostId: remote.id, projectPath: '/project' });
+      assert.deepEqual(await (await f.request(`/api/bookmarks?${remoteScope}`, 'GET', undefined, headers)).json(), { bookmarks: [created[2]] });
+    }
+    await f.application.storage.deleteHost(removed.id);
+    assert.deepEqual(await (await f.request(urls[0]!, 'GET', undefined, { ...f.headers, accept: typedBookmarksAccept })).json(),
+      { bookmarks: sorted(created.slice(0, 3)) });
+    assert.equal((await f.request(`/api/bookmarks?${f.scoped({ hostId: removed.id, projectPath: '/project' })}`, 'GET', undefined,
+      { ...f.headers, accept: typedBookmarksAccept })).status, 404);
     assert.equal(f.application.bridges.size, 0);
   } finally { await f.close(); }
 });

@@ -44,7 +44,7 @@ const savedResults = computed(() => !archived.value && search.value.trim()
   ? props.bookmarks.state.allEntries.filter(entry => matchesBookmark(entry, search.value)) : []);
 function bookmarkDetail(entry: ConversationBookmark) {
   const project = bookmarkProjectDetails(entry, props.state.projects, props.state.hosts);
-  return `${project.projectName} · ${project.hostName}`;
+  return `${entry.kind === 'thread' ? '聊天' : '选中内容'} · ${project.projectName} · ${project.hostName}`;
 }
 const hostProjects = computed(() => props.state.projects);
 const pins = computed(() => props.state.preferences.pins);
@@ -314,8 +314,8 @@ onBeforeUnmount(() => {
         <div class="sidebar-section-heading"><strong>收藏对话</strong><span>{{ savedResults.length }}</span></div>
         <button v-for="entry in savedResults" :key="entry.id" type="button" class="nav-bookmark-result"
           :disabled="!!bookmarks.state.busyId" :aria-label="`跳转到收藏 ${entry.name}`" @click="emit('bookmark', entry)">
-          <Icon name="Bookmark" :size="14" />
-          <span><strong>{{ entry.name }}</strong><small>{{ bookmarkDetail(entry) }}</small><span class="nav-bookmark-excerpt">{{ entry.source.text.slice(0, 180) }}</span></span>
+          <Icon :name="entry.kind === 'thread' ? 'MessagesSquare' : 'Quote'" :size="14" />
+          <span><strong>{{ entry.name }}</strong><small>{{ bookmarkDetail(entry) }}</small><span v-if="entry.kind !== 'thread'" class="nav-bookmark-excerpt">{{ entry.source.text.slice(0, 180) }}</span></span>
         </button>
         <p v-if="bookmarks.state.indexError" class="nav-bookmark-error" role="alert">{{ bookmarks.state.indexError }}<button type="button" @click="bookmarks.ensureIndex({ force: true })">重试</button></p>
         <p v-else-if="!savedResults.length" class="nav-empty">{{ bookmarks.state.indexLoading ? '正在搜索收藏…' : '没有匹配的收藏' }}</p>
