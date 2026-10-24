@@ -1,4 +1,4 @@
-import { test, expect, login, MockCodex } from "./fixtures";
+import { test, expect, login, setComposerSelection, MockCodex } from "./fixtures";
 
 function skill(name: string, root = "/test/.codex/skills", enabled = true) {
   return { name, description: `${name} 的技能说明`, path: `${root}/${name}/SKILL.md`, enabled,
@@ -92,10 +92,7 @@ test("skill keyboard selection preserves surrounding text, deduplicates, and rem
   await login(page);
   const input = page.getByRole("textbox", { name: "消息输入框" });
   await input.fill("请用 /writer 处理文档");
-  await input.evaluate((element: HTMLTextAreaElement) => {
-    element.setSelectionRange(10, 10);
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-  });
+  await setComposerSelection(input, 10);
   await expect(page.getByRole("listbox")).toBeVisible();
   await input.press("ArrowDown");
   await input.press("Enter");

@@ -1,7 +1,7 @@
-import { test, expect, login, MockCodex } from './fixtures';
+import { test, expect, login, setComposerSelection, getComposerSelection, readComposerClipboardSource, MockCodex } from './fixtures';
 import type { Page } from '@playwright/test';
 
-const sourceInput = (page: Page) => page.locator('textarea[aria-label="消息输入框"]');
+const sourceInput = (page: Page) => page.getByRole('textbox', { name: '消息输入框', exact: true });
 const preview = (page: Page) => page.getByRole('region', { name: 'Markdown 草稿预览', exact: true });
 const openPreview = (page: Page) => page.getByRole('button', { name: '预览 Markdown', exact: true }).click();
 async function history(page: Page) {
@@ -56,11 +56,11 @@ test('returning to source restores the caret and keeps Enter, Shift+Enter and me
   await login(page);
   const input = sourceInput(page);
   await input.fill('**原始草稿**');
-  await input.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(2, 6));
+  await setComposerSelection(input, 2, 6);
   await openPreview(page);
   await page.getByRole('button', { name: '编辑 Markdown', exact: true }).click();
   await expect(input).toBeFocused();
-  expect(await input.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([2, 6]);
+  expect(await getComposerSelection(input)).toEqual([2, 6]);
   await input.fill('第一行');
   await input.press('End');
   await input.press('Shift+Enter');
@@ -146,7 +146,7 @@ test('the preview is bounded without truncating the editable draft or sending pa
   await expect(preview(page)).not.toContainText('保留全文结尾');
   expect(await preview(page).evaluate(element => element.clientHeight)).toBeLessThanOrEqual(210);
   await page.getByRole('button', { name: '编辑 Markdown', exact: true }).click();
-  await expect(sourceInput(page)).toHaveValue(source);
+  expect(await readComposerClipboardSource(sourceInput(page))).toBe(source);
   await openPreview(page);
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect.poll(() => mock.request('turn/start')?.params.input[0]?.text).toBe(source);
@@ -248,7 +248,7 @@ for (const width of [320, 390]) {
     await page.screenshot({ path: `.data/composer-markdown-mobile-${width}.png` });
     await page.getByRole('button', { name: '编辑 Markdown', exact: true }).click();
     await expect(sourceInput(page)).toBeFocused();
-    await expect(sourceInput(page)).toHaveValue(source);
+    expect(await readComposerClipboardSource(sourceInput(page))).toBe(source);
     await sourceInput(page).press('Escape');
   });
 }

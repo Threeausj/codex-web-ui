@@ -4,10 +4,12 @@ import Icon from "./Icon.vue";
 import NewConversationContext from "./NewConversationContext.vue";
 import MessageQueuePanel from "./MessageQueuePanel.vue";
 import ModelServiceOptions from "./ModelServiceOptions.vue";
+import MarkdownComposerEditor from "./MarkdownComposerEditor.vue";
 import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
 import { composerMarkdownPreview } from "../lib/composer-markdown";
+import { continueMarkdown, formatMarkdown, isMarkdownCodeAt, type MarkdownEdit, type MarkdownFormat } from "../lib/markdown-editing";
 import { insertPromptPreset } from "../lib/prompt-presets";
 import type { PromptPreset } from "../../shared/prompt-presets";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
@@ -22,6 +24,7 @@ const emit = defineEmits<{
   project: [project: any];
   noProject: [];
   host: [hostId: string];
+  search: [];
 }>();
 const draft = ref("");
 const markdownPreview = ref(false);
@@ -32,7 +35,7 @@ const renderedDraft = computed(() => markdownPreview.value
   : null);
 const draftStorageWarning = ref(false);
 const quotedContexts = ref<ConversationSelectionSource[]>([]);
-const input = ref<HTMLTextAreaElement>();
+const input = ref<InstanceType<typeof MarkdownComposerEditor>>();
 const area = ref<HTMLElement>();
 const pickerElement = ref<HTMLElement>();
 const pickerMaxHeight = ref(400);
@@ -182,14 +185,8 @@ const modes = computed(() => [
     ? "设定目标并持续推进，直到完成" : props.state.modeCapabilities?.loaded ? "当前 Codex 版本未提供 Goal 模式" : "正在检测当前 Codex 的 Goal 模式…", icon: "CheckCircle2",
     disabled: !!props.state.busy || !props.state.modeCapabilities?.goal },
 ].filter((mode) => `${mode.name} ${mode.id}`.toLowerCase().includes(query.value.toLowerCase())));
-const files = computed(() => {
-  const result = props.state.searchResults || [];
-  return (
-    Array.isArray(result)
-      ? result
-      : result.files || result.data || result.results || []
-  ).slice(0, 12).map((file: any) => ({ ...file, kind: "file" }));
-});
+const pickerFiles = ref<any[]>([]);
+const files = computed(() => pickerFiles.value.slice(0, 12).map((file: any) => ({ ...file, kind: "file" })));
 const results = computed<any[]>(() =>
   picker.value === "commands" ? [...matchingCommands.value, ...matchingPresets.value, ...matchingSkills.value] : [...modes.value, ...files.value],
 );
@@ -412,10 +409,35 @@ const canSend = computed(
     hasContent.value,
 );
 function resize() {
-  if (input.value) {
-    input.value.style.height = "auto";
-    input.value.style.height = `${Math.min(input.value.scrollHeight, 210)}px`;
-  }
+  input.value?.resize();
+}
+function draftSelection() {
+  return { start: input.value?.selectionStart ?? draft.value.length, end: input.value?.selectionEnd ?? draft.value.length };
+}
+function applyMarkdownEdit(edit: MarkdownEdit) {
+  if (!edit.handled || !input.value) return false;
+  const previous = draft.value;
+  let from = 0, tail = 0;
+  while (from < previous.length && from < edit.text.length && previous[from] === edit.text[from]) from++;
+  while (tail < previous.length - from && tail < edit.text.length - from &&
+      previous[previous.length - tail - 1] === edit.text[edit.text.length - tail - 1]) tail++;
+  input.value.replaceSelection(from, previous.length - tail, edit.text.slice(from, edit.text.length - tail), edit.selection);
+  inspectInput();
+  return true;
+}
+function markdownEnter() {
+  const selection = draftSelection();
+  const continued = continueMarkdown(draft.value, selection);
+  if (applyMarkdownEdit(continued)) return true;
+  if (!isMarkdownCodeAt(draft.value, selection.start)) return false;
+  const text = draft.value.slice(0, selection.start) + '\n' + draft.value.slice(selection.end);
+  return applyMarkdownEdit({ text, selection: { start: selection.start + 1, end: selection.start + 1 }, handled: true });
+}
+function onBeforeInput(event: InputEvent) {
+  if (event.isComposing || input.value?.composing || !event.cancelable || event.inputType !== 'insertParagraph') return;
+  if (picker.value) { event.preventDefault(); return; }
+  event.preventDefault();
+  if (!markdownEnter()) void send();
 }
 function editDraft() {
   markdownPreview.value = false;
@@ -442,8 +464,16 @@ function toggleMarkdownPreview() {
   markdownPreview.value = true;
   void nextTick(() => previewElement.value?.focus({ preventScroll: true }));
 }
-watch(() => [props.state.hostId, props.state.projectPath, props.state.activeThread?.id,
-  props.state.authenticationGeneration, props.state.authenticated], () => { markdownPreview.value = false; }, { flush: 'sync' });
+watch([() => props.state.hostId, () => props.state.projectPath, () => props.state.activeThread?.id,
+  () => props.state.authenticationGeneration, () => props.state.authenticated], () => {
+  markdownPreview.value = false;
+  picker.value = "";
+  pickerFiles.value = [];
+  pickerError.value = "";
+  searchPending.value = false;
+  ++pickerGeneration;
+  if (searchTimer) clearTimeout(searchTimer);
+}, { flush: 'sync' });
 function fitPicker() {
   const viewportHeight = window.visualViewport?.height || window.innerHeight;
   const space = (area.value?.getBoundingClientRect().top ?? viewportHeight) - 12;
@@ -465,6 +495,9 @@ function inspectInput() {
   if (picker.value !== nextPicker || query.value !== nextQuery) {
     selected.value = 0;
     pickerError.value = "";
+    // The previous query's files must not remain selectable while a new
+    // debounced search is pending, including a late response to the old query.
+    pickerFiles.value = [];
     if (pickerElement.value) pickerElement.value.scrollTop = 0;
   }
   picker.value = nextPicker;
@@ -482,9 +515,11 @@ function inspectInput() {
     });
   if (picker.value === "mentions") {
     searchPending.value = true;
+    const requestedQuery = nextQuery;
     searchTimer = setTimeout(async () => {
       try {
-        await props.api.searchFiles(query.value);
+        const matches = await props.api.searchFiles(requestedQuery);
+        if (generation === pickerGeneration) pickerFiles.value = matches;
       } catch (cause: any) {
         if (generation === pickerGeneration) pickerError.value = cause.message || "搜索文件失败";
       } finally {
@@ -555,7 +590,21 @@ async function pick(result: any) {
   resize();
 }
 function onKeydown(event: KeyboardEvent) {
-  if (event.isComposing || event.keyCode === 229) return;
+  if (event.isComposing || event.keyCode === 229 || input.value?.composing) return;
+  if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+    const key = event.key.toLowerCase();
+    const formats: Record<string, MarkdownFormat> = { b: 'bold', i: 'italic', e: 'code' };
+    const format = key === 'k' && event.shiftKey ? 'link' : !event.shiftKey && formats[key];
+    if (format) {
+      event.preventDefault(); event.stopPropagation();
+      applyMarkdownEdit(formatMarkdown(draft.value, draftSelection(), format));
+      return;
+    }
+    // Route the existing app shortcut explicitly before the editor keymap can
+    // consume it, preserving both search access and the selected draft text.
+    if (key === 'k') { event.preventDefault(); event.stopPropagation(); emit('search'); return; }
+    if (event.key === 'Enter') { event.preventDefault(); void send(); return; }
+  }
   if (choosing.value && picker.value && (event.key === "Enter" || event.key === "Tab")) {
     event.preventDefault();
     return;
@@ -584,6 +633,7 @@ function onKeydown(event: KeyboardEvent) {
   } else if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     if (picker.value) return;
+    if (markdownEnter()) return;
     void send();
   }
 }
@@ -766,6 +816,7 @@ watch(
     picker.value = "";
     pickerError.value = "";
     searchPending.value = false;
+    pickerFiles.value = [];
     pickerGeneration++;
     if (searchTimer) clearTimeout(searchTimer);
     if (previous) {
@@ -1013,7 +1064,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
           </button>
         </div>
       </div>
-      <textarea
+      <MarkdownComposerEditor
         v-show="!markdownPreview"
         ref="input"
         v-model="draft"
@@ -1026,19 +1077,19 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
                 ? conversationMode === 'goal' && !state.goal ? '输入希望 Codex 持续完成的目标…' : '描述一个任务，让 Codex 帮你完成'
                 : '继续对话，/ 选择技能、@ 选择模式或引用文件'
         "
-        rows="2"
-        spellcheck="false"
-        aria-label="消息输入框"
+        :history-scope="draftKey"
         :aria-controls="picker ? 'composer-picker' : undefined"
         :aria-expanded="!!picker"
         :aria-activedescendant="picker && results.length ? `composer-picker-option-${selected}` : undefined"
         aria-autocomplete="list"
         @input="inspectInput"
+        @selection-change="inspectInput"
         @click="inspectInput"
         @keydown="onKeydown"
+        @beforeinput="onBeforeInput"
         @paste="paste"
         :disabled="!state.connected || contextBusy"
-      ></textarea>
+      />
       <section v-if="markdownPreview" ref="previewElement" class="composer-markdown-preview" tabindex="0"
         role="region" aria-label="Markdown 草稿预览" @keydown.esc.prevent="editDraft" @paste="paste">
         <div class="markdown" v-html="renderedDraft?.html"></div>
@@ -1078,7 +1129,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
           ><button type="button" class="icon-button markdown-preview-toggle"
             :disabled="!draft.trim() || contextBusy"
             :aria-label="markdownPreview ? '编辑 Markdown' : '预览 Markdown'"
-            :title="markdownPreview ? '切回 Markdown 源码编辑' : '预览 Markdown'"
+            :title="markdownPreview ? '返回实时 Markdown 编辑' : '完整 Markdown 预览；输入框已实时渲染。Ctrl/⌘+B 粗体、I 斜体、E 代码、Shift+K 链接'"
             :aria-pressed="markdownPreview" @pointerdown.prevent @click="toggleMarkdownPreview">
             <Icon :name="markdownPreview ? 'Pencil' : 'Eye'" :size="16" />
           </button><span class="toolbar-separator"></span

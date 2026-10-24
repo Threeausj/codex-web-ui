@@ -23,21 +23,22 @@ function activeTurn(mock: any) {
 async function openActive(page: Page) {
   await login(page);
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).click();
-  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveAttribute('placeholder', /追加指令/);
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveAttribute('aria-placeholder', /追加指令/);
   await expect(page.getByText(progressText, { exact: true })).toBeVisible();
 }
 
 async function expectChronology(page: Page, after = false) {
-  await expect(page.getByText(steerText, { exact: true })).toHaveCount(1);
-  await expect(page.getByText(steerText, { exact: true })).toBeVisible();
+  const steer = turnGroup(page).locator('.user-message').getByText(steerText, { exact: true });
+  await expect(steer).toHaveCount(1);
+  await expect(steer).toBeVisible();
   await expect(page.getByText(progressText, { exact: true })).toBeVisible();
   if (after) await expect(page.getByText(afterText, { exact: true })).toBeVisible();
   const order = await turnGroup(page).locator('.message').evaluateAll(elements => elements.map(element => element.textContent || ''));
   const progress = order.findIndex(text => text.includes(progressText));
-  const steer = order.findIndex(text => text.includes(steerText));
+  const steerIndex = order.findIndex(text => text.includes(steerText));
   expect(progress).toBeGreaterThanOrEqual(0);
-  expect(steer).toBeGreaterThan(progress);
-  if (after) expect(order.findIndex(text => text.includes(afterText))).toBeGreaterThan(steer);
+  expect(steerIndex).toBeGreaterThan(progress);
+  if (after) expect(order.findIndex(text => text.includes(afterText))).toBeGreaterThan(steerIndex);
 }
 
 async function cachedSteer(page: Page, clientId: string) {
@@ -77,6 +78,7 @@ test('local steering retains its chronological position through optimistic rende
   await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill(steerText);
   await page.getByRole('button', { name: '追加指令', exact: true }).click();
   await expect.poll(() => !!held).toBe(true);
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue(steerText);
   await expectChronology(page);
   const user = { id: 'order-steer-canonical', clientId: held!.request.params.clientUserMessageId, type: 'userMessage', content: input(steerText) };
   turn.items.push(user);
@@ -129,6 +131,7 @@ test('a response-only steering acknowledgment clears the optimistic status witho
   await page.getByRole('button', { name: '追加指令', exact: true }).click();
   await expect.poll(() => !!held).toBe(true);
   // Neither a request reply nor a canonical notification has arrived yet.
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue(steerText);
   await expectChronology(page);
   const clientId = held!.request.params.clientUserMessageId;
   held!.socket.send(JSON.stringify({ id: held!.request.id, result: { turnId } }));
@@ -193,7 +196,7 @@ test('two web clients retain live steering and its neighboring progress through 
       const reads = summaryReads;
       await target.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).click();
       await expect.poll(() => summaryReads).toBeGreaterThan(reads);
-      await expect(target.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveAttribute('placeholder', /追加指令/);
+      await expect(target.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveAttribute('aria-placeholder', /追加指令/);
       await expectChronology(target, true);
       await expect(turnGroup(target).locator('.turn-activity > summary')).toHaveCount(1);
       expect(await turnGroup(target).locator('.activity-loading').count()).toBeLessThanOrEqual(1);
