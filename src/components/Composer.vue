@@ -136,8 +136,12 @@ function usePreset(preset: PromptPreset, position = input.value?.selectionStart 
     const command = presetCommand(preset);
     if (!command) { pickerError.value = "当前网页尚不支持此命令，请在设置中编辑预设。"; return; }
     if (!props.state.connected) { pickerError.value = "请连接主机后执行命令。"; return; }
-    if (["compact", "fork"].includes(command.id) && (!props.state.activeThread || props.state.busy)) {
-      pickerError.value = props.state.busy ? "请等待当前任务完成后执行此命令。" : "请先选择一个对话。";
+    if (["compact", "fork"].includes(command.id) && !props.state.activeThread) {
+      pickerError.value = "请先选择一个对话。";
+      return;
+    }
+    if (command.id === "compact" && props.state.busy) {
+      pickerError.value = "请等待当前任务完成后执行此命令。";
       return;
     }
     removePickerToken("/", position);

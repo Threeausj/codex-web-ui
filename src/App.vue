@@ -264,10 +264,11 @@ const editDisabled = computed(() =>
   state.selectingThread || state.switchingHost || state.changingContext ||
   state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady),
 );
-const threadActionsDisabled = computed(() =>
-  !state.activeThread || state.busy || state.compacting || !state.connected || !state.online ||
-  !state.threadReady || state.runtimePaused || state.threadReleased || state.selectingThread,
+const forkActionsDisabled = computed(() =>
+  !state.activeThread || actionBusy.value || !state.connected || !state.online ||
+  !state.threadReady || state.runtimePaused || state.threadReleased || state.selectingThread || state.switchingHost,
 );
+const threadActionsDisabled = computed(() => forkActionsDisabled.value || state.busy || state.compacting);
 const editableItemId = computed(() => {
   if (editDisabled.value) return undefined;
   const item = state.items.filter((item) => item.type === 'userMessage').at(-1);
@@ -720,12 +721,10 @@ async function execute(command: string) {
           : "先开始一个对话，再压缩上下文。",
       );
   } else if (command === "fork") {
-    if (state.activeThread && !state.busy) await action(() => api.fork());
+    if (!forkActionsDisabled.value) await fork();
     else
       showError(
-        state.busy
-          ? "请等待当前任务完成后创建分支。"
-          : "先选择一个对话，再创建分支。",
+        state.activeThread ? "请先恢复当前会话连接，再创建分支。" : "先选择一个对话，再创建分支。",
       );
   } else if (
     ["terminal", "files", "preview", "changes", "git", "agents"].includes(command)
@@ -738,9 +737,11 @@ async function execute(command: string) {
   }
 }
 async function fork(turnId?: string) {
-  await action(() => api.fork(turnId));
-  await nextTick();
-  scrollBottom();
+  if (forkActionsDisabled.value) return;
+  const result = await action(() => api.forkThread(state.activeThread!.id, state.hostId, turnId));
+  // A pending fork must not navigate or scroll a conversation selected later.
+  // Reuse normal navigation so the source reading position is saved as well.
+  if (result?.canSelect) await selectThread(result);
 }
 function openRename() {
   renameValue.value = state.activeThread?.name || "";
@@ -1282,7 +1283,7 @@ watch(() => [state.authenticated, state.loading], () => {
             </button>
             <div v-if="threadMenu" class="thread-menu">
               <button
-                :disabled="threadActionsDisabled"
+                :disabled="forkActionsDisabled"
                 @click="execute('fork')"
               >
                 <Icon name="GitBranch" :size="16" />创建分支</button
@@ -1492,6 +1493,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :items="state.items"
               :turns="state.turns"
               :busy="state.busy"
+              :fork-disabled="forkActionsDisabled"
               :editable-item-id="editableItemId"
               :editing="state.editingMessage"
               :edit-disabled="editDisabled"

@@ -45,7 +45,7 @@ Codex 将 `clientInfo.name` 用于模型请求的 `originator`。[官方客户�
 | --- | --- | --- |
 | 新建对话 | `thread/start` | 保存服务返回的 thread id |
 | 恢复 | `thread/resume` | 恢复已有 thread，也用于重新加入同进程活动 thread |
-| Fork | `thread/fork` | 返回新 thread id；`lastTurnId` 可选择截止 turn，但该 turn 不能正在运行 |
+| Fork | `thread/fork` | 返回新 thread id；`lastTurnId` 可选择已结束的截止 turn。运行中创建当前进度分支时省略该字段，副本将部分轮次标为 interrupted，原任务继续；网页菜单、消息按钮及 `/fork` 均支持 |
 | 编辑上一条消息 | `thread/revert`、`turn/start` | 以 `beforeTurnId` 移除原 turn，再在同一 thread 发送修改后的输入；不撤销文件修改 |
 | 会话列表 | `thread/list` | 使用 `nextCursor` 翻页；默认仅交互来源、未归档历史 |
 | 历史 turn | `thread/turns/list` | 默认时间倒序，`itemsView` 默认 `summary`，完整消息需要 `full` |

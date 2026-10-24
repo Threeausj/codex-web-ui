@@ -4,7 +4,7 @@ export function serviceTierScope(state: any) {
 export function modelServiceTiers(state: any): { id: string; name: string; description: string }[] {
   const model = state.models?.find((entry: any) => entry.model === state.model);
   return (model?.serviceTiers || []).filter((tier: any) => typeof tier?.id === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(tier.id))
-    .map((tier: any) => ({ id: tier.id, name: typeof tier.name === 'string' ? tier.name : tier.id, description: typeof tier.description === 'string' ? tier.description : '' }));
+    .map((tier: any) => ({ id: tier.id, name: typeof tier.name === 'string' && tier.name.trim() ? tier.name : tier.id, description: typeof tier.description === 'string' ? tier.description : '' }));
 }
 /** An omitted override preserves the native thread's current tier. */
 export function serviceTierParams(state: any): { serviceTier?: string | null } {

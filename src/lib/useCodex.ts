@@ -1735,7 +1735,11 @@ function receiveThreadChange(change: any) {
       permissionSelections.set(recencyKey(state.hostId, threadId), { mode: state.permission, profileId: '' });
     }
     if (request.collaborationMode?.mode) state.collaborationMode = request.collaborationMode.mode;
-    if ('serviceTier' in request) state.nativeServiceTier = request.serviceTier;
+    if ('serviceTier' in request) {
+      state.nativeServiceTier = request.serviceTier ?? null;
+      state.serviceTier = state.nativeServiceTier;
+      state.serviceTierScope = serviceTierScope(state);
+    }
     state.permissionChangePending = state.busy;
     return;
   }
@@ -3951,8 +3955,14 @@ async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string
   const source = hostId === state.hostId
     ? state.threads.find(thread => thread.id === id) ?? (state.activeThread?.id === id ? state.activeThread : undefined)
     : state.navigation[hostId]?.threads.find(thread => thread.id === id);
+  // Native allows a snapshot of a running thread when no boundary is given.
+  // A lastTurnId naming its active turn is rejected; the snapshot's partial
+  // turn gets an interruption marker while the source continues untouched.
+  const selectedSource = hostId === state.hostId && state.activeThread?.id === id;
+  const activeBoundary = lastTurnId && hostId === state.hostId &&
+    (activeTurns.get(id) === lastTurnId || selectedSource && state.turns.some(turn => turn.id === lastTurnId && turn.status === 'inProgress'));
   const result = await scopedRpc(hostId, "thread/fork", {
-    threadId: id, lastTurnId, excludeTurns: true, deferGoalContinuation: true,
+    threadId: id, ...(lastTurnId && !activeBoundary ? { lastTurnId } : {}), excludeTurns: true, deferGoalContinuation: true,
     ...(isProjectlessThread(source) ? { threadSource: PROJECTLESS_THREAD_SOURCE } : {}),
   });
   if (authentication !== authenticationGeneration || !state.authenticated)

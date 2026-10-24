@@ -12,7 +12,13 @@ const tierSupported = computed(() => props.state.activeThread ? methodAccepts(ca
   methodAccepts(capabilities.value, 'thread/start', ['serviceTier']) && methodAccepts(capabilities.value, 'turn/start', ['threadId', 'input', 'serviceTier']));
 const tiers = computed(() => tierSupported.value ? catalogTiers.value : []);
 const windows = computed(() => rateLimitWindows(props.state.rateLimits));
-const selected = computed(() => props.state.serviceTierScope === serviceTierScope(props.state) ? props.state.serviceTier || '' : props.state.nativeServiceTier || '');
+const selected = computed({
+  get: () => props.state.serviceTierScope === serviceTierScope(props.state) ? props.state.serviceTier || '' : props.state.nativeServiceTier || '',
+  set: (value: string) => { void choose(value); },
+});
+const selectedTier = computed(() => catalogTiers.value.find(tier => tier.id === selected.value));
+const selectedLabel = computed(() => !selected.value ? '原生默认' : selectedTier.value?.name || `原生：${selected.value}`);
+const unlistedSelection = computed(() => !!selected.value && !selectedTier.value);
 let generation = 0;
 let disposed = false;
 let quotaRevision = 0, quotaDirty = false;
@@ -58,9 +64,9 @@ const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any)
   if (message.method === 'bridge/status' && message.params?.engineId !== seenEngine) { seenEngine = message.params?.engineId || null; capabilityGeneration++; capabilities.value = null; capabilityPending = null; void readCapabilities(); }
 }) || (() => {});
 onBeforeUnmount(() => { disposed = true; generation++; quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
-async function choose(event: Event) {
+async function choose(value: string) {
   busy.value = true; error.value = '';
-  try { await props.api.setServiceTier((event.target as HTMLSelectElement).value || null); }
+  try { await props.api.setServiceTier(value || null); }
   catch (cause: any) { error.value = cause.message; }
   finally { busy.value = false; }
 }
@@ -68,7 +74,10 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 </script>
 <template>
   <div v-if="tiers.length || windows.length || state.rateLimits?.ordinaryUsageAllowed === false" class="model-service-options">
-    <label v-if="tiers.length" class="composer-select service-tier-select" title="服务层级由当前主机的模型目录提供"><Icon name="Zap" :size="13" /><select :value="selected" aria-label="模型服务层级" :disabled="disabled || busy" @change="choose"><option value="">原生默认</option><option v-for="tier in tiers" :key="tier.id" :value="tier.id" :title="tier.description">{{ tier.name }}</option></select></label>
+    <label v-if="tiers.length" class="composer-select service-tier-select" :title="selectedTier?.description || '服务层级由当前主机的模型目录提供'">
+      <Icon name="Zap" :size="13" /><span class="service-tier-value" aria-hidden="true">{{ selectedLabel }}</span><Icon name="ChevronDown" :size="12" />
+      <select v-model="selected" aria-label="模型服务层级" :disabled="disabled || busy"><option value="">原生默认</option><option v-if="unlistedSelection" :value="selected" disabled>{{ selectedLabel }}</option><option v-for="tier in tiers" :key="tier.id" :value="tier.id" :title="tier.description">{{ tier.name }}</option></select>
+    </label>
     <details v-if="windows.length" class="account-usage"><summary aria-label="查看账户使用额度"><Icon name="Gauge" :size="13" />额度</summary><div class="account-usage-popover"><strong>主机账户额度</strong><div v-for="window in windows" :key="window.key"><span>{{ window.name }} · {{ window.label }}</span><span>已用 {{ Math.round(window.used) }}%</span><progress :value="window.used" max="100"></progress><small>{{ resetTime(window.resetsAt) }}</small></div><p v-if="state.rateLimits?.ordinaryUsageAllowed === false">服务端已限制常规额度；以账户实际状态为准。</p></div></details>
     <span v-if="state.rateLimits?.ordinaryUsageAllowed === false" class="service-tier-error" role="status">常规额度已受限</span>
     <span v-if="error" class="service-tier-error" role="alert">{{ error }}</span>
@@ -76,8 +85,14 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 </template>
 <style scoped>
 .model-service-options { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-.service-tier-select { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
-.service-tier-select select { max-width: 90px; border: 0; color: inherit; font: inherit; background: transparent; }
+.service-tier-select { display: flex; align-items: center; flex: none; gap: 4px; color: var(--muted); font-size: 11px; }
+/* Keep the current speed visible during native-select repaint and catalog
+   updates. The select still owns pointer, keyboard and assistive interaction. */
+.service-tier-value { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.service-tier-select select { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; opacity: 0; cursor: pointer; }
+.service-tier-select:has(select:focus-visible) { outline: 2px solid var(--green); outline-offset: 3px; border-radius: 4px; }
+.service-tier-select:has(select:disabled) { opacity: .65; }
+.service-tier-select select:disabled { cursor: default; }
 .account-usage { position: relative; font-size: 11px; color: var(--muted); }
 .account-usage summary { display: flex; align-items: center; gap: 4px; cursor: pointer; list-style: none; }
 .account-usage summary::-webkit-details-marker { display: none; }
@@ -85,5 +100,5 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 .account-usage-popover > div { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 12px; }
 .account-usage progress, .account-usage small { grid-column: 1 / -1; width: 100%; }
 .service-tier-error { color: var(--red); font-size: 11px; }
-@media(max-width:760px) { .service-tier-select select { max-width: 68px; } .account-usage summary { min-height: 36px; } }
+@media(max-width:760px) { .service-tier-select { min-height: 36px; } .service-tier-value { max-width: 80px; } .account-usage summary { min-height: 36px; } }
 </style>
