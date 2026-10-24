@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, ref, useId } from "vue";
+import { computed, inject, nextTick, ref, useId, watch } from "vue";
 import Icon from "./Icon.vue";
 import ThreadCopyMenu from './ThreadCopyMenu.vue';
 import ThreadProjectMoveDialog from './ThreadProjectMoveDialog.vue';
 import { isPinned, threadActivityAt } from "../lib/navigation";
 import { searchableThreadTitle } from '../lib/thread-title-search';
 import { threadIndicatorsKey } from '../lib/thread-indicators';
+import { threadBookmarkActionsKey } from '../lib/conversation-bookmarks';
 const props = defineProps<{
   thread: any;
   state: any;
@@ -22,6 +23,12 @@ const emit = defineEmits<{
   moved: [thread: { id: string; hostId: string; projectId: string }];
 }>();
 const menu = ref(false);
+const chatBookmarks = inject(threadBookmarkActionsKey, null);
+watch(menu, open => { if (open && chatBookmarks) void chatBookmarks.refresh(); });
+function toggleBookmark() {
+  menu.value = false;
+  void chatBookmarks?.toggle(props.thread, hostId.value);
+}
 const moveDialog = ref(false);
 const pending = ref(false);
 const menuButton = ref<HTMLButtonElement>();
@@ -198,6 +205,9 @@ async function submitDialog() {
     >
       <button :disabled="pending" @click="openDialog('rename')">
         <Icon name="Pencil" :size="14" />重命名对话
+      </button>
+      <button v-if="chatBookmarks" :disabled="pending || chatBookmarks.busy()" @click="toggleBookmark">
+        <Icon name="Bookmark" :size="14" />{{ chatBookmarks.saved(hostId, thread.id) ? '取消收藏聊天' : '收藏聊天' }}
       </button>
       <button :disabled="pending || running || !state.online" :title="running ? '请先停止或等待任务结束后调整项目' : undefined" @click="menu = false; moveDialog = true">
         <Icon name="FolderInput" :size="14" />移动到项目

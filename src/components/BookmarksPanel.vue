@@ -80,7 +80,8 @@ onMounted(() => dialog.value?.showModal());
           <li v-for="entry in group.entries" :key="entry.id" class="bookmark-entry" :class="{ busy: busyId === entry.id }">
             <button type="button" class="bookmark-open" :disabled="!!busyId" :aria-label="`跳转到收藏 ${entry.name}`" @click="emit('open', entry)">
               <span class="bookmark-name">{{ entry.name }}<Icon name="ArrowUpRight" :size="15" /></span>
-              <span class="bookmark-excerpt">{{ entry.source.text }}</span>
+              <span class="bookmark-kind"><Icon :name="entry.kind === 'thread' ? 'MessagesSquare' : 'Quote'" :size="12" />{{ entry.kind === 'thread' ? '聊天' : '选中内容' }}</span>
+              <span v-if="entry.kind !== 'thread'" class="bookmark-excerpt">{{ entry.source.text }}</span>
               <span class="bookmark-meta"><span>{{ entry.source.threadName || '未命名对话' }}</span><time>{{ time(entry.createdAt) }}</time></span>
             </button>
             <div class="bookmark-actions">
@@ -91,9 +92,9 @@ onMounted(() => dialog.value?.showModal());
             </ul>
           </section>
         </div>
-        <div v-else class="bookmarks-empty"><Icon name="Bookmark" :size="24" /><p>{{ search.trim() ? '没有匹配的收藏' : allProjects ? '还没有收藏' : '此项目还没有收藏' }}</p><span v-if="!search.trim()">选中对话中的文字，点击“收藏”即可保存位置。</span></div>
+        <div v-else class="bookmarks-empty"><Icon name="Bookmark" :size="24" /><p>{{ search.trim() ? '没有匹配的收藏' : allProjects ? '还没有收藏' : '此项目还没有收藏' }}</p><span v-if="!search.trim()">在聊天菜单中选择“收藏聊天”，或选中文字后点击“收藏”保存位置。</span></div>
       </div>
-      <footer><span>{{ search.trim() ? `${entries.length} / ${props.entries.length}` : props.entries.length }} 条收藏</span><span>点击收藏可回到原文</span></footer>
+      <footer><span>{{ search.trim() ? `${entries.length} / ${props.entries.length}` : props.entries.length }} 条收藏</span><span>打开聊天或定位选中内容</span></footer>
     </dialog>
   </Teleport>
 </template>
@@ -130,6 +131,7 @@ h2 { margin: 0; font-size: 17px; line-height: 1.5; font-weight: 600; }
 .bookmark-open:focus-visible, .bookmark-actions button:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
 .bookmark-name { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
 .bookmark-name svg { flex: none; margin-top: 3px; color: var(--muted); }
+.bookmark-kind { display: inline-flex; align-items: center; gap: 5px; margin-top: 5px; color: var(--muted); font-size: 11px; }
 .bookmark-excerpt { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .bookmark-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 9px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .bookmark-meta > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

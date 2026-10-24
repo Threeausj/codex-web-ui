@@ -4,6 +4,7 @@ import {
   nextTick,
   onBeforeUnmount,
   onMounted,
+  provide,
   ref,
   watch,
 } from "vue";
@@ -15,7 +16,7 @@ import { useMobilePanelBack } from "./lib/mobile-panel-back";
 import { ReadingPositions, isReadingPosition, type ReadingPosition } from "./lib/reading-positions";
 import { captureConversationReading, nearConversationBottom, restoreConversationReading } from './lib/conversation-reading';
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
-import { bookmarkTextRange, matchesBookmark, useConversationBookmarks } from './lib/conversation-bookmarks';
+import { bookmarkTextRange, matchesBookmark, threadBookmarkActionsKey, useConversationBookmarks, type ThreadBookmarkTarget } from './lib/conversation-bookmarks';
 import { bookmarkProjectDetails } from './lib/bookmark-project';
 import type { ConversationBookmark, ConversationBookmarkInput } from '../shared/bookmarks';
 import Icon from "./components/Icon.vue";
@@ -52,6 +53,13 @@ watch(() => [state.authenticated, state.hostId, state.activeThread?.id], () => c
 const bookmarks = useConversationBookmarks(api);
 const bookmarkNaming = ref<{ mode: 'add' | 'rename'; input: ConversationBookmarkInput | ConversationBookmark; authentication: number; initialName: string } | null>(null);
 const bookmarkSaving = ref(false), bookmarkError = ref('');
+const threadBookmarkPending = ref(false);
+provide(threadBookmarkActionsKey, {
+  saved: isChatBookmarked,
+  busy: () => threadBookmarkPending.value || bookmarkSaving.value || bookmarks.state.indexLoading || !!bookmarks.state.busyId,
+  refresh: () => bookmarks.ensureIndex({ force: true }),
+  toggle: toggleChatBookmark,
+});
 const conversationOutput = ref<InstanceType<typeof ConversationOutput>>();
 let bookmarkNavigation = 0;
 let bookmarkHighlightTimer: ReturnType<typeof setTimeout> | undefined;
@@ -132,6 +140,7 @@ const paletteSelected = ref(0);
 const searchOpen = ref(false);
 const threadSearch = ref("");
 const threadMenu = ref(false);
+watch(threadMenu, open => { if (open && state.authenticated) void bookmarks.ensureIndex({ force: true }); });
 const renameOpen = ref(false);
 const renameValue = ref("");
 const editingProject = ref<any>(null);
@@ -144,7 +153,8 @@ const messageEditOpen = ref(false);
 const updateCanReload = computed(() => !(
   state.busy || state.compacting || actionBusy.value || state.loading ||
   state.selectingThread || state.switchingHost || state.changingContext ||
-  state.modeBusy || messageEditOpen.value || composer.value?.working || workspace.value?.working || settingsPanel.value?.working ||
+  state.modeBusy || state.modelSettingsBusy || bookmarkSaving.value || !!bookmarkNaming.value || !!bookmarks.state.busyId ||
+  messageEditOpen.value || composer.value?.working || workspace.value?.working || settingsPanel.value?.working ||
   sideChat.state.busy || sideChat.state.loading || sideChat.state.saving
 ));
 setPwaUpdateGuard(() => updateCanReload.value);
@@ -340,7 +350,8 @@ const paletteResults = computed(() => {
     .map(entry => {
       const project = bookmarkProjectDetails(entry, state.projects, state.hosts);
       return { id: entry.id, hostId: entry.hostId, name: entry.name,
-        detail: `收藏 · ${project.projectName} · ${project.hostName}`, icon: 'Bookmark', kind: 'bookmark', bookmark: entry };
+        detail: `${entry.kind === 'thread' ? '收藏聊天' : '收藏内容'} · ${project.projectName} · ${project.hostName}`,
+        icon: entry.kind === 'thread' ? 'MessagesSquare' : 'Quote', kind: 'bookmark', bookmark: entry };
     }) : [];
   return [...actions, ...saved, ...threads];
 });
@@ -583,6 +594,36 @@ function bookmarkSelection(value: ConversationSelectionSource) {
       threadId: source.threadId, turnId: source.turnId, itemId: source.itemId, text: source.text, threadName: source.threadName || threadTitle.value,
     } } };
 }
+function isChatBookmarked(hostId: string, threadId: string) {
+  return bookmarks.state.allEntries.some(entry => entry.kind === 'thread' && entry.hostId === hostId && entry.source.threadId === threadId);
+}
+async function toggleChatBookmark(thread: ThreadBookmarkTarget, hostId = state.hostId) {
+  if (threadBookmarkPending.value || bookmarkSaving.value || bookmarks.state.busyId || !state.authenticated) return;
+  threadMenu.value = false;
+  const authentication = api.runtimeIdentity().authenticationGeneration;
+  const target = { ...thread };
+  threadBookmarkPending.value = true;
+  try {
+    await bookmarks.ensureIndex({ force: true });
+    if (authentication !== api.runtimeIdentity().authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId)) return;
+    if (bookmarks.state.indexError) throw new Error(bookmarks.state.indexError);
+    const existing = bookmarks.state.allEntries.find(entry => entry.kind === 'thread' && entry.hostId === hostId && entry.source.threadId === target.id);
+    if (existing) {
+      await bookmarks.remove(existing, { throwOnError: true });
+      if (authentication === api.runtimeIdentity().authenticationGeneration) api.toast('已取消收藏聊天');
+      return;
+    }
+    const project = state.projects.find(project => (project.hostId || 'local') === hostId && api.threadMatchesProject(target, project));
+    const projectPath = project?.path || target.cwd;
+    if (!projectPath?.startsWith('/')) throw new Error('无法确定聊天所属目录，请同步对话后重试');
+    const threadName = searchableThreadTitle(target).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 1000) || '未命名对话';
+    bookmarkError.value = '';
+    bookmarkNaming.value = { mode: 'add', authentication, initialName: threadName.slice(0, 160),
+      input: { kind: 'thread', hostId, projectPath, name: '', source: { threadId: target.id, threadName } } };
+  } catch (error: any) {
+    if (authentication === api.runtimeIdentity().authenticationGeneration) showError(error?.message || '无法收藏聊天，请重试');
+  } finally { threadBookmarkPending.value = false; }
+}
 function renameBookmark(entry: ConversationBookmark) {
   bookmarkError.value = '';
   bookmarkNaming.value = { mode: 'rename', input: entry, initialName: entry.name, authentication: api.runtimeIdentity().authenticationGeneration };
@@ -594,7 +635,7 @@ async function saveBookmark(name: string) {
   try {
     await bookmarks.save(dialog.input, name);
     if (bookmarkNaming.value === dialog && dialog.authentication === api.runtimeIdentity().authenticationGeneration) {
-      bookmarkNaming.value = null; api.toast(dialog.mode === 'add' ? '已收藏此段对话' : '收藏名称已更新');
+      bookmarkNaming.value = null; api.toast(dialog.mode === 'add' ? dialog.input.kind === 'thread' ? '已收藏聊天' : '已收藏此段对话' : '收藏名称已更新');
     }
   } catch (error: any) { if (bookmarkNaming.value === dialog) bookmarkError.value = error?.message || '保存收藏失败，请重试'; }
   finally { if (dialog.authentication === api.runtimeIdentity().authenticationGeneration) bookmarkSaving.value = false; }
@@ -610,6 +651,7 @@ async function openBookmark(entry: ConversationBookmark) {
     const current = () => operation === bookmarkNavigation && authentication === api.runtimeIdentity().authenticationGeneration &&
       generation === navigationSelection && state.hostId === entry.hostId && state.activeThread?.id === entry.source.threadId;
     if (!current()) return;
+    if (entry.kind === 'thread') { bookmarks.close(); sidebarOpen.value = false; return; }
     pauseFollowing();
     showScrollBottom.value = true;
     await api.revealBookmarkSource(entry.source);
@@ -1298,6 +1340,9 @@ watch(() => [state.authenticated, state.loading], () => {
                 <Icon name="RefreshCw" :size="16" />压缩上下文</button
               ><button :disabled="!state.activeThread" @click="openRename">
                 <Icon name="Pencil" :size="16" />重命名对话</button
+              ><button :disabled="!state.activeThread || threadBookmarkPending || bookmarkSaving || bookmarks.state.indexLoading || !!bookmarks.state.busyId"
+                @click="toggleChatBookmark(state.activeThread, state.hostId)">
+                <Icon name="Bookmark" :size="16" />{{ isChatBookmarked(state.hostId, state.activeThread?.id) ? '取消收藏聊天' : '收藏聊天' }}</button
               ><button :disabled="!state.activeThread || state.busy || actionPending"
                 @click="threadMenu = false; movingProject = { thread: { ...state.activeThread, hostId: state.hostId }, hostId: state.hostId }">
                 <Icon name="FolderInput" :size="16" />移动到项目</button
@@ -1597,7 +1642,7 @@ watch(() => [state.authenticated, state.loading], () => {
     <ConversationImageViewer v-if="conversationImages.image.value" :image="conversationImages.image.value" @close="conversationImages.close" />
     <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
-    <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
+    <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :kind="bookmarkNaming.input.kind === 'thread' ? 'thread' : 'message'" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.kind === 'thread' ? undefined : bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
     <ThreadProjectMoveDialog v-if="movingProject && state.authenticated" :key="`${movingProject.hostId}:${movingProject.thread.id}`" :thread="movingProject.thread" :host-id="movingProject.hostId" :state="state" :api="api" @close="movingProject = null" />
     <ResizableWorkspace v-if="workspaceOpen && currentHost" v-show="!sideChat.state.open">
       <WorkspacePanel

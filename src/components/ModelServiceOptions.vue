@@ -20,6 +20,8 @@ const selectedTier = computed(() => catalogTiers.value.find(tier => tier.id === 
 const selectedLabel = computed(() => !selected.value ? '原生默认' : selectedTier.value?.name || `原生：${selected.value}`);
 const unlistedSelection = computed(() => !!selected.value && !selectedTier.value);
 let generation = 0;
+let choiceGeneration = 0;
+watch([() => props.state.hostId, () => props.state.activeThread?.id, () => props.state.projectPath, () => props.state.authenticationGeneration, () => props.state.connected, () => props.state.selectingThread], () => { ++choiceGeneration; busy.value = false; error.value = ''; });
 let disposed = false;
 let quotaRevision = 0, quotaDirty = false;
 let pending: Promise<void> | null = null;
@@ -66,9 +68,10 @@ const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any)
 onBeforeUnmount(() => { disposed = true; generation++; quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
 async function choose(value: string) {
   busy.value = true; error.value = '';
+  const choice = choiceGeneration;
   try { await props.api.setServiceTier(value || null); }
-  catch (cause: any) { error.value = cause.message; }
-  finally { busy.value = false; }
+  catch (cause: any) { if (choice === choiceGeneration) error.value = cause.message; }
+  finally { if (choice === choiceGeneration) busy.value = false; }
 }
 function resetTime(value: number | null) { return value ? new Date(value).toLocaleString() : '未提供重置时间'; }
 </script>

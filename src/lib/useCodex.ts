@@ -159,6 +159,8 @@ const state = reactive({
   goalTokenBudget: null as number | null,
   modeCapabilities: { plan: false, goal: false, loaded: false },
   modeBusy: false,
+  modelSettingsBusy: false,
+  modelSettingsNotice: "",
   modeError: "",
   goalReadError: "",
   apps: [] as any[],
@@ -1740,7 +1742,7 @@ function receiveThreadChange(change: any) {
       state.serviceTier = state.nativeServiceTier;
       state.serviceTierScope = serviceTierScope(state);
     }
-    state.permissionChangePending = state.busy;
+    if (request.sandboxPolicy || request.approvalPolicy !== undefined) state.permissionChangePending = state.busy;
     return;
   }
   if (method === 'turn/start') {
@@ -3425,7 +3427,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   if (state.selectingThread || state.switchingHost || state.changingContext)
     throw fail(new Error("正在加载会话或主机配置，请稍后发送"));
   if (sendInFlight) throw fail(new Error("上一条消息正在发送，请稍候"));
-  if (state.modeBusy) throw fail(new Error("正在切换模式，请稍候"));
+  if (state.modeBusy || state.modelSettingsBusy) throw fail(new Error("正在更新会话设置，请稍候"));
   const goalMode = state.goalMode;
   const collaborationMode = state.collaborationMode;
   const supportsCollaborationModes = state.modeCapabilities.plan;
@@ -5016,26 +5018,100 @@ async function writeFile(path: string, content: string, expectedVersion: string,
   toast("文件已保存");
   return result;
 }
-async function setServiceTier(value: string | null) {
-  requireQueueSettingsUnlocked();
-  if (value !== null && !modelServiceTiers(state).some(tier => tier.id === value)) throw new Error("当前主机的模型目录未提供此服务层级");
-  if (!state.connected || state.switchingHost || state.selectingThread || state.changingContext || state.modeBusy || state.busy || state.editingMessage || sendInFlight)
-    throw new Error("请等待当前会话连接就绪且任务完成");
-  if (state.activeThread && (!state.threadReady || state.threadReleased || state.threadConflict)) throw new Error("请先恢复当前会话连接");
-  const hostId = state.hostId;
-  const selection = serviceTierScope(state);
-  const selectedEngine = engineId;
-  const capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false);
-  if (hostId !== state.hostId || selection !== serviceTierScope(state) || selectedEngine !== engineId || !state.connected || state.busy || (state.activeThread && !state.threadReady)) throw new Error("会话状态已变化，请重新选择服务层级");
-  const supported = state.activeThread ? methodAccepts(capabilities, "thread/settings/update", ["threadId", "serviceTier"]) :
-    methodAccepts(capabilities, "thread/start", ["serviceTier"]) && methodAccepts(capabilities, "turn/start", ["threadId", "input", "serviceTier"]);
-  if (!supported) throw new Error("当前 Codex 的原生服务层级协议尚未确认，请更新 Codex 或稍后重试");
-  if (state.activeThread) await rpc("thread/settings/update", { threadId: state.activeThread.id, serviceTier: value }, 15000, { silentError: true });
-  if (hostId !== state.hostId || selection !== serviceTierScope(state)) return;
-  state.serviceTier = value;
-  state.serviceTierScope = selection;
-  state.nativeServiceTier = value;
+type ModelSettingsChange = { model?: string; effort?: string; serviceTier?: string | null };
+let modelSettingsOperation = 0;
+watch([() => state.hostId, () => state.activeThread?.id, () => state.projectPath,
+  () => state.authenticationGeneration, () => state.connected, () => state.selectingThread], () => {
+  ++modelSettingsOperation;
+  state.modelSettingsBusy = false;
+  state.modelSettingsNotice = "";
+}, { flush: 'sync' });
+function queueSettingsOperationPending() {
+  const queue = messageQueue?.state;
+  return !!(queue?.restoring || queue?.loading || queue?.mutating || queue?.uncertain);
 }
+async function changeModelSettings(change: ModelSettingsChange) {
+  if (!state.connected || state.switchingHost || state.selectingThread || state.changingContext || state.modeBusy || state.modelSettingsBusy ||
+      state.editingMessage || sendInFlight || queueSettingsOperationPending()) throw new Error("请等待当前设置或消息提交完成后重试");
+  if (state.activeThread && (!state.threadReady || state.threadReleased || state.threadConflict)) throw new Error("请先恢复当前会话连接");
+  const model = change.model ?? state.model;
+  const selectedModel = state.models.find(entry => entry.model === model && !entry.hidden);
+  if (change.model && !selectedModel) throw new Error("当前主机没有提供此模型");
+  if (change.effort && selectedModel?.supportedReasoningEfforts?.length &&
+      !selectedModel.supportedReasoningEfforts.some((entry: any) => entry.reasoningEffort === change.effort)) throw new Error("当前模型不支持此推理强度");
+  if ('serviceTier' in change && change.serviceTier !== null && !modelServiceTiers(state).some(tier => tier.id === change.serviceTier))
+    throw new Error("当前主机的模型目录未提供此服务层级");
+  const hostId = state.hostId, threadId = state.activeThread?.id, cwd = state.projectPath;
+  const authentication = authenticationGeneration, selection = selectionGeneration, selectedEngine = engineId, selectedSocket = socket;
+  const operation = ++modelSettingsOperation;
+  const current = () => operation === modelSettingsOperation && authentication === authenticationGeneration && hostId === state.hostId &&
+    threadId === state.activeThread?.id && cwd === state.projectPath && selection === selectionGeneration && selectedEngine === engineId && selectedSocket === socket && state.connected;
+  const assertCurrent = () => { if (!current()) throw new Error("会话状态已变化，请在当前会话重新调整设置"); };
+  state.modelSettingsBusy = true;
+  state.modelSettingsNotice = "";
+  try {
+    // Unknown/old runtimes can still select model and effort for the next
+    // explicit turn/start, whose request already carries these fields.
+    let capabilities: any = null;
+    try { capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false); } catch {}
+    assertCurrent();
+    const fields = Object.keys(change);
+    const queued = !!messageQueue?.state.items.length;
+    let saved = false;
+    if (threadId && !queued && methodAccepts(capabilities, 'thread/settings/update', ['threadId', ...fields])) {
+      try {
+        await rpc('thread/settings/update', { threadId, ...change } as any, 15000, { silentError: true });
+        saved = true;
+      } catch (cause: any) { if (cause.code !== -32601) throw cause; }
+      assertCurrent();
+    }
+    if ('serviceTier' in change && !saved && !methodAccepts(capabilities, 'turn/start', ['threadId', 'input', 'serviceTier']))
+      throw new Error("当前 Codex 的原生服务层级协议尚未确认，请更新 Codex 或稍后重试");
+    if (change.model) state.model = change.model;
+    if (change.effort) state.effort = change.effort;
+    if ('serviceTier' in change) {
+      state.serviceTier = change.serviceTier;
+      state.serviceTierScope = serviceTierScope(state);
+      if (saved) state.nativeServiceTier = change.serviceTier ?? null;
+    }
+    const queueNotice = queued ? "；已排队消息保留原设置" : "";
+    const futureNotice = queued
+      ? `已选择，下一次手动发送新一轮时生效${queueNotice}`
+      : "已保存，后续新一轮生效";
+    const activeTurnId = threadId && state.busy ? activeTurns.get(threadId) : undefined;
+    if (!activeTurnId || !methodAccepts(capabilities, 'turn/settings/update', ['threadId', 'turnId', ...fields])) {
+      state.modelSettingsNotice = state.busy || queued ? futureNotice : "";
+      return;
+    }
+    try {
+      const result = await rpc('turn/settings/update', { threadId: threadId!, turnId: activeTurnId, ...change } as any, 15000, { silentError: true });
+      if (!current()) return;
+      state.modelSettingsNotice = result?.status === 'applied' && activeTurns.get(threadId!) === activeTurnId
+        ? `已更新，当前任务后续模型请求生效；已发出的请求不变${queueNotice}`
+        : futureNotice;
+    } catch (cause: any) {
+      if (current()) state.modelSettingsNotice = cause.code === -32601 || /step_model_switching|feature.*(?:disabled|require)|only fallback metadata/i.test(cause.message || '')
+        ? futureNotice : `${futureNotice}；当前轮未更新：${cause.message || '请稍后重试'}`;
+    }
+  } finally { if (operation === modelSettingsOperation) state.modelSettingsBusy = false; }
+}
+async function setModel(model: string) {
+  const selected = state.models.find(entry => entry.model === model && !entry.hidden);
+  if (!selected) throw new Error("当前主机没有提供此模型");
+  const efforts = selected.supportedReasoningEfforts || [];
+  const effort = efforts.length && !efforts.some((entry: any) => entry.reasoningEffort === state.effort)
+    ? selected.defaultReasoningEffort || efforts[0].reasoningEffort : state.effort;
+  const override = serviceTierParams(state);
+  const explicitTier = Object.prototype.hasOwnProperty.call(override, 'serviceTier');
+  const tier = explicitTier ? override.serviceTier : state.nativeServiceTier;
+  // An advertised tier list is an explicit compatibility boundary. An omitted
+  // catalog is unknown, so leave that validation to the native runtime.
+  const unsupportedTier = !!tier && Array.isArray(selected.serviceTiers) && !selected.serviceTiers.some((entry: any) => entry.id === tier);
+  await changeModelSettings({ model, effort, ...(unsupportedTier ? { serviceTier: null } : explicitTier ? { serviceTier: tier ?? null } : {}) });
+}
+async function setReasoningEffort(effort: string) { await changeModelSettings({ effort }); }
+async function setServiceTier(value: string | null) { await changeModelSettings({ serviceTier: value }); }
+
 async function runTerminal(command: string) {
   if (state.terminalRunning) throw fail(new Error("已有终端命令正在运行"));
   const hostId = state.hostId, authentication = authenticationGeneration;
@@ -5978,11 +6054,14 @@ async function prepareQueuedSettings(hostId: string, threadId: string, capabilit
   const policy = !profile && state.runtimePolicy
     ? state.runtimePolicy
     : resolveWebPermissionSelection(state.permission as any, { profile, cwd: state.projectPath, requirements: state.requirements });
-  const params: any = { threadId, cwd: state.projectPath, model: state.model || undefined, effort: state.effort,
+  // Native queue entries share saved thread defaults. Selecting settings for
+  // later manual input must not rewrite defaults beneath already queued input.
+  const preserveQueuedModels = !!messageQueue?.state.items.length;
+  const params: any = { threadId, cwd: state.projectPath, ...(!preserveQueuedModels ? { model: state.model || undefined, effort: state.effort, ...serviceTierParams(state) } : {}),
     ...(state.runtimePolicy?.source !== 'native' ? {
       sandboxPolicy: profile ? policy.sandboxPolicy : sandboxPolicy(), approvalPolicy: profile ? policy.approvalPolicy : state.runtimePolicy?.approvalPolicy ?? policy.approvalPolicy,
     } : {}) };
-  if (state.modeCapabilities.plan) params.collaborationMode = nativeCollaborationMode(state.collaborationMode, state.model, state.effort);
+  if (state.modeCapabilities.plan && !preserveQueuedModels) params.collaborationMode = nativeCollaborationMode(state.collaborationMode, state.model, state.effort);
   if (!methodAccepts(capabilities, 'thread/settings/update', Object.keys(params))) throw new Error('当前 Codex 无法保存下一轮设置，请更新 Codex 后使用队列');
   await sideChatRpc(hostId, 'thread/settings/update', params);
   state.permissionChangePending = state.busy;
@@ -6079,6 +6158,8 @@ export function useCodex() {
     writeFile,
     http,
     requestHttp: http,
+    setModel,
+    setReasoningEffort,
     setServiceTier,
     updatePreferences,
     promptPresets,

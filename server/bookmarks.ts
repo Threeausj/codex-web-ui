@@ -17,27 +17,43 @@ const scopeSchema = z.object({ hostId: identifier, projectPath }).strict();
 const queryScopeSchema = scopeSchema.extend({ _request: z.string().max(256).optional() })
   .transform(({ hostId, projectPath }) => ({ hostId, projectPath }));
 const allQuerySchema = z.object({ all: z.literal('true'), _request: z.string().max(256).optional() }).strict();
-export const bookmarkInput = scopeSchema.extend({
+const threadName = z.string().max(1000).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'Control characters are not allowed');
+const messageBookmarkInput = scopeSchema.extend({
   name,
+  kind: z.literal('message').optional(),
   source: z.object({
     threadId: identifier,
     turnId: identifier,
     itemId: identifier,
     text: z.string().min(1).max(16000).refine(value => !!value.trim() && !value.includes('\0'), 'Select conversation text to bookmark'),
-    threadName: z.string().max(1000).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'Control characters are not allowed'),
+    threadName,
   }).strict(),
 }).strict();
+const threadBookmarkInput = scopeSchema.extend({
+  name,
+  kind: z.literal('thread'),
+  source: z.object({ threadId: identifier, threadName }).strict(),
+}).strict();
+export const bookmarkInput = z.union([messageBookmarkInput, threadBookmarkInput]);
 const bookmarkId = z.string().uuid();
-const bookmarkSchema = bookmarkInput.extend({
+const bookmarkMetadata = {
   id: bookmarkId,
   createdAt: z.number().int().nonnegative().safe(),
   updatedAt: z.number().int().nonnegative().safe(),
-}).strict();
+};
+const bookmarkSchema = z.union([messageBookmarkInput.extend(bookmarkMetadata), threadBookmarkInput.extend(bookmarkMetadata)]);
 const persistedSchema = z.object({ version: z.literal(1), bookmarks: z.array(bookmarkSchema).max(MAX_BOOKMARKS) }).strict();
 const matchingScope = (bookmark: BookmarkScope, scope: BookmarkScope) => bookmark.hostId === scope.hostId && bookmark.projectPath === scope.projectPath;
 const newestFirst = (a: ConversationBookmark, b: ConversationBookmark) => b.createdAt - a.createdAt || a.id.localeCompare(b.id);
 const failure = (status: number, message: string) => Object.assign(new Error(message), { status });
 const missing = () => failure(404, '收藏不存在或已移除');
+const typedBookmarksMediaType = 'application/vnd.codex-web.bookmarks.v2+json';
+const acceptsChatBookmarks = (accept: string | undefined) => (accept || '').split(',').some(value => {
+  const [mediaType, ...parameters] = value.toLowerCase().split(';').map(part => part.trim());
+  if (mediaType !== typedBookmarksMediaType) return false;
+  const quality = parameters.find(parameter => /^q\s*=/.test(parameter));
+  return quality === undefined || Number(quality.slice(quality.indexOf('=') + 1)) > 0;
+});
 
 /** Dedicated, serialized writes keep another browser's bookmark edits intact. */
 export class Bookmarks {
@@ -74,9 +90,13 @@ export class Bookmarks {
   add(input: unknown): Promise<ConversationBookmark> {
     const validated = bookmarkInput.parse(input);
     return this.mutate(async () => {
-      const duplicate = this.bookmarks.find(bookmark => matchingScope(bookmark, validated) &&
-        bookmark.source.threadId === validated.source.threadId && bookmark.source.turnId === validated.source.turnId &&
-        bookmark.source.itemId === validated.source.itemId && bookmark.source.text === validated.source.text);
+      const duplicate = this.bookmarks.find(bookmark => {
+        if (validated.kind === 'thread') return bookmark.kind === 'thread' && bookmark.hostId === validated.hostId &&
+          bookmark.source.threadId === validated.source.threadId;
+        return bookmark.kind !== 'thread' && matchingScope(bookmark, validated) &&
+          bookmark.source.threadId === validated.source.threadId && bookmark.source.turnId === validated.source.turnId &&
+          bookmark.source.itemId === validated.source.itemId && bookmark.source.text === validated.source.text;
+      });
       if (duplicate) return structuredClone(duplicate);
       if (this.bookmarks.length >= MAX_BOOKMARKS) throw failure(409, '收藏数量已达上限，请先移除不需要的收藏');
       const timestamp = Date.now();
@@ -135,11 +155,16 @@ export async function registerBookmarks(app: Express, dataDir: string, hostExist
     return scope;
   };
   app.get('/api/bookmarks', (req, res, next) => {
+    // Existing installed clients assume every result has selected text and an
+    // item anchor. Whole-chat results require explicit typed-client opt-in.
+    res.vary('Accept');
+    const compatible = (entries: ConversationBookmark[]) => acceptsChatBookmarks(req.get('Accept'))
+      ? entries : entries.filter(bookmark => bookmark.kind !== 'thread');
     try {
       if (Object.hasOwn(req.query, 'all')) {
         allQuerySchema.parse(req.query);
-        res.json({ bookmarks: bookmarks.listAll().filter(bookmark => hostExists(bookmark.hostId)) });
-      } else res.json({ bookmarks: bookmarks.list(checkedScope(req.query)) });
+        res.json({ bookmarks: compatible(bookmarks.listAll().filter(bookmark => hostExists(bookmark.hostId))) });
+      } else res.json({ bookmarks: compatible(bookmarks.list(checkedScope(req.query))) });
     }
     catch (error) { next(error); }
   });

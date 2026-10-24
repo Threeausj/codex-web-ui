@@ -80,6 +80,22 @@ const contextDisabled = computed(
   () => props.contextBusy || props.state.busy || props.state.switchingHost ||
     props.state.selectingThread || props.state.modeBusy || uploading.value || submitting.value,
 );
+const modelSettingsError = ref("");
+let modelChoiceGeneration = 0;
+const modelControlsDisabled = computed(() => !!(props.contextBusy || !props.state.connected || props.state.switchingHost ||
+  props.state.selectingThread || props.state.threadReleased || props.state.threadConflict || props.state.runtimePaused ||
+  (props.state.activeThread && props.state.threadReady === false) || props.state.modeBusy || props.state.modelSettingsBusy || uploading.value || submitting.value ||
+  queue.value?.state.restoring || queue.value?.state.loading || queue.value?.state.mutating || queue.value?.state.uncertain));
+async function chooseModelSetting(event: Event, kind: 'model' | 'effort') {
+  const element = event.target as HTMLSelectElement;
+  modelSettingsError.value = "";
+  const generation = modelChoiceGeneration;
+  try { await (kind === 'model' ? props.api.setModel(element.value) : props.api.setReasoningEffort(element.value)); }
+  catch (cause: any) { if (generation === modelChoiceGeneration) modelSettingsError.value = cause.message || '无法更新模型设置'; }
+  finally { element.value = kind === 'model' ? props.state.model : props.state.effort; }
+}
+watch([() => props.state.hostId, () => props.state.activeThread?.id, () => props.state.projectPath, () => props.state.authenticationGeneration, () => props.state.connected, () => props.state.selectingThread],
+  () => { ++modelChoiceGeneration; modelSettingsError.value = ""; });
 const pickerDisabled = computed(() => !!(props.contextBusy || props.state.switchingHost ||
   props.state.selectingThread || props.state.modeBusy || uploading.value || submitting.value));
 const picker = ref<"commands" | "mentions" | "">("");
@@ -402,6 +418,7 @@ const canSend = computed(
     !props.state.selectingThread &&
     !props.state.switchingHost &&
     !props.state.modeBusy &&
+    !props.state.modelSettingsBusy &&
     !(props.state.goalMode && goalBudgetInvalid.value) &&
     !props.contextBusy &&
     !submitting.value &&
@@ -1137,15 +1154,11 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             class="composer-select model-select"
             :title="selectedModel?.description || '选择模型'"
             ><select
-              v-model="state.model"
+              :value="state.model"
+              @change="chooseModelSetting($event, 'model')"
               aria-label="选择模型"
               :disabled="
-                state.busy || queue?.settingsLocked.value ||
-                state.modeBusy ||
-                state.selectingThread ||
-                state.switchingHost ||
-                contextBusy ||
-                !state.models?.length
+                modelControlsDisabled || !state.models?.length
               "
             >
               <option v-if="!state.models?.some((entry: any) => !entry.hidden && entry.model === state.model)" :value="state.model">
@@ -1166,10 +1179,11 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             class="composer-select effort-select"
             title="推理强度"
             ><select
-              v-model="state.effort"
+              :value="state.effort"
+              @change="chooseModelSetting($event, 'effort')"
               aria-label="推理强度"
               :disabled="
-                state.busy || queue?.settingsLocked.value || state.modeBusy || state.selectingThread || state.switchingHost || contextBusy
+                modelControlsDisabled
               "
             >
               <option
@@ -1183,7 +1197,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               </option></select
             ><Icon name="ChevronDown" :size="12"
           /></label>
-          <ModelServiceOptions :api="api" :state="state" :disabled="contextDisabled || state.busy || state.modeBusy || queue?.settingsLocked.value" />
+          <ModelServiceOptions :api="api" :state="state" :disabled="modelControlsDisabled" />
         </div>
         <div class="composer-submit">
           <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : queue?.state.status !== 'supported' ? queue?.state.reason : '立即补充到当前任务'">
@@ -1286,6 +1300,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         </div>
       </div>
     </div>
+    <p v-if="modelSettingsError || state.modelSettingsNotice" class="composer-setting-notice" :class="{ 'is-error': !!modelSettingsError }" :role="modelSettingsError ? 'alert' : 'status'">{{ modelSettingsError || state.modelSettingsNotice }}</p>
     <p v-if="submitting && submittedDuringCompaction" class="compaction-send-note" role="status"><Icon name="LoaderCircle" :size="12" class="spin" />压缩结束后发送，草稿暂时保留。</p>
   </div>
   <Teleport to="body">
@@ -1320,6 +1335,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 </template>
 
 <style scoped>
+.composer-setting-notice { color:var(--muted);font-size:11px;line-height:1.5;margin:5px 2px 0; }
+.composer-setting-notice.is-error { color:var(--red); }
 .compaction-send-note { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; margin: 7px 4px 0; }
 .composer-area {
   border: 1px solid var(--border);

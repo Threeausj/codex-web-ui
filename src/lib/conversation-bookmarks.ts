@@ -1,7 +1,15 @@
-import { reactive } from 'vue';
+import { reactive, type InjectionKey } from 'vue';
 import type { ConversationBookmark, BookmarkScope, ConversationBookmarkInput } from '../../shared/bookmarks';
 
 type Api = { requestHttp(path: string, options?: RequestInit, reportError?: boolean): Promise<any>; runtimeIdentity(): { authenticationGeneration: number } };
+const bookmarkCatalogAccept = 'application/vnd.codex-web.bookmarks.v2+json';
+export type ThreadBookmarkTarget = { id: string; hostId?: string; cwd?: string; name?: string | null; title?: string | null; preview?: string | null; projectId?: string | null };
+export const threadBookmarkActionsKey: InjectionKey<{
+  saved(hostId: string, threadId: string): boolean;
+  busy(): boolean;
+  refresh(): Promise<void>;
+  toggle(thread: ThreadBookmarkTarget, hostId: string): Promise<void>;
+}> = Symbol('thread-bookmark-actions');
 /** Isolated targets stay before the continuous window until native pagination reaches them. */
 export function retainBookmarkTargets(turns: any[], previous: any[], items: { id: string; turnId?: string }[]) {
   const ids = new Set(turns.map(turn => turn.id));
@@ -31,7 +39,7 @@ export function mergeBookmarkMessages<T extends { id: string }>(known: readonly 
 /** Match saved names, quotations and conversation titles without searching unrelated history. */
 export function matchesBookmark(entry: ConversationBookmark, query: string): boolean {
   const tokens = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
-  const text = [entry.name, entry.source.text, entry.source.threadName].join('\n').toLocaleLowerCase();
+  const text = [entry.name, entry.kind === 'thread' ? '' : entry.source.text, entry.source.threadName].join('\n').toLocaleLowerCase();
   return tokens.every(token => text.includes(token));
 }
 
@@ -125,7 +133,7 @@ export function useConversationBookmarks(api: Api) {
     let completed = false;
     const promise = (async () => {
       try {
-        const result = await api.requestHttp('/bookmarks?all=true', {}, false);
+        const result = await api.requestHttp('/bookmarks?all=true', { headers: { Accept: bookmarkCatalogAccept } }, false);
         if (current()) {
           state.allEntries = mergeChanges(result.bookmarks, read.revision); indexLoaded = true;
           synchronizeAllPanel();
@@ -151,7 +159,7 @@ export function useConversationBookmarks(api: Api) {
     const current = () => revision === generation && validSession(authentication, epoch) && showsScope(scope) && knownHost(scope.hostId);
     state.loading = true; state.error = '';
     try {
-      const result = await api.requestHttp('/bookmarks?' + query(scope), {}, false);
+      const result = await api.requestHttp('/bookmarks?' + query(scope), { headers: { Accept: bookmarkCatalogAccept } }, false);
       if (current()) state.entries = mergeChanges(result.bookmarks, read.revision, scope);
     } catch (error: any) { if (current()) state.error = error?.message || '无法读取收藏，请重试'; }
     finally { if (current()) state.loading = false; releaseRead(read); }
@@ -185,8 +193,11 @@ export function useConversationBookmarks(api: Api) {
     if (validSession(authentication, epoch) && knownHost(input.hostId) && host === hostRevision(input.hostId)) applyChange(result.bookmark);
     return result.bookmark as ConversationBookmark;
   }
-  async function remove(entry: ConversationBookmark) {
-    if (state.busyId) return;
+  async function remove(entry: ConversationBookmark, options?: { throwOnError?: boolean }) {
+    if (state.busyId) {
+      if (options?.throwOnError) throw new Error('请等待当前收藏操作完成');
+      return;
+    }
     const authentication = api.runtimeIdentity().authenticationGeneration, epoch = lifetime, panel = generation, host = hostRevision(entry.hostId);
     synchronizeIndexAuthentication(authentication);
     const currentMutation = () => validSession(authentication, epoch) && knownHost(entry.hostId) && host === hostRevision(entry.hostId);
@@ -195,7 +206,10 @@ export function useConversationBookmarks(api: Api) {
     try {
       await api.requestHttp(`/bookmarks/${encodeURIComponent(entry.id)}?${query(entry)}`, { method: 'DELETE' }, false);
       if (currentMutation()) applyChange(entry, true);
-    } catch (error: any) { if (currentPanel()) state.error = error?.message || '无法移除收藏，请重试'; }
+    } catch (error: any) {
+      if (currentPanel()) state.error = error?.message || '无法移除收藏，请重试';
+      if (options?.throwOnError) throw error;
+    }
     finally { if (panel === generation && validSession(authentication, epoch) && state.busyId === entry.id) state.busyId = ''; }
   }
   return { state, open, openAll, close, clear, refresh, ensureIndex, setHosts, save, remove };

@@ -57,7 +57,7 @@ test('an unlisted native tier stays visible, and rejected changes restore the re
   await expect(speed).toBeEnabled();
 });
 
-test('late catalogs and model changes preserve the displayed native tier before any pointer interaction', async ({ page, mock }) => {
+test('late catalogs preserve native speed and changing to an incompatible model resets the requested tier', async ({ page, mock }) => {
   let released = false;
   const pendingCapabilities: (() => Promise<void>)[] = [];
   await page.route('**/api/hosts/local/native-capabilities?*', route => released ? route.fulfill({ json: capabilities }) : new Promise<void>(resolve => {
@@ -81,11 +81,11 @@ test('late catalogs and model changes preserve the displayed native tier before 
   await expect(page.locator('.service-tier-value')).toHaveText('Fast');
   await expect(speed).toHaveValue('priority');
   await page.getByRole('combobox', { name: '选择模型', exact: true }).selectOption('mock-model-b');
-  await expect(page.locator('.service-tier-value')).toHaveText('原生：priority');
-  await expect(speed).toHaveValue('priority');
+  await expect(page.locator('.service-tier-value')).toHaveText('原生默认');
+  await expect(speed).toHaveValue('');
   await page.getByRole('combobox', { name: '选择模型', exact: true }).selectOption('mock-model-a');
-  await expect(page.locator('.service-tier-value')).toHaveText('Fast');
-  await expect(speed).toHaveValue('priority');
+  await expect(page.locator('.service-tier-value')).toHaveText('原生默认');
+  await expect(speed).toHaveValue('');
 });
 
 test('speed changes from another device update the current label without clicking or affecting another thread', async ({ page, mock }) => {

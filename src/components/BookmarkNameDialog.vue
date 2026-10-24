@@ -5,6 +5,7 @@ import Icon from './Icon.vue';
 const props = defineProps<{
   mode: 'add' | 'rename';
   initialName: string;
+  kind?: 'message' | 'thread';
   excerpt?: string;
   busy?: boolean;
   error?: string;
@@ -31,9 +32,9 @@ onMounted(async () => {
   <Teleport to="body">
     <dialog ref="dialog" class="bookmark-name-dialog" :aria-labelledby="titleId" @cancel.prevent="close">
       <form @submit.prevent="save">
-        <header><h2 :id="titleId"><Icon name="Bookmark" :size="19" />{{ mode === 'add' ? '收藏对话' : '重命名收藏' }}</h2><button type="button" class="icon-button" :disabled="busy" aria-label="关闭收藏名称编辑" @click="close"><Icon name="X" :size="18" /></button></header>
+        <header><h2 :id="titleId"><Icon name="Bookmark" :size="19" />{{ mode === 'add' ? kind === 'thread' ? '收藏聊天' : '收藏对话' : '重命名收藏' }}</h2><button type="button" class="icon-button" :disabled="busy" aria-label="关闭收藏名称编辑" @click="close"><Icon name="X" :size="18" /></button></header>
         <label :for="inputId">收藏名称</label>
-        <input :id="inputId" ref="input" v-model="name" class="bookmark-name-input" aria-label="收藏名称" placeholder="为这段对话起个名字" maxlength="160" required :disabled="busy" autofocus />
+        <input :id="inputId" ref="input" v-model="name" class="bookmark-name-input" aria-label="收藏名称" :placeholder="kind === 'thread' ? '为这条聊天起个收藏名称' : '为这段对话起个名字'" maxlength="160" required :disabled="busy" autofocus />
         <p v-if="excerpt" class="bookmark-name-excerpt">{{ excerpt }}</p>
         <p v-if="error" class="bookmark-name-error" role="alert">{{ error }}</p>
         <footer><button type="button" class="button button-secondary" :disabled="busy" @click="close">取消</button><button type="submit" class="button button-primary" :disabled="busy || !valid">{{ busy ? '保存中…' : mode === 'add' ? '收藏' : '保存名称' }}</button></footer>
