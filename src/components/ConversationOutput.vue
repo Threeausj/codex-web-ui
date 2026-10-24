@@ -23,6 +23,7 @@ const props = defineProps<{
   turns: any[];
   busy: boolean;
   hideFork?: boolean;
+  forkDisabled?: boolean;
   hostId?: string;
   threadId?: string;
   cwd?: string;
@@ -224,7 +225,7 @@ function itemBindings(row: ConversationTimelineRow) {
   return { item, hostId: props.hostId, threadId: props.threadId, cwd: props.cwd,
     busy: row.running ?? props.busy, collapseTools: row.nested,
     asyncQuestionStatus: props.asyncQuestionStatus, answerAsyncQuestion: props.answerAsyncQuestion, asyncQuestionsDisabled: props.asyncQuestionsDisabled, loadToolOutput: props.loadToolOutput,
-    canFork: !props.hideFork && !props.busy && !props.editing && !!item.turnId && (item.type === 'userMessage' || item.type === 'agentMessage' && row.output),
+    canFork: !props.hideFork && !props.forkDisabled && !props.editing && !!item.turnId && (item.type === 'userMessage' || item.type === 'agentMessage' && row.output),
     canEdit: !editSession.value && item.id === props.editableItemId, editing: props.editing, editDisabled: props.editDisabled,
     editSession: editSession.value, beginEdit, cancelEdit, saveEdit, uploadEdit, removeEditAttachment };
 }
@@ -270,7 +271,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
       :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
       :item="block.item"
       :busy="busy"
-      :can-fork="!hideFork && !busy && !editing && !!block.item.turnId"
+      :can-fork="!hideFork && !forkDisabled && !editing && !!block.item.turnId"
       :can-edit="!editSession && block.item.id === editableItemId"
       :editing="editing"
       :edit-disabled="editDisabled"
@@ -293,7 +294,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
         :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
-        :can-fork="!hideFork && !busy && !editing && !!item.turnId"
+        :can-fork="!hideFork && !forkDisabled && !editing && !!item.turnId"
         :can-edit="!editSession && item.id === editableItemId"
         :editing="editing"
         :edit-disabled="editDisabled"
@@ -357,7 +358,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
               :item="entry.item"
               :class="{ 'timeline-output': segment.outputs.some(item => item.id === entry.id) }"
               :busy="running(block)"
-              :can-fork="!hideFork && entry.item.type === 'agentMessage' && block.answers.some(item => item.id === entry.id) && !busy && !editing && !!entry.item.turnId"
+              :can-fork="!hideFork && !forkDisabled && entry.item.type === 'agentMessage' && block.answers.some(item => item.id === entry.id) && !editing && !!entry.item.turnId"
               @fork="emit('fork', $event)"
               @open-file="(path, line) => emit('openFile', path, line)"
               @error="emit('error', $event)"
@@ -374,7 +375,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
         :load-tool-output="loadToolOutput" :async-question-status="asyncQuestionStatus" :answer-async-question="answerAsyncQuestion" :async-questions-disabled="asyncQuestionsDisabled"
         :item="item"
         :busy="running(block)"
-        :can-fork="!hideFork && item.type === 'agentMessage' && !busy && !editing && !!item.turnId"
+        :can-fork="!hideFork && !forkDisabled && item.type === 'agentMessage' && !editing && !!item.turnId"
         @fork="emit('fork', $event)"
         @open-file="(path, line) => emit('openFile', path, line)"
         @error="emit('error', $event)"

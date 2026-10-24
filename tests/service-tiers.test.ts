@@ -20,3 +20,8 @@ test('account quota windows show backend usage and reset times without inventing
   const windows = rateLimitWindows({ rateLimitsByLimitId: { codex: { limitId: 'codex', primary: { usedPercent: 63.4, windowDurationMins: 300, resetsAt: 1700000000 }, secondary: { usedPercent: 0, windowDurationMins: 10080, resetsAt: null } } } });
   assert.equal(windows.length, 2); assert.equal(windows[0].label, '5 小时'); assert.equal(windows[0].resetsAt, 1700000000000); assert.equal(windows[1].label, '7 天'); assert.equal(windows[1].resetsAt, null);
 });
+
+test('an advertised service tier with a blank display name retains its real identifier as a visible label', () => {
+  const state = { model: 'model-a', models: [{ model: 'model-a', serviceTiers: [{ id: 'priority', name: '  ' }] }] };
+  assert.deepEqual(modelServiceTiers(state), [{ id: 'priority', name: 'priority', description: '' }]);
+});
