@@ -1,4 +1,4 @@
-import { test, expect, login, MockCodex } from './fixtures';
+import { test, expect, login, setComposerSelection, MockCodex } from './fixtures';
 import type { Page } from '@playwright/test';
 import type { PromptPreset } from '../../shared/prompt-presets';
 
@@ -53,7 +53,7 @@ test('slash recall preserves surrounding draft text, selection and attachments w
   seed(mock, 1, { content: '**审查**\n保留中文和 $x^2$' }); await login(page);
   await input(page).fill('前文 /1 后文');
   await page.locator('.composer input[type="file"]').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('notes') });
-  await input(page).evaluate((element: HTMLTextAreaElement) => { element.setSelectionRange(5, 5); element.dispatchEvent(new Event('input', { bubbles: true })); });
+  await setComposerSelection(input(page), 5);
   await page.getByRole('option').filter({ hasText: '/1 · 代码审查' }).click();
   await expect(input(page)).toHaveValue('前文 **审查**\n保留中文和 $x^2$ 后文');
   await expect(page.locator('.attachment').filter({ hasText: 'notes.txt' })).toBeVisible();
@@ -73,7 +73,7 @@ test('slash searches preset names and keeps numeric slots separate from skill an
 
 test('/presets opens settings and removes only the menu token', async ({ page }) => {
   await login(page); await input(page).fill('/presets 后文');
-  await input(page).evaluate((element: HTMLTextAreaElement) => { element.setSelectionRange(8, 8); element.dispatchEvent(new Event('input', { bubbles: true })); });
+  await setComposerSelection(input(page), 8);
   await input(page).press('Enter'); await expect(panel(page)).toBeVisible(); await close(page);
   await expect(input(page)).toHaveValue(' 后文');
 });

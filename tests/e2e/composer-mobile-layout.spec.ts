@@ -9,7 +9,7 @@ for (const width of [320, 390, 430]) {
     const verify = async () => {
       const area = await page.locator(".composer-area").boundingBox();
       const context = await page.locator(".new-context").boundingBox();
-      const input = await page.getByRole("textbox", { name: "消息输入框" }).boundingBox();
+      const input = await page.locator(".markdown-composer-editor").boundingBox();
       const toolbar = await page.locator(".composer-toolbar").boundingBox();
       const tools = await page.locator(".composer-tools").boundingBox();
       const submit = await page.locator(".composer-submit").boundingBox();

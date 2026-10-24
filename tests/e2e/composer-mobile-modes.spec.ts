@@ -1,4 +1,4 @@
-import { test, expect, login, type MockCodex } from './fixtures'
+import { test, expect, login, setComposerSelection, readComposerSource, type MockCodex } from './fixtures'
 
 test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
 
@@ -23,6 +23,12 @@ function modesWire(mock: MockCodex, supported = true) {
           status: request.params.status || 'active', tokenBudget: request.params.tokenBudget ?? null,
           tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1791200000, updatedAt: 1791200001 }
         return reply({ goal })
+      case 'fuzzyFileSearch':
+        // This test explicitly filters to a mode token. The generic fixture
+        // always returns README, even for 'plan', so a delayed search could
+        // select an unrelated file instead of exercising disabled modes.
+        if (['plan', 'goal'].includes(request.params.query)) { mock.requests.push(request); return reply({ files: [] }) }
+        return original(socket, request)
       case 'thread/settings/update':
         mock.requests.push(request)
         if (control.holdModeUpdate) { control.releaseModeUpdate = () => reply({}); return }
@@ -87,14 +93,11 @@ test('a delayed native mode response removes the original picker token after a m
   const input = page.getByRole('textbox', { name: '消息输入框' })
   await expect(input).toBeEnabled()
   await input.fill('请用 @plan 修改代码')
-  await input.evaluate((element: HTMLTextAreaElement) => {
-    element.setSelectionRange(8, 8)
-    element.dispatchEvent(new Event('input', { bubbles: true }))
-  })
+  await setComposerSelection(input, 8)
   control.holdModeUpdate = true
   await option(page, 'Plan 模式').tap()
   await expect.poll(() => typeof control.releaseModeUpdate).toBe('function')
-  await input.evaluate((element: HTMLTextAreaElement) => element.setSelectionRange(element.value.length, element.value.length))
+  await setComposerSelection(input, (await readComposerSource(input)).length)
   control.releaseModeUpdate?.()
   await expect(input).toHaveValue('请用  修改代码')
   await expect(page.locator('.mode-token')).toContainText('Plan 模式')

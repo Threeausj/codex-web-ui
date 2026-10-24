@@ -1,5 +1,5 @@
-import { test, expect, type Browser, type BrowserContext, type Page } from '@playwright/test';
-import { login, MockCodex } from './fixtures';
+import { test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { expect, login, MockCodex } from './fixtures';
 import type { StoredThreadReadReceipt, ThreadReadReceipt } from '../../shared/thread-read-receipts';
 
 const targetId = 'shared-completed-task';

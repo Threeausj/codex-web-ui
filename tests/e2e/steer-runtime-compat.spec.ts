@@ -63,7 +63,7 @@ async function openRunning(page: Page) {
   await login(page);
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).first().click();
   await expect(stop(page)).toBeVisible();
-  await expect(input(page)).toHaveAttribute('placeholder', /追加指令/);
+  await expect(input(page)).toHaveAttribute('aria-placeholder', /追加指令/);
 }
 
 async function sendSteer(page: Page) {
@@ -136,7 +136,7 @@ test('a third live turn during confirmation preserves the draft and blocks repla
   control.probeRelease!();
   await expect(page.locator('.global-error')).toContainText('消息尚未发送');
   await expect(input(page)).toHaveValue(question);
-  await expect(input(page)).toHaveAttribute('placeholder', /追加指令/);
+  await expect(input(page)).toHaveAttribute('aria-placeholder', /追加指令/);
   await expect(page.getByRole('button', { name: '追加指令', exact: true })).toBeVisible();
   expect(steers(mock)).toHaveLength(1);
   expect(mock.requests.some(request => request.method === 'turn/start')).toBe(false);

@@ -980,6 +980,7 @@ function onKeydown(event: KeyboardEvent) {
     event.preventDefault();
     openSettings("shortcuts");
   } else if (event.key === "Escape") {
+    const restoreComposerFocus = paletteOpen.value;
     paletteOpen.value = false;
     settingsOpen.value = false;
     resourcesOpen.value = false;
@@ -987,6 +988,7 @@ function onKeydown(event: KeyboardEvent) {
     renameOpen.value = false;
     sidebarOpen.value = false;
     threadMenu.value = false;
+    if (restoreComposerFocus) void nextTick(() => composer.value?.focus());
   }
 }
 function applyTheme() {
@@ -1586,6 +1588,7 @@ watch(() => [state.authenticated, state.loading], () => {
             @no-project="chooseNewContext(state.hostId, null)"
             @host="chooseNewContext($event)"
             @command="execute"
+            @search="openPalette"
             @error="showError"
           />
         </div>

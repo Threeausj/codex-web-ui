@@ -42,20 +42,20 @@ test("the first image paste reads clipboard items immediately and duplicated Fil
   expect(bodies[1].toString().match(/filename="deduplicated.png"/g)).toHaveLength(1);
 });
 
-test("normal text and mixed clipboard text keep the browser's default paste behavior", async ({ page, mock }) => {
+test("normal text and mixed clipboard text insert their literal source once while images upload separately", async ({ page, mock }) => {
   await login(page);
   const input = page.getByRole("textbox", { name: "消息输入框" });
-  const prevented = await input.evaluate((element) => {
+  await input.evaluate((element) => {
     const clipboard = new DataTransfer();
     clipboard.setData("text/plain", "普通粘贴内容");
     const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard });
     element.dispatchEvent(event);
-    return event.defaultPrevented;
   });
-  expect(prevented).toBe(false);
+  await expect(input).toHaveValue("普通粘贴内容");
   expect(mock.uploads).toHaveLength(0);
-  expect(await pasteImage(page, "mixed.png", true, "图片说明")).toBe(false);
+  await pasteImage(page, "mixed.png", true, "图片说明");
   await expect.poll(() => mock.uploads.length).toBe(1);
+  await expect(input).toHaveValue("普通粘贴内容图片说明");
 });
 
 test("one paste uploads a clipboard image once even when its FileList alias has different metadata", async ({ page }) => {

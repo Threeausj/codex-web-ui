@@ -8,7 +8,8 @@ import type { ConversationBookmark } from '../../shared/bookmarks';
 import { asyncQuestionNoticeKey, type AsyncQuestionNotice } from '../../shared/async-question-notices';
 import {
   test as base,
-  expect,
+  expect as baseExpect,
+  type Locator,
   type Page,
   type WebSocketRoute,
 } from "@playwright/test";
@@ -972,7 +973,125 @@ export const test = base.extend<{ mock: MockCodex }>({
     { auto: true },
   ],
 });
-export { expect };
+/** Inspect the public editor DOM, including hidden Markdown delimiter text.
+ * CodeMirror owns the rendering; no private view or Vue state is consulted.
+ * Use readComposerClipboardSource for documents outside the virtual viewport.
+ */
+export async function readComposerSource(editor: Locator) {
+  return editor.evaluate(element => {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) return element.value;
+    const lines = [...element.querySelectorAll<HTMLElement>('.cm-line')];
+    return lines.length ? lines.map(line => {
+      const copy = line.cloneNode(true) as HTMLElement; copy.querySelectorAll('.cm-placeholder, .cm-widgetBuffer').forEach(node => node.remove());
+      return copy.textContent || '';
+    }).join('\n') : element.textContent || '';
+  });
+}
+
+/** Exercise the editor's ordinary Select All / Copy / Undo Selection commands.
+ * The ClipboardEvent owns a private DataTransfer and never writes the system
+ * clipboard. This also reads source which CodeMirror has not mounted in DOM.
+ */
+export async function readComposerClipboardSource(editor: Locator) {
+  const focused = await editor.page().evaluateHandle(() => document.activeElement);
+  await editor.press('ControlOrMeta+A');
+  const source = await editor.evaluate(element => {
+    const data = new DataTransfer();
+    element.dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+    return data.getData('text/plain');
+  });
+  await editor.press('ControlOrMeta+u');
+  await focused.evaluate(element => { if (element instanceof HTMLElement && element.isConnected) element.focus({ preventScroll: true }); });
+  await focused.dispose();
+  return source;
+}
+
+/** Match editable Markdown source with the same contract as the former textarea.
+ * Native inputs/selects retain Playwright's built-in matcher and diagnostics.
+ */
+export const expect = baseExpect.extend({
+  async toHaveValue(editor: Locator, expected: string | RegExp, options?: { timeout?: number }) {
+    const rich = await editor.evaluate(element => element instanceof HTMLElement && element.classList.contains('cm-content') && element.getAttribute('aria-label') === '消息输入框', undefined, { timeout: options?.timeout });
+    let pass = false;
+    let result: any;
+    try {
+      if (rich) {
+        const check = baseExpect.poll(() => readComposerSource(editor), options);
+        const comparison = this.isNot ? check.not : check;
+        if (expected instanceof RegExp) await comparison.toMatch(expected);
+        else await comparison.toBe(expected);
+      } else {
+        const comparison = this.isNot ? baseExpect(editor).not : baseExpect(editor);
+        await comparison.toHaveValue(expected, options);
+      }
+      pass = true;
+    } catch (cause: any) { result = cause.matcherResult; }
+    return {
+      pass: this.isNot ? !pass : pass,
+      actual: result?.actual,
+      expected,
+      name: 'toHaveValue',
+      message: () => `${this.utils.matcherHint('toHaveValue', undefined, undefined, { isNot: this.isNot })}\n\nExpected source: ${this.isNot ? 'not ' : ''}${this.utils.printExpected(expected)}\nReceived source: ${this.utils.printReceived(result?.actual)}`,
+    };
+  },
+});
+
+/** Set a source selection through the native DOM Selection interface. */
+export async function setComposerSelection(editor: Locator, start: number, end = start) {
+  await editor.evaluate((element, value) => {
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+      element.focus(); element.setSelectionRange(value.start, value.end);
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      return;
+    }
+    const lines = [...element.querySelectorAll<HTMLElement>('.cm-line')];
+    function point(offset: number): { node: Node; offset: number } {
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index]!, length = line.textContent?.length || 0;
+        if (offset <= length || index === lines.length - 1) {
+          const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+          let node: Node | null;
+          while ((node = walker.nextNode())) {
+            const size = node.textContent?.length || 0;
+            if (offset <= size) return { node, offset };
+            offset -= size;
+          }
+          return { node: line, offset: line.childNodes.length };
+        }
+        offset -= length + 1;
+      }
+      return { node: element, offset: 0 };
+    }
+    const from = point(value.start), to = point(value.end), range = document.createRange();
+    range.setStart(from.node, from.offset); range.setEnd(to.node, to.offset);
+    (element as HTMLElement).focus();
+    const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+  }, { start, end });
+  await baseExpect.poll(() => getComposerSelection(editor)).toEqual([start, end]);
+}
+
+export async function getComposerSelection(editor: Locator): Promise<[number, number]> {
+  return editor.evaluate(element => {
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return [element.selectionStart || 0, element.selectionEnd || 0];
+    const selection = window.getSelection();
+    if (!selection?.rangeCount) return [0, 0];
+    const lines = [...element.querySelectorAll<HTMLElement>('.cm-line')];
+    const offset = (node: Node | null, local: number) => {
+      let prefix = 0;
+      for (const line of lines) {
+        if (node && line.contains(node)) {
+          const range = document.createRange(); range.selectNodeContents(line); range.setEnd(node, local);
+          return prefix + range.toString().length;
+        }
+        prefix += (line.textContent?.length || 0) + 1;
+      }
+      return 0;
+    };
+    const anchor = offset(selection.anchorNode, selection.anchorOffset), head = offset(selection.focusNode, selection.focusOffset);
+    return [Math.min(anchor, head), Math.max(anchor, head)];
+  });
+}
 
 export async function editSource(page: Page, name: string, text: string) {
   // Use CodeMirror's actual key/input handlers; DOM-only fill can race a

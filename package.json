@@ -22,6 +22,8 @@
   "dependencies": {
     "@aiden0z/pptx-renderer": "1.4.0",
     "@babel/parser": "^7.29.9",
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/lang-markdown": "6.5.2",
     "@codemirror/language": "^6.13.1",
     "@codemirror/language-data": "^6.5.2",
     "@codemirror/state": "^6.7.6",

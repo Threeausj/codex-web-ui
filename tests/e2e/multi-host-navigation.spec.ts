@@ -157,7 +157,7 @@ test("host status strip is removed while remote projects, local chat and mobile 
         .fontSize,
     ),
     input: parseFloat(
-      getComputedStyle(document.querySelector(".composer textarea")!).fontSize,
+      getComputedStyle(document.querySelector('.composer [role="textbox"][aria-label="消息输入框"]')!).fontSize,
     ),
   }));
   expect(metrics.width).toBeLessThanOrEqual(metrics.viewport);
