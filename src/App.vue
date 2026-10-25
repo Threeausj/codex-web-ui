@@ -36,6 +36,8 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import AutomationsPanel from "./components/AutomationsPanel.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import ConversationNav from "./components/ConversationNav.vue";
+import ChatTabs from './components/ChatTabs.vue';
+import { createChatTabs, sameChatTab, type ChatTabTarget } from './lib/chat-tabs';
 import ThreadCopyMenu from './components/ThreadCopyMenu.vue';
 import ThreadProjectMoveDialog from './components/ThreadProjectMoveDialog.vue';
 import ProjectDialog from "./components/ProjectDialog.vue";
@@ -48,6 +50,57 @@ import { pushTarget, pushTargetFromUrl, type PushTarget } from "./lib/push-navig
 
 const api = useCodex();
 const state = api.state;
+const chatTabs = createChatTabs({ ready: () => api.privateSessionReady(), authentication: () => api.runtimeIdentity().authenticationGeneration });
+const chatTabsView = ref<InstanceType<typeof ChatTabs>>();
+const chatTabSaving = ref(false);
+let chatTabPinOperation = 0;
+const selectedChatTab = computed(() => state.activeThread ? { hostId: state.hostId, threadId: state.activeThread.id } : null);
+const activeChatTabKey = computed(() => selectedChatTab.value ? JSON.stringify([selectedChatTab.value.hostId, selectedChatTab.value.threadId]) : null);
+const chatTabPinned = computed(() => chatTabs.state.entries.find(tab => sameChatTab(tab, selectedChatTab.value))?.pinned === true);
+const chatTabsDisabled = computed(() => state.editingMessage || state.loading || chatTabSaving.value);
+watch(() => [state.authenticated, state.authenticationGeneration], () => {
+  ++chatTabPinOperation; chatTabSaving.value = false;
+  if (state.authenticated) void chatTabs.load();
+  else chatTabs.clear();
+}, { immediate: true });
+watch([() => state.authenticated, () => state.hostId, () => state.activeThread?.id, () => state.switchingHost], () => {
+  if (state.authenticated && state.activeThread && !state.switchingHost)
+    chatTabs.open({ hostId: state.hostId, threadId: state.activeThread.id,
+      title: state.activeThread.name?.trim() || state.activeThread.preview?.trim() || undefined });
+});
+// Catalog pages are partial. Update known titles without treating missing rows
+// as deletion or opening every background chat as a tab.
+watch(() => api.navigationThreads().map(thread => ({ hostId: thread.hostId, threadId: thread.id,
+  title: thread.name?.trim() || thread.preview?.trim() })), entries => {
+  if (state.authenticated) for (const entry of entries) if (entry.title) chatTabs.rename(entry, entry.title);
+});
+watch(() => state.activeThread?.name?.trim() || state.activeThread?.preview?.trim(), title => {
+  if (title && selectedChatTab.value && !state.switchingHost) chatTabs.rename(selectedChatTab.value, title);
+});
+watch(() => state.hosts.map(host => host.id), (hosts, previous) => {
+  if (state.authenticated) for (const hostId of previous || []) if (!hosts.includes(hostId)) chatTabs.removeHost(hostId);
+});
+watch(() => [chatTabs.state.hydrated, state.authenticated, state.loading, state.connected,
+  state.error, ...state.hosts.map(host => host.id)], () => {
+  // Reconcile persisted host IDs only after bootstrap; an offline or failed
+  // bootstrap must not erase fixed tabs from the previous app window.
+  if (!chatTabs.state.hydrated || !state.authenticated || state.loading ||
+      !state.connected && (state.hosts.length > 0 || !!state.error)) return;
+  const hosts = new Set(state.hosts.map(host => host.id));
+  for (const hostId of new Set(chatTabs.state.entries.map(tab => tab.hostId)))
+    if (!hosts.has(hostId)) chatTabs.removeHost(hostId);
+});
+const stopChatTabEvents = api.subscribeProtocol((hostId, message) => {
+  if (!state.authenticated) return;
+  const params = message.params || {};
+  if (typeof params.threadId !== 'string') return;
+  if (message.method === 'bridge/thread/removed' || message.method === 'thread/deleted' ||
+      message.method === 'bridge/thread/changed' && ['thread/archive', 'thread/delete'].includes(params.method))
+    chatTabs.remove({ hostId, threadId: params.threadId });
+  const title = message.method === 'thread/name/updated' ? params.threadName ?? params.name
+    : message.method === 'bridge/thread/changed' && params.method === 'thread/name/set' ? params.request?.name : undefined;
+  if (typeof title === 'string') chatTabs.rename({ hostId, threadId: params.threadId }, title);
+});
 const conversationImages = provideConversationImageViewer();
 watch(() => [state.authenticated, state.hostId, state.activeThread?.id], () => conversationImages.close());
 const bookmarks = useConversationBookmarks(api);
@@ -140,7 +193,54 @@ const paletteSelected = ref(0);
 const searchOpen = ref(false);
 const threadSearch = ref("");
 const threadMenu = ref(false);
-watch(threadMenu, open => { if (open && state.authenticated) void bookmarks.ensureIndex({ force: true }); });
+const threadMenuButton = ref<HTMLButtonElement>();
+const threadMenuPanel = ref<HTMLElement>();
+const threadMenuPosition = ref({ left: '8px', top: '42px', right: 'auto' });
+function placeThreadMenu() {
+  const anchor = threadMenuButton.value?.getBoundingClientRect();
+  if (!anchor) return;
+  const width = Math.min(228, window.innerWidth - 16);
+  threadMenuPosition.value = { left: `${Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8))}px`,
+    top: `${anchor.bottom + 6}px`, right: 'auto' };
+}
+function toggleThreadMenu() {
+  placeThreadMenu();
+  threadMenu.value = !threadMenu.value;
+}
+function threadMenuKeys(event: KeyboardEvent) {
+  const buttons = [...threadMenuPanel.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || []];
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || !buttons.length) return;
+  event.preventDefault();
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+    : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+  buttons[next]?.focus({ preventScroll: true });
+}
+function dismissThreadMenu(event: Event) {
+  if (!threadMenu.value || chatTabSaving.value) return;
+  const target = event.target as Node | null;
+  if (!target || threadMenuButton.value?.contains(target) || threadMenuPanel.value?.contains(target)) return;
+  threadMenu.value = false;
+}
+function closeThreadMenuOnLayout(event: Event) {
+  if (chatTabSaving.value && event.type === 'scroll') return;
+  if (event.type === 'scroll' && !(event.target instanceof HTMLElement && event.target.classList.contains('chat-tabs-scroll'))) return;
+  threadMenu.value = false;
+}
+// Compare scalar identities: replacing a thread snapshot with the same ID
+// (for example on completion) must not dismiss its menu or reopen its tab.
+watch([() => state.hostId, () => state.activeThread?.id], () => { threadMenu.value = false; });
+watch([() => state.selectingThread, () => state.switchingHost], ([selecting, switching]) => {
+  if (selecting || switching) threadMenu.value = false;
+});
+watch(threadMenu, open => {
+  if (open && state.authenticated) {
+    void bookmarks.ensureIndex({ force: true });
+    void nextTick(() => {
+      if (threadMenu.value) threadMenuPanel.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus({ preventScroll: true });
+    });
+  }
+});
 const renameOpen = ref(false);
 const renameValue = ref("");
 const editingProject = ref<any>(null);
@@ -153,7 +253,7 @@ const messageEditOpen = ref(false);
 const updateCanReload = computed(() => !(
   state.busy || state.compacting || actionBusy.value || state.loading ||
   state.selectingThread || state.switchingHost || state.changingContext ||
-  state.modeBusy || state.modelSettingsBusy || bookmarkSaving.value || !!bookmarkNaming.value || !!bookmarks.state.busyId ||
+  state.modeBusy || state.modelSettingsBusy || chatTabSaving.value || bookmarkSaving.value || !!bookmarkNaming.value || !!bookmarks.state.busyId ||
   messageEditOpen.value || composer.value?.working || workspace.value?.working || settingsPanel.value?.working ||
   sideChat.state.busy || sideChat.state.loading || sideChat.state.saving
 ));
@@ -190,7 +290,8 @@ const projectName = computed(
     state.projectPath.split("/").filter(Boolean).pop() ||
     "选择项目",
 );
-const threadTitle = computed(() => threadLabel(state.activeThread, "新对话", 70));
+const threadTitle = computed(() => threadLabel(state.activeThread,
+  chatTabs.state.entries.find(tab => sameChatTab(tab, selectedChatTab.value))?.title || '新对话', 70));
 const visibleThreads = computed(() =>
   state.threads.filter(
     (thread: any) =>
@@ -436,7 +537,8 @@ async function restoreScroll(id: string, generation = navigationSelection) {
 async function selectThread(
   selection: string | { id: string; hostId: string },
 ) {
-  if (state.editingMessage) return;
+  if (state.editingMessage) return false;
+  threadMenu.value = false;
   const generation = ++navigationSelection;
   const id = typeof selection === "string" ? selection : selection.id;
   const hostId =
@@ -453,9 +555,51 @@ async function selectThread(
       if (generation === navigationSelection) throw error;
     }
   });
-  if (generation !== navigationSelection) return;
+  if (generation !== navigationSelection) return false;
   await nextTick();
   await restoreScroll(id, generation);
+  return generation === navigationSelection && hostId === state.hostId &&
+    id === state.activeThread?.id && state.threadReady && !state.threadConflict;
+}
+async function selectChatTab(tab: ChatTabTarget) {
+  if (chatTabsDisabled.value || sameChatTab(tab, selectedChatTab.value)) return;
+  await selectThread({ hostId: tab.hostId, id: tab.threadId });
+}
+async function closeChatTab(tab: ChatTabTarget) {
+  if (chatTabsDisabled.value) return;
+  threadMenu.value = false;
+  const authentication = api.runtimeIdentity().authenticationGeneration;
+  if (sameChatTab(tab, selectedChatTab.value)) {
+    const entries = chatTabs.state.entries, index = entries.findIndex(entry => sameChatTab(entry, tab));
+    const next = entries[index + 1] || entries[index - 1];
+    if (next) {
+      if (!await selectThread({ hostId: next.hostId, id: next.threadId })) return;
+    }
+    else await newThread();
+    // A failed navigation must leave the current tab available for retry.
+    if (authentication !== api.runtimeIdentity().authenticationGeneration || sameChatTab(tab, selectedChatTab.value)) return;
+  }
+  chatTabs.remove(tab);
+  await nextTick();
+  chatTabsView.value?.focusSelected();
+}
+async function toggleChatTabPin() {
+  if (chatTabsDisabled.value || !selectedChatTab.value) return;
+  if (!chatTabs.togglePinned(selectedChatTab.value)) {
+    showError('最多固定 23 个聊天标签，请先取消固定部分标签。'); return;
+  }
+  const operation = ++chatTabPinOperation;
+  chatTabSaving.value = true;
+  try {
+    // A closed menu acknowledges the operation. Start the durable write now
+    // rather than relying on the debounce timer or pagehide after a reload.
+    await chatTabs.flush();
+    if (operation !== chatTabPinOperation) return;
+    threadMenu.value = false;
+    chatTabSaving.value = false;
+    await nextTick();
+    chatTabsView.value?.focusSelected();
+  } finally { if (operation === chatTabPinOperation) chatTabSaving.value = false; }
 }
 async function newThread() {
   if (state.editingMessage) return;
@@ -876,6 +1020,7 @@ function onBackground() {
   clearTimeout(foregroundTimer);
   saveScroll();
   void readingPositions.flush();
+  void chatTabs.flush();
 }
 function onVisibilityChange() {
   if (document.visibilityState === 'hidden') onBackground();
@@ -1023,6 +1168,7 @@ function onKeydown(event: KeyboardEvent) {
     openSettings("shortcuts");
   } else if (event.key === "Escape") {
     const restoreComposerFocus = paletteOpen.value;
+    const restoreThreadMenuFocus = threadMenu.value;
     paletteOpen.value = false;
     settingsOpen.value = false;
     resourcesOpen.value = false;
@@ -1031,6 +1177,7 @@ function onKeydown(event: KeyboardEvent) {
     sidebarOpen.value = false;
     threadMenu.value = false;
     if (restoreComposerFocus) void nextTick(() => composer.value?.focus());
+    else if (restoreThreadMenuFocus) void nextTick(() => threadMenuButton.value?.focus({ preventScroll: true }));
   }
 }
 function applyTheme() {
@@ -1090,6 +1237,10 @@ onMounted(() => {
   window.visualViewport?.addEventListener("resize", updateViewport);
   window.addEventListener("resize", updateViewport);
   document.addEventListener("keydown", onKeydown);
+  document.addEventListener('pointerdown', dismissThreadMenu);
+  document.addEventListener('focusin', dismissThreadMenu);
+  window.addEventListener('resize', closeThreadMenuOnLayout);
+  document.addEventListener('scroll', closeThreadMenuOnLayout, true);
   prefersDark.addEventListener("change", applyTheme);
   window.addEventListener("online", onNetworkChange);
   window.addEventListener("offline", onNetworkChange);
@@ -1121,7 +1272,12 @@ onBeforeUnmount(() => {
   conversationImages.close();
   clearTimeout(bookmarkHighlightTimer); (globalThis.CSS as any)?.highlights?.delete('conversation-bookmark');
   onBackground();
+  stopChatTabEvents();
   document.removeEventListener("keydown", onKeydown);
+  document.removeEventListener('pointerdown', dismissThreadMenu);
+  document.removeEventListener('focusin', dismissThreadMenu);
+  window.removeEventListener('resize', closeThreadMenuOnLayout);
+  document.removeEventListener('scroll', closeThreadMenuOnLayout, true);
   prefersDark.removeEventListener("change", applyTheme);
   window.visualViewport?.removeEventListener("resize", updateViewport);
   window.removeEventListener("resize", updateViewport);
@@ -1261,7 +1417,8 @@ watch(() => [state.authenticated, state.loading], () => {
       </footer>
     </ResizableSidebar>
     <section class="main-column">
-      <header class="main-header">
+      <header class="main-header chat-tabs-header" :data-host-id="state.hostId" :data-project-name="projectName">
+        <h1 class="chat-active-heading">{{ threadTitle }}</h1>
         <div class="header-left">
           <button
             class="icon-button mobile-only"
@@ -1277,57 +1434,31 @@ watch(() => [state.authenticated, state.loading], () => {
           >
             <Icon name="PanelLeft" />
           </button>
-          <div class="header-project">
-            <button
-              @click="openSettings(state.hosts.length ? 'projects' : 'hosts')"
-              :title="state.noProject ? '不在项目中工作' : state.projectPath"
-            >
-              <Icon :name="state.hosts.length ? (state.noProject ? 'MessagesSquare' : 'Folder') : 'Globe'" :size="15" /><span>{{ state.hosts.length ? projectName : '连接工作站' }}</span
-              ><Icon name="ChevronDown" :size="12" /></button
-            ><span class="header-breadcrumb">/</span>
-            <h1 :title="threadTitle">{{ threadTitle }}</h1>
-          </div>
-        </div>
-        <div class="header-actions">
-          <span
-            v-if="currentHost"
-            class="host-badge header-host"
-            :title="currentHost?.hostname || currentHost?.name"
-            ><Icon
-              :name="currentHost?.kind === 'ssh' ? 'Server' : 'Monitor'"
-              :size="12"
-            /><span>{{ currentHost?.name || "本机" }}</span></span
-          ><button
-            class="icon-button"
-            :disabled="!state.activeThread || state.selectingThread || state.switchingHost || state.changingContext"
-            :class="{ selected: sideChat.state.open }"
-            :aria-pressed="sideChat.state.open"
-            @click="openSideChat"
-            title="新建侧边聊天"
-            aria-label="新建侧边聊天"
-          >
-            <Icon name="MessagesSquare" :size="18" />
-          </button><button
-            class="icon-button"
-            :disabled="!currentHost"
-            :class="{ selected: workspaceOpen && !sideChat.state.open }"
-            @click="toggleWorkspace"
-            title="工作区：文件、预览、终端"
-            aria-label="切换工作区"
-          >
-            <Icon name="PanelRight" :size="18" />
-          </button>
+          <ChatTabs ref="chatTabsView" :tabs="chatTabs.state.entries" :active-key="activeChatTabKey"
+            :draft="!state.activeThread" :disabled="chatTabsDisabled"
+            @select="selectChatTab" @close="closeChatTab" @new="newThread">
+            <template #menu>
           <div class="thread-menu-wrapper">
             <button
+              ref="threadMenuButton"
               class="icon-button"
-              @click="threadMenu = !threadMenu"
+              @click="toggleThreadMenu"
               title="对话操作"
               aria-label="对话操作"
               :aria-expanded="threadMenu"
+              aria-controls="active-chat-menu"
             >
               <Icon name="MoreHorizontal" :size="19" />
             </button>
-            <div v-if="threadMenu" class="thread-menu">
+            <Teleport to="body">
+            <div v-if="threadMenu" ref="threadMenuPanel" id="active-chat-menu" class="thread-menu chat-tabs-menu" :style="threadMenuPosition" role="group" aria-label="当前聊天操作" @keydown="threadMenuKeys">
+              <button :disabled="!selectedChatTab || chatTabsDisabled" @click="toggleChatTabPin">
+                <Icon :name="chatTabPinned ? 'PinOff' : 'Pin'" :size="16" />{{ chatTabPinned ? '取消固定标签页' : '固定标签页' }}
+              </button>
+              <button :disabled="!selectedChatTab || chatTabsDisabled" @click="selectedChatTab && closeChatTab(selectedChatTab)">
+                <Icon name="X" :size="16" />关闭标签页
+              </button>
+              <hr />
               <button
                 :disabled="forkActionsDisabled"
                 @click="execute('fork')"
@@ -1386,7 +1517,32 @@ watch(() => [state.authenticated, state.loading], () => {
                 <Icon name="Keyboard" :size="16" />快捷键
               </button>
             </div>
+            </Teleport>
           </div>
+            </template>
+          </ChatTabs>
+        </div>
+        <div class="header-actions">
+          <button
+            class="icon-button"
+            :disabled="!state.activeThread || state.selectingThread || state.switchingHost || state.changingContext"
+            :class="{ selected: sideChat.state.open }"
+            :aria-pressed="sideChat.state.open"
+            @click="openSideChat"
+            title="新建侧边聊天"
+            aria-label="新建侧边聊天"
+          >
+            <Icon name="MessagesSquare" :size="18" />
+          </button><button
+            class="icon-button"
+            :disabled="!currentHost"
+            :class="{ selected: workspaceOpen && !sideChat.state.open }"
+            @click="toggleWorkspace"
+            title="工作区：文件、预览、终端"
+            aria-label="切换工作区"
+          >
+            <Icon name="PanelRight" :size="18" />
+          </button>
         </div>
       </header>
       <div v-if="state.runtimePaused" class="connection-banner" role="status">

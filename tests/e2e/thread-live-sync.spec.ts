@@ -88,7 +88,7 @@ test('canonical rename and revert refresh the observing page and late discarded-
   await expect(other.getByText('应该移除的旧回复', { exact: true })).toBeVisible();
   mock.threads[0].name = '其他网页修改后的名称';
   change(mock, { threadId, method: 'thread/name/set', changeId: 'web:13', result: {}, request: { name: mock.threads[0].name } });
-  await expect(other.locator('.main-header')).toContainText('其他网页修改后的名称');
+  await expect(other.locator('.main-header h1')).toHaveText('其他网页修改后的名称');
   mock.turns.set(threadId, mock.turns.get(threadId)!.filter(turn => turn.id !== removed.id));
   // Native Codex emits this before replying, and the reply never includes its
   // retained turns. The browser must retain old IDs until it reads real history.
@@ -114,12 +114,12 @@ test('change IDs may be reused after reconnect while the draft and selected thre
   await draft.fill('断线重连也保留草稿');
   mock.threads[0].name = '断线前的名称';
   change(mock, { threadId, method: 'thread/name/set', changeId: 'web:1', result: {}, request: { name: mock.threads[0].name } });
-  await expect(page.locator('.main-header')).toContainText('断线前的名称');
+  await expect(page.locator('.main-header h1')).toHaveText('断线前的名称');
   await mock.sockets[0]!.close({ code: 4003, reason: 'Reconnect fixture' });
   await expect.poll(() => mock.sockets.length, { timeout: 12_000 }).toBe(2);
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   change(mock, { threadId, method: 'thread/name/set', changeId: 'web:1', result: {}, request: { name: '新连接复用编号后的名称' } });
-  await expect(page.locator('.main-header')).toContainText('新连接复用编号后的名称');
+  await expect(page.locator('.main-header h1')).toHaveText('新连接复用编号后的名称');
   await expect(draft).toHaveValue('断线重连也保留草稿');
   expect(mock.request('turn/start')).toBeUndefined();
 });

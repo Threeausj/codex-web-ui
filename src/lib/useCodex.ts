@@ -341,10 +341,10 @@ function subscribeProtocol(listener: (hostId: string, message: any) => boolean |
   protocolListeners.add(listener);
   return () => protocolListeners.delete(listener);
 }
-function notifyProtocol(message: any) {
+function notifyProtocol(message: any, hostId = state.hostId) {
   let consumed = false;
   for (const listener of protocolListeners) {
-    try { consumed = listener(state.hostId, message) === true || consumed; }
+    try { consumed = listener(hostId, message) === true || consumed; }
     catch { /* One view must not interrupt the shared protocol transport. */ }
   }
   return consumed;
@@ -4160,6 +4160,7 @@ function cleanupDeletedThread(id: string, hostId = state.hostId) {
     browserStorage.local.setItem('codex.selectedThreadIds', JSON.stringify(selections));
   }
   void privateState.remove('queue-outcome', JSON.stringify([hostId, id])).catch(() => {});
+  notifyProtocol({ method: 'bridge/thread/removed', params: { threadId: id } }, hostId);
   if (state.preferences.pins.some(pin => pin.hostId === hostId && pin.kind === 'thread' && pin.id === id)) {
     void updatePreferences({ pins: state.preferences.pins.filter(pin =>
       pin.hostId !== hostId || pin.kind !== 'thread' || pin.id !== id) }).catch(() => {
@@ -4198,6 +4199,7 @@ function cleanupArchivedThread(id: string) {
   itemCache.delete(id);
   conversationCache.remove(state.hostId, id);
   tokenUsages.delete(recencyKey(state.hostId, id));
+  notifyProtocol({ method: 'bridge/thread/removed', params: { threadId: id } });
 }
 async function archiveThread(id: string, hostId = state.hostId) {
   const known = hostId === state.hostId ? state.threads.find(thread => thread.id === id)
@@ -4209,6 +4211,7 @@ async function archiveThread(id: string, hostId = state.hostId) {
   if (authentication !== authenticationGeneration || !state.authenticated) return;
   invalidateThreadTitleSearch(hostId);
   if (hostId === state.hostId) cleanupArchivedThread(id);
+  else notifyProtocol({ method: 'bridge/thread/removed', params: { threadId: id } }, hostId);
   const nav = state.navigation[hostId];
   if (nav) nav.threads = nav.threads.filter((thread) => thread.id !== id);
   advanceNavigationRevision(hostId);

@@ -69,18 +69,18 @@ test('favoriting an unopened remote chat with an identical native ID keeps the s
   await login(page); await row(page).locator('.thread-row').click();
   const draft = page.getByRole('textbox', { name: '消息输入框', exact: true }); await draft.fill('本机草稿不能丢失');
   await favoriteRow(page, 'remote-favorite'); await saveName(page, '远程整条聊天');
-  await expect(page.locator('.header-host')).toHaveText('本机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
   await expect(draft).toHaveValue('本机草稿不能丢失');
   expect(remote.request('thread/resume')).toBeUndefined();
   expect(mock.bookmarks.filter(entry => entry.kind === 'thread')).toHaveLength(2);
   const itemReads = remote.requests.filter(request => request.method === 'thread/items/list').length;
   await catalog(page); await page.getByRole('button', { name: '跳转到收藏 远程整条聊天', exact: true }).click();
   await expect(page.getByRole('dialog', { name: '收藏对话', exact: true })).toHaveCount(0);
-  await expect(page.locator('.header-host')).toHaveText('远程收藏主机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'remote-favorite');
   expect(remote.request('thread/resume')?.params.threadId).toBe('thread-existing');
   expect(remote.requests.filter(request => request.method === 'thread/items/list')).toHaveLength(itemReads);
   await catalog(page); await page.getByRole('button', { name: '跳转到收藏 本机同 ID 聊天', exact: true }).click();
-  await expect(page.locator('.header-host')).toHaveText('本机'); await expect(draft).toHaveValue('本机草稿不能丢失');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local'); await expect(draft).toHaveValue('本机草稿不能丢失');
   noModelMutation(mock); noModelMutation(remote);
 });
 
@@ -93,6 +93,7 @@ test('chat favorites share project grouping, searching, renaming and removal wit
   await page.getByRole('button', { name: '重命名收藏 整条研发聊天', exact: true }).click();
   await page.getByRole('textbox', { name: '收藏名称', exact: true }).fill('新名称工程聊天');
   await page.locator('.bookmark-name-dialog').getByRole('button', { name: '保存名称', exact: true }).click();
+  await expect(page.locator('.bookmark-name-dialog')).toHaveCount(0);
   await search.fill('新名称'); await expect(page.getByRole('button', { name: '跳转到收藏 新名称工程聊天', exact: true })).toBeVisible();
   await search.fill('历史保持可读'); await expect(page.locator('.bookmark-entry')).toHaveCount(1); await expect(page.locator('.bookmark-name')).toHaveText('旧版选中内容');
   await search.fill('新名称'); await page.getByRole('button', { name: '取消收藏 新名称工程聊天', exact: true }).click();

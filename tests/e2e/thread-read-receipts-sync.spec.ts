@@ -118,7 +118,7 @@ function complete(targets: Device[], turnId: string, at = completedAt, hostId = 
 async function openTarget(device: Device, hostId = 'local', title = targetTitle) {
   await device.page.bringToFront();
   await row(device.page, hostId, title).locator('.thread-row').click();
-  await expect(device.page.locator('.main-header')).toContainText(title);
+  await expect(device.page.locator('.main-header h1')).toHaveText(title);
   await expect(device.page.getByText(`${title}的回复`, { exact: true })).toBeVisible();
 }
 
@@ -137,7 +137,7 @@ test('reading on one independent device immediately clears the other device and 
     await unread([a, b], 0);
     expect(backend.records.get(receiptKey({ hostId: 'local', threadId: targetId }))?.turnIds).toContain('device-shared-turn');
     await expect(input(b.page)).toHaveValue('另一台设备保留的草稿');
-    await expect(b.page.locator('.main-header')).toContainText('已有测试历史');
+    await expect(b.page.locator('.main-header h1')).toHaveText('已有测试历史');
     await b.page.reload();
     await expect(input(b.page)).toBeEnabled();
     await unread([b], 0);
@@ -203,7 +203,7 @@ test('read receipts keep identical thread IDs on different hosts separate', asyn
     // runtime. Background host navigation uses HTTP rather than a second RPC socket.
     for (const device of [a, b]) {
       await device.page.getByRole('combobox', { name: '新对话主机', exact: true }).selectOption('ssh-test');
-      await expect(device.page.locator('.header-host')).toHaveText('远程主机');
+      await expect(device.page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-test');
       await expect.poll(() => device.mock.hostMocks.get('ssh-test')!.sockets.length).toBe(1);
     }
     complete([a, b], 'same-turn-id', completedAt, 'ssh-test');

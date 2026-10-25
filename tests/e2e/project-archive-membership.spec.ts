@@ -59,7 +59,7 @@ test('project archive pages native membership and legacy roots on its own host, 
   expect(queries.every(params => params.archived === false)).toBe(true);
   expect(remote.requests.filter(request => request.method === 'thread/delete')).toHaveLength(0);
   expect(mutations(mock)).toHaveLength(0);
-  await expect(page.locator('.header-host')).toHaveText('本机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
   await expect(page.locator('.agent-message')).toContainText('历史保持可读');
 });
 

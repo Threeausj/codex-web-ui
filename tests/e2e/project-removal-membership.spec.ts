@@ -68,10 +68,10 @@ test('removing the source project retains a moved chat in its destination immedi
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   await input(page).fill('移除旧项目时保留的草稿');
   await move(page, 'local');
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await remove(page, 'local', sourcePath);
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await expect(input(page)).toHaveValue('移除旧项目时保留的草稿');
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   expect((mock.threads[0] as any).projectId).toBe('native-b');
@@ -81,7 +81,7 @@ test('removing the source project retains a moved chat in its destination immedi
   await page.reload();
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
   await expect(group(page, 'local', sourcePath)).toHaveCount(0);
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await expect(input(page)).toHaveValue('移除旧项目时保留的草稿');
   expectNoChatDeletion(mock);
 });
@@ -108,8 +108,8 @@ test('removing a background host source project preserves moved membership on bo
   await expect(group(page, 'ssh-nas', targetPath).locator('.thread-row')).toHaveCount(1);
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
   await expect(group(page, 'local', sourcePath)).toHaveCount(1);
-  await expect(page.locator('.header-host')).toHaveText('本机');
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await expect(input(page)).toHaveValue('本机对话草稿不应受 NAS 项目影响');
   expect(mutations).toEqual([{ method: 'DELETE', fields: { hostId: 'ssh-nas', path: sourcePath } }]);
   expectNoChatDeletion(mock);
@@ -140,7 +140,7 @@ test('editing and adding unrelated projects cannot discard a moved chat destinat
   await edit.getByRole('button', { name: '保存项目', exact: true }).click();
   await expect(edit).toHaveCount(0);
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await page.locator('.settings-button').click();
   const settings = page.getByRole('dialog', { name: '设置', exact: true });
   await settings.locator('.settings-nav').getByRole('button', { name: '项目', exact: true }).click();
@@ -150,8 +150,8 @@ test('editing and adding unrelated projects cannot discard a moved chat destinat
   await expect(settings.getByText('项目已添加', { exact: true })).toBeVisible();
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-host')).toHaveText('本机');
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await expect(input(page)).toHaveValue('项目管理操作保留当前草稿');
   expect(mutations.map(entry => entry.method)).toEqual(['PATCH', 'POST']);
   expectNoChatDeletion(mock);
@@ -203,7 +203,7 @@ test('a delayed current-host project page cannot restore obsolete history after 
   await expect(source.locator('.thread-row')).toHaveCount(0);
   await expect(source.getByRole('button', { name: '加载项目旧对话', exact: true })).toHaveCount(0);
   await expect(group(page, 'local', targetPath).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-project > button')).toContainText('目标项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '目标项目 B');
   await expect(input(page)).toHaveValue('旧项目分页返回时保留的草稿');
   expect(mock.requests.some(request => request.method === 'thread/list' && request.params?.cursor === 'obsolete-third-page')).toBe(false);
   expectNoChatDeletion(mock);

@@ -113,7 +113,7 @@ test('a retired destination handshake cannot replace a newer host or expose its 
   await shown(page, 'other third', 'other third answer');
   await expect.poll(() => connection.closed.length).toBe(1);
   connection.release();
-  await expect(page.locator('.header-host')).toHaveText('other');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'other');
   await shown(page, 'other third', 'other third answer');
   expect(remote.request('thread/resume')).toBeUndefined();
   expect(other.sockets).toHaveLength(1);
@@ -166,7 +166,7 @@ test('a late configuration from a retired destination cannot overwrite a newer h
   await row(page, 'other', 'other third').click();
   await shown(page, 'other third', 'other third answer');
   remote.releaseConfigReadResponse();
-  await expect(page.locator('.header-host')).toHaveText('other');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'other');
   await shown(page, 'other third', 'other third answer');
   expect(other.sockets).toHaveLength(1);
   expect(remote.request('thread/resume')).toBeUndefined();

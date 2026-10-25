@@ -26,7 +26,7 @@ test('choosing no project retains the current host, draft and attachment, and st
   await projectChoice(page).selectOption({ label: '不在项目中工作' });
   await expect(projectChoice(page)).toBeEnabled();
   await expect(projectChoice(page)).toHaveValue('');
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
   await expect(page.locator('.welcome')).toContainText('不关联项目');
   await expect(input(page)).toHaveValue('不关联项目的聊天草稿');
   await expect(page.locator('.attachment')).toHaveCount(2);
@@ -42,7 +42,7 @@ test('choosing no project retains the current host, draft and attachment, and st
   expect(mock.request('turn/start')?.params.input[0].text).toContain('/test/uploads/notes.txt');
   expect(mock.request('turn/start')?.params.input).toContainEqual({ type: 'localImage', path: '/test/uploads/sample.png' });
   await expect(projectGroup(page).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
 });
 
 test('a no-project chat does not inherit extra workspace roots from a project sharing its execution directory', async ({ page, mock }) => {
@@ -75,11 +75,11 @@ test('visiting an existing project chat in another directory does not overwrite 
   await input(page).fill('保留普通聊天的默认位置');
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).click();
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
-  await expect(page.locator('.header-project > button')).toContainText('另一个项目');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '另一个项目');
   await page.locator('.new-thread-button').click();
   await expect(projectChoice(page)).toHaveValue('');
   await expect(input(page)).toHaveValue('保留普通聊天的默认位置');
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
   await page.reload();
   await expect(input(page)).toBeEnabled();
   await expect(projectChoice(page)).toHaveValue('');
@@ -124,14 +124,14 @@ test('forking a completed no-project chat preserves its source marker and keeps 
   await page.getByRole('button', { name: '创建分支', exact: true }).click();
   await expect.poll(() => mock.request('thread/fork')?.params.threadId).toBe(sourceId);
   expect(mock.request('thread/fork')?.params.threadSource).toBe('codex-web:no-project');
-  await expect(page.locator('.header-project > h1')).toHaveText('分支测试对话');
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header h1')).toHaveText('分支测试对话');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
   await expect(projectGroup(page).locator('.thread-row')).toHaveCount(1);
   await expect(page.locator('[data-section="recent"] .thread-row')).toHaveCount(3);
   await page.reload();
   await expect(input(page)).toBeEnabled();
-  await expect(page.locator('.header-project > h1')).toHaveText('分支测试对话');
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header h1')).toHaveText('分支测试对话');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
   await expect(projectGroup(page).locator('.thread-row')).toHaveCount(1);
 });
 
@@ -145,11 +145,11 @@ test('no-project selection and its draft survive reloading without falling back 
   await expect(input(page)).toBeEnabled();
   await expect(projectChoice(page)).toHaveValue('');
   await expect(input(page)).toHaveValue('刷新后仍然是不关联项目的草稿');
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
   await projectChoice(page).selectOption(workspace);
   await expect(projectChoice(page)).toBeEnabled();
   await expect(projectChoice(page)).toHaveValue(workspace);
-  await expect(page.locator('.header-project > button')).toContainText('Demo Project');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', 'Demo Project');
   await expect(input(page)).toHaveValue('刷新后仍然是不关联项目的草稿');
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect.poll(() => mock.request('thread/start')?.params.projectId).toBe('native-local');
@@ -170,7 +170,7 @@ for (const supported of [true, false]) {
     await page.reload();
     await expect(input(page)).toBeEnabled();
     await expect(projectGroup(page).locator('.thread-row')).toHaveCount(1);
-    await expect(page.locator('.header-project > button')).toContainText('聊天');
+    await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
 
     const context = await page.context().browser()!.newContext();
     const other = await context.newPage();
@@ -183,7 +183,7 @@ for (const supported of [true, false]) {
       await expect(recent).toHaveCount(2);
       await recent.filter({ hasText: mock.threads.find(thread => thread.id === threadId)!.name }).click();
       await expect.poll(() => mock.request('thread/resume')?.params.threadId).toBe(threadId);
-      await expect(other.locator('.header-project > button')).toContainText('聊天');
+      await expect(other.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
     } finally { await context.close(); }
   });
 }
@@ -219,5 +219,5 @@ test('the mobile project selector can choose no project on a remote host and ret
   expect(remote.request('thread/start')?.params.projectId).toBeNull();
   expect(remote.request('thread/start')?.params.threadSource).toBe('codex-web:no-project');
   expect(mock.request('thread/start')).toBeUndefined();
-  await expect(page.locator('.header-project > button')).toContainText('聊天');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '聊天');
 });

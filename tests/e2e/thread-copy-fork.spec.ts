@@ -25,7 +25,7 @@ test('copy links and workspace paths from an unopened remote row preserves the s
  await copy(page,'ssh-copy','复制工作目录');await expect.poll(()=>clipboard(page)).toContain('/remote/project');
  expect(remote.request('thread/read')?.params).toEqual({threadId:'thread-existing',includeTurns:false});
  expect(remote.request('thread/resume')).toBeUndefined();
- await expect(page.locator('.header-host')).toHaveText('本机');await expect(page.getByRole('textbox',{name:'消息输入框',exact:true})).toHaveValue('保留草稿');
+ await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');await expect(page.getByRole('textbox',{name:'消息输入框',exact:true})).toHaveValue('保留草稿');
 });
 
 test('Markdown copy reads complete paginated history from the intended host without switching or resuming it',async({page,mock})=>{
@@ -75,7 +75,7 @@ test('forking an unopened remote conversation keeps native history and opens the
  const remote=remoteFixture(mock);await login(page);await row(page).locator('.thread-row').click();
  const original=structuredClone(remote.turns.get('thread-existing'));
  await row(page,'ssh-copy').locator('.nav-row-menu').click();await row(page,'ssh-copy').getByRole('button',{name:'分叉对话 (Fork)',exact:true}).click();
- await expect(page.locator('.main-header')).toContainText('分支测试对话');await expect(page.locator('.header-host')).toHaveText('远程主机');
+ await expect(page.locator('.main-header h1')).toHaveText('分支测试对话');await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-copy');
  expect(remote.request('thread/fork')?.params).toEqual({threadId:'thread-existing',excludeTurns:true,deferGoalContinuation:true});
  expect(mock.request('thread/fork')).toBeUndefined();expect(remote.turns.get('fork-1')).toEqual(original);
  expect(remote.turns.get('thread-existing')).toEqual(original);expect(remote.request('turn/start')).toBeUndefined();
@@ -98,7 +98,7 @@ test('a late remote fork does not steal focus after switching away and back to t
  await expect(page.getByRole('heading',{name:'已有测试历史',exact:true})).toBeVisible();
  await page.getByRole('textbox',{name:'消息输入框',exact:true}).fill('当前草稿');
  release();await expect(page.locator('[data-section="recent"] .nav-thread[data-host-id="ssh-copy"]').filter({hasText:'分支测试对话'})).toBeVisible();
- await expect(page.locator('.header-host')).toHaveText('本机');await expect(page.getByRole('heading',{name:'已有测试历史',exact:true})).toBeVisible();
+ await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');await expect(page.getByRole('heading',{name:'已有测试历史',exact:true})).toBeVisible();
  await expect(page.getByRole('textbox',{name:'消息输入框',exact:true})).toHaveValue('当前草稿');expect(remote.request('thread/resume')).toBeUndefined();
 });
 
@@ -106,7 +106,7 @@ test('a copied remote deep link restores the correct host and thread when opened
  const remote=remoteFixture(mock);await setupClipboard(page);await login(page);await copy(page,'ssh-copy','复制深度链接');
  await expect.poll(()=>clipboard(page)).toHaveLength(1);const link=(await clipboard(page))[0]!;
  await page.goto(link);
- await expect(page.getByRole('heading',{name:'远程复制会话',exact:true})).toBeVisible();await expect(page.locator('.header-host')).toHaveText('远程主机');
+ await expect(page.getByRole('heading',{name:'远程复制会话',exact:true})).toBeVisible();await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-copy');
  expect(remote.request('thread/resume')?.params.threadId).toBe('thread-existing');
 });
 

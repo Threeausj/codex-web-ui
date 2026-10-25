@@ -10,7 +10,7 @@ This is an evolving desktop-style workflow, with implemented features and remain
 
 These images show the real Vue application with fixed demonstration data. They contain no real account, workstation, or private conversation data. Resource values and execution records illustrate the interface, not benchmark results. The current interface uses Chinese labels.
 
-The interface uses white and cool gray surfaces, blue interaction accents, and a high contrast dark theme. Desktop headers are 42 px tall, with workspace navigation in the same row; mobile headers retain 48 px height and space for touch controls.
+The interface uses white and cool gray surfaces, blue interaction accents, and a high contrast dark theme. Desktop headers are 42 px tall, with workspace navigation in the same row; mobile chat tabs use a compact 44 px header with space for touch controls.
 
 <table>
   <tr>
@@ -46,6 +46,8 @@ To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run doc
 [Deployment](#docker-quick-start) · [Features and limits](#features-and-limits) · [Development](#development-and-validation) · [Code review and priorities](docs/project-audit.md)
 
 Conversations can be moved between projects on the same host from their menu, using native project membership while retaining the working directory. Settings includes archived chat management for the selected host. Workspace files and unsaved drafts stay isolated by host and project when switching conversations. See [project membership](docs/native-projects.md) and [host settings](docs/host-settings.md).
+
+The header supports [chat tabs](docs/chat-tabs.md): switch between open chats, keep frequently used chats fixed, create a draft with `+`, and access actions from the active tab. Closing a tab keeps its task running and preserves drafts and reading positions.
 
 ## Docker quick start
 

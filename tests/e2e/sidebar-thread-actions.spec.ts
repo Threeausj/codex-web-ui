@@ -33,7 +33,7 @@ test("renaming an unopened remote row preserves the current host, conversation a
   await expect(dialog).toHaveCount(0);
   await expect(recent(page, "ssh-actions").locator(".thread-title")).toHaveText("远程新名称");
   await expect(page.locator('.nav-project-group[data-host-id="ssh-actions"] .thread-title')).toHaveText("远程新名称");
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await expect(page.getByRole("heading", { name: "已有测试历史", exact: true })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toHaveValue("当前会话草稿");
   expect(remote.request("thread/name/set")?.params).toEqual({ threadId: "thread-existing", name: "远程新名称" });
@@ -154,7 +154,7 @@ test("archived remote conversations can be renamed and deleted without restoring
   expect(remote.request("thread/unarchive")).toBeUndefined();
   expect(remote.request("thread/resume")).toBeUndefined();
   expect(mock.request("thread/delete")).toBeUndefined();
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
 });
 
 test("an archived query started before deletion cannot restore the deleted row or erase other results", async ({ page, mock }) => {

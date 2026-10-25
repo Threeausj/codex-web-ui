@@ -77,7 +77,7 @@ test('focus-existing notification launches switch hosts while ordinary or untrus
   });
   expect(events).toBe(0);
   await page.evaluate(() => (window as any).appLaunchFixture.deliver(location.origin + '/'));
-  await expect(page.locator('.header-host')).toHaveText('Remote');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-test');
   await openThread(page); // The recent row for the local thread is first.
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('本机原来的草稿');
   expect(mock.request('turn/start')).toBeUndefined();

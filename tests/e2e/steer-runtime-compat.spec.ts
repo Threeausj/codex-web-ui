@@ -175,7 +175,7 @@ test('changing conversations while confirming steering never sends it to the new
   await sendSteer(page);
   await expect.poll(() => probes(mock).length).toBe(1);
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '另一个即时引导会话' }).first().click();
-  await expect(page.locator('.main-header')).toContainText('另一个即时引导会话');
+  await expect(page.locator('.main-header h1')).toHaveText('另一个即时引导会话');
   control.probeRelease!();
   await expect(stop(page)).toBeVisible();
   expect(steers(mock)).toHaveLength(1);

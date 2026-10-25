@@ -97,9 +97,9 @@ test("remote resume does not change merged host recency, including a subsequent 
   await expect(order(page)).toHaveText(["已有测试历史", "空的旧对话"]);
   const time = await row(page, "空的旧对话").locator("small").textContent();
   await row(page, "空的旧对话").locator(".thread-row").click();
-  await expect(page.locator(".header-host")).toHaveText("测试远端");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-recency");
   await row(page, "已有测试历史").locator(".thread-row").click();
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await page.getByRole("button", { name: "刷新对话", exact: true }).click();
   await expect(order(page)).toHaveText(["已有测试历史", "空的旧对话"]);
   await expect(row(page, "空的旧对话").locator("small")).toHaveText(time!);

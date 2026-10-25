@@ -138,7 +138,7 @@ test('switching the parent while sidebar Stop confirms a conflict still stops it
   await stop(page).click();
   await expect.poll(() => probes(mock).length).toBe(1);
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '另一个父对话' }).first().click();
-  await expect(page.locator('.main-header')).toContainText('另一个父对话');
+  await expect(page.locator('.main-header h1')).toHaveText('另一个父对话');
   control.releaseProbe!();
   await expect(page.locator('.side-chat-panel')).toBeHidden();
   await expect.poll(() => stops(mock).some(request => request.params.turnId === newId)).toBe(true);

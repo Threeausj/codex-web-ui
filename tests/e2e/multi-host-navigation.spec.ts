@@ -40,7 +40,7 @@ for (const width of [1280, 390]) {
     await expect(footer.locator(".settings-button")).toBeVisible();
     if (width < 760) await page.getByRole("button", { name: "关闭侧边栏", exact: true }).click();
     await page.getByRole("combobox", { name: "新对话主机", exact: true }).selectOption("ssh-test");
-    await expect(page.locator(".header-host")).toHaveText("开发服务器");
+    await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-test");
     if (width < 760) {
       await page.getByRole("button", { name: "打开侧边栏", exact: true }).click();
       await expect(page.locator(".sidebar")).toHaveCSS("transform", "matrix(1, 0, 0, 1, 0, 0)");
@@ -74,7 +74,7 @@ test("all hosts share navigation, same IDs and paths remain isolated, switching 
     .fill("本机草稿");
   await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
   await expect(page.locator(".agent-message")).toContainText("远程会话内容");
-  await expect(page.locator(".header-host")).toHaveText("开发服务器");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-test");
   await expect(page.locator(".nav-project-group")).toHaveCount(2);
   await expect(
     page.getByRole("textbox", { name: "消息输入框", exact: true }),
@@ -119,7 +119,7 @@ test("pin, search and archive target the row's host without replacing the active
   await expect.poll(() => remote.archivedThreads.length).toBe(1);
   expect(mock.archivedThreads).toHaveLength(0);
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await page.getByRole("button", { name: "返回会话导航", exact: true }).click();
   await page.getByRole("button", { name: "已归档对话", exact: true }).click();
   await expect(page.locator(".nav-search-results .thread-row")).toHaveCount(1);
@@ -145,7 +145,7 @@ test("host status strip is removed while remote projects, local chat and mobile 
   await expect(page.locator(".error-banner")).toHaveCount(0);
   await recent(page).locator('[data-host-id="local"] .thread-row').click();
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   const metrics = await page.evaluate(() => ({
     width: document.documentElement.scrollWidth,
     viewport: innerWidth,
@@ -176,7 +176,7 @@ test("a slow remote connection can be cancelled without resuming its ID on the l
   });
   await login(page);
   await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
-  await expect(page.locator(".header-host")).toHaveText("开发服务器");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-test");
   const input = page.getByRole("textbox", { name: "消息输入框", exact: true });
   await expect(input).toBeDisabled();
   await expect(
@@ -184,7 +184,7 @@ test("a slow remote connection can be cancelled without resuming its ID on the l
   ).toBeDisabled();
   await recent(page).locator('[data-host-id="local"] .thread-row').click();
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   expect(remote.request("thread/resume")).toBeUndefined();
   await input.fill("本机恢复可发送");
   await expect(
