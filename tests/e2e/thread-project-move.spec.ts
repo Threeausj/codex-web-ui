@@ -34,7 +34,7 @@ test('moving a chat uses the same host native project, keeps cwd and draft, and 
   await expect(input).toHaveValue('项目调整时保留的草稿');
   await expect(group(page, a).locator('.thread-row')).toHaveCount(0);
   await expect(group(page, b).locator('.thread-row')).toHaveCount(1);
-  await expect(page.locator('.header-project > button')).toContainText('项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '项目 B');
   await expect(group(page, b).locator('.nav-project-header')).toHaveClass(/active/);
   await expect(group(page, a).locator('.nav-project-header')).not.toHaveClass(/active/);
   expect(mock.request('thread/settings/update')).toBeUndefined();
@@ -142,6 +142,6 @@ test('moving a background host chat keeps the selected host, conversation and dr
   expect(mock.request('thread/metadata/update')).toBeUndefined();
   expect((mock.threads[0] as any).projectId).toBe('native-a');
   expect(remote.threads[0].cwd).toBe(a);
-  await expect(page.locator('.header-host')).toHaveText('本机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('本机当前草稿');
 });

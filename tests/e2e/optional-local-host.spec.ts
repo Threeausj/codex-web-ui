@@ -64,7 +64,7 @@ test('a disabled local executor selects an available SSH host instead of reconne
   const wire = await availability(page, mock, { enabled: false, remote: true });
   await page.addInitScript(() => localStorage.setItem('codex.hostId', JSON.stringify('local')));
   await login(page);
-  await expect(page.locator('.header-host')).toHaveText('计算服务器');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-only');
   expect(mock.sockets).toHaveLength(0);
   expect(wire.remote.sockets).toHaveLength(1);
   const settings = await connections(page);
@@ -72,7 +72,7 @@ test('a disabled local executor selects an available SSH host instead of reconne
   await expect(settings.getByRole('button', { name: '启用本机 Codex', exact: true })).toBeVisible();
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
   await page.reload();
-  await expect(page.locator('.header-host')).toHaveText('计算服务器');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-only');
   expect(mock.sockets).toHaveLength(0);
 });
 
@@ -154,7 +154,7 @@ test('another browser disabling local updates the selected executor without a re
   const wire = await availability(page, mock, { remote: true });
   await login(page);
   wire.externallyDisable();
-  await expect(page.locator('.header-host')).toHaveText('计算服务器');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-only');
   const localSockets = mock.sockets.length;
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   await expect.poll(() => mock.sockets.length).toBe(localSockets);
@@ -186,7 +186,7 @@ test('a closed disabled-host socket refreshes availability even when its notific
   wire.externallyDisable();
   mock.emit = emit;
   await mock.sockets[0]!.close({ code: 4004, reason: 'Host execution disabled' });
-  await expect(page.locator('.header-host')).toHaveText('计算服务器');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-only');
   expect(mock.sockets).toHaveLength(1);
   expect(wire.remote.sockets).toHaveLength(1);
 });

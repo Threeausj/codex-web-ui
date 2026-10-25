@@ -23,7 +23,7 @@ for (const width of [1440, 390]) {
     await filters.getByRole("button", { name: "NAS", exact: true }).click();
     await expect(recent(page).locator(".thread-title")).toHaveText(["NAS 标题"]);
     await expect(filters.getByRole("button", { name: "NAS", exact: true })).toHaveAttribute("aria-pressed", "true");
-    await expect(page.locator(".header-host")).toHaveText("本机");
+    await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
     await expect(page.locator('[data-section="projects"] .thread-title')).toHaveText(["已有测试历史"]);
     expect(remote.request("thread/resume")).toBeUndefined();
     await page.reload();
@@ -128,5 +128,5 @@ test("loading older filtered recent conversations requests only the chosen devic
   await expect(recent(page).locator(".thread-title")).toHaveText(["NAS 标题", "NAS 旧会话"]);
   expect(calls.some(r => r.params.cursor === "next")).toBe(true);
   expect(mock.requests.filter(r => r.method === "thread/list").length).toBe(localRequests);
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
 });

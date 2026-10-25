@@ -174,7 +174,7 @@ test('changing hosts while native project resolution is pending cannot create a 
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect.poll(() => !!finishResolution).toBe(true);
   await page.locator('.project-row').filter({ hasText: 'NAS待连接项目' }).click();
-  await expect(page.locator('.header-host')).toHaveText('NAS待连接主机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-pending-project');
   await expect(page.getByRole('textbox', { name: '消息输入框' })).toBeEnabled();
   await finishResolution!();
   await expect(page.getByRole('alert')).toContainText('新对话位置已变化');

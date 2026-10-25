@@ -36,7 +36,7 @@ test("notification navigation opens a remote chat from an existing window and ig
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("codex:push-navigate", {
     detail: { hostId: "https://attacker.invalid", threadId: "thread-existing" },
   })));
-  await expect(page.locator(".header-host")).toHaveText("Remote");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-test");
   expect(remote.requests.length).toBe(requests);
   expect(remote.request("turn/start")).toBeUndefined();
 });
@@ -51,7 +51,7 @@ test("a notification can switch to a reachable host when the last used remote ho
   await page.getByRole("textbox", { name: "访问密码" }).fill("test-password-123");
   await page.getByRole("button", { name: "进入工作区", exact: true }).click();
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   expect(mock.request("thread/resume")?.params.threadId).toBe("thread-existing");
   expect(mock.request("turn/start")).toBeUndefined();
 });

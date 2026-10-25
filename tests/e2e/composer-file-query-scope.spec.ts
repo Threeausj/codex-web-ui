@@ -33,7 +33,7 @@ test('refreshing the same conversation in another directory rejects file results
   // response, rather than modifying Vue state from a test-only browser hook.
   mock.threads[0]!.cwd = nextDirectory;
   await currentConversation.click();
-  await expect(page.locator('.header-project > button')).toContainText('项目 B');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '项目 B');
   await expect(input).toHaveValue(draft);
   const picker = page.getByRole('listbox', { name: '模式与项目文件', exact: true });
   releaseOldSearch!();

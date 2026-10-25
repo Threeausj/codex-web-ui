@@ -42,7 +42,7 @@ test('settings manage the chosen host archives without replacing the active conv
   expect(remote.request('thread/resume')).toBeUndefined();
   expect(mock.request('thread/unarchive')).toBeUndefined();
   await page.getByRole('button', { name: '关闭设置', exact: true }).click();
-  await expect(page.locator('.header-host')).toHaveText('本机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
   await expect(page.locator('.agent-message')).toContainText('历史保持可读');
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('保留当前草稿');
 });
@@ -193,7 +193,7 @@ test('moving a remote archived chat updates its project group without a selected
   await expect(panel(page).getByRole('region', { name: '远程项目的归档', exact: true })).toHaveCount(0);
   expect(remote.archivedThreads[0].cwd).toBe('/srv/project');
   expect(remote.sockets).toHaveLength(0);
-  await expect(page.locator('.header-host')).toHaveText('本机');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
 });
 
 test('mobile archive management fits the settings pane and keeps row actions accessible', async ({ page, mock }) => {

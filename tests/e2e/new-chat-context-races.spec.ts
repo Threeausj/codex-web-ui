@@ -34,7 +34,7 @@ test("opening a local existing chat supersedes an unfinished remote context swit
   await expect.poll(() => remote.request("config/read")?.method).toBe("config/read");
   await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeDisabled();
   await existing.click();
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
   await expect(input).toHaveValue("已有对话自己的草稿");
   await expect(page.locator(".attachment")).toHaveCount(0);
@@ -43,7 +43,7 @@ test("opening a local existing chat supersedes an unfinished remote context swit
   await page.waitForTimeout(100);
   await expect(input).toHaveValue("已有对话自己的草稿");
   await expect(page.locator(".attachment")).toHaveCount(0);
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await expect.poll(() => mock.request("turn/start")?.params.cwd).toBe("/workspace/demo");
   expect(mock.request("turn/start")?.params.input).toEqual([
@@ -111,7 +111,7 @@ test("a late remote upload failure cannot show an unrelated error or change the 
   await expect.poll(() => !!releaseRemoteUpload).toBe(true);
   await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeDisabled();
   await existing.click();
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
   await expect(input).toHaveValue("本机聊天自己的未发送草稿");
   await expect(page.locator(".attachment")).toHaveCount(0);
@@ -123,7 +123,7 @@ test("a late remote upload failure cannot show an unrelated error or change the 
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect(input).toHaveValue("本机聊天自己的未发送草稿");
   await expect(page.locator(".attachment")).toHaveCount(0);
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await expect.poll(() => mock.request("turn/start")?.params.cwd).toBe("/workspace/demo");
   expect(mock.request("turn/start")?.params.input).toEqual([

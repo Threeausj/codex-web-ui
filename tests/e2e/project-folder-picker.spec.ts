@@ -119,7 +119,7 @@ test("remote project browsing and addition preserve the current local chat and d
   expect(calls).toEqual([{ hostId: "ssh-folders", path: null }]);
   expect(mock.projects.find((project) => project.path === "/root")).toMatchObject({ hostId: "ssh-folders", rootPaths: ["/remote/shared"] });
   await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
   await expect(input).toHaveValue("保留当前草稿");
   expect(mock.requests.filter((request) => request.method === "thread/resume")).toHaveLength(resumeCount);

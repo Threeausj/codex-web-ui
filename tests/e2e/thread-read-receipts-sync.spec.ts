@@ -203,7 +203,7 @@ test('read receipts keep identical thread IDs on different hosts separate', asyn
     // runtime. Background host navigation uses HTTP rather than a second RPC socket.
     for (const device of [a, b]) {
       await device.page.getByRole('combobox', { name: '新对话主机', exact: true }).selectOption('ssh-test');
-      await expect(device.page.locator('.header-host')).toHaveText('远程主机');
+      await expect(device.page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-test');
       await expect.poll(() => device.mock.hostMocks.get('ssh-test')!.sockets.length).toBe(1);
     }
     complete([a, b], 'same-turn-id', completedAt, 'ssh-test');

@@ -105,7 +105,7 @@ test('a fresh app window restores the host, project, chat and draft without logg
   const reopened = await context.newPage();
   await mock.install(reopened);
   await reopened.goto('/');
-  await expect(reopened.locator('.header-host')).toHaveText('Remote');
+  await expect(reopened.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-test');
   await expect(reopened.locator('.agent-message').last()).toHaveText('远程对话仍在');
   await expect(reopened.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('退出应用后继续编辑');
   await expect(reopened.getByRole('textbox', { name: '访问密码' })).toHaveCount(0);
@@ -126,7 +126,7 @@ test('a stale foreground check cannot replace a host chosen while it was waiting
   await expect.poll(() => !!mock.request('bridge/ping')).toBe(true);
   await page.locator('[data-section="recent"] [data-host-id="ssh-test"] .thread-row').click();
   await expect(page.locator('.agent-message').last()).toHaveText('远程选择保持不变');
-  await expect(page.locator('.header-host')).toHaveText('Remote');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-test');
   expect(mock.sockets).toHaveLength(1);
   expect(remote.sockets).toHaveLength(1);
   expect(remote.request('turn/start')).toBeUndefined();

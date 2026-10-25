@@ -148,7 +148,7 @@ test("showing a remote project opens its host's workspace files without resuming
   await page
     .getByRole("menuitem", { name: "在工作区文件中显示", exact: true })
     .click();
-  await expect(page.locator(".header-host")).toHaveText("远程开发机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-project");
   await expect(page.locator(".workspace-panel")).toBeVisible();
   await expect
     .poll(() => remote.request("fs/readDirectory")?.params.path)
@@ -238,7 +238,7 @@ test("editing an imported local project preserves the active remote chat and sav
     },
   ]);
   await expect(localRow(page)).toContainText("本机项目新名称");
-  await expect(page.locator(".header-host")).toHaveText("远程编辑机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-editor");
   await expect(page.locator(".agent-message")).toContainText(
     "远程聊天保持显示",
   );
@@ -454,6 +454,6 @@ test("project archive includes every page and root only on the chosen host while
   ]);
   expect(mock.archivedThreads).toHaveLength(0);
   expect(mock.threads).toHaveLength(2);
-  await expect(page.locator(".header-host")).toHaveText("本机");
+  await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "local");
   await expect(page.locator(".agent-message")).toContainText("历史保持可读");
 });
