@@ -93,6 +93,7 @@ test('chat favorites share project grouping, searching, renaming and removal wit
   await page.getByRole('button', { name: '重命名收藏 整条研发聊天', exact: true }).click();
   await page.getByRole('textbox', { name: '收藏名称', exact: true }).fill('新名称工程聊天');
   await page.locator('.bookmark-name-dialog').getByRole('button', { name: '保存名称', exact: true }).click();
+  await expect(page.locator('.bookmark-name-dialog')).toHaveCount(0);
   await search.fill('新名称'); await expect(page.getByRole('button', { name: '跳转到收藏 新名称工程聊天', exact: true })).toBeVisible();
   await search.fill('历史保持可读'); await expect(page.locator('.bookmark-entry')).toHaveCount(1); await expect(page.locator('.bookmark-name')).toHaveText('旧版选中内容');
   await search.fill('新名称'); await page.getByRole('button', { name: '取消收藏 新名称工程聊天', exact: true }).click();

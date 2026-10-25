@@ -74,6 +74,7 @@ test('fixed tabs stay first and survive a page reload without changing sidebar p
   await login(page); await open(page, '已有测试历史'); await open(page, '常驻聊天');
   await page.getByRole('button', { name: '对话操作', exact: true }).click();
   await page.locator('.thread-menu').getByRole('button', { name: '固定标签页', exact: true }).click();
+  await expect(page.locator('.thread-menu')).toHaveCount(0);
   await expect(strip(page).getByRole('tab').first()).toHaveText('常驻聊天');
   await expect(wrapper(page, 'local', 'second-tab').getByRole('button', { name: '关闭标签页：常驻聊天', exact: true })).toHaveCount(0);
   await page.reload();
@@ -248,5 +249,30 @@ test('the tab menu restores keyboard focus, dismisses on outside click and close
   await trigger.click(); await menu.getByRole('button', { name: '关闭标签页', exact: true }).click();
   await expect(tab(page, '常驻聊天')).toHaveCount(0);
   await expect(tab(page, '已有测试历史')).toHaveAttribute('aria-selected', 'true');
+  noDestructiveRequests(mock);
+});
+
+test('a failed neighboring resume leaves the original tab and its draft available for retry', async ({ page, mock }) => {
+  add(mock, 'second-tab', '无法恢复的相邻聊天');
+  const receive = (mock as any).receive.bind(mock);
+  let failNeighbor = false;
+  (mock as any).receive = (socket: any, request: any) => {
+    if (!failNeighbor || request.method !== 'thread/resume' || request.params.threadId !== 'second-tab')
+      return receive(socket, request);
+    mock.requests.push(request);
+    socket.send(JSON.stringify({ id: request.id, error: { code: -32603, message: '模拟相邻聊天恢复失败，请重试' } }));
+  };
+  await login(page); await open(page, '已有测试历史'); await open(page, '无法恢复的相邻聊天');
+  await tab(page, '已有测试历史').click();
+  await editor(page).fill('关闭失败后仍保留的草稿');
+  failNeighbor = true;
+  await page.getByRole('button', { name: '关闭标签页：已有测试历史', exact: true }).click();
+  await expect(page.locator('.global-error')).toContainText('模拟相邻聊天恢复失败');
+  await expect(tab(page, '已有测试历史')).toHaveCount(1);
+  await expect(tab(page, '无法恢复的相邻聊天')).toHaveCount(1);
+  failNeighbor = false;
+  await tab(page, '已有测试历史').click();
+  await expect(tab(page, '已有测试历史')).toHaveAttribute('aria-selected', 'true');
+  await expect(editor(page)).toHaveValue('关闭失败后仍保留的草稿');
   noDestructiveRequests(mock);
 });
