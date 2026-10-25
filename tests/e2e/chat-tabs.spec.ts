@@ -182,3 +182,71 @@ test('mobile overflowing tabs keep the selected chat, menu and right-hand contro
   await page.screenshot({ path: '.data/chat-tabs-mobile.png' });
   noDestructiveRequests(mock);
 });
+
+test('sidebar renaming refreshes current and inactive tab labels without selecting another chat', async ({ page, mock }) => {
+  add(mock, 'second-tab', '第二条标签聊天');
+  await login(page); await open(page, '已有测试历史'); await open(page, '第二条标签聊天');
+  async function rename(previous: string, name: string) {
+    const row = page.locator('[data-section="recent"] .nav-thread[data-host-id="local"]').filter({ has: page.locator('.thread-row').filter({ hasText: previous }) });
+    await row.locator('.nav-row-menu').click();
+    await row.getByRole('button', { name: '重命名对话', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '重命名对话', exact: true });
+    await dialog.getByRole('textbox', { name: '对话名称', exact: true }).fill(name);
+    await dialog.getByRole('button', { name: '保存名称', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+  }
+  await editor(page).fill('重命名不能替换草稿');
+  await rename('已有测试历史', '后台标签新标题');
+  await expect(tab(page, '已有测试历史')).toHaveCount(0);
+  await expect(tab(page, '后台标签新标题')).toHaveAttribute('aria-selected', 'false');
+  await expect(tab(page, '第二条标签聊天')).toHaveAttribute('aria-selected', 'true');
+  await rename('第二条标签聊天', '当前标签新标题');
+  await expect(tab(page, '当前标签新标题')).toHaveAttribute('aria-selected', 'true');
+  await expect(editor(page)).toHaveValue('重命名不能替换草稿');
+  noDestructiveRequests(mock);
+});
+
+test('archiving and deleting inactive chats clean only their tabs when another host has the same native ID', async ({ page, mock }) => {
+  const remote = new MockCodex(); remote.threads[0]!.name = '远端同 ID 聊天';
+  add(mock, 'second-tab', '当前保留聊天');
+  mock.hosts.push({ id: 'tabs-remote', name: '远端主机', kind: 'ssh', hostname: 'remote.invalid' });
+  mock.projects.push({ ...mock.projects[0], id: 'remote-tabs-project', hostId: 'tabs-remote' });
+  mock.hostMocks.set('tabs-remote', remote);
+  await login(page); await open(page, '已有测试历史'); await open(page, '远端同 ID 聊天', 'tabs-remote'); await open(page, '当前保留聊天');
+  const local = page.locator('[data-section="recent"] .nav-thread[data-host-id="local"]').filter({ has: page.locator('.thread-row').filter({ hasText: '已有测试历史' }) });
+  await local.locator('.nav-row-menu').click();
+  await local.getByRole('button', { name: '归档对话', exact: true }).click();
+  await expect(wrapper(page, 'local')).toHaveCount(0);
+  await expect(wrapper(page, 'tabs-remote')).toHaveCount(1);
+  await expect(tab(page, '当前保留聊天')).toHaveAttribute('aria-selected', 'true');
+  const otherHost = page.locator('[data-section="recent"] .nav-thread[data-host-id="tabs-remote"]');
+  await otherHost.locator('.nav-row-menu').click();
+  await otherHost.getByRole('button', { name: '删除对话', exact: true }).click();
+  await page.getByRole('dialog', { name: '删除对话', exact: true }).getByRole('button', { name: '永久删除', exact: true }).click();
+  await expect(wrapper(page, 'tabs-remote')).toHaveCount(0);
+  await expect(tab(page, '当前保留聊天')).toHaveAttribute('aria-selected', 'true');
+  expect(mock.request('thread/archive')?.params.threadId).toBe('thread-existing');
+  expect(mock.request('thread/delete')).toBeUndefined();
+  expect(remote.request('thread/delete')?.params.threadId).toBe('thread-existing');
+  expect(remote.request('thread/archive')).toBeUndefined();
+  expect(mock.request('turn/interrupt')).toBeUndefined(); expect(remote.request('turn/interrupt')).toBeUndefined();
+});
+
+test('the tab menu restores keyboard focus, dismisses on outside click and closes fixed tabs explicitly', async ({ page, mock }) => {
+  add(mock, 'second-tab', '常驻聊天');
+  await login(page); await open(page, '已有测试历史'); await open(page, '常驻聊天');
+  const trigger = page.getByRole('button', { name: '对话操作', exact: true });
+  await trigger.focus(); await trigger.press('Enter');
+  const menu = page.locator('.thread-menu');
+  await expect(menu.getByRole('button', { name: '固定标签页', exact: true })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0); await expect(trigger).toBeFocused();
+  await trigger.click(); await editor(page).click();
+  await expect(menu).toHaveCount(0);
+  await trigger.click(); await menu.getByRole('button', { name: '固定标签页', exact: true }).click();
+  await expect(page.getByRole('button', { name: '关闭标签页：常驻聊天', exact: true })).toHaveCount(0);
+  await trigger.click(); await menu.getByRole('button', { name: '关闭标签页', exact: true }).click();
+  await expect(tab(page, '常驻聊天')).toHaveCount(0);
+  await expect(tab(page, '已有测试历史')).toHaveAttribute('aria-selected', 'true');
+  noDestructiveRequests(mock);
+});
