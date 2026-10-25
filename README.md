@@ -10,7 +10,7 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 
 下图来自真实 Vue 界面，使用固定演示数据，未包含实际主机、账户或私人对话。资源数值及执行记录用于展示界面，不代表性能基准。
 
-界面采用白色与冷灰色层级、蓝色交互提示和清晰的深色主题。桌面顶部栏压缩为 42 px，工作区标题与视图导航合为一行；手机保留 48 px 顶栏和触控空间。
+界面采用白色与冷灰色层级、蓝色交互提示和清晰的深色主题。桌面顶部栏压缩为 42 px，工作区标题与视图导航合为一行；手机使用 44 px 聊天标签栏并保留触控空间。
 
 <table>
   <tr>
@@ -44,6 +44,8 @@ Vue 3 + TypeScript + Node.js 22 构建的 Codex 网页客户端，支持桌面�
 截图生成：`npm ci`、`npx playwright install chromium`，再执行 `npm run docs:screenshots`；仅更新收藏截图可执行 `npm run docs:screenshots -- --only=bookmarks`。脚本只启动独立前端和测试协议数据，不连接实际 Codex 或运行模型；图片不打包进 Docker 镜像。
 
 [Docker 部署](#docker-快速部署) · [功能与限制](#功能状态) · [开发与验证](#开发与验证) · [本轮审查与改进建议](docs/project-audit.md)
+
+顶部支持[聊天标签页](docs/chat-tabs.md)：打开、固定和切换常用聊天，`＋` 新建对话，当前标签的 `…` 管理聊天。关闭标签不会停止任务；草稿与阅读位置分别保留。
 
 ## Docker 快速部署
 
