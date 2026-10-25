@@ -103,7 +103,7 @@ test('switching conversations while Stop confirms a mismatch prevents the retry 
   await page.getByRole('button', { name: '停止生成', exact: true }).click();
   await expect.poll(() => probes(mock).length).toBe(1);
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '另一个运行中的会话' }).first().click();
-  await expect(page.locator('.main-header')).toContainText('另一个运行中的会话');
+  await expect(page.locator('.main-header h1')).toHaveText('另一个运行中的会话');
   control.releaseProbe!();
   await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
   expect(stops(mock)).toHaveLength(1);

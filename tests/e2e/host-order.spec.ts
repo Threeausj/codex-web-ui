@@ -124,7 +124,7 @@ test('moving enabled local and remote hosts persists the order without changing 
   ]);
   await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
   await expect(filters(page)).toHaveText(['全部', 'RTX4090x8', 'NAS', '本机']);
-  await expect(page.locator('.main-header')).toContainText('NAS 历史');
+  await expect(page.locator('.main-header h1')).toHaveText('NAS 历史');
   await expect(page.locator('.agent-message')).toContainText('NAS 原有内容');
   await expect(input(page)).toHaveValue('排序不会丢失的 NAS 草稿');
   expect(socketCounts(mock)).toEqual(sockets);
@@ -132,7 +132,7 @@ test('moving enabled local and remote hosts persists the order without changing 
   expectNoModelCalls(mock);
   await page.reload();
   await expect(input(page)).toHaveValue('排序不会丢失的 NAS 草稿');
-  await expect(page.locator('.main-header')).toContainText('NAS 历史');
+  await expect(page.locator('.main-header h1')).toHaveText('NAS 历史');
   await expect(filters(page)).toHaveText(['全部', 'RTX4090x8', 'NAS', '本机']);
   await connections(page);
   await expect(rows(page)).toHaveText(names(backend.order));
@@ -244,7 +244,7 @@ test('another independent device applies the shared order while retaining its ho
     for (const { page } of devices) await expect(filters(page)).toHaveText(['全部', 'NAS', '本机', 'RTX4090x8']);
     await expect(filters(b.page).filter({ hasText: /^RTX4090x8$/ })).toHaveAttribute('aria-pressed', 'true');
     await expect(b.page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-rtx');
-    await expect(b.page.locator('.main-header')).toContainText('RTX4090x8 历史');
+    await expect(b.page.locator('.main-header h1')).toHaveText('RTX4090x8 历史');
     await expect(input(b.page)).toHaveValue('设备 B 的 RTX 草稿');
     expect(socketCounts(b.mock)).toEqual(sockets);
     await settings.getByRole('button', { name: '关闭设置', exact: true }).click();

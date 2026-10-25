@@ -144,7 +144,7 @@ test('switching a main conversation retains the side branch, its original contex
   await expect(page.locator('.side-chat-transcript')).toContainText('流式回复完成 ✅');
   await input.fill('还要解释原对话');
   await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '另一个主对话' }).first().click();
-  await expect(page.locator('.main-header')).toContainText('另一个主对话');
+  await expect(page.locator('.main-header h1')).toHaveText('另一个主对话');
   await expect(page.locator('#side-chat-panel')).toBeHidden();
   await page.getByRole('button', { name: '新建侧边聊天', exact: true }).click();
   await expect(input).toHaveValue('还要解释原对话');
@@ -157,7 +157,7 @@ test('switching a main conversation retains the side branch, its original contex
   expect(mock.turns.get('another-parent')).toHaveLength(0);
   expect(wire.releases).toHaveLength(0);
   await page.getByRole('button', { name: '返回原对话', exact: true }).click();
-  await expect(page.locator('.main-header')).toContainText('已有测试历史');
+  await expect(page.locator('.main-header h1')).toHaveText('已有测试历史');
   await expect(page.locator('#side-chat-panel')).toBeVisible();
   await expect(page.getByRole('button', { name: '引用回答到主对话', exact: true })).toBeEnabled();
 });

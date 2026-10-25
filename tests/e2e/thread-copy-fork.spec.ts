@@ -75,7 +75,7 @@ test('forking an unopened remote conversation keeps native history and opens the
  const remote=remoteFixture(mock);await login(page);await row(page).locator('.thread-row').click();
  const original=structuredClone(remote.turns.get('thread-existing'));
  await row(page,'ssh-copy').locator('.nav-row-menu').click();await row(page,'ssh-copy').getByRole('button',{name:'分叉对话 (Fork)',exact:true}).click();
- await expect(page.locator('.main-header')).toContainText('分支测试对话');await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-copy');
+ await expect(page.locator('.main-header h1')).toHaveText('分支测试对话');await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'ssh-copy');
  expect(remote.request('thread/fork')?.params).toEqual({threadId:'thread-existing',excludeTurns:true,deferGoalContinuation:true});
  expect(mock.request('thread/fork')).toBeUndefined();expect(remote.turns.get('fork-1')).toEqual(original);
  expect(remote.turns.get('thread-existing')).toEqual(original);expect(remote.request('turn/start')).toBeUndefined();

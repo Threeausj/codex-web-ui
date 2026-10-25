@@ -118,7 +118,7 @@ function complete(targets: Device[], turnId: string, at = completedAt, hostId = 
 async function openTarget(device: Device, hostId = 'local', title = targetTitle) {
   await device.page.bringToFront();
   await row(device.page, hostId, title).locator('.thread-row').click();
-  await expect(device.page.locator('.main-header')).toContainText(title);
+  await expect(device.page.locator('.main-header h1')).toHaveText(title);
   await expect(device.page.getByText(`${title}的回复`, { exact: true })).toBeVisible();
 }
 
@@ -137,7 +137,7 @@ test('reading on one independent device immediately clears the other device and 
     await unread([a, b], 0);
     expect(backend.records.get(receiptKey({ hostId: 'local', threadId: targetId }))?.turnIds).toContain('device-shared-turn');
     await expect(input(b.page)).toHaveValue('另一台设备保留的草稿');
-    await expect(b.page.locator('.main-header')).toContainText('已有测试历史');
+    await expect(b.page.locator('.main-header h1')).toHaveText('已有测试历史');
     await b.page.reload();
     await expect(input(b.page)).toBeEnabled();
     await unread([b], 0);
