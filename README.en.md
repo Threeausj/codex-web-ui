@@ -10,7 +10,7 @@ This is an evolving desktop-style workflow, with implemented features and remain
 
 These images show the real Vue application with fixed demonstration data. They contain no real account, workstation, or private conversation data. Resource values and execution records illustrate the interface, not benchmark results. The current interface uses Chinese labels.
 
-The interface uses white and cool gray surfaces, blue interaction accents, and a high contrast dark theme. Desktop headers are 42 px tall, with workspace navigation in the same row; mobile headers retain 48 px height and space for touch controls.
+The interface uses white and cool gray surfaces, blue interaction accents, and a high contrast dark theme. Desktop headers are 42 px tall, with workspace navigation in the same row; mobile chat tabs use a compact 44 px header with space for touch controls.
 
 <table>
   <tr>

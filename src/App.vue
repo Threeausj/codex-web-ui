@@ -63,7 +63,7 @@ watch(() => [state.authenticated, state.authenticationGeneration], () => {
   if (state.authenticated) void chatTabs.load();
   else chatTabs.clear();
 }, { immediate: true });
-watch(() => [state.authenticated, state.hostId, state.activeThread?.id, state.switchingHost], () => {
+watch([() => state.authenticated, () => state.hostId, () => state.activeThread?.id, () => state.switchingHost], () => {
   if (state.authenticated && state.activeThread && !state.switchingHost)
     chatTabs.open({ hostId: state.hostId, threadId: state.activeThread.id,
       title: state.activeThread.name?.trim() || state.activeThread.preview?.trim() || undefined });
@@ -227,7 +227,12 @@ function closeThreadMenuOnLayout(event: Event) {
   if (event.type === 'scroll' && !(event.target instanceof HTMLElement && event.target.classList.contains('chat-tabs-scroll'))) return;
   threadMenu.value = false;
 }
-watch(() => [state.hostId, state.activeThread?.id, state.selectingThread, state.switchingHost], () => { threadMenu.value = false; });
+// Compare scalar identities: replacing a thread snapshot with the same ID
+// (for example on completion) must not dismiss its menu or reopen its tab.
+watch([() => state.hostId, () => state.activeThread?.id], () => { threadMenu.value = false; });
+watch([() => state.selectingThread, () => state.switchingHost], ([selecting, switching]) => {
+  if (selecting || switching) threadMenu.value = false;
+});
 watch(threadMenu, open => {
   if (open && state.authenticated) {
     void bookmarks.ensureIndex({ force: true });
