@@ -30,6 +30,17 @@ export type PushObserverOptions = {
 const object = (value: unknown): Record<string, any> | undefined => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : undefined
 const validId = (value: unknown): value is string => identifier.safeParse(value).success
 const keyFor = (hostId: string, threadId: string) => JSON.stringify([hostId, threadId])
+const liveDeltaMethods = new Set(['item/agentMessage/delta', 'item/plan/delta', 'item/reasoning/summaryTextDelta',
+  'item/reasoning/textDelta', 'item/commandExecution/outputDelta', 'item/fileChange/outputDelta'])
+function liveItemActivity(method: string | undefined, params: Record<string, any> | undefined) {
+  if (!params) return false
+  if (liveDeltaMethods.has(method || '')) return validId(params.itemId) && typeof params.delta === 'string' && params.delta.length > 0
+  if (method !== 'item/started') return false
+  const item = object(params.item)
+  return validId(item?.id) && ['agentMessage', 'plan', 'reasoning', 'commandExecution', 'fileChange', 'mcpToolCall',
+    'dynamicToolCall', 'collabAgentToolCall', 'webSearch', 'imageGeneration', 'contextCompaction'].includes(item?.type) &&
+    (item?.status === undefined || item.status === 'inProgress')
+}
 
 /** Durable, read-only supervision: browsers never own the push observer lifecycle.
  * Reconnecting a transport is safe; resuming a thread would acquire a writer,
@@ -128,6 +139,12 @@ export class PushObservers {
       const accepted = object(p?.result)
       this.remember(host, threadId, validId(accepted?.turn?.id) ? accepted!.turn.id : validId(accepted?.turnId) ? accepted!.turnId : undefined)
     }
+    // Metadata can report active without its turn ID. Bind a later live item
+    // to that existing watch so a missed completion remains recoverable. An
+    // old delta cannot start observation or replace an already identified turn.
+    const watched = this.watched.get(key)
+    if (watched && !watched.turnId && validId(p?.turnId) && liveItemActivity(message.method, p))
+      this.remember(host, threadId, p!.turnId)
     if (message.method === 'turn/completed' && validId(turn?.id)) {
       const watched = this.watched.get(key)
       if (watched && (!watched.turnId || watched.turnId === turn!.id)) {

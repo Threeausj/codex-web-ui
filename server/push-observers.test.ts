@@ -84,6 +84,71 @@ test('a missed completion is recovered using only a previously observed active t
   } finally { await f.cleanup() }
 })
 
+for (const activity of [
+  { method: 'item/started', params: { item: { id: 'live-answer', type: 'agentMessage' } } },
+  { method: 'item/agentMessage/delta', params: { itemId: 'live-answer', delta: 'Working' } },
+]) test(`${activity.method} identifies an already observed active turn and recovers its missed completion once`, async () => {
+  const f = await fixture()
+  try {
+    f.service.observe(local, { method: 'thread/status/changed', params: { threadId: 'active', status: { type: 'active' } } })
+    f.service.observe(local, { method: activity.method, params: { ...activity.params, threadId: 'active', turnId: 'bound-work' } })
+    await f.service.flush()
+    assert.equal(JSON.parse(await fs.readFile(path.join(f.directory, 'push-observers.json'), 'utf8')).threads[0].turnId, 'bound-work')
+    f.bridge.connected = false
+    f.service.observe(local, { method: 'bridge/disconnected', params: {} })
+    f.threads.set('active', { id: 'active', source: 'cli', status: { type: 'idle' } })
+    f.turns.set('active', [{ id: 'bound-work', status: 'completed' }, { id: 'old', status: 'completed' }])
+    f.advance(1000); await f.service.poll(); await f.service.flush()
+    const notices = () => f.events.filter(value => value.message.method === 'turn/completed')
+    assert.deepEqual(notices().map(value => value.message.params), [{ threadId: 'active', turn: { id: 'bound-work', status: 'completed' } }])
+    f.advance(60_000); await f.service.poll(); await f.service.flush()
+    assert.equal(notices().length, 1)
+    assert.equal(JSON.parse(await fs.readFile(path.join(f.directory, 'push-observers.json'), 'utf8')).threads.length, 0)
+    assert.ok(f.requests.every(value => ['thread/loaded/list', 'thread/read', 'thread/turns/list'].includes(value.method)))
+  } finally { await f.cleanup() }
+})
+
+test('delayed live activity never replaces a known running turn or starts an idle thread watch', async () => {
+  const f = await fixture()
+  try {
+    f.service.observe(local, { method: 'turn/started', params: { threadId: 'active', turn: { id: 'current-work', status: 'inProgress' } } })
+    for (const threadId of ['active', 'idle']) for (const message of [
+      { method: 'item/started', params: { item: { id: 'old-item', type: 'reasoning' } } },
+      { method: 'item/commandExecution/outputDelta', params: { itemId: 'old-item', delta: 'Old output' } },
+    ]) f.service.observe(local, { method: message.method, params: { ...message.params, threadId, turnId: 'old-work' } })
+    await f.service.flush()
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.directory, 'push-observers.json'), 'utf8')).threads.map((entry: any) =>
+      ({ threadId: entry.threadId, turnId: entry.turnId })), [{ threadId: 'active', turnId: 'current-work' }])
+    f.threads.set('active', { id: 'active', source: 'cli', status: { type: 'idle' } })
+    f.turns.set('active', [{ id: 'old-work', status: 'completed' }, { id: 'current-work', status: 'completed' }])
+    await f.service.poll(); await f.service.flush()
+    assert.deepEqual(f.events.filter(value => value.message.method === 'turn/completed').map(value => value.message.params),
+      [{ threadId: 'active', turn: { id: 'current-work', status: 'completed' } }])
+  } finally { await f.cleanup() }
+})
+
+test('history, errors, arbitrary methods and malformed activity cannot identify an unknown active turn', async () => {
+  const f = await fixture()
+  try {
+    f.service.observe(local, { method: 'thread/status/changed', params: { threadId: 'active', status: { type: 'active' } } })
+    for (const message of [
+      { method: 'item/completed', params: { item: { id: 'old-item', type: 'agentMessage' } } },
+      { method: 'error', params: { message: 'Unrelated error' } },
+      { method: 'item/other/delta', params: { itemId: 'old-item', delta: 'Unrecognized activity' } },
+      { method: 'item/agentMessage/delta', params: { itemId: 'old-item', delta: '' } },
+      { method: 'item/agentMessage/delta', params: { delta: 'Missing item identity' } },
+      { method: 'item/started', params: { item: { id: 'old-item', type: 'commandExecution', status: 'completed' } } },
+      { method: 'item/started', params: { item: { id: 'old-item', type: 'userMessage' } } },
+    ]) f.service.observe(local, { method: message.method, params: { ...message.params, threadId: 'active', turnId: 'untrusted-turn' } })
+    f.service.observe(local, { method: 'item/agentMessage/delta', params: { threadId: 'active', turnId: 'invalid\nturn', itemId: 'old-item', delta: 'Invalid turn identity' } })
+    await f.service.flush()
+    const journal = JSON.parse(await fs.readFile(path.join(f.directory, 'push-observers.json'), 'utf8'))
+    assert.equal(journal.threads.length, 1)
+    assert.equal(journal.threads[0].turnId, undefined)
+    assert.equal(f.events.filter(value => value.message.method === 'turn/completed').length, 0)
+  } finally { await f.cleanup() }
+})
+
 test('observer restart recovers a tracked completion without notifying old idle threads', async () => {
   const f = await fixture()
   let restored: PushObservers | undefined
