@@ -322,7 +322,7 @@ onBeforeUnmount(() => { disposed = true; ++testGeneration; stopTestPolling(); cl
       <p v-if="deliveryError" class="pwa-subtle">{{ deliveryError }}</p>
       <p class="pwa-subtle">设置仅作用于这台设备。退出登录会撤销本机通知；移动系统可能因省电或网络状态延迟送达。</p>
       <p class="pwa-subtle">网络或推送服务暂时出错时，服务器会保存通知并自动重试；最多尝试 8 次，有效期 1 小时。服务接收成功不代表手机已显示通知。</p>
-      <p v-if="android" class="pwa-subtle">Android Chrome 的后台通知需要手机能连接 Google 推送服务。若测试已接收却未收到，先点击“检查系统通知”；能收到系统检查通知时，请检查手机的 Google 服务连接和省电设置。</p>
+      <p v-if="android" class="pwa-subtle">Android Chrome 的后台通知需要手机能连接 Google 推送服务。“检查系统通知”只验证本机显示。若通知总在亮屏后收到，请检查 Chrome、Google Play 服务及所用代理的省电与后台联网限制；仅允许 PWA 后台运行可能不足。服务器显示“已接收”仅表示推送服务接收，无法确认手机已显示。</p>
     </section>
   </div>
 </template>
