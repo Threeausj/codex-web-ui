@@ -76,6 +76,16 @@ Android 可以冻结或回收后台页面，因此不能靠一直保留浏览器
 
 送达依赖浏览器厂商服务、网络、设备通知权限、专注模式和系统资源策略。关闭页面后的后台推送属于支持范围，系统强退、强制停止、严格省电或系统限制下的即时送达无法保证；也不把通知当作任务结果的唯一记录。回到网页时以 app-server 的真实状态和历史为准。
 
+### Android 通知在亮屏时才出现
+
+只点亮屏幕就出现、无需打开网页，通常应先排查手机的休眠联网与推送唤醒。Android 官方说明，Doze 会限制后台网络，亮屏、移动设备或接上电源会退出该状态。[Doze 与 App Standby](https://developer.android.com/training/monitoring-device-state/doze-standby)。这是与现象相符的解释，不能仅凭亮屏时收到就认定具体是哪一项系统策略。
+
+服务端已使用 Web Push `Urgency: high`，手机 Service Worker 收到事件后立即通过 `event.waitUntil(showNotification(...))` 显示，不等待页面可见、不先请求 API，也不依赖手机的 WebSocket。推送服务仍可能在客户端离线时排队；高优先级表示请求优先唤醒，不构成即时显示保证。[Web Push 的优先级](https://web.dev/articles/push-notifications-web-push-protocol#urgency)、[消息传递流程](https://web.dev/articles/push-notifications-overview)。原生 Android FCM 配置不适用于本项目使用的浏览器 Web Push 订阅。
+
+先检查安装 PWA 所用的浏览器（例如 Chrome）、Google Play 服务及手机上实际使用的 VPN／代理是否受到后台数据或省电限制；在系统提供对应选项时，对这些应用允许后台联网并取消电池限制。再保持同一网络，比较充电息屏和拔掉电源息屏的送达表现。接电时恢复正常支持省电策略这个排查方向；两种状态都延迟时继续检查设备到 Google 推送服务的连接。
+
+“检查系统通知”直接在本机显示，绕过远程推送链路；“发送测试通知”的 `accepted` 和投递统计只代表推送厂商接收。当前系统没有手机 Service Worker 收到、系统显示这两阶段的回执，因此服务端记录正常不能证明某次锁屏通知已即时显示。
+
 Service Worker 只缓存公开的应用界面和静态资源，不缓存 API、上传、预览或私人对话。另有按有效登录隔离的 IndexedDB 会话快照，最多保存 12 个会话、总计 4 MiB、24 小时；登出或登录失效时清理。重进优先显示上次会话及缓存历史，随后核对原生会话；同步完成前禁止发送。离线不显示未经登录验证的私人缓存，也不支持发送、审批、文件操作或执行任务。
 
 切到后台时保存最近历史快照，回到前台会检查登录和连接并恢复选中对话。Android 可以冻结或回收 PWA 的页面进程，网页无法强制永久驻留；会话恢复与服务端保留的运行连接用于应对回收。[Chrome 页面生命周期](https://developer.chrome.com/docs/web-platform/page-lifecycle-api)。主动在“资源管理”关闭 Web Codex 后保持暂停，自动重连和服务重启不会抢回桌面端的会话，需显式点击“连接 Web Codex”。
