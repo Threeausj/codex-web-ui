@@ -356,7 +356,7 @@ function sideChatRpc(hostId: string, method: Method, params: any) {
   return rpc(method, params, 45000, { silentError: true });
 }
 function runtimeIdentity() { return { authenticationGeneration, engineId }; }
-let metadataReconnectChoices: { authentication: number; hostId: string; hostGeneration: number; threadId: string | null } | null = null;
+let metadataReconnectChoices: { authentication: number; hostId: string; hostGeneration: number; threadId: string | null; observedEngine?: string } | null = null;
 function preserveMetadataChoices() {
   const selection = metadataReconnectChoices;
   return !!selection && selection.authentication === authenticationGeneration && selection.hostId === state.hostId &&
@@ -375,16 +375,25 @@ watch(() => [state.authenticated, state.authenticationGeneration], () => promptP
 async function refreshCurrentRuntimeMetadata() {
   const authentication = authenticationGeneration, hostId = state.hostId, selectedEngine = engineId;
   const hostGeneration = hostSelectionGeneration;
+  const choices = metadataReconnectChoices;
   const current = () => authentication === authenticationGeneration && state.authenticated && hostId === state.hostId &&
     hostGeneration === hostSelectionGeneration && selectedEngine === engineId && state.connected && !state.runtimePaused;
   if (!state.authenticated || !state.connected || state.runtimePaused) return;
   try {
+    // A focus/probe recovery can run alongside this metadata refresh. Protect
+    // acknowledged composer choices through its sync/readConfig and resume.
+    await resumeConnection();
+    if (!current()) return;
     const information = await settingsApi.refreshRuntimeInformation(hostId);
     if (!current() || information.runtime?.engineId !== selectedEngine) return;
     await readConfig(true, true);
     if (!current()) return;
     if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
   } catch { /* A later reconnect/read retries metadata; never replay mutations. */ }
+  finally {
+    if (choices?.observedEngine === selectedEngine && metadataReconnectChoices === choices)
+      metadataReconnectChoices = null;
+  }
 }
 async function reconnectRuntime(hostId = state.hostId) {
   if (!hostId || !state.hosts.some(host => host.id === hostId)) throw new Error('请先添加或启用一个执行主机');
@@ -1815,6 +1824,10 @@ function receive(message: any) {
     if (typeof p.engineId === 'string') {
       if (engineId !== p.engineId) {
         if (changedEngine) {
+          if (!preserveMetadataChoices()) metadataReconnectChoices = {
+            authentication: authenticationGeneration, hostId: state.hostId, hostGeneration: hostSelectionGeneration,
+            threadId: state.activeThread?.id || null, observedEngine: p.engineId,
+          };
           invalidateRuntimeCapabilities();
           verifiedConfiguration = null;
           configurationRequest = null;
@@ -3951,12 +3964,48 @@ async function interruptOnce() {
     if (current()) throw fail(error);
   }
 }
-async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string) {
+async function attachedThreadCapabilities(hostId: string) {
+  const capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false);
+  if (!methodAccepts(capabilities, 'thread/fork', ['threadId', 'attachToSource', 'excludeTurns']) ||
+      !methodAccepts(capabilities, 'thread/list', ['attachedToThreadId', 'cursor', 'limit', 'modelProviders', 'archived']))
+    throw new Error('当前主机尚未确认支持附属分支，请更新并重启至 Codex 0.165 或更新版本后重试');
+  return capabilities;
+}
+async function queryAttachedThreads(threadId: string, hostId = state.hostId, cursor: string | null = null, archived = false) {
+  const authentication = authenticationGeneration;
+  await attachedThreadCapabilities(hostId);
+  if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId))
+    throw new Error('登录状态或主机连接已变化，请重新打开附属分支');
+  const result = await scopedRpc(hostId, 'thread/list', { attachedToThreadId: threadId, cursor, limit: 60, modelProviders: [], archived });
+  if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId))
+    throw new Error('登录状态已变化，请重新打开附属分支');
+  if (!Array.isArray(result.data) || result.data.some((thread: any) => !thread || typeof thread.id !== 'string' || !thread.id || thread.id === threadId))
+    throw new Error('附属分支列表无效，请刷新重试');
+  return { data: result.data.map((thread: any) => ({ ...thread, hostId })), nextCursor: result.nextCursor ?? null };
+}
+async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string, options: { attachToSource?: boolean } = {}) {
   const authentication = authenticationGeneration;
   const selection = selectionGeneration, selectedHost = state.hostId, selectedThread = state.activeThread?.id;
   const source = hostId === state.hostId
     ? state.threads.find(thread => thread.id === id) ?? (state.activeThread?.id === id ? state.activeThread : undefined)
     : state.navigation[hostId]?.threads.find(thread => thread.id === id);
+  const attached = options.attachToSource === true;
+  if (attached) {
+    // Attached branches are persistent, hidden in native ordinary lists, and
+    // cannot use deferGoalContinuation. Never copy a goal into an auto-running
+    // branch or turn a read-only ephemeral side chat into a persistent one.
+    await attachedThreadCapabilities(hostId);
+    const [metadata, goal] = await Promise.all([
+      scopedRpc(hostId, 'thread/read', { threadId: id, includeTurns: false }),
+      scopedRpc(hostId, 'thread/goal/get', { threadId: id }),
+    ]);
+    if (!metadata.thread?.id || metadata.thread.id !== id || metadata.thread.ephemeral !== false)
+      throw new Error('仅支持为已保存的普通对话创建附属分支，请先保存此对话');
+    if (!goal || !('goal' in goal) || goal.goal !== null)
+      throw new Error('此对话包含 Goal，无法安全创建附属分支；请使用普通分支');
+    if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId))
+      throw new Error('登录状态或主机连接已变化，请重新打开附属分支');
+  }
   // Native allows a snapshot of a running thread when no boundary is given.
   // A lastTurnId naming its active turn is rejected; the snapshot's partial
   // turn gets an interruption marker while the source continues untouched.
@@ -3964,16 +4013,20 @@ async function forkThread(id: string, hostId = state.hostId, lastTurnId?: string
   const activeBoundary = lastTurnId && hostId === state.hostId &&
     (activeTurns.get(id) === lastTurnId || selectedSource && state.turns.some(turn => turn.id === lastTurnId && turn.status === 'inProgress'));
   const result = await scopedRpc(hostId, "thread/fork", {
-    threadId: id, ...(lastTurnId && !activeBoundary ? { lastTurnId } : {}), excludeTurns: true, deferGoalContinuation: true,
+    threadId: id, ...(lastTurnId && !activeBoundary ? { lastTurnId } : {}), excludeTurns: true,
+    ...(attached ? { attachToSource: true } : { deferGoalContinuation: true }),
     ...(isProjectlessThread(source) ? { threadSource: PROJECTLESS_THREAD_SOURCE } : {}),
   });
-  if (authentication !== authenticationGeneration || !state.authenticated)
+  if (authentication !== authenticationGeneration || !state.authenticated || attached && !state.hosts.some(host => host.id === hostId))
     throw new Error('登录状态已变化，请重新同步对话后确认已创建的分支');
-  if (!result.thread?.id) throw new Error('无法确认已创建的分支，请同步对话');
+  if (!result.thread?.id || result.thread.id === id || attached && result.thread.ephemeral !== false)
+    throw Object.assign(new Error('无法确认已创建的分支，请刷新分支列表后确认；请勿重复创建'), { uncertain: true });
   invalidateThreadTitleSearch(hostId);
-  if (hostId === state.hostId) updateThread(result.thread);
-  else mergeNavigation(hostId, [result.thread]);
-  toast("已创建对话分支");
+  if (!attached) {
+    if (hostId === state.hostId) updateThread(result.thread);
+    else mergeNavigation(hostId, [result.thread]);
+  }
+  toast(attached ? '已创建附属分支，可在附属分支列表打开' : '已创建对话分支');
   return { id: result.thread.id as string, hostId,
     canSelect: selection === selectionGeneration && selectedHost === state.hostId && selectedThread === state.activeThread?.id };
 }
@@ -6124,6 +6177,7 @@ export function useCodex() {
     interrupt,
     fork,
     forkThread,
+    queryAttachedThreads,
     compact,
     setAutoCompact,
     renameThread,

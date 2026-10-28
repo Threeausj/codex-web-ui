@@ -16,9 +16,13 @@ const request = z.discriminatedUnion("method", [
     method: z.literal('thread/fork'),
     params: z.object({
       threadId, lastTurnId: threadId.optional(),
-      excludeTurns: z.literal(true), deferGoalContinuation: z.literal(true),
+      excludeTurns: z.literal(true),
+      deferGoalContinuation: z.literal(true).optional(),
+      attachToSource: z.literal(true).optional(),
       threadSource: z.literal(PROJECTLESS_THREAD_SOURCE).optional(),
-    }).strict(),
+    }).strict().refine(params => params.attachToSource === true
+      ? params.deferGoalContinuation === undefined : params.deferGoalContinuation === true,
+    { message: 'Attached forks cannot defer goal continuation; ordinary forks must defer it' }),
   }).strict(),
   z
     .object({
@@ -29,6 +33,7 @@ const request = z.discriminatedUnion("method", [
           modelProviders: z.array(z.string().max(256)).max(20).optional(),
           cwd: z.array(z.string().min(1).max(4096)).max(12).optional(),
           projectId: z.string().min(1).max(512).nullable().optional(),
+          attachedToThreadId: threadId.optional(),
           searchTerm: z.string().max(1000).optional(),
         })
         .strict(),
@@ -46,6 +51,12 @@ const request = z.discriminatedUnion("method", [
     .object({
       method: z.literal("thread/read"),
       params: z.object({ threadId, includeTurns: z.literal(false) }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal('thread/goal/get'),
+      params: z.object({ threadId }).strict(),
     })
     .strict(),
   z
