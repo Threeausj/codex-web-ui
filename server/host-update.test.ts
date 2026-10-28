@@ -10,8 +10,11 @@ import { EventEmitter } from 'node:events'
 import express from 'express'
 import { z } from 'zod'
 import { Auth } from './auth.js'
+import { AutomationService } from './automations.js'
 import { Bridge, type Transport } from './bridge.js'
 import { HostCodexUpdates, codexUpdateScript, registerHostCodexUpdates } from './host-update.js'
+import { registerHostResources } from './host-resources.js'
+import { writePrivateJson } from './storage.js'
 import type { Host, RpcMessage } from './types.js'
 const turn = () => new Promise<void>(resolve => setImmediate(resolve))
 async function until(predicate: () => boolean) { for (let index = 0; index < 1000 && !predicate(); index++) await turn(); assert.ok(predicate()) }
@@ -20,7 +23,7 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
   const hosts: Host[] = [{ id: 'local', name: 'Local', kind: 'local' }, { id: 'remote', name: 'Remote', kind: 'ssh', hostname: 'offline.invalid' }, { id: 'offline', name: 'Offline', kind: 'local' }]
   const bridges = new Map<string, Bridge>(), peers = new Map<string, { output: PassThrough; disposed: boolean; sent: RpcMessage[] }[]>()
   const installed = new Map([['local', '0.164.0'], ['remote', '0.163.0']]); const calls: { hostId: string; phase: string }[] = []
-  let hold: (() => Promise<void>) | undefined, failure = !!options.fail, reserved = 0
+  let hold: (() => Promise<void>) | undefined, holdPersistence: (() => Promise<void>) | undefined, persistenceCalls = 0, failure = !!options.fail, reserved = 0
   for (const host of hosts.slice(0, 2)) {
     const collection: { output: PassThrough; disposed: boolean; sent: RpcMessage[] }[] = []; peers.set(host.id, collection)
     const bridge = new Bridge(host, { mode: options.proxy ? 'proxy' : 'spawn', transportFactory: () => {
@@ -37,6 +40,7 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
           const result = message.method === 'initialize' ? { userAgent: `codex_cli_rs/${collection.length > 1 && options.runtimeAfter ? options.runtimeAfter : installed.get(host.id)} (fixture)`, codexHome: '/fixture/home' }
             : message.method === 'thread/loaded/list' ? { data: options.nativeBusy || options.queued ? ['native-running'] : [], nextCursor: null }
             : message.method === 'thread/read' ? { thread: { id: params.threadId, status: { type: options.nativeBusy ? 'active' : 'idle' } } }
+            : message.method === 'thread/resume' ? { thread: { id: params.threadId, status: { type: 'idle' } } }
             : message.method === 'thread/queue/list' ? { data: options.queued ? [{ id: 'queued' }] : [], nextCursor: null }
             : { data: [], nextCursor: null }
           queueMicrotask(() => output.write(`${JSON.stringify({ id: message.id, result })}\n`))
@@ -47,14 +51,23 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
   }
   const auth = new Auth('host-update-fixture-secret', new Set(['http://localhost:8787']))
   const app = express(); app.use(express.json()); app.post('/api/auth/login', auth.login); app.use('/api', auth.requireAuth, auth.requireCsrf)
+  const pausedHosts = new Set<string>()
+  const maintenance = new AutomationService(directory, { getHost: id => hosts.find(host => host.id === id), getBridge: async id => bridges.get(id)! })
+  await maintenance.initialize(false)
   const dependencies = { getHost: (id: string) => hosts.find(host => host.id === id), getExistingBridge: (id: string) => bridges.get(id),
-    withRuntimeMaintenance: async <T>(_id: string, work: () => Promise<T>) => { if (options.automationBusy) throw Object.assign(new Error('自动化正在运行'), { status: 409 }); reserved++; return work() },
+    withRuntimeMaintenance: async <T>(id: string, work: () => Promise<T>) => { if (options.automationBusy) throw Object.assign(new Error('自动化正在运行'), { status: 409 }); reserved++; return maintenance.withHostRuntimeMaintenance(id, work) },
     execute: async (host: Host, phase: 'version' | 'update') => {
       calls.push({ hostId: host.id, phase });
       if (phase === 'update') { if (hold) await hold(); if (failure) throw new Error('更新失败，原有连接未重启。'); installed.set(host.id, options.installed || '0.165.0') }
       return { version: installed.get(host.id)! }
     } }
   const updates = await registerHostCodexUpdates(app, directory, dependencies)
+  registerHostResources(app, { ...dependencies, dataDir: directory, pausedHosts, getBridge: async id => bridges.get(id)!,
+    persistRuntime: async () => {
+      persistenceCalls++
+      if (holdPersistence) await holdPersistence()
+      await writePrivateJson(path.join(directory, 'runtime-state.json'), { pausedHostIds: [...pausedHosts], releasedThreads: [] })
+    } })
   app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(error instanceof z.ZodError ? 400 : error.status || 500).json({ error: error.message }))
   const server = http.createServer(app); await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`, origin = 'http://localhost:8787'
@@ -62,9 +75,11 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
   const { csrfToken } = await response.json(), cookie = response.headers.get('set-cookie')!.split(';')[0]!
   const headers = { cookie, origin, 'content-type': 'application/json', 'x-csrf-token': csrfToken }
   const request = (hostId = 'remote', body?: unknown, custom = headers) => fetch(base + `/api/hosts/${hostId}/codex-update`, { method: body === undefined ? 'GET' : 'POST', headers: custom, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) })
+  const resource = (action: string, body: unknown) => fetch(`${base}/api/hosts/remote/runtime/${action}`, { method: 'POST', headers, body: JSON.stringify(body) })
   return { directory, hosts, bridges, peers, installed, calls, updates, dependencies, request, base, headers,
-    setHold(value: () => Promise<void>) { hold = value }, setFailure(value: boolean) { failure = value }, get reserved() { return reserved },
-    async close() { await updates.close(); for (const bridge of bridges.values()) bridge.close(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() }); await fs.rm(directory, { recursive: true, force: true }) } }
+    resource, pausedHosts, get persistenceCalls() { return persistenceCalls },
+    setHold(value: () => Promise<void>) { hold = value }, setPersistenceHold(value: () => Promise<void>) { holdPersistence = value }, setFailure(value: boolean) { failure = value }, get reserved() { return reserved },
+    async close() { await updates.close(); await maintenance.close(); for (const bridge of bridges.values()) bridge.close(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() }); await fs.rm(directory, { recursive: true, force: true }) } }
 }
 const firstId = '10000000-0000-4000-8000-000000000001', secondId = '10000000-0000-4000-8000-000000000002'
 
@@ -105,6 +120,67 @@ test('concurrent requests share a durable operation, reject competing updates an
     assert.equal(f.calls.filter(call => call.phase === 'update').length, 1)
   } finally { release?.() }
 })
+
+test('an installer reservation rejects host and thread release/resume without persisting pauses or disconnecting its old runtime', async t => {
+  const f = await fixture(); t.after(() => f.close())
+  let release!: () => void; f.setHold(() => new Promise<void>(resolve => { release = resolve }))
+  try {
+    await f.request('remote', { requestId: firstId }); await until(() => !!release)
+    const peer = f.peers.get('remote')![0]!, nativeCalls = peer.sent.length
+    for (const [action, body] of [
+      ['close', { confirmed: true }], ['resume', {}], ['threads/owned/close', { confirmed: true }], ['threads/owned/resume', {}],
+    ] as const) {
+      const response = await f.resource(action, body)
+      assert.equal(response.status, 409)
+      assert.equal(f.pausedHosts.has('remote'), false)
+      assert.equal(f.bridges.get('remote')!.paused, false); assert.equal(f.bridges.get('remote')!.connected, true)
+      assert.equal(peer.disposed, false); assert.equal(f.persistenceCalls, 0)
+      assert.equal(peer.sent.length, nativeCalls)
+    }
+    await assert.rejects(fs.stat(path.join(f.directory, 'runtime-state.json')), { code: 'ENOENT' })
+    release(); await until(() => !f.updates.isUpdating('remote'))
+    assert.equal(f.updates.status('remote').operation?.state, 'completed')
+    assert.equal(f.pausedHosts.has('remote'), false); assert.equal(f.bridges.get('remote')!.paused, false)
+  } finally { release?.() }
+})
+
+test('resume refused by a bridge maintenance operation does not pause that operation as error cleanup', async t => {
+  const f = await fixture(); t.after(() => f.close())
+  let release!: () => void, entered = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const reconnecting = f.bridges.get('remote')!.reconnect(async () => { entered = true; await gate })
+  try {
+    await until(() => entered)
+    const response = await f.resource('resume', {})
+    assert.equal(response.status, 409)
+    assert.equal(f.peers.get('remote')![0]!.disposed, false)
+    assert.equal(f.bridges.get('remote')!.paused, false)
+    assert.equal(f.persistenceCalls, 0)
+  } finally { release(); await reconnecting }
+})
+
+for (const action of ['close', 'threads/owned/close'] as const)
+  test(`a ${action} resource reservation prevents update dispatch while its durable state is being saved`, async t => {
+    const f = await fixture(); t.after(() => f.close())
+    if (action.includes('threads')) await f.bridges.get('remote')!.request('thread/resume', { threadId: 'owned' })
+    let release!: () => void, persistenceStarted = false
+    const gate = new Promise<void>(resolve => { release = resolve })
+    f.setPersistenceHold(async () => { persistenceStarted = true; await gate })
+    const closing = f.resource(action, { confirmed: true })
+    try {
+      await until(() => persistenceStarted)
+      assert.equal(f.peers.get('remote')![0]!.disposed, false)
+      const response = await f.request('remote', { requestId: firstId })
+      assert.equal(response.status, action === 'close' ? 202 : 409)
+      await until(() => !f.updates.isUpdating('remote'))
+      if (response.status === 202) assert.equal(f.updates.status('remote').operation?.state, 'failed')
+      assert.deepEqual(f.calls, [])
+      release()
+      assert.equal((await closing).status, 200)
+      if (action === 'close') assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.directory, 'runtime-state.json'), 'utf8')).pausedHostIds, ['remote'])
+      else assert.equal(f.bridges.get('remote')!.releasedThreads.has('owned'), true)
+    } finally { release(); await closing }
+  })
 
 for (const condition of ['active', 'approval', 'terminal', 'proxy', 'offline', 'nativeBusy', 'queued', 'automationBusy'] as const)
   test(`an update preserves ${condition} work and never runs the installer`, async t => {
