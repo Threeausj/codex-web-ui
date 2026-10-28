@@ -10,6 +10,7 @@ import HostDiagnostics from "./HostDiagnostics.vue";
 import IntegrationsSettings from "./IntegrationsSettings.vue";
 import PerformanceSettings from "./PerformanceSettings.vue";
 import CodexSettings from "./CodexSettings.vue";
+import HostCodexUpdate from "./HostCodexUpdate.vue";
 import ArchivedChatsPanel from "./ArchivedChatsPanel.vue";
 import type { PromptPresetInput } from "../lib/prompt-presets";
 const PromptPresetsPanel = defineAsyncComponent(() => import("./PromptPresetsPanel.vue"));
@@ -35,6 +36,7 @@ const emit = defineEmits<{ close: []; theme: [value: string] }>();
 const section = ref(props.initialTab || (props.state.hosts?.length ? "general" : "hosts"));
 const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "");
 const codexSettingsBusy = ref(false);
+const codexUpdateBusy = ref(false);
 const presetsEditor = ref<InstanceType<typeof PromptPresetsPanel>>();
 const presetsState = computed(() => props.api.promptPresets.state);
 const presetCommands = [
@@ -51,7 +53,7 @@ function changeSection(value: string) { if (value !== section.value && canLeave(
 async function savePreset(value: PromptPresetInput) { try { await props.api.promptPresets.save(value); } catch {} }
 async function removePreset(value: { slot: number; expectedVersion: number }) { try { await props.api.promptPresets.remove(value); } catch {} }
 watch(section, value => { if (value === "presets") void props.api.promptPresets.refresh(); }, { immediate: true });
-defineExpose({ close: closeSettings, working: computed(() => presetsEditor.value?.working || presetsState.value.busy) });
+defineExpose({ close: closeSettings, working: computed(() => presetsEditor.value?.working || presetsState.value.busy || codexSettingsBusy.value || codexUpdateBusy.value) });
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
   { id: "performance", label: "性能", icon: "Zap" },
@@ -389,7 +391,7 @@ watch(() => [settingsHostId.value, section.value], () => {
       </header>
       <div class="settings-host-bar">
         <label for="settings-host-select"><Icon name="Server" :size="16" /><span>设置主机</span></label>
-        <select id="settings-host-select" v-model="settingsHostId" class="text-input" aria-label="设置主机" :disabled="!currentHosts.length || saving || codexSettingsBusy || !!state.runtimeReconnectingHostId">
+        <select id="settings-host-select" v-model="settingsHostId" class="text-input" aria-label="设置主机" :disabled="!currentHosts.length || saving || codexSettingsBusy || codexUpdateBusy || !!state.runtimeReconnectingHostId">
           <option v-if="!currentHosts.length" value="">尚未添加执行主机</option>
           <option v-for="host in currentHosts" :key="host.id" :value="host.id">{{ host.name }}{{ host.kind === 'ssh' ? ' · 远程' : ' · 本机' }}</option>
         </select>
@@ -515,7 +517,7 @@ watch(() => [settingsHostId.value, section.value], () => {
             </div>
           </template>
           <PwaSettings v-else-if="section === 'pwa'" :api="api" :state="state" />
-          <PerformanceSettings v-else-if="section === 'performance'" :api="api" :state="state" :host-id="settingsHostId" />
+          <PerformanceSettings v-else-if="section === 'performance'" :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" />
           <template v-else-if="section === 'projects'">
             <h3>项目</h3>
             <p class="settings-description">
@@ -646,6 +648,11 @@ watch(() => [settingsHostId.value, section.value], () => {
                     >当前</span
                   >
                   <div class="connection-actions">
+                    <button class="icon-button" :disabled="saving || codexSettingsBusy || codexUpdateBusy"
+                      @click="settingsHostId = host.id; section = 'performance'"
+                      :title="`更新并重启 ${host.name} 的 Codex`" :aria-label="`更新并重启 ${host.name} 的 Codex`">
+                      <Icon name="Download" :size="16" />
+                    </button>
                     <div class="connection-order-actions" role="group" :aria-label="`调整 ${host.name} 的顺序`">
                       <button class="icon-button" :disabled="saving || index === 0"
                         @click="moveHost(host.id, -1)" :title="`上移 ${host.name}`" :aria-label="`上移 ${host.name}`">
@@ -1090,6 +1097,10 @@ watch(() => [settingsHostId.value, section.value], () => {
               </div>
             </div></template
           >
+          <HostCodexUpdate v-if="settingsHost" v-show="['performance', 'codex', 'hosts'].includes(section)"
+            :api="api" :state="state" :host-id="settingsHostId"
+            :disabled="saving || codexSettingsBusy || !!state.runtimeReconnectingHostId"
+            @busy="codexUpdateBusy = $event" />
         </div>
       </div>
     </section>

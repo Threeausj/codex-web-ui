@@ -246,6 +246,54 @@ test('a queued worker update preserves an open preset editor until the user expl
   } finally { workerRevision = ''; }
 });
 
+test('a queued app update waits for host Codex maintenance even when its settings tab is hidden', async ({ page, mock }) => {
+  const information: any = { command: 'codex update', canUpdate: true, runtimeVersion: '0.164.0', operation: null };
+  const requests: string[] = [];
+  await page.route('**/api/hosts/local/codex-update', route => {
+    if (route.request().method() === 'POST') {
+      const { requestId } = route.request().postDataJSON();
+      requests.push(requestId);
+      information.operation = { id: requestId, hostId: 'local', state: 'updating',
+        beforeVersion: '0.164.0', startedAt: Date.now(), updatedAt: Date.now() };
+      return route.fulfill({ status: 202, json: information });
+    }
+    return route.fulfill({ json: information });
+  });
+  await loginBuilt(page);
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('Codex 更新期间保留的草稿');
+  await page.locator('.settings-button').click();
+  const settings = page.getByRole('dialog', { name: '设置', exact: true });
+  await settings.locator('.settings-nav').getByRole('button', { name: '性能', exact: true }).click();
+  const updater = settings.getByRole('region', { name: '主机 Codex 更新', exact: true });
+  await updater.getByRole('button', { name: '更新并重启 Codex', exact: true }).click();
+  await expect(updater.getByRole('status')).toContainText('正在执行 codex update');
+  let navigations = 0;
+  page.on('domcontentloaded', () => { navigations++; });
+  workerRevision = '\n// host-codex-maintenance-deferred-update-fixture\n';
+  try {
+    await settings.locator('.settings-nav').getByRole('button', { name: '应用与通知', exact: true }).click();
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    const updates = settings.locator('section[aria-labelledby="pwa-update-heading"]');
+    await updates.getByRole('button', { name: '更新应用', exact: true }).click();
+    await expect(updates.getByRole('status')).toHaveText('已安排在当前任务结束后更新');
+    expect(navigations).toBe(0);
+    expect(requests).toHaveLength(1);
+    await settings.locator('.settings-nav').getByRole('button', { name: '性能', exact: true }).click();
+    await expect(updater.getByRole('status')).toContainText('正在执行 codex update');
+    information.runtimeVersion = '0.165.0';
+    information.operation = { ...information.operation, state: 'completed', installedVersion: '0.165.0',
+      runtimeVersion: '0.165.0', finishedAt: Date.now(), updatedAt: Date.now() };
+    await Promise.all([page.waitForEvent('domcontentloaded'), updater.getByRole('button', { name: '刷新更新状态', exact: true }).click()]);
+    await expect(input).toHaveValue('Codex 更新期间保留的草稿');
+    await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
+    expect(navigations).toBe(1);
+    expect(requests).toHaveLength(1);
+    expect(mock.request('turn/start')).toBeUndefined();
+    expect(mock.request('turn/interrupt')).toBeUndefined();
+  } finally { workerRevision = ''; }
+});
+
 test('a pending workspace file save postpones a worker update until its write is acknowledged', async ({ page, mock }) => {
   mock.turns.get('thread-existing')![0].items[1].text = '[打开文件](/workspace/demo/README.md)';
   const receive = (mock as any).receive.bind(mock);

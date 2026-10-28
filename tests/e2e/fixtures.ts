@@ -160,7 +160,7 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
-      const hostSettingsRoute = /^\/api\/hosts\/([^/]+)\/(runtime\/(?:information|reconnect)|settings\/rpc|codex-settings(?:\/(?:provider|login(?:\/cancel)?|logout))?)$/.exec(url.pathname);
+      const hostSettingsRoute = /^\/api\/hosts\/([^/]+)\/(runtime\/(?:information|reconnect)|codex-update|settings\/rpc|codex-settings(?:\/(?:provider|login(?:\/cancel)?|logout))?)$/.exec(url.pathname);
       if (hostSettingsRoute) {
         const hostId = decodeURIComponent(hostSettingsRoute[1]!);
         const target = hostId === "local" ? this : this.hostMocks.get(hostId);
@@ -179,6 +179,11 @@ export class MockCodex {
           models: target.runtimeConnected && !target.runtimePaused ? models : [], canReconnect: !target.runtimePaused, reconnectDisabledReason: target.runtimePaused ? "Web Codex 已释放" : null,
         });
         if (operation === "runtime/reconnect") return respond({ ok: true });
+        if (operation === "codex-update" && request.method() === "GET") return respond({
+          operation: null, command: "codex update", runtimeVersion: "0.164.0",
+          canUpdate: target.runtimeConnected && !target.runtimePaused,
+          disabledReason: target.runtimePaused ? "Web Codex 已释放" : !target.runtimeConnected ? "请先连接此主机" : undefined,
+        });
         if (operation === "settings/rpc") {
           try {
             const input = request.postDataJSON();
