@@ -153,6 +153,36 @@ test('bridge continuity identifies an engine, sequences notifications and acknow
   } finally { value.bridge.close() }
 })
 
+test('an opt-in bridge probe returns current approvals and bounded terminal state while ordinary liveness stays lightweight', async () => {
+  const value = fixture(), browser = new Browser()
+  value.bridge.attach('session:state-probe', browser.ws(), 'state-probe')
+  try {
+    await value.bridge.connect()
+    browser.request({ id: 'terminal-request', method: 'command/exec', params: { processId: 'parked-shell', command: ['sh'], tty: true } })
+    await tick()
+    value.receive({ method: 'command/exec/outputDelta', params: { processId: 'parked-shell', stream: 'stdout', deltaBase64: Buffer.from('parked terminal output').toString('base64') } })
+    value.receive({ id: 'parked-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-a', turnId: 'turn-a', itemId: 'command-a', command: 'echo approval' } })
+    browser.request({ id: 'lite-state', method: 'bridge/ping', params: {} })
+    browser.request({ id: 'full-state', method: 'bridge/ping', params: { includeState: true } })
+    await tick()
+    const lite = browser.sent.find(message => message.id === 'lite-state')!.result as any
+    const full = browser.sent.find(message => message.id === 'full-state')!.result as any
+    assert.equal(Object.hasOwn(lite, 'pendingRequests'), false)
+    assert.equal(Object.hasOwn(lite, 'activeProcesses'), false)
+    assert.equal(full.stateIncluded, true)
+    assert.equal(full.pendingRequests[0].id, 'parked-approval')
+    assert.equal(full.activeProcesses[0].processId, 'parked-shell')
+    assert.equal(full.activeProcesses[0].lastOutput, 'parked terminal output')
+    assert.deepEqual(full.releasedThreadIds, [])
+    assert.equal(value.sent.some(message => message.method === 'bridge/ping'), false)
+    value.receive({ method: 'serverRequest/resolved', params: { requestId: 'parked-approval' } })
+    browser.request({ id: 'resolved-state', method: 'bridge/ping', params: { includeState: true } })
+    await tick()
+    assert.deepEqual((browser.sent.find(message => message.id === 'resolved-state')!.result as any).pendingRequests, [])
+    assert.equal(value.bridge.connected, true)
+  } finally { value.bridge.close() }
+})
+
 test('a client disconnected after its accepted response still gets the missing mutation during replay', async () => {
   const value = fixture();
   const first = new Browser(); value.bridge.attach('session:first', first.ws(), 'first');

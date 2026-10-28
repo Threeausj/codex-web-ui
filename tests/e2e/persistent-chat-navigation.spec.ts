@@ -103,7 +103,7 @@ test('selecting another conversation during destination configuration keeps its 
   expect(remote.requests.filter(request => request.method === 'config/read')).toHaveLength(1);
 });
 
-test('a retired destination handshake cannot replace a newer host or expose its connection error', async ({ page, mock }) => {
+test('a parked destination handshake cannot replace a newer host and remains reusable on return', async ({ page, mock }) => {
   const remote = addRemote(mock), other = addRemote(mock, 'other');
   const connection = await holdHandshake(page, 'remote', remote);
   await login(page);
@@ -111,12 +111,16 @@ test('a retired destination handshake cannot replace a newer host or expose its 
   await row(page, 'remote', 'remote second').click();
   await row(page, 'other', 'other third').click();
   await shown(page, 'other third', 'other third answer');
-  await expect.poll(() => connection.closed.length).toBe(1);
+  expect(connection.closed).toEqual([]);
   connection.release();
   await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'other');
   await shown(page, 'other third', 'other third answer');
   expect(remote.request('thread/resume')).toBeUndefined();
   expect(other.sockets).toHaveLength(1);
+  await row(page, 'remote', 'remote second').click();
+  await shown(page, 'remote second', 'remote second answer');
+  expect(connection.sockets).toHaveLength(1);
+  expect(connection.closed).toEqual([]);
 });
 
 test('a real disconnected transport still shows the retry notice and restores the selected conversation', async ({ page, mock }) => {
@@ -168,6 +172,22 @@ test('a late configuration from a retired destination cannot overwrite a newer h
   remote.releaseConfigReadResponse();
   await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'other');
   await shown(page, 'other third', 'other third answer');
+  expect(other.sockets).toHaveLength(1);
+  expect(remote.request('thread/resume')).toBeUndefined();
+});
+
+test('an inactive destination handshake failure cannot publish an error over the currently selected host', async ({ page, mock }) => {
+  const remote = addRemote(mock), other = addRemote(mock, 'other');
+  const connection = await holdHandshake(page, 'remote', remote);
+  await login(page);
+  await row(page, 'remote', 'remote first').click();
+  await row(page, 'remote', 'remote second').click();
+  await row(page, 'other', 'other third').click();
+  await shown(page, 'other third', 'other third answer');
+  connection.sockets[0]!.send(JSON.stringify({ method: 'bridge/status', params: { hostId: 'remote', connected: false, error: '后台主机握手失败不得进入当前聊天' } }));
+  await expect.poll(() => connection.closed.length).toBe(1);
+  await shown(page, 'other third', 'other third answer');
+  await expect(page.getByText('后台主机握手失败不得进入当前聊天', { exact: true })).toHaveCount(0);
   expect(other.sockets).toHaveLength(1);
   expect(remote.request('thread/resume')).toBeUndefined();
 });

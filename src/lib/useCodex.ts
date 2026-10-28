@@ -30,6 +30,7 @@ import { revokeDevicePush } from "./pwa";
 import { useMessageQueue } from "./message-queue";
 import { clearConversationMarkdownCache } from "./conversation-markdown";
 import { privateState } from "./private-state";
+import { AttachmentDraftStore, attachmentDraftIdentity, type DraftAttachment } from './attachment-drafts';
 import { LazyHistoryReader, mergeHistoryDetails, retainHistoryDetails } from './lazy-history';
 import { boundConversationOutputs, COMMAND_OUTPUT_WINDOW, retainConversationHistory } from './conversation-retention';
 import { isInteractiveServerRequest } from '../../shared/server-requests';
@@ -63,7 +64,7 @@ import {
 } from "./events";
 
 type Method = ClientRequest["method"] | "bridge/ping";
-type Params<M extends Method> = M extends "bridge/ping" ? Record<string, never> : Extract<ClientRequest, { method: M }>["params"];
+type Params<M extends Method> = M extends "bridge/ping" ? { includeState?: boolean } : Extract<ClientRequest, { method: M }>["params"];
 type Pending = {
   method: Method;
   resolve: (value: any) => void;
@@ -146,6 +147,8 @@ const state = reactive({
   asyncQuestionOperations: {} as Record<string, AsyncQuestionOperation>,
   agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number; turnId?: string; turnStatus?: string }>,
   attachments: [] as any[],
+  attachmentsLoading: false,
+  attachmentDraftWarning: '',
   config: null as any,
   runtimeInformation: {} as Record<string, any>,
   runtimeReconnectingHostId: '',
@@ -186,10 +189,35 @@ const state = reactive({
   plan: [] as any[],
 });
 let socket: WebSocket | null = null;
+type HostConnection = {
+  hostId: string; authentication: number; socket: WebSocket;
+  ready: Promise<void>; status: any | null; usedAt: number;
+  engineId: string | null; sequence: number | null; gap: boolean;
+};
+// Keep a bounded set of visited hosts connected. Inactive output is never
+// buffered: returning to a host refreshes its writer/history after an event gap.
+const hostConnections = new Map<string, HostConnection>();
+const MAX_HOST_CONNECTIONS = 8;
+function retireHostConnection(hostId: string) {
+  const connection = hostConnections.get(hostId);
+  if (!connection) return;
+  hostConnections.delete(hostId);
+  connection.socket.close();
+}
+function retireHostConnections() {
+  for (const hostId of [...hostConnections.keys()]) retireHostConnection(hostId);
+}
+function pruneHostConnections() {
+  for (const hostId of [...hostConnections.keys()])
+    if (!state.hosts.some(host => host.id === hostId)) retireHostConnection(hostId);
+}
+
 let csrfToken = "";
 let authenticationGeneration = 0;
 function advanceAuthentication() {
+  resetAttachmentDrafts();
   state.authenticationGeneration = ++authenticationGeneration;
+  retireHostConnections();
   hostAvailabilityRequest = null;
   settingsApi.resetHostSettings();
   nativeProjectBindingTimes.clear();
@@ -674,11 +702,14 @@ function activateConversationCache() {
     if (authentication === authenticationGeneration && state.authenticated && csrfToken === credential) {
       conversationCache.activate(scope);
       privateState.activate(scope);
+      attachmentDrafts.activate(scope);
+      activateAttachmentDraft(true);
     }
   }).catch(() => {});
   return cacheActivation;
 }
 function clearConversationCaches() {
+  resetAttachmentDrafts();
   titleSearchPages.clear();
   titleSearchSupport.clear();
   ++titleSearchRevision.value;
@@ -1026,6 +1057,83 @@ function releaseAttachments(files = state.attachments) {
 function clearAttachments() {
   releaseAttachments();
   state.attachments = [];
+}
+const attachmentDrafts = new AttachmentDraftStore();
+let attachmentDraftScope = '';
+let attachmentDraftHost = '';
+let attachmentSelectionToken = 0;
+let restoringAttachments = false;
+function resetAttachmentDrafts() {
+  attachmentDrafts.activate(null);
+  attachmentDraftScope = attachmentDraftHost = '';
+  ++attachmentSelectionToken;
+  restoringAttachments = true;
+  state.attachments = []; state.attachmentsLoading = false; state.attachmentDraftWarning = '';
+  restoringAttachments = false;
+}
+function attachmentIdentity() {
+  return attachmentDraftIdentity(state.hostId, state.activeThread?.id, state.projectPath, state.noProject);
+}
+function attachmentWarning(identity: string) {
+  const warning = attachmentDrafts.warning(identity);
+  return warning ? `附件已保留在当前页面，刷新后可能丢失：${warning}` : '';
+}
+function attachmentSave(identity: string, hostId: string, files: DraftAttachment[]) {
+  const authentication = authenticationGeneration;
+  return attachmentDrafts.save(identity, hostId, files).then(() => {
+    if (authentication === authenticationGeneration && identity === attachmentDraftScope) state.attachmentDraftWarning = '';
+  }).catch(cause => {
+    if (authentication === authenticationGeneration && identity === attachmentDraftScope)
+      state.attachmentDraftWarning = `附件已保留在当前页面，刷新后可能丢失：${cause.message}`;
+  });
+}
+function activateAttachmentDraft(force = false) {
+  if (!state.authenticated || !state.hostId) return;
+  const identity = attachmentIdentity(), hostId = state.hostId;
+  if (!force && identity === attachmentDraftScope) return;
+  attachmentDraftScope = identity; attachmentDraftHost = hostId;
+  const token = ++attachmentSelectionToken, authentication = authenticationGeneration;
+  const cached = attachmentDrafts.peek(identity);
+  restoringAttachments = true;
+  state.attachments = cached || [];
+  state.attachmentsLoading = !cached;
+  state.attachmentDraftWarning = attachmentWarning(identity);
+  restoringAttachments = false;
+  void cacheActivation.then(() => attachmentDrafts.read(identity, hostId)).then(files => {
+    if (token !== attachmentSelectionToken || authentication !== authenticationGeneration || !state.authenticated) return;
+    restoringAttachments = true; state.attachments = files; restoringAttachments = false;
+    state.attachmentDraftWarning = attachmentWarning(identity);
+  }).catch(cause => {
+    if (token === attachmentSelectionToken && authentication === authenticationGeneration)
+      state.attachmentDraftWarning = `无法恢复附件草稿：${cause.message}`;
+  }).finally(() => { if (token === attachmentSelectionToken) state.attachmentsLoading = false; });
+}
+watch(() => [state.authenticated, state.hostId, state.activeThread?.id || '', state.activeThread ? '' : state.projectPath, state.activeThread ? false : state.noProject], () => activateAttachmentDraft(), { flush: 'sync' });
+watch(() => state.attachments, files => {
+  if (!restoringAttachments && state.authenticated && attachmentDraftScope)
+    void attachmentSave(attachmentDraftScope, attachmentDraftHost, files.map(file => toRaw(file)));
+}, { deep: true, flush: 'sync' });
+function consumeAttachmentDraft(identity: string, hostId: string, files: DraftAttachment[], authentication = authenticationGeneration) {
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
+  const persisted = attachmentDrafts.consume(identity, hostId, files).catch(cause => {
+    if (authentication === authenticationGeneration && state.authenticated && identity === attachmentDraftScope)
+      state.attachmentDraftWarning = `附件草稿清理失败：${cause.message}`;
+  });
+  if (attachmentDraftScope === identity) {
+    restoringAttachments = true; state.attachments = attachmentDrafts.peek(identity) || []; restoringAttachments = false;
+  }
+  return persisted;
+}
+function moveAttachmentDraft(from: string, to: string, hostId: string) {
+  const files = attachmentDrafts.peek(from) || [];
+  if (!files.length || from === to) return;
+  const destination = attachmentDrafts.peek(to) || [];
+  void attachmentSave(to, hostId, [...destination, ...files.filter(file => !destination.some(existing => existing.id === file.id))]);
+  void attachmentSave(from, hostId, []);
+}
+function originalAttachment(file: any): File | undefined {
+  return attachmentOriginals.get(toRaw(file)) || (file.original instanceof Blob
+    ? new File([file.original], file.name, { type: file.mime, lastModified: file.lastModified }) : undefined);
 }
 async function http(
   path: string,
@@ -1507,7 +1615,7 @@ function navigationProjectPage(hostId: string, projectPath: string) {
     ? state.projectThreadPages[projectPath]
     : state.navigation[hostId]?.projectPages[projectPath];
 }
-function closeConnection() {
+function closeConnection(options: { retainHost?: boolean } = {}) {
   cancelGoalRefresh();
   notifyProtocol({ method: 'bridge/disconnecting', params: { permanent: state.switchingHost || !state.authenticated } });
   saveConversationSnapshot();
@@ -1516,7 +1624,19 @@ function closeConnection() {
   clearInterval(refreshTimer);
   const old = socket;
   socket = null;
-  old?.close();
+  if (old) {
+    const retained = hostConnections.get(state.hostId);
+    if (options.retainHost && retained?.socket === old && retained.authentication === authenticationGeneration &&
+        (old.readyState === WebSocket.CONNECTING || old.readyState === WebSocket.OPEN)) {
+      retained.engineId = engineId;
+      retained.sequence = eventSequence;
+      retained.gap = socketHasEventGap;
+      retained.usedAt = Date.now();
+    } else {
+      if (retained?.socket === old) hostConnections.delete(state.hostId);
+      old.close();
+    }
+  }
   connecting = null;
   for (const entry of pending.values()) {
     clearTimeout(entry.timer);
@@ -2171,61 +2291,109 @@ function connect(): Promise<void> {
   if (connecting) return connecting;
   clearTimeout(reconnectTimer);
   const host = state.hostId;
+  const authentication = authenticationGeneration;
+  const retained = hostConnections.get(host);
+  if (retained && retained.authentication === authentication &&
+      (retained.socket.readyState === WebSocket.CONNECTING || retained.socket.readyState === WebSocket.OPEN) &&
+      (!retained.status || retained.status.connected || retained.status.paused)) {
+    retained.usedAt = Date.now();
+    socket = retained.socket;
+    replayedConnection = null;
+    if (retained.status) {
+      receive({ method: 'bridge/status', params: { ...retained.status,
+        // These can change without a status broadcast; the full return probe
+        // supplies authoritative values before any actions are enabled.
+        pendingRequests: undefined, activeProcesses: undefined,
+        eventSequence: retained.sequence ?? retained.status.eventSequence } });
+      // Notifications belonging to an inactive host never mutate the active
+      // view. A fresh history read must reconcile them before sending again.
+      if (retained.gap) { socketHasEventGap = true; ++eventGapRevision; }
+    }
+    const connection = retained.ready.finally(() => { if (connecting === connection) connecting = null; });
+    connecting = connection;
+    return connection;
+  }
+  if (retained) retireHostConnection(host);
+  while (hostConnections.size >= MAX_HOST_CONNECTIONS) {
+    const oldest = [...hostConnections.values()].sort((a, b) => a.usedAt - b.usedAt)[0];
+    if (!oldest) break;
+    retireHostConnection(oldest.hostId);
+  }
   seenThreadChanges.clear();
+  let context!: HostConnection;
   const attempt = new Promise<void>((resolve, reject) => {
     const resumeEvents = engineId && eventSequence !== null && !socketHasEventGap
       ? `&engineId=${encodeURIComponent(engineId)}&afterSequence=${eventSequence}` : '';
     const ws = new WebSocket(
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/rpc?host=${encodeURIComponent(host)}&clientId=${clientId}${resumeEvents}`,
     );
+    context = { hostId: host, authentication, socket: ws, ready: Promise.resolve(), status: null,
+      usedAt: Date.now(), engineId, sequence: eventSequence, gap: socketHasEventGap };
+    hostConnections.set(host, context);
     socket = ws;
     replayedConnection = null;
+    const active = () => socket === ws && state.hostId === host && authenticationGeneration === authentication;
+    const owned = () => hostConnections.get(host) === context && authenticationGeneration === authentication;
     const timer = setTimeout(() => {
       ws.close();
       reject(new Error("app-server 连接超时"));
     }, 30000);
     ws.onmessage = (event) => {
-      if (socket !== ws) return;
+      if (!owned()) return;
       try {
         const message = JSON.parse(event.data);
-        receive(message);
-        if (message.method === 'bridge/status' && message.params?.replayComplete === true &&
-            message.params?.engineId === engineId && !socketHasEventGap) {
-          replayedConnection = { socket: ws, engineId: engineId! };
+        if (message.method === 'bridge/status') {
+          context.status = message.params;
+          if (typeof message.params?.engineId === 'string' && context.engineId !== message.params.engineId) {
+            context.engineId = message.params.engineId;
+            context.sequence = null;
+            context.gap = true;
+          }
+          if (typeof message.params?.eventSequence === 'number') context.sequence = message.params.eventSequence;
         }
-        if (message.method === "bridge/status" && message.params?.connected) {
-          clearTimeout(timer);
-          resolve();
+        if (active()) {
+          receive(message);
+          context.engineId = engineId;
+          context.sequence = eventSequence;
+          context.gap = socketHasEventGap;
+          if (message.method === 'bridge/status' && message.params?.replayComplete === true &&
+              message.params?.engineId === engineId && !socketHasEventGap) {
+            replayedConnection = { socket: ws, engineId: engineId! };
+          }
+        } else {
+          if (typeof message.bridgeEventSequence === 'number') {
+            context.sequence = Math.max(context.sequence ?? 0, message.bridgeEventSequence);
+            context.gap = true;
+          } else if (message.method && message.method !== 'bridge/status') context.gap = true;
+          // These journals are global to the authenticated browser. Other
+          // host/thread notifications remain isolated until that host returns.
+          if (['bridge/host-order/changed', 'bridge/project-order/changed', 'bridge/prompt-presets/changed'].includes(message.method)) receive(message);
+          if (message.method === 'bridge/host-disabled') void refreshHostAvailability().catch(() => {});
         }
-        if (message.method === "bridge/status" && message.params?.paused) {
-          clearTimeout(timer);
-          resolve();
+        if (message.method === "bridge/status" && (message.params?.connected || message.params?.paused)) {
+          clearTimeout(timer); resolve();
         }
         if (message.method === "bridge/status" && message.params?.error) {
-          clearTimeout(timer);
-          reject(new Error(message.params.error));
-          ws.close();
+          clearTimeout(timer); reject(new Error(message.params.error)); ws.close();
         }
-      } catch (error) {
-        fail(error);
-      }
+      } catch (error) { if (active()) fail(error); }
     };
-    ws.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error("无法连接工作站"));
-    };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error("无法连接工作站")); };
     ws.onclose = (event) => {
       clearTimeout(timer);
-      if (socket !== ws) {
-        reject(new Error("主机选择已变更"));
+      if (hostConnections.get(host) === context) hostConnections.delete(host);
+      if (!active()) {
+        reject(new Error("后台主机连接已断开"));
+        if (authentication === authenticationGeneration && state.authenticated) {
+          if (event.code === 4003) void validateSession().catch(() => {});
+          if (event.code === 4004) void refreshHostAvailability().catch(() => {});
+        }
         return;
       }
       localReverts.clear();
       saveConversationSnapshot();
       state.connected = false;
       if (state.activeThread) state.threadReady = false;
-      // Rejecting an old history request must not publish its error after the
-      // replacement socket has already restored this conversation.
       ++selectionGeneration;
       state.selectingThread = false;
       disconnectedWithMutation ||= [...pending.values()].some(entry =>
@@ -2233,12 +2401,7 @@ function connect(): Promise<void> {
         !entry.method.endsWith('/read') && !entry.method.endsWith('/list'));
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
-        entry.reject(
-          Object.assign(
-            new Error("连接已断开，服务端可能已接收；重连后请确认对话"),
-            { uncertain: true },
-          ),
-        );
+        entry.reject(Object.assign(new Error("连接已断开，服务端可能已接收；重连后请确认对话"), { uncertain: true }));
       }
       pending.clear();
       reject(new Error("连接已断开"));
@@ -2251,8 +2414,7 @@ function connect(): Promise<void> {
           if (session?.authenticated && socket === ws) scheduleReconnect();
         }).catch(error => {
           if (socket !== ws || !state.authenticated) return;
-          fail(error);
-          scheduleReconnect();
+          fail(error); scheduleReconnect();
         });
         return;
       }
@@ -2263,9 +2425,8 @@ function connect(): Promise<void> {
       if (state.authenticated) scheduleReconnect();
     };
   });
-  const connection = attempt.finally(() => {
-    if (connecting === connection) connecting = null;
-  });
+  const connection = attempt.finally(() => { if (connecting === connection) connecting = null; });
+  context.ready = connection;
   connecting = connection;
   return connection;
 }
@@ -2274,17 +2435,24 @@ function scheduleReconnect(delay = 2500) {
   if (state.authenticated && state.online && !state.runtimePaused && state.hosts.some(host => host.id === state.hostId))
     reconnectTimer = setTimeout(() => { void resumeConnection(); }, delay);
 }
-async function probeConnection() {
+async function probeConnection(options: { includeState?: boolean } = {}) {
+  const selectedSocket = socket, selectedHost = state.hostId, authentication = authenticationGeneration, hostGeneration = hostSelectionGeneration;
+  const current = () => socket === selectedSocket && state.hostId === selectedHost && authentication === authenticationGeneration && hostGeneration === hostSelectionGeneration;
   let status: any;
-  try { status = await rpc('bridge/ping', {}, 5000, { silentError: true }); }
+  try { status = await rpc('bridge/ping', options, 5000, { silentError: true }); }
   catch (error) {
     if ((error as any)?.code !== -32601) throw error;
   }
+  if (!current()) return;
+  if (options.includeState && status?.stateIncluded !== true) throw new Error('需要重新读取主机状态快照');
   if (typeof status?.connected !== 'boolean' || typeof status.engineId !== 'string') {
     // Compatibility with versions predating the lightweight bridge probe.
     await rpc('thread/loaded/list', { limit: 1 }, 5000, { silentError: true });
     return;
   }
+  if (!current()) return;
+  const context = hostConnections.get(selectedHost);
+  if (context?.socket === selectedSocket) context.status = { ...context.status, ...status };
   receive({ method: 'bridge/status', params: status });
   if (state.activeThread?.id && Array.isArray(status.loadedThreadIds) &&
       !status.loadedThreadIds.includes(state.activeThread.id)) {
@@ -2566,7 +2734,7 @@ async function logout() {
 }
 function setOnline(online: boolean) {
   state.online = online;
-  if (!online) closeConnection();
+  if (!online) { closeConnection(); retireHostConnections(); }
 }
 async function sync(refreshActive = true) {
   if (state.runtimePaused || !state.connected) return;
@@ -2917,7 +3085,6 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   rememberAsyncQuestions(id, state.items);
   state.turns = loadedHistory?.turns ?? cached?.turns ?? (previousId === id ? state.turns : []);
   historyWindowTruncated = (loadedHistory?.historyTruncated ?? cached?.historyTruncated) === true;
-  if (previousId !== id) clearAttachments();
   state.tokenUsage = tokenUsages.has(modeKey) ? tokenUsages.get(modeKey) : cached?.tokenUsage ?? null;
   if (cached && !tokenUsages.has(modeKey)) tokenUsages.set(modeKey, cached.tokenUsage);
   state.diff = "";
@@ -3321,7 +3488,6 @@ function newThread(remember = true) {
   state.items = [];
   state.turns = [];
   state.busy = false;
-  clearAttachments();
   state.tokenUsage = null;
   state.compacting = false;
   state.permissionChangePending = false;
@@ -3430,6 +3596,7 @@ async function resolveNativeProjectIdentity(hostId: string, cwd: string): Promis
   return result.projectId;
 }
 async function send(text: string, editedInput?: any[], selectionContexts: ConversationSelectionSource[] = [], delivery: "immediate" | "queue" = "immediate") {
+  if (state.attachmentsLoading) throw fail(new Error('正在恢复附件草稿，请稍后发送'));
   if (messageQueue?.state.uncertain) throw fail(new Error('上一项队列操作尚未确认，请先核对队列和对话后恢复发送。'));
   const waitingForCompaction = state.compacting;
   if (state.runtimePaused) throw fail(new Error('此主机的 Web Codex 已释放，请先在资源管理中恢复连接。'));
@@ -3505,6 +3672,9 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   if (policy.type === "workspaceWrite" && (!resumed || resolvedProfile))
     policy.writableRoots = workspaceRoots;
   const attachments = editedInput ? [] : [...state.attachments];
+  let submittedAttachmentScope = attachmentDraftScope;
+  if (attachments.some(file => file.hostId !== hostId))
+    throw fail(new Error('附件属于另一台主机，请在原会话发送或重新上传'));
   const selectedModel = state.models.find((entry) => entry.model === model);
   if (
     selectedModel?.inputModalities?.length &&
@@ -3570,7 +3740,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   if (delivery === 'queue') {
     try {
       await messageQueue!.add(inputs, messageId);
-      releaseAttachments(attachments);
+      await consumeAttachmentDraft(submittedAttachmentScope, hostId, attachments, authentication);
       if (generation === selectionGeneration && hostId === state.hostId) {
         state.attachments = state.attachments.filter(file => !attachments.includes(file));
         state.selectedSkills = state.selectedSkills.filter(skill => !selectedSkills.some(sent => sent.path === skill.path));
@@ -3602,6 +3772,9 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
       updateThread(result.thread);
       permissionSelections.set(recencyKey(hostId, id!), { mode: permission, profileId: state.activePermissionProfileId });
       if (generation === selectionGeneration && hostId === state.hostId) {
+        const nextAttachmentScope = attachmentDraftIdentity(hostId, id, cwd, noProject);
+        moveAttachmentDraft(submittedAttachmentScope, nextAttachmentScope, hostId);
+        submittedAttachmentScope = nextAttachmentScope;
         state.activeThread = state.threads.find(thread => thread.id === id) ?? result.thread;
         state.items = itemCache.get(id!) ?? [];
         rememberThread(id!);
@@ -3721,7 +3894,7 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
         }
       }
     }
-    releaseAttachments(attachments);
+    await consumeAttachmentDraft(submittedAttachmentScope, hostId, attachments, authentication);
     if (generation === selectionGeneration && hostId === state.hostId) {
       state.attachments = state.attachments.filter((file) => !attachments.includes(file));
       state.selectedSkills = state.selectedSkills.filter(skill => !selectedSkills.some(sent => sent.path === skill.path));
@@ -4183,6 +4356,7 @@ function cleanupDeletedThread(id: string, hostId = state.hostId) {
   forgetAsyncQuestions(id, hostId);
   const key = recencyKey(hostId, id);
   deletedThreads.add(key);
+  void attachmentDrafts.forget(attachmentDraftIdentity(hostId, id, '', false), hostId).catch(() => {});
   threadNameRevisions.delete(key);
   if (hostId === state.hostId) {
     cleanupArchivedThread(id);
@@ -4451,6 +4625,7 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
   if (state.activeThread || state.busy || state.selectingThread ||
       state.switchingHost || state.changingContext || sendInFlight)
     throw new Error("请等待当前操作完成后选择新对话位置");
+  if (state.attachmentsLoading) throw new Error('正在恢复附件草稿，请稍后选择新对话位置');
   if (!state.hosts.some((host) => host.id === hostId))
     throw new Error("主机不存在");
   if (projectPath != null && !state.projects.some((project) =>
@@ -4463,11 +4638,15 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
   if (hostId === state.hostId && noProject === state.noProject &&
       (projectPath == null || projectPath === state.projectPath)) return true;
   const previousHost = state.hostId;
+  const previousDraft = attachmentDraftScope;
   const attachments = state.attachments;
-  const originals = attachments.map((file) => attachmentOriginals.get(toRaw(file)));
+  const originals = attachments.map(originalAttachment);
   state.changingContext = true;
+  restoringAttachments = true;
   state.attachments = [];
+  restoringAttachments = false;
   let restored = false;
+  let moved = false;
   let expectedSelection = selectionGeneration;
   let expectedHost = hostSelectionGeneration;
   const current = () => state.authenticated && state.hostId === hostId &&
@@ -4495,7 +4674,9 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
     }
     if (!current()) return false;
     if (previousHost === hostId) {
-      state.attachments = attachments;
+      const destination = await attachmentDrafts.read(attachmentDraftScope, hostId);
+      if (!current()) return false;
+      state.attachments = [...destination, ...attachments.filter(file => !destination.some(existing => existing.id === file.id))];
       restored = true;
     } else if (attachments.length) {
       if (originals.some((file) => !file))
@@ -4508,9 +4689,11 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
       }
       if (!current()) return false;
     }
+    moved = true;
+    if (previousDraft !== attachmentDraftScope) void attachmentSave(previousDraft, previousHost, []);
     return true;
   } finally {
-    if (!restored) releaseAttachments(attachments);
+    if (moved && !restored) releaseAttachments(attachments);
     state.changingContext = false;
   }
 }
@@ -4643,7 +4826,11 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     const hostGeneration = hostSelectionGeneration;
     const authentication = authenticationGeneration;
     const selection = ++selectionGeneration;
-    if (!state.connected) await connect();
+    try { if (!state.connected) await connect(); }
+    catch (error) {
+      if (hostGeneration === hostSelectionGeneration && authentication === authenticationGeneration && selection === selectionGeneration && id === state.hostId) throw error;
+      return;
+    }
     if (hostGeneration !== hostSelectionGeneration || authentication !== authenticationGeneration ||
         selection !== selectionGeneration || id !== state.hostId || state.runtimePaused) return;
     if (options.threadId) await selectThread(options.threadId);
@@ -4658,7 +4845,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
   previous.loadedMore = loadedMorePages;
   previous.loaded = state.connected || previous.loaded;
   previous.projectPages = { ...state.projectThreadPages };
-  closeConnection();
+  closeConnection({ retainHost: true });
   discardedTurns.clear();
   completedTurns.clear();
   seenThreadChanges.clear();
@@ -4750,10 +4937,22 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     });
   }
   startNavigationRefresh();
+  const retainedSocket = hostConnections.get(id)?.socket;
   try {
     await connect();
     if (!current()) return;
     if (state.runtimePaused) return;
+    if (retainedSocket && socket === retainedSocket) {
+      // Probe a parked OPEN socket before using it. This also refreshes the
+      // bounded terminal snapshot and pending approvals missed while inactive.
+      try { await probeConnection({ includeState: true }); }
+      catch {
+        if (!current() || socket !== retainedSocket) return;
+        closeConnection();
+        await connect();
+      }
+      if (!current() || state.runtimePaused) return;
+    }
     if (!target) { await sync(); return; }
     // A read-only first page can paint while managed permissions are loading.
     // Resume still performs its own fresh read before confirming a writer.
@@ -4771,6 +4970,9 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     await readConfig();
     if (!previewCurrent()) return;
     await selectThread(target);
+  } catch (error) {
+    // A retired background handshake cannot replace the destination's errors.
+    if (current()) throw error;
   } finally {
     if (current()) {
       state.switchingHost = false;
@@ -4823,6 +5025,7 @@ async function updateHost(id: string, host: any) {
     result.hosts ??
     state.hosts.map((item) => (item.id === id ? result.host : item));
   if (result.connectionReset) {
+    retireHostConnection(id);
     conversationCache.removeHost(id);
     for (const key of tokenUsages.keys()) if (JSON.parse(key)[0] === id) tokenUsages.delete(key);
     if (state.hostId === id) { state.threadReady = false; itemCache.clear(); }
@@ -4844,6 +5047,8 @@ async function removeHost(id: string) {
     method: "DELETE",
   });
   state.hosts = result.hosts ?? state.hosts.filter((host) => host.id !== id);
+  void attachmentDrafts.forgetHost(id).catch(() => {});
+  retireHostConnection(id);
   advanceNavigationRevision(id);
   navigationRequests.delete(id);
   delete state.navigation[id];
@@ -4891,6 +5096,7 @@ function refreshHostAvailability(): Promise<void> {
     const result = await http('/hosts', {}, false);
     if (authentication !== authenticationGeneration || !state.authenticated) return;
     state.hosts = result.hosts;
+    pruneHostConnections();
     state.localEnabled = result.localEnabled ?? result.hosts.some((host: any) => host.id === 'local');
     if (Array.isArray(result.projects)) replaceProjects(result.projects);
     if (!state.hosts.some(host => host.id === state.hostId)) {
@@ -4910,6 +5116,7 @@ async function setLocalEnabled(enabled: boolean) {
   if (authentication !== authenticationGeneration || !state.authenticated) return;
   state.localEnabled = result.localEnabled ?? enabled;
   state.hosts = result.hosts;
+  pruneHostConnections();
   if (Array.isArray(result.projects)) replaceProjects(result.projects);
   advanceNavigationRevision('local');
   navigationRequests.delete('local');
@@ -4922,26 +5129,42 @@ async function setLocalEnabled(enabled: boolean) {
   toast(state.localEnabled ? '本机 Codex 已启用' : '本机 Codex 已停用，Web 服务继续运行');
   return result;
 }
-async function uploadFiles(files: FileList | File[], reportError = true) {
-  const generation = selectionGeneration;
-  const requestScope = scope();
+function prepareFileUpload() {
+  const target = { identity: attachmentDraftScope || attachmentIdentity(), hostId: state.hostId,
+    cwd: state.projectPath, authentication: authenticationGeneration, threadId: state.activeThread?.id };
+  return (files: FileList | File[], reportError = false) => uploadFiles(files, reportError, target);
+}
+async function uploadFiles(files: FileList | File[], reportError = true, target = {
+  identity: attachmentDraftScope || attachmentIdentity(), hostId: state.hostId, cwd: state.projectPath,
+  authentication: authenticationGeneration, threadId: state.activeThread?.id,
+}) {
+  const { identity, hostId, cwd, authentication, threadId } = target;
+  if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId) ||
+    threadId && deletedThreads.has(recencyKey(hostId, threadId))) return;
   const originals = Array.from(files);
+  await cacheActivation;
+  await attachmentDrafts.read(identity, hostId);
+  if (authentication !== authenticationGeneration || !state.authenticated) return;
   const form = new FormData();
-  form.set("hostId", state.hostId);
-  form.set("cwd", state.projectPath);
+  form.set("hostId", hostId);
+  form.set("cwd", cwd);
   for (const file of originals) form.append("files", file);
   const result = await http("/uploads", { method: "POST", body: form }, reportError);
-  if (generation !== selectionGeneration || requestScope !== scope()) return;
-  state.attachments.push(
-    ...result.files.map((file: any, index: number) => {
-      const attachment = { ...file, previewUrl:
+  if (authentication !== authenticationGeneration || !state.authenticated || !state.hosts.some(host => host.id === hostId) ||
+    threadId && deletedThreads.has(recencyKey(hostId, threadId))) return;
+  const additions = result.files.map((file: any, index: number) => {
+      const attachment = { ...file, id: randomUUID(), hostId, original: originals[index], lastModified: originals[index]?.lastModified, previewUrl:
         file.mime?.startsWith("image/") && originals[index]
           ? URL.createObjectURL(originals[index])
           : undefined };
       if (originals[index]) attachmentOriginals.set(attachment, originals[index]);
       return attachment;
-    }),
-  );
+    });
+  const current = attachmentDrafts.peek(identity) || [];
+  await attachmentSave(identity, hostId, [...current, ...additions]);
+  if (authentication === authenticationGeneration && identity === attachmentDraftScope) {
+    restoringAttachments = true; state.attachments = attachmentDrafts.peek(identity) || []; restoringAttachments = false;
+  }
 }
 /** Edit uploads belong to the inline draft, never the next-message composer. */
 async function uploadEditFiles(itemId: string, files: FileList | File[]) {
@@ -4969,8 +5192,7 @@ async function uploadEditFiles(itemId: string, files: FileList | File[]) {
   }));
 }
 function removeAttachment(index: number) {
-  releaseAttachments(state.attachments.slice(index, index + 1));
-  state.attachments.splice(index, 1);
+  consumeAttachmentDraft(attachmentDraftScope, state.hostId, state.attachments.slice(index, index + 1));
 }
 let searchGeneration = 0;
 async function searchFiles(query: string) {
@@ -6209,6 +6431,7 @@ export function useCodex() {
     reorderProjects,
     setLocalEnabled,
     uploadFiles,
+    prepareFileUpload,
     uploadEditFiles,
     removeAttachment,
     searchFiles,

@@ -85,6 +85,7 @@ export class MockCodex {
   failProjectMoveNext = false;
   nativeProjectIds = new Map<string, string>();
   sockets: WebSocketRoute[] = [];
+  pendingRequests: Rpc[] = [];
   authenticated = false;
   runtimeConnected = true;
   runtimePaused = false;
@@ -533,6 +534,12 @@ export class MockCodex {
     if (this.unresponsiveSockets.has(socket)) return;
     const p = request.params || {};
     switch (request.method) {
+      case 'bridge/ping':
+        if (p.includeState === true) return this.reply(socket, request, { stateIncluded: true, connected: this.runtimeConnected,
+          paused: this.runtimePaused, engineId: 'fixture-persistent-engine', eventSequence: 0, loadedThreadIds: ['thread-existing'],
+          pendingRequests: this.pendingRequests, activeProcesses: [...this.activeProcesses.values()].map(({ request: _request, socket: _socket, ...process }) => process),
+          releasedThreadIds: this.runtimeReleasedThreads.map(entry => entry.threadId), mode: 'spawn' });
+        return socket.send(JSON.stringify({ id: request.id, error: { code: -32601, message: 'Fixture lightweight ping unavailable' } }));
       case "thread/loaded/list":
         return this.reply(socket, request, { data: ["thread-existing"], nextCursor: null });
       case "thread/list":

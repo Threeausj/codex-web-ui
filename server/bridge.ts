@@ -490,8 +490,15 @@ export class Bridge {
     return event
   }
 
+  private statusSnapshot() {
+    return { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence,
+      hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent,
+      codexHome: this.codexHome, error: this.lastError, pendingRequests: [...this.approvals.values()].map(a => a.message),
+      activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders, ...process }) => ({ ...process, pendingOutputBase64: this.pendingProcessOutput(decoders) })) }
+  }
   private status(key: string, clientId?: string, replayComplete?: boolean) {
-    this.clientSend(key, { method: 'bridge/status', params: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, ...(replayComplete !== undefined ? { replayComplete } : {}), hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent, codexHome: this.codexHome, error: this.lastError, clientId: clientId || key.slice(key.indexOf(':') + 1), pendingRequests: [...this.approvals.values()].map(a => a.message), activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders, ...process }) => ({ ...process, pendingOutputBase64: this.pendingProcessOutput(decoders) })) } })
+    this.clientSend(key, { method: 'bridge/status', params: { ...this.statusSnapshot(),
+      ...(replayComplete !== undefined ? { replayComplete } : {}), clientId: clientId || key.slice(key.indexOf(':') + 1) } })
   }
 
   private pendingProcessOutput(decoders: Map<string, ProcessDecoder>) {
@@ -630,7 +637,10 @@ export class Bridge {
     if (!validId || typeof message.method !== 'string' || !/^[a-zA-Z][a-zA-Z0-9_/.]*$/.test(message.method)) throw new Error('A request requires a valid id and method')
     if (['initialize', 'initialized'].includes(message.method)) { reply(rpcError(message.id!, 'The bridge owns initialization', -32600)); return }
     if (message.method === 'bridge/ping') {
-      reply({ id: message.id, result: { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence, loadedThreadIds: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)) } })
+      const full = (message.params as { includeState?: unknown } | undefined)?.includeState === true
+      reply({ id: message.id, result: { ...(full ? { ...this.statusSnapshot(), stateIncluded: true } : {
+        connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence }),
+        loadedThreadIds: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)) } })
       return
     }
     try {

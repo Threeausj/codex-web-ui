@@ -373,6 +373,17 @@ watch(() => [state.authenticated, choiceRequests.value.length, asyncChoices.valu
   document.title = state.authenticated ? `${reminder}${threadTitle.value} · Codex Web` : 'Codex Web';
 }, { immediate: true });
 const welcome = computed(() => !state.activeThread && !state.items.length && !state.selectingThread && !state.switchingHost);
+const connectionBannerVisible = ref(false);
+let connectionBannerTimer: ReturnType<typeof setTimeout> | undefined;
+watch(() => [state.hostId, state.hosts.length, state.connected, state.online, state.error, state.runtimePaused, state.switchingHost], () => {
+  clearTimeout(connectionBannerTimer);
+  connectionBannerVisible.value = false;
+  if (!state.hosts.length || state.connected || !state.online || state.error || state.runtimePaused) return;
+  if (!state.switchingHost) { connectionBannerVisible.value = true; return; }
+  // A quick first handshake need not insert and remove an extra row. Real
+  // outages remain visible, while sending still waits for writer readiness.
+  connectionBannerTimer = setTimeout(() => { connectionBannerVisible.value = true; }, 250);
+}, { immediate: true, flush: 'sync' });
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.compacting || state.loading || !state.online ||
   state.selectingThread || state.switchingHost || state.changingContext ||
@@ -1268,6 +1279,7 @@ onMounted(() => {
   });
 });
 onBeforeUnmount(() => {
+  clearTimeout(connectionBannerTimer);
   cancelAnimationFrame(scrollLayoutFrame);
   ++paletteSearchGeneration; clearTimeout(paletteSearchTimer);
   cancelDeferredPwaUpdate();
@@ -1584,7 +1596,7 @@ watch(() => [state.authenticated, state.loading], () => {
       <div v-if="!state.online" class="connection-banner" role="status">
         <Icon name="WifiOff" :size="15" />目前离线，联网后将重新连接。操作不会自动提交。
       </div>
-      <div v-else-if="state.hosts.length && !state.connected && !state.error && !state.runtimePaused" class="connection-banner" role="status">
+      <div v-else-if="connectionBannerVisible" class="connection-banner" role="status">
         <Icon
           :name="state.loading || state.switchingHost ? 'LoaderCircle' : 'WifiOff'"
           :size="15"
