@@ -42,7 +42,8 @@ const pickerMaxHeight = ref(400);
 const fileInput = ref<HTMLInputElement>();
 const dropping = ref(false);
 const uploadCount = ref(0);
-const uploading = computed(() => uploadCount.value > 0);
+const uploadCounts = ref<Record<string, number>>({});
+const uploading = computed(() => (uploadCounts.value[draftKey.value] || 0) > 0);
 let uploadContextGeneration = 0;
 watch(() => [props.state.hostId, props.state.projectPath, props.state.activeThread?.id], () => { ++uploadContextGeneration; }, { flush: "sync" });
 const submitting = ref(false);
@@ -422,7 +423,7 @@ const canSend = computed(
     !(props.state.goalMode && goalBudgetInvalid.value) &&
     !props.contextBusy &&
     !submitting.value &&
-    !uploading.value &&
+    !uploading.value && !props.state.attachmentsLoading &&
     hasContent.value,
 );
 function resize() {
@@ -720,15 +721,22 @@ async function upload(list: FileList | File[] | null, fromClipboard = false) {
   const files = Array.from(list);
   const key = draftKey.value;
   const generation = uploadContextGeneration;
+  const uploadToSource = props.api.prepareFileUpload?.();
   uploadCount.value++;
+  uploadCounts.value[key] = (uploadCounts.value[key] || 0) + 1;
   try {
     const unique = fromClipboard ? await uniqueClipboardFiles(files) : files;
-    if (generation !== uploadContextGeneration || props.contextBusy || props.state.switchingHost || props.state.selectingThread) return;
-    await props.api.uploadFiles(unique, false);
+    if (uploadToSource) await uploadToSource(unique, false);
+    else {
+      if (generation !== uploadContextGeneration || props.contextBusy || props.state.switchingHost || props.state.selectingThread) return;
+      await props.api.uploadFiles(unique, false);
+    }
   } catch (cause: any) {
     if (key === draftKey.value) emit("error", cause.message || "上传失败");
   } finally {
     uploadCount.value--;
+    if (uploadCounts.value[key] > 1) uploadCounts.value[key]!--;
+    else delete uploadCounts.value[key];
     if (fileInput.value) fileInput.value.value = "";
   }
 }
@@ -911,7 +919,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', contextKey, true);
 });
 defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addContext, openPresets, contextMenuOpen, closeContextMenu,
-  working: computed(() => uploading.value || submitting.value) });
+  working: computed(() => uploadCount.value > 0 || submitting.value) });
 </script>
 
 <template>
@@ -1032,6 +1040,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
       <div v-if="draftStorageWarning && (draft || quotedContexts.length)" class="composer-mode-error" role="status" aria-label="草稿保存状态">
         浏览器存储不可用或已满；草稿暂存于此窗口，关闭前请复制保存。
       </div>
+      <div v-if="state.attachmentDraftWarning" class="composer-mode-error" role="status" aria-label="附件草稿保存状态">{{ state.attachmentDraftWarning }}</div>
+      <div v-else-if="state.attachmentsLoading" class="composer-mode-error" role="status" aria-label="恢复附件草稿">正在恢复附件草稿…</div>
       <div v-if="quotedContexts.length" class="composer-quotes" aria-label="引用到对话的内容">
         <div v-for="(source, index) in quotedContexts" :key="conversationSelectionKey(source)" class="composer-quote">
           <Icon name="Quote" :size="14" />
@@ -1122,7 +1132,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             @change="upload(($event.target as HTMLInputElement).files)"
           /><button
             class="icon-button"
-            :disabled="!state.connected || uploading || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
+            :disabled="!state.connected || uploading || state.attachmentsLoading || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
             @click="fileInput?.click()"
             title="上传文件或图片"
             aria-label="上传文件或图片"
