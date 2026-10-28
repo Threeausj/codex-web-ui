@@ -17,8 +17,12 @@ import { registerHostResources } from './host-resources.js'
 import { writePrivateJson } from './storage.js'
 import type { Host, RpcMessage } from './types.js'
 const turn = () => new Promise<void>(resolve => setImmediate(resolve))
-async function until(predicate: () => boolean) { for (let index = 0; index < 1000 && !predicate(); index++) await turn(); assert.ok(predicate()) }
-async function fixture(options: { proxy?: boolean; installed?: string; runtimeAfter?: string; fail?: boolean; nativeBusy?: boolean; queued?: boolean; automationBusy?: boolean } = {}) {
+async function until(predicate: () => boolean) {
+  const deadline = Date.now() + 5000
+  while (!predicate() && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 5))
+  assert.ok(predicate())
+}
+async function fixture(options: { proxy?: boolean; installed?: string; runtimeAfter?: string; fail?: boolean; nativeBusy?: boolean; queued?: boolean; automationBusy?: boolean; changing?: boolean } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-host-update-'))
   const hosts: Host[] = [{ id: 'local', name: 'Local', kind: 'local' }, { id: 'remote', name: 'Remote', kind: 'ssh', hostname: 'offline.invalid' }, { id: 'offline', name: 'Offline', kind: 'local' }]
   const bridges = new Map<string, Bridge>(), peers = new Map<string, { output: PassThrough; disposed: boolean; sent: RpcMessage[] }[]>()
@@ -54,7 +58,7 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
   const pausedHosts = new Set<string>()
   const maintenance = new AutomationService(directory, { getHost: id => hosts.find(host => host.id === id), getBridge: async id => bridges.get(id)! })
   await maintenance.initialize(false)
-  const dependencies = { getHost: (id: string) => hosts.find(host => host.id === id), getExistingBridge: (id: string) => bridges.get(id),
+  const dependencies = { getHost: (id: string) => hosts.find(host => host.id === id), getExistingBridge: (id: string) => bridges.get(id), isHostChanging: () => !!options.changing,
     withRuntimeMaintenance: async <T>(id: string, work: () => Promise<T>) => { if (options.automationBusy) throw Object.assign(new Error('自动化正在运行'), { status: 409 }); reserved++; return maintenance.withHostRuntimeMaintenance(id, work) },
     execute: async (host: Host, phase: 'version' | 'update') => {
       calls.push({ hostId: host.id, phase });
@@ -182,9 +186,9 @@ for (const action of ['close', 'threads/owned/close'] as const)
     } finally { release(); await closing }
   })
 
-for (const condition of ['active', 'approval', 'terminal', 'proxy', 'offline', 'nativeBusy', 'queued', 'automationBusy'] as const)
+for (const condition of ['active', 'approval', 'terminal', 'proxy', 'offline', 'nativeBusy', 'queued', 'automationBusy', 'changing'] as const)
   test(`an update preserves ${condition} work and never runs the installer`, async t => {
-    const f = await fixture({ proxy: condition === 'proxy', nativeBusy: condition === 'nativeBusy', queued: condition === 'queued', automationBusy: condition === 'automationBusy' }); t.after(() => f.close())
+    const f = await fixture({ proxy: condition === 'proxy', nativeBusy: condition === 'nativeBusy', queued: condition === 'queued', automationBusy: condition === 'automationBusy', changing: condition === 'changing' }); t.after(() => f.close())
     const peer = f.peers.get('remote')![0]!
     if (condition === 'active') peer.output.write(JSON.stringify({ method: 'turn/started', params: { threadId: 'work', turn: { id: 'running', status: 'inProgress' } } }) + '\n')
     if (condition === 'approval') peer.output.write(JSON.stringify({ id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'work', itemId: 'item' } }) + '\n')
@@ -225,8 +229,23 @@ test('server restart marks an unfinished update uncertain and never automaticall
 test('journal write failure cannot execute an uncommitted updater command', async t => {
   const f = await fixture(); t.after(() => f.close())
   await fs.mkdir(path.join(f.directory, 'codex-updates.json'))
-  await assert.rejects(f.updates.start('remote', firstId))
+  const first = f.updates.start('remote', firstId)
+  assert.equal(f.updates.status('remote').operation, null, 'GET cannot acknowledge an uncommitted receipt')
+  const duplicate = f.updates.start('remote', firstId)
+  const results = await Promise.allSettled([first, duplicate])
+  assert.ok(results.every(result => result.status === 'rejected'), 'both duplicate submissions must observe the initial write failure')
   await turn(); assert.equal(f.calls.length, 0); assert.equal(f.updates.isUpdating('remote'), false)
+})
+
+test('an old receipt remains idempotent after newer updates instead of expiring during an offline browser retry', async t => {
+  const f = await fixture(); t.after(() => f.close())
+  await fs.writeFile(path.join(f.directory, 'codex-updates.json'), JSON.stringify({ version: 1, operations: [{ id: firstId, hostId: 'remote', state: 'completed', startedAt: 1, updatedAt: 2, finishedAt: 2, runtimeVersion: '0.163.0' }] }))
+  const restored = new HostCodexUpdates(f.directory, f.dependencies); await restored.init(); t.after(() => restored.close())
+  await restored.start('remote', secondId); await until(() => !restored.isUpdating('remote'))
+  assert.equal(f.calls.length, 2)
+  const retried = await restored.start('remote', firstId)
+  assert.equal(retried.operation?.id, firstId); assert.equal(retried.operation?.runtimeVersion, '0.163.0')
+  assert.equal(f.calls.length, 2, 'the historical update must never execute again')
 })
 
 for (const remote of [false, true]) test(`fixed updater uses the configured ${remote ? 'remote login' : 'local'} executable with safe quoting and bounded private output`, async () => {
@@ -238,5 +257,23 @@ for (const remote of [false, true]) test(`fixed updater uses the configured ${re
     const result = spawnSync('python3', ['-'], { input: codexUpdateScript(host, { codexBin: binary }, 'update', directory), encoding: 'utf8', timeout: 15000 })
     assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), { ok: true, version: '0.165.0' })
     assert.deepEqual(JSON.parse(await fs.readFile(counter, 'utf8')), [['update'], ['--version']]); assert.ok(!result.stdout.includes('private installer credential'))
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('remote updater restores configured cwd after login shell startup before resolving a relative CLI path', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "codex-update-cwd-'"))
+  try {
+    const binary = path.join(directory, 'bin', 'codex'), shell = path.join(directory, 'login-shell')
+    await fs.mkdir(path.dirname(binary))
+    await fs.writeFile(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.165.0"; fi\n')
+    await fs.chmod(binary, 0o700)
+    await fs.writeFile(shell, '#!/usr/bin/env python3\nimport os,sys\nos.chdir("/")\nos.execv("/bin/sh",["/bin/sh","-c",sys.argv[-1]])\n')
+    await fs.chmod(shell, 0o700)
+    const host: Host = { id: 'remote', name: 'Relative CLI fixture', kind: 'ssh', hostname: 'offline.invalid', codexPath: './bin/codex', cwd: directory }
+    const result = spawnSync('python3', ['-'], { input: codexUpdateScript(host, {}, 'update'), env: { ...process.env, SHELL: shell }, encoding: 'utf8', timeout: 15000 })
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(JSON.parse(result.stdout), { ok: true, version: '0.165.0' })
+    const missing = spawnSync('python3', ['-'], { input: codexUpdateScript({ ...host, cwd: path.join(directory, 'missing') }, {}, 'update'), env: { ...process.env, SHELL: shell }, encoding: 'utf8', timeout: 15000 })
+    assert.deepEqual(JSON.parse(missing.stdout), { ok: false, reason: 'directory' })
   } finally { await fs.rm(directory, { recursive: true, force: true }) }
 })

@@ -23,6 +23,7 @@ export const codexVersion = (value: string | undefined) => nativeRuntimeVersion(
 type Dependencies = {
   getHost(id: string): Host | undefined
   getExistingBridge(id: string): Bridge | undefined
+  isHostChanging?(id: string): boolean
   withRuntimeMaintenance<T>(hostId: string, work: () => Promise<T>): Promise<T>
   bridgeOptions?: BridgeOptions
   execute?: (host: Host, phase: 'version' | 'update', home?: string) => Promise<{ version: string }>
@@ -43,10 +44,12 @@ def run(arguments,seconds):
     if config['remote']:
         # Match the app-server launcher: login-shell PATH, POSIX command lookup,
         # explicit host Codex home applied after shell startup overrides.
-        launch='codex_bin='+shlex.quote(config['command'])+'\\ncodex_bin=$(command -v "$codex_bin" 2>/dev/null) || exit 127\\n'
+        launch=('cd '+shlex.quote(config['cwd'])+' || exit 126\\n' if config['cwd'] else '')
+        launch+='codex_bin='+shlex.quote(config['command'])+'\\ncodex_bin=$(command -v "$codex_bin" 2>/dev/null) || exit 127\\n'
         launch+='exec '+('env '+shlex.quote('CODEX_HOME='+config['home'])+' ' if config['home'] else '')+'"$codex_bin" '+' '.join(shlex.quote(arg) for arg in arguments)
         executable=[env.get('SHELL') or '/bin/sh','-ilc','exec /bin/sh -c '+shlex.quote(launch)]
-    directory=config['cwd'] if config['cwd'] and pathlib.Path(config['cwd']).is_dir() else None
+    if config['cwd'] and not pathlib.Path(config['cwd']).is_dir(): raise UpdateFailure('directory')
+    directory=config['cwd'] or None
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         try: process=subprocess.Popen(executable,cwd=directory,env=env,stdin=subprocess.DEVNULL,stdout=output,stderr=errors,start_new_session=True)
         except (OSError,ValueError): raise UpdateFailure('not_executable')
@@ -85,11 +88,12 @@ except UpdateFailure as error: print(json.dumps({'ok':False,'reason':str(error)}
 }
 const failureMessages: Record<string, string> = {
   not_executable: '无法执行所配置的 Codex，请检查路径、SSH 登录环境和执行权限。',
+  directory: '所配置的工作目录不存在，未执行更新；请先核对主机连接设置。',
   timeout: 'codex update 执行超时，安装结果待核对；原有连接未主动重启，请在主机上确认后再操作。',
   output_limit: 'codex update 输出超出限制，安装结果待核对；请在主机上确认后重试。',
   permission: 'Codex 安装目录不可写或为只读挂载，请在主机上处理安装权限后重试。',
   unsupported: '此安装不支持 codex update，请先在主机上升级 CLI；未尝试其他安装命令。',
-  command_failed: 'codex update 未成功退出，请在目标主机检查更新日志、网络和安装方式后重试。',
+  command_failed: 'codex update 未成功退出，请在目标主机检查网络和安装方式后重试。',
   version_unknown: '无法确认更新后的 CLI 版本，原有连接未主动重启；请检查所配置的 Codex 路径。',
 }
 
@@ -98,6 +102,7 @@ export class HostCodexUpdates {
   private readonly now: () => number
   private operations: HostCodexUpdateOperation[] = []
   private active = new Map<string, Promise<void>>()
+  private receipts = new Map<string, Promise<void>>()
   private writes: Promise<void> = Promise.resolve()
   private closed = false
   constructor(dataDir: string, private readonly dependencies: Dependencies) {
@@ -129,8 +134,10 @@ export class HostCodexUpdates {
   }
   status(hostId: string): HostCodexUpdateStatus {
     const { bridge } = this.target(hostId)
-    const operation = this.operations.filter(entry => entry.hostId === hostId).at(-1) || null
+    const operation = this.operations.filter(entry => entry.hostId === hostId &&
+      !this.receipts.has(JSON.stringify([entry.hostId, entry.id]))).at(-1) || null
     const disabledReason = this.closed ? 'Web 服务正在停止。' : this.active.has(hostId) ? '此主机正在更新 Codex。'
+      : this.dependencies.isHostChanging?.(hostId) ? '此主机的连接设置正在变更，请完成后再更新。'
       : !bridge?.connected || bridge.paused ? '请先连接此主机的 Codex。'
       : !bridge.runtime.managed ? '此 Codex 由外部代理管理，请在主机更新并重启对应进程。'
       : !bridge.reconnectStatus.canReconnect ? bridge.reconnectStatus.reconnectDisabledReason || '主机暂时不可重启。' : undefined
@@ -147,14 +154,20 @@ export class HostCodexUpdates {
   async start(hostId: string, requestId: string): Promise<HostCodexUpdateStatus> {
     z.string().uuid().parse(requestId)
     const { host, bridge } = this.target(hostId)
+    const key = JSON.stringify([hostId, requestId])
     const repeated = this.operations.find(entry => entry.hostId === hostId && entry.id === requestId)
-    if (repeated) return { ...this.status(hostId), operation: structuredClone(repeated) }
+    if (repeated) {
+      // A concurrent duplicate must not acknowledge an in-memory receipt whose
+      // first durable write could still fail.
+      await this.receipts.get(key)
+      return { ...this.status(hostId), operation: structuredClone(repeated) }
+    }
     const status = this.status(hostId)
     if (!status.canUpdate) throw busy(status.disabledReason!)
     if (!bridge) throw busy('请先连接此主机的 Codex。')
-    // Retain bounded idempotency receipts rather than silently evicting a recent
-    // update and potentially replaying a lost POST acknowledgement.
-    this.operations = this.operations.filter(entry => activeCodexUpdate(entry) || entry.updatedAt > this.now() - 14 * 86400000)
+    // Never evict receipts by age: an old browser can explicitly retry the same
+    // ID after being offline. A full journal must fail visibly rather than
+    // replaying an operation whose acknowledgement was lost.
     if (this.operations.length >= 512) throw busy('Codex 更新记录已达上限，请稍后重试。')
     const operation: HostCodexUpdateOperation = { id: requestId, hostId, state: 'checking', startedAt: this.now(), updatedAt: this.now(), message: '正在核对活动任务和当前版本…' }
     this.operations.push(operation)
@@ -186,9 +199,11 @@ export class HostCodexUpdates {
       }
     }).finally(() => { if (this.active.get(hostId) === task) this.active.delete(hostId) })
     this.active.set(hostId, task)
-    try { await this.persist(); authorized = true }
+    const receipt = this.persist()
+    this.receipts.set(key, receipt)
+    try { await receipt; authorized = true }
     catch (error) { this.operations = this.operations.filter(entry => entry !== operation); this.active.delete(hostId); throw error }
-    finally { release() }
+    finally { this.receipts.delete(key); release() }
     return this.status(hostId)
   }
   private async update(operation: HostCodexUpdateOperation, state: HostCodexUpdateOperation['state'], message: string) {

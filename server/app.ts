@@ -203,6 +203,7 @@ export async function createApp(options: AppOptions = {}) {
   })
   const codexUpdates = await registerHostCodexUpdates(app, dataDir, {
     getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions,
+    isHostChanging: id => changingHosts.has(id),
     withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),
   })
   registerProjectDirectories(app, { getBridge, storage, cwd })
@@ -255,29 +256,37 @@ export async function createApp(options: AppOptions = {}) {
   app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
     if (codexUpdates.isUpdating(id)) throw Object.assign(new Error('此主机 Codex 正在更新，请完成后修改主机。'), { status: 409 })
-    const previousIdentityFile = storage.host(id)?.identityFile
-    const result = await storage.updateHost(id, req.body)
-    if (result.connectionReset) {
-      titleService.cancelHost(id)
-      developmentPreview.deleteHost(id)
-      bridgeOptions.sshPool!.closeHost(id)
-      bridges.get(id)?.close('Host settings changed', 4001)
-      bridges.delete(id)
-    }
-    if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
-    res.json({ ...result, hosts: storage.hosts })
+    if (changingHosts.has(id)) throw Object.assign(new Error('此主机连接正在修改，请稍后重试。'), { status: 409 })
+    changingHosts.add(id)
+    try {
+      const previousIdentityFile = storage.host(id)?.identityFile
+      const result = await storage.updateHost(id, req.body)
+      if (result.connectionReset) {
+        titleService.cancelHost(id)
+        developmentPreview.deleteHost(id)
+        bridgeOptions.sshPool!.closeHost(id)
+        bridges.get(id)?.close('Host settings changed', 4001)
+        bridges.delete(id)
+      }
+      if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
+      res.json({ ...result, hosts: storage.hosts })
+    } finally { changingHosts.delete(id) }
   })))
   app.delete('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
     if (codexUpdates.isUpdating(id)) throw Object.assign(new Error('此主机 Codex 正在更新，请完成后移除主机。'), { status: 409 })
-    const previousIdentityFile = storage.host(id)?.identityFile
-    await storage.deleteHost(id)
-    titleService.cancelHost(id)
-    await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
-    developmentPreview.deleteHost(id)
-    bridgeOptions.sshPool!.closeHost(id)
-    bridges.get(id)?.close(); bridges.delete(id)
-    res.json({ ok: true })
+    if (changingHosts.has(id)) throw Object.assign(new Error('此主机连接正在修改，请稍后重试。'), { status: 409 })
+    changingHosts.add(id)
+    try {
+      const previousIdentityFile = storage.host(id)?.identityFile
+      await storage.deleteHost(id)
+      titleService.cancelHost(id)
+      await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
+      developmentPreview.deleteHost(id)
+      bridgeOptions.sshPool!.closeHost(id)
+      bridges.get(id)?.close(); bridges.delete(id)
+      res.json({ ok: true })
+    } finally { changingHosts.delete(id) }
   })))
   app.get('/api/projects', asyncRoute(async (_req, res) => res.json({ projects: await storage.projects() })))
   app.get('/api/projects/native-bindings', asyncRoute(async (req, res) => {
