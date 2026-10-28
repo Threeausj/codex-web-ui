@@ -39,6 +39,7 @@ import { registerDiagnostics } from './diagnostics.js'
 import { registerThreadContext } from './thread-context.js'
 import { registerHostConnection } from './host-connection.js'
 import { registerHostSettings } from './host-settings.js'
+import { registerHostCodexUpdates } from './host-update.js'
 import { readRuntimePausedHosts, readRuntimeReleasedThreads, registerHostResources } from './host-resources.js'
 import { SshKeys, registerSshKeys } from './ssh-keys.js'
 import { SSHHostKeyService, type SSHHostKeyServiceOptions } from './ssh-host-keys.js'
@@ -200,6 +201,11 @@ export async function createApp(options: AppOptions = {}) {
   registerHostSettings(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions,
     withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),
   })
+  const codexUpdates = await registerHostCodexUpdates(app, dataDir, {
+    getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions,
+    isHostChanging: id => changingHosts.has(id),
+    withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),
+  })
   registerProjectDirectories(app, { getBridge, storage, cwd })
   app.get('/api/bootstrap', asyncRoute(async (_req, res) => {
     res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects(), cwd, codexHome, connectionMode: mode, preferences: preferences.get(), promptPresets: promptPresets.get(), asyncQuestionNoticeDismissals: questionNotices.list().filter(notice => storage.host(notice.hostId)), runtimePausedHostIds: [...runtimePausedHosts], runtimeReleasedThreads: [...runtimeReleasedThreads].flatMap(([hostId, threads]) => [...threads.keys()].map(threadId => ({ hostId, threadId }))) })
@@ -207,6 +213,7 @@ export async function createApp(options: AppOptions = {}) {
   app.get('/api/hosts', asyncRoute(async (_req, res) => res.json({ hosts: storage.hosts, localEnabled: storage.localEnabled, projects: await storage.projects() })))
   app.patch('/api/hosts/local/enabled', asyncRoute(async (req, res) => {
     const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body)
+    if (codexUpdates.isUpdating('local')) throw Object.assign(new Error('本机 Codex 正在更新，请完成后调整连接。'), { status: 409 })
     if (changingHosts.has('local')) throw Object.assign(new Error('正在更新本机连接状态，请稍后重试'), { status: 409 })
     changingHosts.add('local')
     try {
@@ -248,28 +255,38 @@ export async function createApp(options: AppOptions = {}) {
   }))
   app.patch('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
-    const previousIdentityFile = storage.host(id)?.identityFile
-    const result = await storage.updateHost(id, req.body)
-    if (result.connectionReset) {
-      titleService.cancelHost(id)
-      developmentPreview.deleteHost(id)
-      bridgeOptions.sshPool!.closeHost(id)
-      bridges.get(id)?.close('Host settings changed', 4001)
-      bridges.delete(id)
-    }
-    if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
-    res.json({ ...result, hosts: storage.hosts })
+    if (codexUpdates.isUpdating(id)) throw Object.assign(new Error('此主机 Codex 正在更新，请完成后修改主机。'), { status: 409 })
+    if (changingHosts.has(id)) throw Object.assign(new Error('此主机连接正在修改，请稍后重试。'), { status: 409 })
+    changingHosts.add(id)
+    try {
+      const previousIdentityFile = storage.host(id)?.identityFile
+      const result = await storage.updateHost(id, req.body)
+      if (result.connectionReset) {
+        titleService.cancelHost(id)
+        developmentPreview.deleteHost(id)
+        bridgeOptions.sshPool!.closeHost(id)
+        bridges.get(id)?.close('Host settings changed', 4001)
+        bridges.delete(id)
+      }
+      if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
+      res.json({ ...result, hosts: storage.hosts })
+    } finally { changingHosts.delete(id) }
   })))
   app.delete('/api/hosts/:id', asyncRoute((req, res) => sshKeys.withHostMutation(async () => {
     const id = String(req.params.id)
-    const previousIdentityFile = storage.host(id)?.identityFile
-    await storage.deleteHost(id)
-    titleService.cancelHost(id)
-    await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
-    developmentPreview.deleteHost(id)
-    bridgeOptions.sshPool!.closeHost(id)
-    bridges.get(id)?.close(); bridges.delete(id)
-    res.json({ ok: true })
+    if (codexUpdates.isUpdating(id)) throw Object.assign(new Error('此主机 Codex 正在更新，请完成后移除主机。'), { status: 409 })
+    if (changingHosts.has(id)) throw Object.assign(new Error('此主机连接正在修改，请稍后重试。'), { status: 409 })
+    changingHosts.add(id)
+    try {
+      const previousIdentityFile = storage.host(id)?.identityFile
+      await storage.deleteHost(id)
+      titleService.cancelHost(id)
+      await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
+      developmentPreview.deleteHost(id)
+      bridgeOptions.sshPool!.closeHost(id)
+      bridges.get(id)?.close(); bridges.delete(id)
+      res.json({ ok: true })
+    } finally { changingHosts.delete(id) }
   })))
   app.get('/api/projects', asyncRoute(async (_req, res) => res.json({ projects: await storage.projects() })))
   app.get('/api/projects/native-bindings', asyncRoute(async (req, res) => {
@@ -329,7 +346,7 @@ export async function createApp(options: AppOptions = {}) {
   app.use(errorHandler)
   if (options.pushObserverOptions?.autoStart !== false) notificationObservers.start()
   tmuxMonitors.start()
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, threadTitles: titleService, developmentPreview, push, notificationObservers, sshHostKeys, threadReadReceipts, promptPresets, tmuxMonitors, sshPool, stopPushLogoutListener, stopPushPasswordListener, stopPushSubscriptionListener }
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, codexUpdates, threadTitles: titleService, developmentPreview, push, notificationObservers, sshHostKeys, threadReadReceipts, promptPresets, tmuxMonitors, sshPool, stopPushLogoutListener, stopPushPasswordListener, stopPushSubscriptionListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -443,6 +460,7 @@ export async function createServer(options: AppOptions = {}) {
     context.stopPushPasswordListener()
     context.stopPushSubscriptionListener()
     const closingPushObservers = context.notificationObservers.close()
+    await context.codexUpdates.close()
     let automationFailure: unknown
     try { await context.automations.close() } catch (cause) { automationFailure = cause }
     await context.threadTitles.close()

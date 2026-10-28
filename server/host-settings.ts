@@ -4,6 +4,7 @@ import type { Express, RequestHandler } from 'express'
 import { z } from 'zod'
 import { RpcFailure, type Bridge, type BridgeOptions } from './bridge.js'
 import { runHostPython } from './host-helper.js'
+import { nativeRuntimeVersion } from './native-capabilities.js'
 import type { Host } from './types.js'
 
 const providerId = 'web_gateway'
@@ -40,6 +41,16 @@ const text = z.string().max(4096)
 const configPath = text.min(1).refine(value => path.isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(value), '配置路径必须为绝对路径')
 const empty = z.object({}).strict().optional()
 const paging = z.object({ cursor: z.string().max(8192).nullable().optional(), limit: z.number().int().min(1).max(100).optional() }).strict()
+// The built-in GCP provider was added in 0.165. Older/custom binaries must not
+// receive a provider ID they cannot resolve. An already active GCP config is
+// also evidence that this runtime supports it.
+function supportsGcp(userAgent: string | null | undefined, currentProvider?: string) {
+  if (currentProvider === 'gcp') return true
+  const version = nativeRuntimeVersion(userAgent)
+  if (!version || version.includes('-')) return false
+  const [major = 0, minor = 0] = version.split('.').map(Number)
+  return major > 0 || minor >= 165
+}
 const rpcInput = z.discriminatedUnion('method', [
   z.object({ method: z.literal('config/read'), params: z.object({ includeLayers: z.boolean().optional(), cwd: text.optional() }).strict().optional() }).strict(),
   z.object({ method: z.literal('configRequirements/read'), params: empty }).strict(),
@@ -47,6 +58,8 @@ const rpcInput = z.discriminatedUnion('method', [
   z.object({ method: z.literal('permissionProfile/list'), params: z.object({ cwd: text.optional() }).strict().optional() }).strict(),
   z.object({ method: z.literal('modelProvider/capabilities/read'), params: empty }).strict(),
   z.object({ method: z.literal('model/list'), params: paging.extend({ includeHidden: z.boolean().optional() }).optional() }).strict(),
+  z.object({ method: z.literal('memory/status'), params: z.object({ minConsolidatedThreads: z.number().int().min(1).max(4096).nullable().optional() }).strict().optional() }).strict(),
+  z.object({ method: z.literal('thread/memory/read'), params: z.object({ threadId: z.string().min(1).max(256) }).strict() }).strict(),
   z.object({ method: z.literal('skills/list'), params: z.object({ cwds: z.array(text).max(20).optional(), forceReload: z.boolean().optional() }).strict().optional() }).strict(),
   z.object({ method: z.literal('app/list'), params: paging.optional() }).strict(),
   z.object({ method: z.literal('mcpServerStatus/list'), params: paging.extend({ detail: z.enum(['toolsAndAuthOnly', 'full']).optional() }).optional() }).strict(),
@@ -61,6 +74,7 @@ const rpcInput = z.discriminatedUnion('method', [
 const providerInput = z.discriminatedUnion('provider', [
   z.object({ provider: z.literal('official') }).strict(),
   z.object({ provider: z.literal('gateway'), baseUrl: text.min(1), apiKey: z.string().min(1).max(16384).optional(), model: z.string().max(256).optional() }).strict(),
+  z.object({ provider: z.literal('gcp'), model: z.string().max(256).optional() }).strict(),
 ])
 type Dependencies = {
   getHost(id: string): Host | undefined
@@ -97,10 +111,11 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
     const currentProvider = config.model_provider || 'openai'
     const gateway = config.model_providers?.[providerId]
     const proxy = !bridge.runtime.managed
-    let baseUrl = gateway?.base_url || (currentProvider !== 'openai' ? config.model_providers?.[currentProvider]?.base_url : '') || ''
+    let baseUrl = (currentProvider === 'openai' ? gateway?.base_url : config.model_providers?.[currentProvider]?.base_url) || ''
     try { const url = new URL(baseUrl); url.username = ''; url.password = ''; url.search = ''; url.hash = ''; baseUrl = ['http:', 'https:'].includes(url.protocol) ? url.href.replace(/\/$/, '') : '' } catch { baseUrl = '' }
-    return { provider: currentProvider === 'openai' ? 'official' : currentProvider === providerId ? 'gateway' : 'custom',
+    return { provider: currentProvider === 'openai' ? 'official' : currentProvider === providerId ? 'gateway' : currentProvider === 'gcp' ? 'gcp' : 'custom',
       providerId: currentProvider, baseUrl,
+      supportsGcp: supportsGcp(bridge.userAgent, currentProvider),
       hasApiKey: !!gateway?.auth || !!gateway?.experimental_bearer_token || !!gateway?.env_key,
       model: config.model || '', account: redactSettings(account?.account || null), userAgent: bridge.userAgent,
       connected: true, canChange: !proxy && bridge.reconnectStatus.canReconnect,
@@ -130,6 +145,8 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
     if (!bridge.runtime.managed) throw busy('共享代理进程不能在网页中切换提供方，请使用直接连接')
     await dependencies.withRuntimeMaintenance(host.id, () => bridge.reconnect(async request => {
       const before = await request('config/read', { includeLayers: true }) as any
+      if (input.provider === 'gcp' && !supportsGcp(bridge.userAgent, before.config?.model_provider))
+        throw busy('Google Cloud Vertex AI 需要 Codex 0.165.0 或更新版本，请先更新并重新连接此主机')
       const user = [...(before.layers || [])].reverse().find((layer: any) => layer.name?.type === 'user' && !layer.name.profile)
       const file = user?.name?.file
       const home = bridge.codexHome || (typeof file === 'string' ? path.dirname(file) : '')
@@ -155,7 +172,8 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
         } })
         if (input.model?.trim()) edits.push({ keyPath: 'model', value: input.model.trim(), mergeStrategy: 'replace' })
       }
-      edits.push({ keyPath: 'model_provider', value: input.provider === 'official' ? 'openai' : providerId, mergeStrategy: 'replace' })
+      if (input.provider === 'gcp' && input.model?.trim()) edits.push({ keyPath: 'model', value: input.model.trim(), mergeStrategy: 'replace' })
+      edits.push({ keyPath: 'model_provider', value: input.provider === 'official' ? 'openai' : input.provider === 'gcp' ? 'gcp' : providerId, mergeStrategy: 'replace' })
       try {
         await request('config/batchWrite', { edits, ...(file ? { filePath: file } : {}), ...(user?.version ? { expectedVersion: user.version } : {}), reloadUserConfig: false })
       } catch (error) {
@@ -173,8 +191,8 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
       }
     }))
     const settings = await read(host.id)
-    const applied = settings.provider === input.provider && (input.provider !== 'gateway' ||
-      settings.baseUrl === baseUrl && (!input.model?.trim() || settings.model === input.model.trim()))
+    const applied = settings.provider === input.provider && (input.provider !== 'gateway' || settings.baseUrl === baseUrl) &&
+      (input.provider === 'official' || !input.model?.trim() || settings.model === input.model.trim())
     res.json({ ...settings, applied, requestedProvider: input.provider,
       ...(applied ? {} : { warning: '用户配置已保存，但当前生效的提供方、API 地址或模型仍被较高优先级的配置覆盖。请检查项目配置、配置档或启动参数后重新读取设置。' }) })
   }))

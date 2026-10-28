@@ -9,3 +9,5 @@
 [OpenAI App Server 文档](https://learn.chatgpt.com/docs/app-server)说明应使用目标 CLI 生成的协议；公开 `turn/steer` 接口不接受模型覆盖。本项目因此按目标主机能力探测单独的 `thread/settings/update` 与实验性 `turn/settings/update`，而非将设置混进引导消息。
 
 隔离 CLI 0.164.0 验证了 `features.step_model_switching` 关闭时拒绝当前轮更新；启用后，原生目录中有完整元数据的模型可返回 `applied`。只具备回退元数据的模型仍可能拒绝当前轮更新。网页不自动修改主机配置，返回结果决定实际生效提示。速度选项来自模型目录，明确不支持原速度的目标模型会重置到原生默认。
+
+CLI 0.165.0 的推理强度覆盖默认启用，不等于 `turn/settings/update` 默认开放。隔离 App Server 与本地 SSE 服务实测：默认配置下，运行中 `thread/settings/update` 保存的新模型与强度在下一轮使用，当前轮不变；`turn/settings/update` 仍要求 `features.step_model_switching`。启用该开关后，再发出的模型请求可使用更新后的模型、强度与速度。网页继续以接口返回为准，不把保存成功显示成当前轮已应用。

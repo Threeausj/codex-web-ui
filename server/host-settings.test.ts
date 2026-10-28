@@ -15,7 +15,7 @@ import { gatewayKeyWriter, gatewayTokenReader, redactSettings, registerHostSetti
 import type { Host, RpcMessage } from './types.js'
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
-async function fixture(options: { proxy?: boolean; automationBusy?: boolean; config?: Record<string, any>; writeFailure?: boolean; override?: Record<string, any> } = {}) {
+async function fixture(options: { proxy?: boolean; automationBusy?: boolean; config?: Record<string, any>; writeFailure?: boolean; override?: Record<string, any>; cliVersion?: string } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-host-settings-'))
   const origin = 'http://localhost:8787', auth = new Auth('host-settings-fixture', new Set([origin]))
   const hosts: Host[] = [{ id: 'local', kind: 'local', name: 'Local' }, { id: 'remote', kind: 'ssh', name: 'Remote', hostname: 'offline.invalid' }, { id: 'offline', kind: 'local', name: 'Disconnected' }]
@@ -38,10 +38,12 @@ async function fixture(options: { proxy?: boolean; automationBusy?: boolean; con
           if (message.id === undefined) continue
           const params = message.params as any, config = configurations.get(host.id)!
           let result: any = {}
-          if (message.method === 'initialize') result = { userAgent: `fixture/${host.id}/${collection.length}`, codexHome: `/fixture/${host.id}/.codex` }
+          if (message.method === 'initialize') result = { userAgent: options.cliVersion ? `codex_cli_rs/${options.cliVersion}` : `fixture/${host.id}/${collection.length}`, codexHome: `/fixture/${host.id}/.codex` }
           if (message.method === 'thread/loaded/list' || message.method === 'thread/backgroundTerminals/list') result = { data: [], nextCursor: null }
           if (message.method === 'config/read') result = { config: { ...config, ...options.override }, layers: [{ name: { type: 'user', file: `/fixture/${host.id}/.codex/config.toml` }, version: 'fixture-version', config }] }
           if (message.method === 'account/read') result = { account: { type: 'chatgpt', email: `${host.id}@example.invalid`, access_token: 'private-official-token' } }
+          if (message.method === 'memory/status') result = { v2ConsolidatedThreads: 21, v2Ready: true }
+          if (message.method === 'thread/memory/read') result = { summary: `${host.id} memory for ${params.threadId}` }
           if (message.method === 'account/login/start') result = { type: 'chatgptDeviceCode', loginId: `login-${host.id}`, userCode: 'TEST-CODE', verificationUrl: 'https://auth.openai.com/codex/device' }
           if (message.method === 'config/batchWrite') {
             if (failWrite) { queueMicrotask(() => receive({ id: message.id, error: { code: -32001, message: 'Fixture optimistic version conflict' } })); continue }
@@ -244,4 +246,66 @@ test('private gateway writer uses atomic replacement, mode 0600 and preserves un
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600); assert.equal(await fs.readFile(file, 'utf8'), 'private-fixture-key')
   assert.equal(await fs.readFile(authFile, 'utf8'), '{"fixture":"official-preserved"}')
   assert.equal((await fs.readdir(directory)).some(name => name.startsWith('.web-key-')), false)
+})
+
+test('Vertex AI uses the native GCP provider on the selected host and preserves credentials and provider overrides', async t => {
+  const originalGcp = { base_url: 'https://vertex.example.invalid/v1', http_headers: { 'x-custom': 'private-header' } }
+  const f = await fixture({ cliVersion: '0.165.0', config: { model_providers: { gcp: originalGcp, web_gateway: { base_url: 'https://gateway.example.invalid/v1', auth: { command: 'fixture-key' } } } } }); t.after(() => f.close())
+  const localBefore = f.peers.get('local')![0]!.sent.length
+  assert.equal((await (await f.request()).json()).supportsGcp, true)
+  const response = await f.request('codex-settings/provider', { provider: 'gcp', model: 'gpt-6.1-sol' })
+  assert.equal(response.status, 200)
+  const result = await response.json()
+  assert.equal(result.provider, 'gcp'); assert.equal(result.providerId, 'gcp'); assert.equal(result.applied, true)
+  assert.equal(result.baseUrl, originalGcp.base_url); assert.equal(result.model, 'gpt-6.1-sol')
+  assert.doesNotMatch(JSON.stringify(result), /private-header|private-official-token/)
+  assert.deepEqual(f.configurations.get('remote')!.model_providers.gcp, originalGcp)
+  assert.equal(f.writes.length, 0); assert.equal(f.removed.length, 0)
+  const edits = f.peers.get('remote')![0]!.sent.find(message => message.method === 'config/batchWrite')!.params as any
+  assert.deepEqual(edits.edits, [{ keyPath: 'model', value: 'gpt-6.1-sol', mergeStrategy: 'replace' }, { keyPath: 'model_provider', value: 'gcp', mergeStrategy: 'replace' }])
+  assert.equal(f.peers.get('local')![0]!.sent.length, localBefore)
+  assert.equal(f.peers.get('remote')!.flatMap(peer => peer.sent).some(message => ['account/login/start', 'account/logout', 'turn/start'].includes(message.method || '')), false)
+})
+
+for (const cliVersion of [undefined, '0.164.0', '0.165.0-alpha.1']) {
+  test(`Vertex AI rejects an unsupported or unverified CLI (${cliVersion || 'unknown'}) without changing the runtime`, async t => {
+    const f = await fixture({ cliVersion }); t.after(() => f.close())
+    assert.equal((await (await f.request()).json()).supportsGcp, false)
+    const response = await f.request('codex-settings/provider', { provider: 'gcp' })
+    assert.equal(response.status, 409); assert.match((await response.json()).error, /0\.165\.0/)
+    assert.equal(f.configurations.get('remote')!.model_provider, 'openai')
+    assert.equal(f.peers.get('remote')!.length, 1)
+    assert.equal(f.peers.get('remote')![0]!.sent.some(message => message.method === 'config/batchWrite'), false)
+  })
+}
+
+test('GCP rejects unsupported configuration fields and reports higher-priority model overrides', async t => {
+  const f = await fixture({ cliVersion: '0.165.0', override: { model: 'managed-model' } }); t.after(() => f.close())
+  for (const extra of [{ apiKey: 'private-key' }, { projectId: 'project' }, { location: 'global' }, { credentialFile: '/etc/credentials.json' }, { baseUrl: 'https://example.invalid' }])
+    assert.equal((await f.request('codex-settings/provider', { provider: 'gcp', ...extra })).status, 400)
+  const response = await f.request('codex-settings/provider', { provider: 'gcp', model: 'requested-model' })
+  assert.equal(response.status, 200)
+  const value = await response.json()
+  assert.equal(value.provider, 'gcp'); assert.equal(value.applied, false); assert.match(value.warning, /高.*优先级/)
+  assert.equal(f.writes.length, 0)
+})
+
+test('memory settings read only the selected runtime without resuming, enabling or restarting anything', async t => {
+  const f = await fixture({ cliVersion: '0.165.0' }); t.after(() => f.close())
+  const localBefore = f.peers.get('local')![0]!.sent.length, peer = f.peers.get('remote')![0]!
+  peer.output.write(`${JSON.stringify({ method: 'thread/started', params: { thread: { id: 'running', status: { type: 'active' } } } })}\n`)
+  const status = await f.request('settings/rpc', { method: 'memory/status', params: {} })
+  assert.equal(status.status, 200); assert.deepEqual(await status.json(), { v2ConsolidatedThreads: 21, v2Ready: true })
+  const summary = await f.request('settings/rpc', { method: 'thread/memory/read', params: { threadId: 'loaded-thread' } })
+  assert.equal(summary.status, 200); assert.deepEqual(await summary.json(), { summary: 'remote memory for loaded-thread' })
+  assert.equal(f.peers.get('local')![0]!.sent.length, localBefore)
+  assert.equal(peer.disposed, false); assert.equal(f.reserved, 0)
+  assert.equal(peer.sent.some(message => ['thread/resume', 'config/batchWrite', 'memory/reset', 'turn/start'].includes(message.method || '')), false)
+  for (const body of [
+    { method: 'thread/memory/read', params: {} }, { method: 'thread/memory/read', params: { threadId: '' } },
+    { method: 'thread/memory/read', params: { threadId: 'id', enable: true } },
+    { method: 'memory/status', params: { minConsolidatedThreads: 0 } }, { method: 'memory/status', params: { minConsolidatedThreads: 4097 } },
+    { method: 'memory/reset', params: {} },
+  ]) assert.equal((await f.request('settings/rpc', body)).status, 400)
+  assert.equal((await f.request('settings/rpc', { method: 'memory/status', params: {} }, 'offline')).status, 409)
 })

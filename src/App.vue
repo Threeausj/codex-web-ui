@@ -40,6 +40,7 @@ import ChatTabs from './components/ChatTabs.vue';
 import { createChatTabs, sameChatTab, type ChatTabTarget } from './lib/chat-tabs';
 import ThreadCopyMenu from './components/ThreadCopyMenu.vue';
 import ThreadProjectMoveDialog from './components/ThreadProjectMoveDialog.vue';
+import AttachedThreadsPanel from './components/AttachedThreadsPanel.vue';
 import ProjectDialog from "./components/ProjectDialog.vue";
 import BookmarksPanel from './components/BookmarksPanel.vue';
 import BookmarkNameDialog from './components/BookmarkNameDialog.vue';
@@ -149,6 +150,8 @@ const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
 const composer = ref<InstanceType<typeof Composer>>();
 const movingProject = ref<{ thread: any; hostId: string } | null>(null);
+const attachedThreads = ref<{ thread: any; hostId: string } | null>(null);
+watch(() => [state.authenticationGeneration, state.hostId, state.activeThread?.id], () => { attachedThreads.value = null; });
 watch(() => state.authenticated, authenticated => { if (!authenticated) movingProject.value = null; });
 const settingsOpen = ref(false);
 const settingsPanel = ref<InstanceType<typeof SettingsPanel>>();
@@ -1464,6 +1467,8 @@ watch(() => [state.authenticated, state.loading], () => {
                 @click="execute('fork')"
               >
                 <Icon name="GitBranch" :size="16" />创建分支</button
+              ><button :disabled="forkActionsDisabled" @click="threadMenu = false; attachedThreads = { thread: { ...state.activeThread }, hostId: state.hostId }">
+                <Icon name="GitBranch" :size="16" />附属分支…</button
               ><button
                 :disabled="threadActionsDisabled"
                 @click="execute('compact')"
@@ -1800,6 +1805,7 @@ watch(() => [state.authenticated, state.loading], () => {
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :kind="bookmarkNaming.input.kind === 'thread' ? 'thread' : 'message'" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.kind === 'thread' ? undefined : bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
     <ThreadProjectMoveDialog v-if="movingProject && state.authenticated" :key="`${movingProject.hostId}:${movingProject.thread.id}`" :thread="movingProject.thread" :host-id="movingProject.hostId" :state="state" :api="api" @close="movingProject = null" />
+    <AttachedThreadsPanel v-if="attachedThreads && state.authenticated" :key="`${attachedThreads.hostId}:${attachedThreads.thread.id}`" :thread="attachedThreads.thread" :host-id="attachedThreads.hostId" :state="state" :api="api" @close="attachedThreads = null" @open="selection => { attachedThreads = null; selectThread(selection); }" />
     <ResizableWorkspace v-if="workspaceOpen && currentHost" v-show="!sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"

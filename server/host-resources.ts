@@ -251,6 +251,7 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
   const reconnections = new Map<string, Promise<unknown>>()
   const informationCache = new Map<string, { bridge: Bridge; engineId?: string; at: number; value?: unknown; inFlight?: Promise<unknown> }>()
   const now = dependencies.now || Date.now
+  const maintain = <T>(hostId: string, work: () => Promise<T>): Promise<T> => dependencies.withRuntimeMaintenance ? dependencies.withRuntimeMaintenance(hostId, work) : work()
   const released = dependencies.releasedThreads || new Map<string, Map<string, ReleasedThread>>()
   const persist = dependencies.persistRuntime || (() => writePrivateJson(path.join(dependencies.dataDir, 'runtime-state.json'), { pausedHostIds: [...dependencies.pausedHosts], releasedThreads: [...released].flatMap(([hostId, threads]) => [...threads].map(([threadId, entry]) => ({ hostId, threadId, ...entry }))) }))
   const getHost = (id: string) => { const host = dependencies.getHost(id); if (!host) throw Object.assign(new Error('Host not found'), { status: 404 }); return host }
@@ -339,21 +340,21 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
       const host = getHost(String(req.params.id)); const threadId = z.string().min(1).max(256).parse(req.params.threadId)
       if (action === 'close') z.object({ confirmed: z.literal(true) }).strict().parse(req.body)
       else z.object({}).strict().parse(req.body)
-      const operation = mutations.then(async () => {
+      const operation = mutations.then(() => maintain(host.id, async () => {
         const bridge = action === 'close' ? dependencies.getExistingBridge(host.id) : await dependencies.getBridge(host.id)
         if (!bridge) throw Object.assign(new Error('此会话没有由 Web 持有的连接'), { status: 404 })
         released.set(host.id, bridge.releasedThreads)
         if (action === 'close') await bridge.releaseThread(threadId, persist)
         else await bridge.reconnectThread(threadId, persist)
         return { ok: true, runtime: await runtime(host, false) }
-      })
+      }))
       mutations = operation.catch(() => {}); res.json(await operation)
     })().catch(next)
   })
   app.post('/api/hosts/:id/runtime/close', (req, res, next) => {
     void (async () => {
       const host = getHost(String(req.params.id)); z.object({ confirmed: z.literal(true) }).strict().parse(req.body)
-      const operation = mutations.then(async () => {
+      const operation = mutations.then(() => maintain(host.id, async () => {
         const previous = dependencies.pausedHosts.has(host.id)
         dependencies.pausedHosts.add(host.id)
         try { await persist() }
@@ -361,22 +362,28 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
         const bridge = dependencies.getExistingBridge(host.id)
         await bridge?.pause()
         return { ok: true, runtime: await runtime(host, false) }
-      })
+      }))
       mutations = operation.catch(() => {}); res.json(await operation)
     })().catch(next)
   })
   app.post('/api/hosts/:id/runtime/resume', (req, res, next) => {
     void (async () => {
       const host = getHost(String(req.params.id)); z.object({}).strict().parse(req.body)
-      const operation = mutations.then(async () => {
+      const operation = mutations.then(() => maintain(host.id, async () => {
         const bridge = await dependencies.getBridge(host.id)
         try { await bridge.resume() }
-        catch (error) { await bridge.pause(); throw error }
+        catch (error) {
+          // Maintenance refusal did not start a resume. Pausing here would
+          // disconnect the updater's original transport and persist a state
+          // which its successful restart could subsequently overwrite.
+          if ((error as { code?: string }).code !== 'runtime_reconnecting') await bridge.pause()
+          throw error
+        }
         dependencies.pausedHosts.delete(host.id)
         try { await persist() }
         catch (error) { dependencies.pausedHosts.add(host.id); await bridge.pause(); throw error }
         return { ok: true, runtime: await runtime(host, false) }
-      })
+      }))
       mutations = operation.catch(() => {}); res.json(await operation)
     })().catch(next)
   })

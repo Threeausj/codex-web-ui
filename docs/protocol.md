@@ -31,6 +31,16 @@ npm test
 
 这些改动不升级宿主或远端 CLI，Docker 镜像继续使用已有安装。浏览器断线恢复仍受 Bridge 的回放窗口限制；不能将断线时未知结果的写操作当作失败后重试。
 
+## Codex 0.165 兼容行为
+
+协议类型由隔离安装的官方 CLI 0.165.0 生成，保留旧主机的运行时能力探测。新增原生 GCP 提供方和只读记忆入口，使用前检查目标主机能力；不会自动改动已有提供方、认证或记忆配置。[官方版本记录](https://github.com/openai/codex/releases/tag/rust-v0.165.0)中的 TUI 专用行为不等同于 App Server 接口。
+
+聊天菜单的“附属分支…”使用实验性 `thread/fork({attachToSource:true})`，通过 `thread/list({attachedToThreadId})` 分页管理。分支保留当前快照、独立持久保存，默认列表不显示它们；可在管理入口重命名、打开、查看已归档分支及删除。原生不允许删除仍有附属分支的父会话，必须先处理子分支。它与普通 Fork、临时只读侧边聊天分别保留，不把 `attachToSource` 与不兼容的 `ephemeral`、`deferGoalContinuation` 合用；有原生 Goal 时拒绝创建，避免复制后自动执行目标。切换主机、父会话或身份后，迟到的创建结果不会切换当前聊天。
+
+运行中模型设置继续按实际返回区分当前轮与下一轮生效，见[实测说明](runtime-model-settings.md)。隔离验证涵盖真实初始化、schema 能力、GCP 配置及记忆读取、附属分支完整生命周期，以及本地 SSE 服务记录的默认/启用步骤切换两种行为；没有调用线上模型或修改用户历史。
+
+主机更新 API 只接受请求编号，不接受浏览器提供的命令。服务端在实际执行 `codex update` 前持久化编号，并检查原生任务、终端、排队消息和自动化；重启后核对安装版本与运行版本。服务重启时未完成的记录标为结果待核对，不自动重发更新命令。详见[主机设置](host-settings.md#更新并重启-codex)。
+
 ## 客户端标识与模型网关
 
 Bridge 在每次 `initialize` 中发送 `clientInfo`；`name` 来自服务端 `CODEX_CLIENT_NAME`，默认 `codex_web`，`title:Codex Web` 与 `version:0.1.0` 保持本应用信息。本机与 SSH 的 `spawn`/`proxy` 都使用同一配置。标识去除首尾空格后须为 1–64 个 ASCII 字符，以字母或数字开头，其余只允许字母、数字、`_`、`.`、`-`；控制字符始终拒绝，无效值在服务启动时拒绝。

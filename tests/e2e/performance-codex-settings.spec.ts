@@ -157,6 +157,11 @@ test("another Web client observing a new engine refreshes available models witho
   await input.fill("观察页面自己的草稿");
   await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption("mock-model-b");
   await page.getByRole("combobox", { name: "推理强度", exact: true }).selectOption("high");
+  // The selected DOM option can update before the asynchronous native settings
+  // operation completes. Preserve an acknowledged choice across the restart;
+  // a request interrupted by a new engine is deliberately rejected instead.
+  await expect(page.getByRole("combobox", { name: "推理强度", exact: true })).toBeEnabled();
+  await expect(page.getByRole("combobox", { name: "推理强度", exact: true })).toHaveValue("high");
   catalogue.updated = true;
   wire.information.set("local", runtimeInformation({ models: cliModels(true), config: { model: "mock-model-a", model_context_window: 500000 }, runtime: { ...runtimeInformation().runtime, mode: "spawn", engineId: "updated-fixture-engine" } }));
   mock.emit("bridge/status", { hostId: "local", connected: true, paused: false, engineId: "updated-fixture-engine", pendingRequests: [] });

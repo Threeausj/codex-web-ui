@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+import CodexMemorySettings from "./CodexMemorySettings.vue";
 import { copyText } from "../lib/copy-text";
 
-const props = defineProps<{ api: any; state: any; hostId: string }>();
+const props = defineProps<{ api: any; state: any; hostId: string; maintenanceBusy?: boolean }>();
 const emit = defineEmits<{ busy: [value: boolean] }>();
 const information = ref<any>(null);
-const provider = ref<"official" | "gateway">("official");
+const provider = ref<"official" | "gateway" | "gcp">("official");
 const baseUrl = ref("");
 const apiKey = ref("");
 const model = ref("");
@@ -21,12 +22,13 @@ let loginChecks = 0;
 let disposed = false;
 const account = computed(() => information.value?.account?.account || information.value?.account || null);
 const blocked = computed(() => {
+  if (props.maintenanceBusy) return "此主机正在更新 Codex，请等待更新并重启完成。";
   if (!information.value) return "请先读取主机的 Codex 设置";
   if (information.value.canChange === false) return information.value.disabledReason || "当前主机无法更改 Codex 设置";
   if (props.hostId === props.state.hostId && props.state.busy) return "任务运行中，完成或停止后可切换模型账户。";
   return "";
 });
-const pending = computed(() => loading.value || !!operation.value);
+const pending = computed(() => loading.value || !!operation.value || props.maintenanceBusy);
 const loginUrl = computed(() => {
   const value = deviceLogin.value?.verificationUrl;
   if (typeof value !== "string") return "";
@@ -39,7 +41,7 @@ function stopPolling() { clearTimeout(pollTimer); pollTimer = undefined; }
 function applyInformation(value: any, initializeForm = false) {
   information.value = value;
   if (initializeForm) {
-    provider.value = value?.provider === "gateway" ? "gateway" : "official";
+    provider.value = value?.provider === "gateway" ? "gateway" : value?.provider === "gcp" ? "gcp" : "official";
     baseUrl.value = value?.baseUrl || "";
     model.value = value?.model || "";
     apiKey.value = "";
@@ -103,6 +105,7 @@ async function save() {
       if (apiKey.value.trim()) update.apiKey = apiKey.value.trim();
       if (model.value.trim()) update.model = model.value.trim();
     }
+    if (provider.value === "gcp" && model.value.trim()) update.model = model.value.trim();
     try { return await props.api.updateHostCodexProvider(hostId, update); }
     finally { apiKey.value = ""; }
   }, "模型提供方已更新，后续任务使用新配置。");
@@ -177,7 +180,7 @@ async function logout() {
   }, "已退出此主机的 Codex 账户。");
   if (result) applyInformation(result, true);
 }
-watch(() => props.hostId, () => {
+watch(() => [props.hostId, props.state.authenticated, props.state.authenticationGeneration], () => {
   stopPolling();
   ++generation;
   information.value = null;
@@ -192,6 +195,14 @@ watch(() => props.hostId, () => {
   emit("busy", false);
   void refresh();
 }, { immediate: true });
+watch(() => props.maintenanceBusy, (busy, wasBusy) => {
+  if (busy) {
+    stopPolling();
+    // A read started before maintenance may report the old CLI's capabilities.
+    if (loading.value) { ++generation; loading.value = false; }
+  }
+  else if (wasBusy) void refresh(!information.value);
+});
 onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); apiKey.value = ""; emit("busy", false); });
 </script>
 
@@ -199,16 +210,21 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); apiKey.val
   <section class="codex-settings" aria-label="Codex 设置">
     <div class="settings-title-row"><h3>Codex</h3><button class="icon-button" :disabled="pending" aria-label="刷新 Codex 设置" title="刷新 Codex 设置" @click="refresh()"><Icon :name="loading ? 'LoaderCircle' : 'RefreshCw'" :class="{ spin: loading }" :size="16" /></button></div>
     <p class="settings-description">切换所选主机的模型提供方和账户。更改会影响这台主机的 Codex，网页访问密码保持独立。</p>
-    <p v-if="information?.provider && !['official', 'gateway'].includes(information.provider)" class="codex-note">当前使用自定义提供方 {{ information.provider }}。保存后切换为所选提供方。</p>
+    <p v-if="information?.provider && !['official', 'gateway', 'gcp'].includes(information.provider)" class="codex-note">当前使用自定义提供方 {{ information.providerId || information.provider }}。保存后切换为所选提供方。</p>
     <div class="codex-provider-options" role="group" aria-label="模型提供方">
       <button :class="{ active: provider === 'official' }" :aria-pressed="provider === 'official'" :disabled="pending || !!deviceLogin" @click="provider = 'official'; apiKey = ''"><Icon name="Bot" :size="17" />官方账户</button>
       <button :class="{ active: provider === 'gateway' }" :aria-pressed="provider === 'gateway'" :disabled="pending || !!deviceLogin" @click="provider = 'gateway'"><Icon name="Globe" :size="17" />中转站</button>
+      <button :class="{ active: provider === 'gcp' }" :aria-pressed="provider === 'gcp'" :disabled="pending || !!deviceLogin || !information?.supportsGcp" :title="information?.supportsGcp ? '使用所选主机的 Google Cloud 认证' : '需要 Codex 0.165.0 或更新版本'" @click="provider = 'gcp'; apiKey = ''"><Icon name="Cloud" :size="17" />Vertex AI</button>
     </div>
     <form class="codex-provider-form" @submit.prevent="save">
       <template v-if="provider === 'gateway'">
         <label class="form-label">中转站 URL<input v-model="baseUrl" class="text-input" type="url" aria-label="中转站 URL" placeholder="https://api.example.com/v1" autocomplete="off" :disabled="pending || !!blocked" required /></label>
         <label class="form-label">API 密钥<input v-model="apiKey" class="text-input" type="password" aria-label="中转站 API 密钥" :placeholder="information?.hasApiKey ? '已配置，留空保留现有密钥' : '输入中转站 API 密钥'" autocomplete="new-password" spellcheck="false" :disabled="pending || !!blocked" /></label>
         <label class="form-label">模型<span class="optional">可选</span><input v-model="model" class="text-input" aria-label="中转站默认模型" placeholder="保留主机当前默认模型" autocomplete="off" :disabled="pending || !!blocked" /></label>
+      </template>
+      <template v-else-if="provider === 'gcp'">
+        <p class="codex-note">使用 Google Cloud Vertex AI。请先在所选主机配置 <code>GOOGLE_CLOUD_PROJECT</code> 和 gcloud Application Default Credentials。区域可通过 <code>GOOGLE_CLOUD_LOCATION</code> 设置，留空使用原生默认值。网页沿用该主机的认证，保存后使用原生 <code>gcp</code> 提供方。</p>
+        <label class="form-label">模型<span class="optional">可选</span><input v-model="model" class="text-input" aria-label="Vertex AI 默认模型" placeholder="保留主机当前默认模型" autocomplete="off" :disabled="pending || !!blocked" /></label>
       </template>
       <p v-else class="codex-note">使用 OpenAI 官方服务。先保存提供方，再登录 ChatGPT 账户。</p>
       <p v-if="blocked && !loading" class="codex-note">{{ blocked }}</p>
@@ -227,12 +243,13 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); apiKey.val
     </div>
     <p v-if="error" class="panel-error" role="alert"><Icon name="AlertCircle" :size="16" />{{ error }}</p>
     <p v-if="notice" class="settings-success" role="status"><Icon name="CheckCircle2" :size="16" />{{ notice }}</p>
+    <CodexMemorySettings :api="api" :state="state" :host-id="hostId" :connected="!!information?.connected" :disabled="pending" />
   </section>
 </template>
 
 <style scoped>
-.codex-provider-options { display:flex; gap:8px; margin:20px 0; }
-.codex-provider-options button { display:flex; align-items:center; justify-content:center; gap:8px; flex:1; border:1px solid var(--border); border-radius:9px; padding:12px; font-size:12px; color:var(--muted); }
+.codex-provider-options { display:flex; flex-wrap:wrap; gap:8px; margin:20px 0; }
+.codex-provider-options button { display:flex; align-items:center; justify-content:center; gap:8px; flex:1; min-width:110px; border:1px solid var(--border); border-radius:9px; padding:12px; font-size:12px; color:var(--muted); }
 .codex-provider-options button.active { color:var(--text); background:var(--selected); border-color:var(--text); }
 .codex-provider-form { display:flex; flex-direction:column; gap:17px; }
 .codex-provider-form > .button { align-self:flex-end; }

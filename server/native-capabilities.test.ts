@@ -22,6 +22,22 @@ test('capabilities keep only validated known method fields and reject unknown sc
   assert.equal(parseNativeCapabilities(raw, 10).status, 'unknown')
 })
 
+test('0.165 capability discovery retains attached branch and memory fields without inferring feature enablement', async () => {
+  const raw = { ...known(), checkedCliVersion: '0.165.0' }
+  raw.methods['thread/fork'] = { available: true, params: ['threadId', 'attachToSource', 'excludeTurns', 'deferGoalContinuation'], required: ['threadId'] }
+  raw.methods['thread/list'] = { available: true, params: ['attachedToThreadId', 'cursor', 'limit', 'archived', 'modelProviders'], required: [] }
+  raw.methods['thread/memory/read'] = { available: true, params: ['threadId'], required: ['threadId'] }
+  raw.methods['memory/status'] = { available: true, params: [], required: [] }
+  const service = new NativeCapabilitiesService({ collect: async () => raw })
+  const value = await service.read(host, { userAgent: 'codex_web/0.165.0 (Fixture)' })
+  assert.equal(value.status, 'known')
+  assert.ok(value.methods['thread/fork']!.params.includes('attachToSource'))
+  assert.ok(value.methods['thread/list']!.params.includes('attachedToThreadId'))
+  assert.deepEqual(value.methods['thread/memory/read']!.required, ['threadId'])
+  assert.deepEqual(value.methods['memory/status']!.required, [])
+  assert.ok(!('features' in value) && !('step_model_switching' in value))
+})
+
 test('schema discovery is singleflight and bounded by positive TTL and native engine identity', async () => {
   let clock = 1000; let calls = 0; let release!: (value: unknown) => void
   const service = new NativeCapabilitiesService({ now: () => clock, collect: async () => { calls++; return new Promise(resolve => { release = resolve }) } })

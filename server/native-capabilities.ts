@@ -5,7 +5,8 @@ import type { Host } from './types.js'
 export const nativeMethods = [
   'thread/queue/add', 'thread/queue/list', 'thread/queue/update', 'thread/queue/delete', 'thread/queue/reorder', 'thread/queue/start',
   'skills/config/write', 'mcpServer/oauth/login', 'config/mcpServer/reload', 'mcpServerStatus/list',
-  'thread/start', 'turn/start', 'thread/settings/update', 'turn/settings/update',
+  'thread/start', 'thread/fork', 'thread/list', 'turn/start', 'thread/settings/update', 'turn/settings/update',
+  'memory/status', 'thread/memory/read', 'externalAgentConfig/detect', 'externalAgentConfig/import',
 ] as const
 export type NativeMethod = typeof nativeMethods[number]
 export type NativeMethodCapability = { available: boolean; params: string[]; required: string[] }

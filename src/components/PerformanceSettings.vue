@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 
-const props = defineProps<{ api: any; state: any; hostId: string }>();
+const props = defineProps<{ api: any; state: any; hostId: string; maintenanceBusy?: boolean }>();
 const hostId = computed(() => props.hostId);
 const loading = ref(false);
 const reconnecting = ref(false);
@@ -23,9 +23,10 @@ const mode = computed(() => {
   if (value === "spawn") return "本机进程";
   return value || "未报告";
 });
-const pending = computed(() => loading.value || reconnecting.value || props.state.runtimeReconnectingHostId === hostId.value);
+const pending = computed(() => loading.value || reconnecting.value || props.maintenanceBusy || props.state.runtimeReconnectingHostId === hostId.value);
 const disabledReason = computed(() => {
   if (!props.state.authenticated) return "请先登录";
+  if (props.maintenanceBusy) return "此主机正在更新 Codex，请等待更新并重启完成。";
   if (pending.value) return "正在更新连接信息…";
   if (!information.value) return "请先读取主机信息";
   if (runtime.value?.paused) return "此主机的 Web Codex 已释放，请在资源管理中恢复连接后重试。";
