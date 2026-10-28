@@ -910,7 +910,7 @@ watch(() => [settingsHostId.value, section.value], () => {
             </div>
           </template>
           <ArchivedChatsPanel v-else-if="section === 'archived'" :api="api" :state="state" :host-id="settingsHostId" />
-          <CodexSettings v-else-if="section === 'codex'" :api="api" :state="state" :host-id="settingsHostId" @busy="codexSettingsBusy = $event" />
+          <CodexSettings v-else-if="section === 'codex'" :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" @busy="codexSettingsBusy = $event" />
           <template v-else-if="section === 'account'">
             <h3>网页账户</h3>
             <p class="settings-description">管理此 Web 应用的访问密码与登录。主机的模型账户可在 Codex 中切换。</p>

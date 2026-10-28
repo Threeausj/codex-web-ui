@@ -116,6 +116,44 @@ test('server busy tasks, terminals and unmanaged proxy runtimes disable update w
   noTaskMutation(mock);
 });
 
+test('host maintenance disables provider changes and refreshes new provider support after completion without replacing form drafts', async ({ page, mock }) => {
+  const wire = await setup(page, mock);
+  let settingsReads = 0;
+  const writes: string[] = [];
+  await page.route(/\/api\/hosts\/ssh-update-host\/codex-settings(?:\/[^?]*)?(?:\?|$)/, route => {
+    if (route.request().method() !== 'GET') { writes.push(route.request().url()); return route.fallback(); }
+    settingsReads++;
+    return route.fulfill({ json: { provider: 'official', supportsGcp: wire.states.get(remoteId)!.runtimeVersion === '0.165.0',
+      connected: true, canChange: true, account: null, model: 'mock-model-a', hasApiKey: false } });
+  });
+  await login(page);
+  const dialog = await settings(page, 'Codex');
+  await expect.poll(() => settingsReads).toBeGreaterThan(0);
+  await expect(dialog.getByRole('button', { name: 'Vertex AI', exact: true })).toBeDisabled();
+  await dialog.getByRole('button', { name: '中转站', exact: true }).click();
+  const address = dialog.getByRole('textbox', { name: '中转站 URL', exact: true });
+  const key = dialog.getByRole('textbox', { name: '中转站 API 密钥', exact: true });
+  await address.fill('https://draft-gateway.invalid/v1');
+  await key.fill('unsaved-fixture-key');
+  await button(page).click();
+  await expect(dialog.getByRole('button', { name: '保存提供方', exact: true })).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: '官方账户', exact: true })).toBeDisabled();
+  await expect(address).toBeDisabled();
+  await expect.poll(() => wire.posts.length).toBe(1);
+  const beforeRefresh = settingsReads;
+  wire.states.set(remoteId, { ...info('0.165.0'), operation: operation('completed', {
+    id: wire.posts[0]!.body.requestId, installedVersion: '0.165.0', runtimeVersion: '0.165.0',
+  }) });
+  await panel(page).getByRole('button', { name: '刷新更新状态', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Vertex AI', exact: true })).toBeEnabled();
+  await expect(dialog.getByRole('button', { name: '保存提供方', exact: true })).toBeEnabled();
+  await expect(address).toHaveValue('https://draft-gateway.invalid/v1');
+  await expect(key).toHaveValue('unsaved-fixture-key');
+  expect(settingsReads).toBeGreaterThan(beforeRefresh);
+  expect(writes).toEqual([]);
+  noTaskMutation(mock);
+});
+
 test('duplicate clicks start once and closing settings keeps the server operation discoverable on reopening', async ({ page, mock }) => {
   const wire = await setup(page, mock);
   let release!: () => void;
