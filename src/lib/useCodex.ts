@@ -1824,7 +1824,10 @@ function receive(message: any) {
     if (typeof p.engineId === 'string') {
       if (engineId !== p.engineId) {
         if (changedEngine) {
-          if (!preserveMetadataChoices()) metadataReconnectChoices = {
+          // A newer observed engine owns this protection even when an older
+          // engine's delayed refresh has not started or settled yet. Explicit
+          // reconnects keep their own marker until their full recovery ends.
+          if (!preserveMetadataChoices() || metadataReconnectChoices?.observedEngine) metadataReconnectChoices = {
             authentication: authenticationGeneration, hostId: state.hostId, hostGeneration: hostSelectionGeneration,
             threadId: state.activeThread?.id || null, observedEngine: p.engineId,
           };
