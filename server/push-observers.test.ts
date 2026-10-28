@@ -119,11 +119,17 @@ test('delayed live activity never replaces a known running turn or starts an idl
     await f.service.flush()
     assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.directory, 'push-observers.json'), 'utf8')).threads.map((entry: any) =>
       ({ threadId: entry.threadId, turnId: entry.turnId })), [{ threadId: 'active', turnId: 'current-work' }])
+    // init() schedules a background scan. Make that initial empty-metadata
+    // scan explicit, since it may already run during the journal's async I/O.
+    await f.service.poll(); await f.service.flush()
+    assert.equal(f.events.filter(value => value.message.method === 'turn/completed').length, 0)
     f.threads.set('active', { id: 'active', source: 'cli', status: { type: 'idle' } })
     f.turns.set('active', [{ id: 'old-work', status: 'completed' }, { id: 'current-work', status: 'completed' }])
+    f.advance(60_000)
     await f.service.poll(); await f.service.flush()
     assert.deepEqual(f.events.filter(value => value.message.method === 'turn/completed').map(value => value.message.params),
       [{ threadId: 'active', turn: { id: 'current-work', status: 'completed' } }])
+    assert.ok(f.requests.every(value => ['thread/loaded/list', 'thread/read', 'thread/turns/list'].includes(value.method)))
   } finally { await f.cleanup() }
 })
 
