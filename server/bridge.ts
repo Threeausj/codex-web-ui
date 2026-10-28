@@ -1002,7 +1002,7 @@ export class Bridge {
     } catch (error) { return { canReconnect: false, reconnectDisabledReason: (error as Error).message } }
   }
 
-  private async assertNativeRuntimeIdle() {
+  private async assertNativeRuntimeIdle(checkQueuedInputs = false) {
     if (this.connected) {
       // Query native memory rather than assuming all child sessions have
       // been opened in this browser. Never resume a thread for this check.
@@ -1034,6 +1034,20 @@ export class Bridge {
           throw Object.assign(new Error('无法核对 Codex 后台终端，请稍后重新连接'), { status: 409 })
         if (terminals.data.length || terminals.nextCursor) throw Object.assign(new Error('此主机仍有后台命令或终端正在运行，请先关闭后重新连接'), { status: 409, code: 'runtime_busy' })
         this.assertRuntimeIdle()
+        if (checkQueuedInputs) {
+          let queued: { data?: unknown; nextCursor?: unknown } | undefined
+          try { queued = await this.rawRequest('thread/queue/list', { threadId, limit: 1 }, undefined, undefined, 10000) as typeof queued }
+          catch (error) {
+            // A CLI without the queue API cannot have native queued inputs.
+            if (!(error instanceof RpcFailure) || error.rpc.code !== -32601)
+              throw Object.assign(new Error('无法核对 Codex 排队消息，请稍后再更新。'), { status: 409 })
+          }
+          if (queued && (!Array.isArray(queued.data) || queued.nextCursor != null && typeof queued.nextCursor !== 'string'))
+            throw Object.assign(new Error('无法确认排队消息状态，请稍后再更新。'), { status: 409 })
+          if (queued && ((queued.data as unknown[]).length || queued.nextCursor))
+            throw Object.assign(new Error('此主机还有排队消息，请处理后再更新 Codex。'), { status: 409, code: 'runtime_busy' })
+          this.assertRuntimeIdle()
+        }
       }
     }
     this.assertRuntimeIdle()
@@ -1056,7 +1070,7 @@ export class Bridge {
 
   /** Explicitly refresh only this Web client's runtime. The shared proxy daemon
    * is never terminated: disposing its transport closes only our proxy client. */
-  reconnect(prepare?: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<void>): Promise<void> {
+  reconnect(prepare?: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<void>, options: { checkQueuedInputs?: boolean } = {}): Promise<void> {
     if (this.reconnecting) return prepare ? Promise.reject(Object.assign(new Error('另一项 Codex 更新正在进行，请稍后重试'), { status: 409 })) : this.reconnecting
     try {
       if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
@@ -1066,7 +1080,7 @@ export class Bridge {
     const wasPaused = this.paused
     const operation = (async () => {
       try {
-        await this.assertNativeRuntimeIdle()
+        await this.assertNativeRuntimeIdle(options.checkQueuedInputs === true)
         this.assertRuntimeIdle()
         if (prepare) {
           if (!this.connected) throw Object.assign(new Error('请先连接 Codex 后再更新配置'), { status: 409 })
