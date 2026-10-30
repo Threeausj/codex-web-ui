@@ -16,12 +16,13 @@ import { sharedSshPool, type SshConnectionPool } from './ssh-pool.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import { hostConnectionMode, hostTransportMode } from './connection-mode.js'
 import { ensureCodexDaemon } from './daemon.js'
+import { mergeContextUsage } from '../shared/context-usage.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
 export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; daemonManaged?: boolean; socketPath?: string; transportFactory?: (host: Host) => Transport; prepareDaemon?: typeof ensureCodexDaemon; recoverThreadIds?: (host: Host) => Promise<string[]>; sshHostKeyPin?: SSHHostKeyPin; sshPool?: SshConnectionPool; sshControl?: SSHConnectionControl; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Compaction = { requests: Set<string>; items: Map<string, string | undefined>; revision: number }
-type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; runtimeSnapshot: number; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ProcessDecoder = { decoder: StringDecoder; suffix: Buffer }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, ProcessDecoder> }
@@ -115,6 +116,9 @@ export class Bridge {
   private nativeActiveThreads = new Set<string>()
   private subscribedThreads = new Set<string>()
   private activeThreads = new Set<string>()
+  private runtimeSequence = 0
+  private runtimeSequenceFloor = 0
+  private closedRuntimeSequences = new Map<string, number>()
   // Metadata generation shares the native connection, never the visible chat.
   private internalThreads = new Set<string>()
   private threadNames = new Map<string, string>()
@@ -191,7 +195,10 @@ export class Bridge {
       const state = this.compactions.get(p.threadId)
       if (state) ++state.revision
     }
-    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage: { ...p.tokenUsage, modelContextWindow: p.tokenUsage.modelContextWindow ?? previous.tokenUsage?.modelContextWindow ?? null } })
+    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) {
+      const tokenUsage = mergeContextUsage(previous.tokenUsage, p.tokenUsage)
+      if (tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage })
+    }
     const freshItem = ['item/started', 'item/completed'].includes(message.method || '') && this.rememberContextItem(p.threadId, p.item)
     if (p.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
       if (message.method === 'item/started' && freshItem) {
@@ -413,7 +420,7 @@ export class Bridge {
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
-      this.pending.set(id, { method, params, compactionSnapshot, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
+      this.pending.set(id, { method, params, runtimeSnapshot: this.runtimeSequence, compactionSnapshot, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
       try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { this.removeCompactionRequest(compactThread, id); clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
@@ -776,12 +783,24 @@ export class Bridge {
     }
   }
 
-  private forgetDeletedThread(threadId: string) {
+  /** A native unload retires runtime state, not persisted history or grants.
+   * Keep a bounded revision so an older resume ACK cannot revive that actor. */
+  private retireThreadRuntime(threadId: string) {
+    this.closedRuntimeSequences.delete(threadId)
+    this.closedRuntimeSequences.set(threadId, ++this.runtimeSequence)
+    while (this.closedRuntimeSequences.size > 1024) {
+      const [id, sequence] = this.closedRuntimeSequences.entries().next().value!
+      this.closedRuntimeSequences.delete(id)
+      this.runtimeSequenceFloor = Math.max(this.runtimeSequenceFloor, sequence)
+    }
     this.subscribedThreads.delete(threadId)
     this.activeThreads.delete(threadId)
-    this.threadNames.delete(threadId)
-    this.contexts.delete(threadId)
+    this.nativeActiveThreads.delete(threadId)
+    this.recoverableThreads.delete(threadId)
+    this.recoveryFailures.delete(threadId)
     this.compactions.delete(threadId)
+    const context = this.contexts.get(threadId)
+    if (context) this.contexts.set(threadId, { ...context, compacting: false })
     for (const [key, approval] of this.approvals) {
       const params = approval.message.params as { threadId?: string; conversationId?: string } | undefined
       if ((params?.threadId || params?.conversationId) !== threadId) continue
@@ -791,6 +810,16 @@ export class Bridge {
       if (JSON.parse(key)[0] !== threadId) continue
       this.approvalItems.delete(key); this.approvalItemBytes -= item.bytes
     }
+  }
+
+  private staleRuntimeResponse(pending: Pending, threadId: string) {
+    return pending.runtimeSnapshot < this.runtimeSequenceFloor || (this.closedRuntimeSequences.get(threadId) || 0) > pending.runtimeSnapshot
+  }
+
+  private forgetDeletedThread(threadId: string) {
+    this.retireThreadRuntime(threadId)
+    this.threadNames.delete(threadId)
+    this.contexts.delete(threadId)
   }
 
   private receive(message: RpcMessage) {
@@ -810,6 +839,7 @@ export class Bridge {
     if (activity?.threadId) {
       if (message.method === 'turn/started' && (!activity.turn?.status || activity.turn.status === 'inProgress') || message.method === 'thread/status/changed' && activity.status?.type === 'active') this.nativeActiveThreads.add(activity.threadId)
       if (['turn/completed', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/status/changed' && activity.status?.type !== 'active') this.nativeActiveThreads.delete(activity.threadId)
+      if (['thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/status/changed' && activity.status?.type === 'notLoaded') this.retireThreadRuntime(activity.threadId)
     }
     this.rememberApprovalItem(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
@@ -818,6 +848,8 @@ export class Bridge {
       if (id) this.hiddenArchiveEvents.add(id)
     }
     const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
+    const responseThreadId = (message.result as { thread?: { id?: unknown } } | undefined)?.thread?.id
+    const staleSubscription = pending && ['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && typeof responseThreadId === 'string' && this.staleRuntimeResponse(pending, responseThreadId)
     const startedThread = message.method === 'thread/started' ? (message.params as any)?.thread : undefined
     const returnedThread = pending?.method === 'thread/start' ? (message.result as any)?.thread : undefined
     if (typeof startedThread?.id === 'string' && startedThread.ephemeral === true && startedThread.threadSource === 'thread_title') this.rememberInternalThread(startedThread.id)
@@ -830,7 +862,7 @@ export class Bridge {
         return
       }
     }
-    this.observeProtocol(message, pending?.method)
+    this.observeProtocol(message, staleSubscription ? undefined : pending?.method)
     if (message.id !== undefined && !message.method) {
       if (!pending) return
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
@@ -852,7 +884,7 @@ export class Bridge {
             if (['agentMessage', 'reasoning'].includes(item.type || '')) this.rememberContextItem(history.id, item)
         if (result?.thread?.id && (result.thread.name || result.thread.preview)) this.threadNames.set(result.thread.id, (result.thread.name || result.thread.preview || '').slice(0, 160))
         if (pending.method === 'thread/name/set' && params?.threadId && (pending.params as any)?.name) this.threadNames.set(params.threadId, (pending.params as any).name.slice(0, 160))
-        if (['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
+        if (!staleSubscription && ['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
           this.subscribedThreads.add(result.thread.id)
           if (result.thread.status?.type === 'active') this.activeThreads.add(result.thread.id)
         }
@@ -861,7 +893,7 @@ export class Bridge {
         // Otherwise an ACK followed by a disconnect could hide a lost result.
         if (pending.originalId !== undefined) pending.respond?.({ id: pending.originalId, result: message.result })
         if (pending.method === 'thread/delete' && params?.threadId) this.forgetDeletedThread(params.threadId)
-        if (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method)) this.broadcastThreadChange(pending, message.result, String(message.id))
+        if (!staleSubscription && (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method))) this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
       return
@@ -973,6 +1005,9 @@ export class Bridge {
     this.subscribedThreads.clear()
     this.activeThreads.clear()
     this.nativeActiveThreads.clear()
+    this.closedRuntimeSequences.clear()
+    this.runtimeSequence = 0
+    this.runtimeSequenceFloor = 0
     this.internalThreads.clear()
     this.contexts.clear()
     this.compactions.clear()
@@ -981,7 +1016,7 @@ export class Bridge {
     for (const key of this.clients.keys()) this.status(key)
   }
 
-  /** Unsubscribe retains a native writer for 30 minutes. Archive shuts down
+  /** Unsubscribe retains a native writer until its inactivity grace expires. Archive shuts down
    * just this thread family, then unarchive restores its durable history without
    * reacquiring writers. Journal the restoration set before moving any logs. */
   async releaseThread(threadId: string, persist: () => Promise<void>) {
