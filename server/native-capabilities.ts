@@ -1,6 +1,7 @@
 import type { BridgeOptions } from './bridge.js'
 import { runHostPython } from './host-helper.js'
 import type { Host } from './types.js'
+import { hostConnectionMode } from './connection-mode.js'
 
 export const nativeMethods = [
   'thread/queue/add', 'thread/queue/list', 'thread/queue/update', 'thread/queue/delete', 'thread/queue/reorder', 'thread/queue/start',
@@ -13,6 +14,14 @@ export type NativeMethodCapability = { available: boolean; params: string[]; req
 export type NativeCapabilities = { status: 'known' | 'unknown'; checkedAt: number; methods: Partial<Record<NativeMethod, NativeMethodCapability>>; checkedCliVersion?: string; reason?: 'proxy_runtime' | 'runtime_version_unknown' | 'runtime_version_mismatch' | 'schema_unavailable' }
 export type NativeIdentity = { engineId?: string | null; userAgent?: string | null; connectionMode?: string }
 export type NativeCapabilitiesOptions = { bridgeOptions?: BridgeOptions; now?: () => number; collect?: (host: Host) => Promise<unknown> }
+
+/** A managed daemon can be verified against its selected CLI. An arbitrary
+ * external proxy may point at another package, so keep discovery conservative. */
+export function externalProxyRuntime(host: Host, native: NativeIdentity, options: BridgeOptions = {}) {
+  const mode = ['spawn', 'proxy', 'daemon'].includes(native.connectionMode || '')
+    ? native.connectionMode : hostConnectionMode(host, options)
+  return mode === 'proxy'
+}
 
 function object(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 const versionPattern = /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/
@@ -100,10 +109,10 @@ export class NativeCapabilitiesService {
   private readonly now: () => number
   constructor(private readonly options: NativeCapabilitiesOptions = {}) { this.now = options.now || Date.now }
   read(host: Host, native: NativeIdentity = {}): Promise<NativeCapabilities> {
-    if (native.connectionMode === 'proxy' || this.options.bridgeOptions?.mode === 'proxy') return Promise.resolve({ status: 'unknown', checkedAt: this.now(), methods: {}, reason: 'proxy_runtime' })
+    if (externalProxyRuntime(host, native, this.options.bridgeOptions)) return Promise.resolve({ status: 'unknown', checkedAt: this.now(), methods: {}, reason: 'proxy_runtime' })
     const runtimeVersion = nativeRuntimeVersion(native.userAgent)
     if (!runtimeVersion) return Promise.resolve({ status: 'unknown', checkedAt: this.now(), methods: {}, reason: 'runtime_version_unknown' })
-    const identity = JSON.stringify([native.engineId, native.userAgent, native.connectionMode, host.kind, host.codexPath, this.options.bridgeOptions?.codexBin])
+    const identity = JSON.stringify([native.engineId, native.userAgent, native.connectionMode, host.kind, host.codexPath, host.connectionMode, this.options.bridgeOptions?.codexBin])
     const previous = this.cache.get(host.id)
     if (previous?.identity === identity) {
       if (previous.pending) return previous.pending.then(value => structuredClone(value))

@@ -5,6 +5,8 @@ import { z } from 'zod'
 import { Bridge, type ReleasedThread, type BridgeOptions } from './bridge.js'
 import { sshKnownHostsArgs, sshPythonArgs, type SSHConnectionControl } from './ssh.js'
 import { runHostPython } from './host-helper.js'
+import { hostConnectionMode } from './connection-mode.js'
+import { restartCodexDaemon } from './daemon.js'
 import { writePrivateJson } from './storage.js'
 import type { Host } from './types.js'
 
@@ -242,6 +244,7 @@ type Dependencies = {
   getHost: (id: string) => Host | undefined; getBridge: (id: string) => Promise<Bridge>; getExistingBridge: (id: string) => Bridge | undefined
   persistRuntime?: () => Promise<void>; releasedThreads?: Map<string, Map<string, ReleasedThread>>; pausedHosts: Set<string>; dataDir: string; bridgeOptions?: BridgeOptions; collect?: (host: Host) => Promise<RawHostResources>; now?: () => number
   withRuntimeMaintenance?: <T>(hostId: string, work: () => Promise<T>) => Promise<T>
+  daemonRestart?: typeof restartCodexDaemon
 }
 
 export function registerHostResources(app: Express, dependencies: Dependencies) {
@@ -257,7 +260,7 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
   const getHost = (id: string) => { const host = dependencies.getHost(id); if (!host) throw Object.assign(new Error('Host not found'), { status: 404 }); return host }
   const runtime = async (host: Host, probe = true) => {
     const bridge = dependencies.getExistingBridge(host.id)
-    if (!bridge) return { connected: false, paused: dependencies.pausedHosts.has(host.id), managed: dependencies.bridgeOptions?.mode !== 'proxy', mode: host.kind === 'ssh' ? 'ssh' : dependencies.bridgeOptions?.mode || 'spawn', loadedThreadCount: 0, activeThreadCount: 0, activeProcesses: [], processes: [], threads: [...(released.get(host.id) || [])].map(([id, entry]) => ({ id, name: entry.name, loaded: false, active: false, released: true, restoring: !!entry.restoreThreadIds.length })) }
+    if (!bridge) return { connected: false, paused: dependencies.pausedHosts.has(host.id), managed: hostConnectionMode(host, dependencies.bridgeOptions) !== 'proxy', connectionMode: hostConnectionMode(host, dependencies.bridgeOptions), independentDaemon: hostConnectionMode(host, dependencies.bridgeOptions) !== 'spawn', mode: host.kind === 'ssh' ? 'ssh' : dependencies.bridgeOptions?.mode || 'spawn', loadedThreadCount: 0, activeThreadCount: 0, activeProcesses: [], processes: [], threads: [...(released.get(host.id) || [])].map(([id, entry]) => ({ id, name: entry.name, loaded: false, active: false, released: true, restoring: !!entry.restoreThreadIds.length })) }
     const info = bridge.runtime
     let owned = ownedPids.get(bridge)
     if (owned?.transportPid !== info.pid || owned?.startedAt !== info.startedAt) { owned = undefined; ownedPids.delete(bridge) }
@@ -332,7 +335,9 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
       }
       const value = await entry.inFlight || entry.value
       if (!bridge.connected || bridge.runtime.engineId !== engineId) throw Object.assign(new Error('Codex 连接已改变，请重新刷新运行信息'), { status: 409 })
-      res.json({ ...(value as object), runtime: { ...await runtime(host, false), userAgent: bridge.userAgent || null }, ...bridge.reconnectStatus })
+      res.json({ ...(value as object), runtime: { ...await runtime(host, false), userAgent: bridge.userAgent || null }, ...bridge.reconnectStatus,
+        canRestartDaemon: bridge.options.daemonManaged === true && bridge.runtime.managed && bridge.maintenanceStatus.canReconnect,
+        daemonRestartDisabledReason: bridge.options.daemonManaged === true && bridge.runtime.managed ? bridge.maintenanceStatus.reconnectDisabledReason : '此连接由其他客户端启动，请在原客户端管理或迁移为托管服务' })
     })().catch(next)
   })
   for (const action of ['close', 'resume'] as const) app.post(`/api/hosts/:id/runtime/threads/:threadId/${action}`, (req, res, next) => {
@@ -387,10 +392,13 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
       mutations = operation.catch(() => {}); res.json(await operation)
     })().catch(next)
   })
-  app.post('/api/hosts/:id/runtime/reconnect', (req, res, next) => {
+  for (const action of ['reconnect', 'daemon/restart'] as const) app.post(`/api/hosts/:id/runtime/${action}`, (req, res, next) => {
     void (async () => {
-      const hostId = String(req.params.id); getHost(hostId); z.object({}).strict().parse(req.body)
-      let operation = reconnections.get(hostId)
+      const hostId = String(req.params.id); getHost(hostId)
+      if (action === 'daemon/restart') z.object({ confirmed: z.literal(true) }).strict().parse(req.body)
+      else z.object({}).strict().parse(req.body)
+      const operationKey = `${hostId}:${action}`
+      let operation = reconnections.get(operationKey)
       if (!operation) {
         const reconnect = async () => {
           // Resolve again after queued resource mutations: deleted or edited
@@ -402,14 +410,18 @@ export function registerHostResources(app: Express, dependencies: Dependencies) 
           if (bridge.host !== host) throw Object.assign(new Error('主机配置已改变，请重新打开设置后重试'), { status: 409 })
           if (dependencies.pausedHosts.has(hostId) || bridge.paused)
             throw Object.assign(new Error('此主机已暂停，请在资源管理中恢复连接'), { status: 409, code: 'runtime_paused' })
-          await bridge.reconnect()
+          if (action === 'daemon/restart') {
+            if (!bridge.options.daemonManaged) throw Object.assign(new Error('仅可重启此网页管理的独立 daemon'), { status: 409 })
+            if (!bridge.runtime.managed) throw Object.assign(new Error('此 daemon 由其他客户端启动，请在原客户端重启或迁移为托管服务'), { status: 409 })
+            await bridge.reconnect(async () => { await (dependencies.daemonRestart || restartCodexDaemon)(host, { ...bridge.options, daemonHome: bridge.codexHome }) }, { checkQueuedInputs: true })
+          } else await bridge.reconnect()
           ownedPids.delete(bridge)
           informationCache.delete(hostId)
           return { ok: true, runtime: await runtime(host, false), userAgent: bridge.userAgent || null, codexHome: bridge.codexHome || null }
         }
         operation = mutations.then(() => dependencies.withRuntimeMaintenance ? dependencies.withRuntimeMaintenance(hostId, reconnect) : reconnect())
-          .finally(() => { reconnections.delete(hostId) })
-        reconnections.set(hostId, operation)
+          .finally(() => { reconnections.delete(operationKey) })
+        reconnections.set(operationKey, operation)
         mutations = operation.catch(() => {})
       }
       res.json(await operation)

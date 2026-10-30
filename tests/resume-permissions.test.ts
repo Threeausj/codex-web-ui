@@ -4,7 +4,7 @@ import { reactive } from 'vue'
 import type { ConfigRequirements } from '../shared/protocol/v2/ConfigRequirements.js'
 import type { SandboxPolicy } from '../shared/protocol/v2/SandboxPolicy.js'
 import { DEFAULT_PERMISSION_PROFILES } from '../src/lib/configuration.js'
-import { explicitWebPermissionSelection, resolveResumePermissionOverrides, restoreRuntimePermissionPolicy } from '../src/lib/resume-permissions.js'
+import { captureForkPermissionInheritance, explicitWebPermissionSelection, resolveForkPermissionInheritance, resolveResumePermissionOverrides, restoreRuntimePermissionPolicy } from '../src/lib/resume-permissions.js'
 
 test('an unselected Web fallback omits overrides while legacy and explicit defaults retain their semantics', () => {
   assert.equal(explicitWebPermissionSelection({}), null)
@@ -87,4 +87,89 @@ test('writer-preserving refreshes can copy a Vue runtime policy without losing g
   assert.notEqual(restored.sandboxPolicy, policy.sandboxPolicy)
   assert.notEqual(restored.approvalPolicy, policy.approvalPolicy)
   assert.deepEqual(restoreRuntimePermissionPolicy({ sandbox: policy.sandboxPolicy }, policy)?.approvalPolicy, policy.approvalPolicy)
+})
+
+test('native profile provenance and review routing remain isolated from Web presets and mutable responses', () => {
+  const response = reactive({
+    sandbox: { type: 'workspaceWrite' as const, writableRoots: ['/srv/project', '/approved/data'], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: false },
+    approvalPolicy: 'on-request' as const,
+    activePermissionProfile: { id: 'web-workspace', extends: 'project-denials' },
+    approvalsReviewer: 'guardian_subagent' as const,
+  })
+  const restored = restoreRuntimePermissionPolicy(response)!
+  assert.deepEqual(restored.activePermissionProfile, { id: 'web-workspace', extends: 'project-denials' })
+  assert.equal(restored.approvalsReviewer, 'guardian_subagent')
+  assert.notEqual(restored.activePermissionProfile, response.activePermissionProfile)
+  response.activePermissionProfile.extends = 'changed-after-response'
+  assert.equal(restored.activePermissionProfile?.extends, 'project-denials')
+  const copied = restoreRuntimePermissionPolicy({}, restored)!
+  assert.deepEqual(copied, restored)
+  assert.notEqual(copied.activePermissionProfile, restored.activePermissionProfile)
+  const cleared = restoreRuntimePermissionPolicy({ activePermissionProfile: null, approvalsReviewer: 'user' }, restored)!
+  assert.equal(cleared.activePermissionProfile, null)
+  assert.equal(cleared.approvalsReviewer, 'user')
+  // A fresh legacy projection does not prove that an earlier named profile is
+  // still active, even when both project to the same broad sandbox type.
+  assert.equal(restoreRuntimePermissionPolicy({ sandbox: response.sandbox }, restored)?.activePermissionProfile, undefined)
+})
+
+test('an acknowledged fork retains native grants instead of replaying its unchanged global defaults', () => {
+  const preferences = { defaultPermission: 'danger-full-access', defaultPermissionExplicit: true }
+  const sandbox: SandboxPolicy = { type: 'workspaceWrite', writableRoots: ['/project', '/approved/data'], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true }
+  const approvalPolicy = { granular: { sandbox_approval: true, rules: false, skill_approval: true, request_permissions: true, mcp_elicitations: false } }
+  const inheritance = captureForkPermissionInheritance({ sandbox, approvalPolicy,
+    activePermissionProfile: { id: 'project-reviewed', extends: ':workspace' }, approvalsReviewer: 'auto_review' }, preferences)!
+  const inherited = resolveForkPermissionInheritance(inheritance, preferences)
+  assert.equal(inherited.selection, null)
+  assert.deepEqual(resolveResumePermissionOverrides(inherited.selection), {})
+  assert.deepEqual(inherited.inheritedPolicy, {
+    sandboxPolicy: sandbox, approvalPolicy, source: 'native',
+    activePermissionProfile: { id: 'project-reviewed', extends: ':workspace' }, approvalsReviewer: 'auto_review',
+  })
+  sandbox.writableRoots.length = 0
+  assert.deepEqual((inherited.inheritedPolicy!.sandboxPolicy as Extract<SandboxPolicy, { type: 'workspaceWrite' }>).writableRoots, ['/project', '/approved/data'])
+  assert.notEqual(inherited.inheritedPolicy, inheritance.policy)
+  assert.notEqual(inherited.inheritedPolicy!.activePermissionProfile, inheritance.policy.activePermissionProfile)
+})
+
+test('pending source restrictions survive forking a running writer and deliberate child choices take precedence', () => {
+  const preferences = { defaultPermission: 'danger-full-access', defaultPermissionExplicit: true }
+  const pending = { mode: 'read-only' as const, profileId: '' }
+  const inheritance = captureForkPermissionInheritance({ sandbox: { type: 'dangerFullAccess' }, approvalPolicy: 'never' }, preferences, pending)!
+  const inherited = resolveForkPermissionInheritance(inheritance, preferences)
+  assert.deepEqual(inherited.selection, pending)
+  assert.equal(inherited.inheritedPolicy, null)
+  assert.deepEqual(resolveResumePermissionOverrides(inherited.selection), { sandbox: 'read-only', approvalPolicy: 'on-request' })
+  assert.notEqual(inherited.selection, inheritance.pendingSelection)
+  assert.deepEqual(resolveForkPermissionInheritance(inheritance, preferences, { mode: 'workspace-write', profileId: '' }).selection,
+    { mode: 'workspace-write', profileId: '' })
+  assert.deepEqual(resolveForkPermissionInheritance(inheritance, { ...preferences, defaultPermission: 'workspace-write' }).selection,
+    { mode: 'workspace-write', profileId: '' })
+})
+
+test('new global restrictions supersede fork inheritance without treating cosmetic profile edits as permission changes', () => {
+  const selected = { id: 'project-default', name: 'Project', sandboxMode: 'workspace-write' as const, approvalPolicy: 'on-request' as const, networkAccess: false }
+  const unrelated = { ...selected, id: 'other', name: 'Other' }
+  const preferences = { defaultPermission: 'workspace-write', defaultPermissionExplicit: true, activePermissionProfileId: selected.id, permissionProfiles: [selected, unrelated] }
+  const inheritance = captureForkPermissionInheritance({ sandbox: { type: 'workspaceWrite', writableRoots: ['/approved'], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false }, approvalPolicy: 'untrusted' }, preferences)!
+  assert.equal(resolveForkPermissionInheritance(inheritance, { ...preferences, permissionProfiles: [{ ...selected, name: 'Renamed' }, { ...unrelated, networkAccess: true }] }).selection, null)
+  assert.equal(resolveForkPermissionInheritance(inheritance, { ...preferences, defaultPermission: 'danger-full-access' }).selection, null)
+  const restricted = resolveForkPermissionInheritance(inheritance, { ...preferences, defaultPermission: 'read-only', activePermissionProfileId: '' })
+  assert.deepEqual(restricted.selection, { mode: 'read-only', profileId: '' })
+  assert.equal(restricted.inheritedPolicy, null)
+  const changedProfile = resolveForkPermissionInheritance(inheritance, { ...preferences, permissionProfiles: [{ ...selected, approvalPolicy: 'untrusted' }] })
+  assert.deepEqual(changedProfile.selection, { mode: 'workspace-write', profileId: selected.id })
+  assert.equal(changedProfile.inheritedPolicy, null)
+})
+
+test('legacy fork responses without an effective policy retain explicit global safety settings', () => {
+  const preferences = { defaultPermission: 'read-only', defaultPermissionExplicit: true }
+  const inheritance = captureForkPermissionInheritance({}, preferences)
+  assert.equal(inheritance, null)
+  assert.deepEqual(resolveForkPermissionInheritance(inheritance, preferences), {
+    selection: { mode: 'read-only', profileId: '' }, inheritedPolicy: null,
+  })
+  assert.deepEqual(resolveResumePermissionOverrides(resolveForkPermissionInheritance(inheritance, preferences).selection), {
+    sandbox: 'read-only', approvalPolicy: 'on-request',
+  })
 })

@@ -7,6 +7,7 @@ import type { Host } from './types.js'
 import { runHostPython } from './host-helper.js'
 import { writePrivateJson } from './storage.js'
 import { nativeRuntimeVersion } from './native-capabilities.js'
+import { updateCodexDaemon, type CodexDaemonOptions } from './daemon.js'
 import { activeCodexUpdate, type HostCodexUpdateOperation, type HostCodexUpdateStatus } from '../shared/host-update.js'
 
 const semver = z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/).max(100)
@@ -27,6 +28,7 @@ type Dependencies = {
   withRuntimeMaintenance<T>(hostId: string, work: () => Promise<T>): Promise<T>
   bridgeOptions?: BridgeOptions
   execute?: (host: Host, phase: 'version' | 'update', home?: string) => Promise<{ version: string }>
+  executeDaemonUpdate?: (host: Host, options: CodexDaemonOptions) => Promise<{ installedVersion: string; runningVersion: string }>
   now?: () => number
 }
 
@@ -140,7 +142,7 @@ export class HostCodexUpdates {
       : this.dependencies.isHostChanging?.(hostId) ? '此主机的连接设置正在变更，请完成后再更新。'
       : !bridge?.connected || bridge.paused ? '请先连接此主机的 Codex。'
       : !bridge.runtime.managed ? '此 Codex 由外部代理管理，请在主机更新并重启对应进程。'
-      : !bridge.reconnectStatus.canReconnect ? bridge.reconnectStatus.reconnectDisabledReason || '主机暂时不可重启。' : undefined
+      : !bridge.maintenanceStatus.canReconnect ? bridge.maintenanceStatus.reconnectDisabledReason || '主机暂时不可重启。' : undefined
     return { command: 'codex update', canUpdate: !disabledReason, ...(disabledReason ? { disabledReason } : {}),
       ...(codexVersion(bridge?.userAgent) ? { runtimeVersion: codexVersion(bridge?.userAgent) } : {}), operation: structuredClone(operation) }
   }
@@ -185,7 +187,17 @@ export class HostCodexUpdates {
           const installed = await this.execute(host, 'update', bridge.codexHome)
           operation.installedVersion = semver.parse(installed.version)
           if (this.dependencies.getHost(hostId) !== host) throw busy('主机配置已改变，更新结果待核对；未继续重启。')
-          await this.update(operation, 'restarting', '安装版本已确认，正在重启 Codex 连接…')
+          if (bridge.options.daemonManaged) {
+            await this.update(operation, 'restarting', '安装版本已确认，正在更新独立 Codex 后台服务…')
+            const options: CodexDaemonOptions = { ...bridge.options, daemonHome: bridge.codexHome }
+            const daemon = await (this.dependencies.executeDaemonUpdate
+              ? this.dependencies.executeDaemonUpdate(host, options)
+              : updateCodexDaemon(host, options))
+            if (semver.parse(daemon.installedVersion) !== operation.installedVersion || semver.parse(daemon.runningVersion) !== operation.installedVersion)
+              throw new Error('CLI 安装已更新，但独立后台服务的版本未能与安装版本一致；请核对主机 daemon 状态后重新连接。')
+            if (this.dependencies.getHost(hostId) !== host) throw busy('主机配置已改变，后台服务更新结果待核对；未继续重新连接。')
+          }
+          await this.update(operation, 'restarting', '安装版本已确认，正在重新连接 Codex…')
         }, { checkQueuedInputs: true }))
         const runtimeVersion = codexVersion(bridge.userAgent)
         operation.runtimeVersion = runtimeVersion

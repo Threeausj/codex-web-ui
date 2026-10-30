@@ -70,9 +70,9 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.local.yaml -f c
 
 独立 Linux 原生安装同样挂载**实际可执行文件所在目录**，并设 `CODEX_BIN=/opt/host-codex/实际文件名`；例如 `HOST_CODEX_DIRECTORY=/srv/codex-bin`、`CODEX_BIN=/opt/host-codex/codex`。保留安装依赖和符号链接指向的文件；避免只挂载版本文件，因为宿主升级的原子替换可能让容器保留旧 inode。pnpm/Bun 等跨目录符号链接布局需自行提供覆盖所有目标的受限目录挂载，或使用 SSH 连接宿主机。macOS/Windows 的二进制不能在 Linux 容器运行，请用 SSH 在对应主机执行。
 
-更新 Codex 使用宿主或远端原有的升级方式；网页不会执行升级，也无需因此重建 Web 镜像。升级后先完成活动任务，再重启应用服务以重建 app-server；仍运行的 app-server 和普通浏览器重连继续使用旧进程。目录路径保持不变时，下一次启动直接使用已更新文件；若 nvm 切换 Node 版本或安装前缀变动，修改 `HOST_CODEX_DIRECTORY` 后重新创建容器。SSH 每次真正建立 app-server 连接都会重新解析远端登录 shell 的 PATH。
+可在设置中对可写安装执行“更新并重启 Codex”，或使用宿主原有的升级方式，无需为 CLI 升级重建 Web 镜像。只读安装需在宿主升级；随后在主机空闲时刷新运行时。独立 daemon 的普通重连只更换客户端，不会加载新版本；使用显式 daemon 更新或重启，参见[主机设置](host-settings.md)。若 nvm 切换 Node 版本或安装前缀变动，修改 `HOST_CODEX_DIRECTORY` 后重新创建容器。SSH 每次真正建立连接都会重新解析远端登录 shell 的 PATH。
 
-网页启动的 app-server 通过进程参数 `-c features.default_mode_request_user_input=true` 启用普通模式的结构化选择，不写入宿主 `config.toml`。连接既有 daemon 的 `proxy` 模式仍受该 daemon 与会话配置控制，proxy 命令本身不能修改已运行 daemon 的启动配置。
+网页启动的 app-server 通过进程参数 `-c features.default_mode_request_user_input=true` 启用普通模式的结构化选择，不写入宿主 `config.toml`。独立后台服务模式通过 Web 会话私有的 `config` 启用同一能力，保留显式会话设置，不修改共享 daemon 或全局配置；已经加载的会话保留其运行配置。仅连接已有服务的 `proxy` 模式仍受该 daemon 与会话配置控制，proxy 命令本身不能修改已运行 daemon 的启动配置。
 
 ## 模型网关与客户端标识
 

@@ -14,12 +14,15 @@ import { isInteractiveServerRequest } from '../shared/server-requests.js'
 import { codexAppServerArgs, sshAppServerArgs, type SSHConnectionControl } from './ssh.js'
 import { sharedSshPool, type SshConnectionPool } from './ssh-pool.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
+import { hostConnectionMode, hostTransportMode } from './connection-mode.js'
+import { ensureCodexDaemon } from './daemon.js'
+import { mergeContextUsage } from '../shared/context-usage.js'
 export { shellQuote } from './ssh.js'
 
 export type Transport = { input: Writable; output: Readable; events: EventEmitter; dispose: () => void; maxFrameBytes?: number; pid?: number; startedAt?: number; closed?: Promise<void> }
-export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; socketPath?: string; transportFactory?: (host: Host) => Transport; sshHostKeyPin?: SSHHostKeyPin; sshPool?: SshConnectionPool; sshControl?: SSHConnectionControl; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
+export type BridgeOptions = { codexBin?: string; codexHome?: string; clientName?: string; cwd?: string; mode?: 'spawn' | 'proxy'; daemonManaged?: boolean; socketPath?: string; transportFactory?: (host: Host) => Transport; prepareDaemon?: typeof ensureCodexDaemon; recoverThreadIds?: (host: Host) => Promise<string[]>; sshHostKeyPin?: SSHHostKeyPin; sshPool?: SshConnectionPool; sshControl?: SSHConnectionControl; resolveSshHostKeyPin?: (host: Host) => Promise<SSHHostKeyPin | undefined>; connectionProbe?: boolean; onStderr?: (chunk: string) => void; onProtocolMessage?: (host: Host, message: RpcMessage, responseMethod?: string) => void | Promise<void> }
 type Compaction = { requests: Set<string>; items: Map<string, string | undefined>; revision: number }
-type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { respond?: (message: RpcMessage) => void; originalId?: RpcId; clientKey?: string; clientSocket?: WebSocket; method: string; params?: unknown; runtimeSnapshot: number; compactionSnapshot?: { state: Compaction; revision: number }; resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }
 type Approval = { message: RpcMessage; timer?: ReturnType<typeof setTimeout> }
 type ProcessDecoder = { decoder: StringDecoder; suffix: Buffer }
 type ActiveProcess = { processId: string; tty: boolean; cwd?: string; startedAt: number; lastOutput: string; requestId: string; decoders: Map<string, ProcessDecoder> }
@@ -38,8 +41,8 @@ export function spawnTransport(host: Host, options: BridgeOptions): Transport {
   const executable = host.kind === 'ssh' ? 'ssh' : options.codexBin || 'codex'
   let args: string[]
   if (host.kind === 'ssh') {
-    args = sshAppServerArgs(host, options.mode, options.connectionProbe, options.sshHostKeyPin, options.sshControl)
-  } else args = codexAppServerArgs(options.mode, options.socketPath)
+    args = sshAppServerArgs(host, options.mode, options.connectionProbe, options.sshHostKeyPin, options.sshControl, options.daemonManaged)
+  } else args = codexAppServerArgs(options.mode, options.socketPath, options.daemonManaged)
   const child: ChildProcessWithoutNullStreams = spawn(executable, args, {
     cwd: options.cwd || process.cwd(),
     env: { ...process.env, ...(options.codexHome ? { CODEX_HOME: options.codexHome } : {}) },
@@ -102,11 +105,20 @@ export class Bridge {
   private pausing?: Promise<void>
   private reconnecting?: Promise<void>
   private runtimeMaintenance = false
+  private startupAbort?: AbortController
+  private initializingGeneration?: number
+  private recoverableThreads = new Set<string>()
+  private recoveryFailures = new Set<string>()
+  private recoveryRetry?: Promise<void>
+  private daemonLifecycleManaged?: boolean
   // Children created by Codex need not be browser subscriptions. Track their
   // activity separately so refreshing the engine cannot terminate them.
   private nativeActiveThreads = new Set<string>()
   private subscribedThreads = new Set<string>()
   private activeThreads = new Set<string>()
+  private runtimeSequence = 0
+  private runtimeSequenceFloor = 0
+  private closedRuntimeSequences = new Map<string, number>()
   // Metadata generation shares the native connection, never the visible chat.
   private internalThreads = new Set<string>()
   private threadNames = new Map<string, string>()
@@ -121,10 +133,14 @@ export class Bridge {
   lastError?: string
   private readonly clientName: string
   constructor(readonly host: Host, readonly options: BridgeOptions = {}, releasedThreads = new Map<string, ReleasedThread>()) {
+    const connectionMode = hostConnectionMode(host, options)
+    this.options = { ...options, mode: hostTransportMode(host, options), daemonManaged: connectionMode === 'daemon',
+      socketPath: connectionMode === 'daemon' ? undefined : options.socketPath }
     this.clientName = normalizeCodexClientName(options.clientName)
     this.releasedThreads = releasedThreads
   }
   get mode() { return this.host.kind === 'ssh' ? 'ssh' : this.options.mode || 'spawn' }
+  get connectionMode() { return this.options.daemonManaged ? 'daemon' : this.options.mode === 'proxy' ? 'proxy' : this.mode }
   threadContext(threadId: string) { return this.contexts.get(threadId) ?? { tokenUsage: null, compacting: false } }
   private compaction(threadId: string) {
     let state = this.compactions.get(threadId)
@@ -179,7 +195,10 @@ export class Bridge {
       const state = this.compactions.get(p.threadId)
       if (state) ++state.revision
     }
-    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage: { ...p.tokenUsage, modelContextWindow: p.tokenUsage.modelContextWindow ?? previous.tokenUsage?.modelContextWindow ?? null } })
+    if (message.method === 'thread/tokenUsage/updated' && p.tokenUsage) {
+      const tokenUsage = mergeContextUsage(previous.tokenUsage, p.tokenUsage)
+      if (tokenUsage) this.contexts.set(p.threadId, { ...previous, tokenUsage })
+    }
     const freshItem = ['item/started', 'item/completed'].includes(message.method || '') && this.rememberContextItem(p.threadId, p.item)
     if (p.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
       if (message.method === 'item/started' && freshItem) {
@@ -218,7 +237,9 @@ export class Bridge {
     if (this.contexts.size > 1000) this.contexts.delete(this.contexts.keys().next().value!)
   }
   get runtime() {
-    return { engineId: this.engineId, connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy', mode: this.mode,
+    return { engineId: this.engineId, connected: this.connected, paused: this.paused, managed: this.options.mode !== 'proxy' || this.options.daemonManaged === true && this.daemonLifecycleManaged !== false, mode: this.mode,
+      daemonLifecycleManaged: this.daemonLifecycleManaged,
+      connectionMode: this.connectionMode, independentDaemon: this.options.mode === 'proxy', recoveryPending: [...this.recoveryFailures],
       ...(this.transport?.pid ? { pid: this.transport.pid, startedAt: this.transport.startedAt } : {}),
       loadedThreadCount: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)).length, activeThreadCount: [...this.activeThreads].filter(id => !this.internalThreads.has(id)).length,
       threads: [...new Set([...this.subscribedThreads, ...this.releasedThreads.keys()])].filter(id => !this.internalThreads.has(id)).map(id => ({ id,
@@ -235,8 +256,8 @@ export class Bridge {
   async connect(): Promise<void> {
     if (this.runtimeMaintenance) throw Object.assign(new Error('正在重新连接 Codex，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
     if (this.paused) throw Object.assign(new Error('此主机的 Web Codex 已释放，点击“连接 Web Codex”后恢复'), { status: 409, code: 'runtime_paused' })
-    if (this.connected) return
     if (this.connecting) return this.connecting
+    if (this.connected) return
     if (this.disposed) throw new Error('Host connection was closed')
     this.connecting = this.initialize().finally(() => { this.connecting = undefined })
     return this.connecting
@@ -244,6 +265,9 @@ export class Bridge {
 
   private async initialize() {
     const generation = ++this.generation
+    this.initializingGeneration = generation
+    const startup = new AbortController()
+    this.startupAbort = startup
     this.lastError = undefined
     let transport: Transport
     try {
@@ -253,6 +277,11 @@ export class Bridge {
       const lease = this.host.kind === 'ssh' && !this.options.transportFactory ? await (this.options.sshPool || sharedSshPool).acquire(this.host, knownHostsFile) : undefined
       if (generation !== this.generation || this.disposed || this.paused) { lease?.release(); throw new Error('Host connection was closed') }
       try {
+        if (this.options.daemonManaged && (this.options.prepareDaemon || !this.options.transportFactory)) {
+          const daemon = await (this.options.prepareDaemon || ensureCodexDaemon)(this.host, this.options, startup.signal)
+          this.daemonLifecycleManaged = typeof daemon.managedCodexVersion === 'string' && typeof daemon.backend === 'string'
+          if (generation !== this.generation || this.disposed || this.paused) throw new Error('Host connection was closed')
+        }
         transport = this.options.transportFactory ? this.options.transportFactory(this.host)
           : spawnTransport(this.host, { ...this.options, sshHostKeyPin: knownHostsFile, sshControl: lease?.control })
         void transport.closed?.then(() => lease?.release())
@@ -288,11 +317,61 @@ export class Bridge {
       this.codexHome = result.codexHome
       this.connected = true
       this.lastConnectedAt = Date.now()
+      if (this.options.daemonManaged) await this.restoreDaemonSubscriptions(generation)
+      if (generation !== this.generation || this.disposed || this.paused) throw new Error('App-server connection changed')
+      if (this.startupAbort === startup) this.startupAbort = undefined
+      this.initializingGeneration = undefined
       for (const key of this.clients.keys()) this.status(key)
     } catch (error) {
       if (generation === this.generation) this.disconnect(error as Error, 'initializeFailure')
       throw error
     }
+  }
+
+  /** Rejoin only previously observed threads still loaded and active in this
+   * daemon. Never load an idle Goal from disk merely to restore a Web page. */
+  private async restoreDaemonSubscriptions(generation: number, retryIds?: Set<string>) {
+    const current = () => generation === this.generation && this.connected && !this.disposed && !this.paused
+    const desired = new Set(retryIds || this.recoverableThreads)
+    try {
+      if (!retryIds) for (const id of await this.options.recoverThreadIds?.(this.host) || []) if (typeof id === 'string' && id.length && id.length <= 256) desired.add(id)
+      if (!current() || !desired.size) return
+      let cursor: string | null = null
+      const seen = new Set<string>(), loaded = new Set<string>()
+      const deadline = Date.now() + 20000
+      do {
+        const page = await this.rawRequest('thread/loaded/list', { cursor, limit: 100 }, undefined, undefined, 4000) as { data: string[]; nextCursor?: string | null }
+        if (!Array.isArray(page.data) || page.data.some(id => typeof id !== 'string')) throw new Error('Invalid loaded thread list')
+        for (const id of page.data) loaded.add(id)
+        cursor = page.nextCursor || null
+        if (!current() || loaded.size > 10000 || cursor && (seen.has(cursor) || Date.now() > deadline)) throw new Error('Recovery state changed')
+        if (cursor) seen.add(cursor)
+      } while (cursor)
+      this.recoveryFailures.clear()
+      for (const threadId of [...desired].slice(-512)) {
+        if (!current()) return
+        if (!loaded.has(threadId) || this.releasedThreads.has(threadId) || this.internalThreads.has(threadId)) continue
+        if (Date.now() > deadline) { this.recoveryFailures.add(threadId); continue }
+        try {
+          const value = await this.rawRequest('thread/read', { threadId, includeTurns: false }, undefined, undefined, 4000) as { thread?: { id?: string; ephemeral?: boolean; status?: { type?: string } } }
+          if (!current()) return
+          if (value.thread?.id !== threadId) throw new Error('Unexpected thread identity')
+          if (value.thread.status?.type !== 'active' || value.thread.ephemeral === true) continue
+          await this.rawRequest('thread/resume', { threadId, excludeTurns: true }, undefined, undefined, 4000)
+          this.recoverableThreads.delete(threadId)
+        } catch { if (current()) this.recoveryFailures.add(threadId) }
+      }
+    } catch { if (current()) for (const id of desired) this.recoveryFailures.add(id) }
+  }
+
+  /** Retry incomplete subscriptions on the same proxy. A temporary native
+   * metadata failure must not require disconnecting healthy browser clients. */
+  retryDaemonSubscriptions(): Promise<void> {
+    if (this.recoveryRetry) return this.recoveryRetry
+    if (!this.options.daemonManaged || !this.connected || this.connecting || this.runtimeMaintenance || this.disposed || this.paused || !this.recoveryFailures.size) return Promise.resolve()
+    const operation = this.restoreDaemonSubscriptions(this.generation, new Set(this.recoveryFailures)).finally(() => { if (this.recoveryRetry === operation) this.recoveryRetry = undefined })
+    this.recoveryRetry = operation
+    return operation
   }
 
   private send(message: RpcMessage) {
@@ -303,6 +382,20 @@ export class Bridge {
   }
 
   private rawRequest(method: string, params: unknown, clientKey?: string, originalId?: RpcId, timeout = 120000, clientSocket?: WebSocket, respond?: (message: RpcMessage) => void) {
+    // daemon start ignores CLI config overrides. Apply the Web client's normal
+    // question capability only to its own thread config, without changing a
+    // shared daemon or overriding an explicit per-thread feature choice.
+    if (this.options.daemonManaged && ['thread/start', 'thread/resume', 'thread/fork'].includes(method) && params && typeof params === 'object' && !Array.isArray(params)) {
+      const value = params as Record<string, unknown>
+      const config = value.config == null ? {} : value.config
+      if (value.experimentalPredictionMode !== true && config && typeof config === 'object' && !Array.isArray(config)) {
+        const fields = config as Record<string, unknown>
+        const features = fields.features
+        const explicit = Object.hasOwn(fields, 'features.default_mode_request_user_input') ||
+          features != null && (typeof features !== 'object' || Array.isArray(features) || Object.hasOwn(features, 'default_mode_request_user_input'))
+        if (!explicit) params = { ...value, config: { ...fields, 'features.default_mode_request_user_input': true } }
+      }
+    }
     const id = `web:${++this.counter}`
     const targetThread = (params as { threadId?: string })?.threadId
     if (typeof targetThread === 'string' && ['thread/name/set', 'thread/archive', 'thread/delete', 'thread/revert', 'thread/rollback'].includes(method))
@@ -327,7 +420,7 @@ export class Bridge {
         reject(Object.assign(new Error(`App-server request timed out: ${method}`), { uncertain: true }))
       }, timeout)
       timer.unref?.()
-      this.pending.set(id, { method, params, compactionSnapshot, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
+      this.pending.set(id, { method, params, runtimeSnapshot: this.runtimeSequence, compactionSnapshot, clientKey, clientSocket, originalId, respond, resolve, reject, timer })
       try { this.send({ id, method, ...(params !== undefined ? { params } : {}) }) } catch (error) { this.removeCompactionRequest(compactThread, id); clearTimeout(timer); this.pending.delete(id); this.finishProcess(id, undefined, { code: -32000, message: (error as Error).message }); reject(error) }
     })
   }
@@ -461,7 +554,7 @@ export class Bridge {
   diagnostics() {
     this.pruneReplay()
     return { engineId: this.engineId || null, userAgent: this.userAgent || null, connected: this.connected, paused: this.paused,
-      connectionMode: this.mode, reconnectCount: Math.max(0, this.connectionAttempts - 1),
+      connectionMode: this.connectionMode, reconnectCount: Math.max(0, this.connectionAttempts - 1),
       lastConnectedAt: this.lastConnectedAt || null, lastDisconnectedAt: this.lastDisconnectedAt || null,
       lastDisconnect: this.lastDisconnect ? { ...this.lastDisconnect } : null,
       lastProtocolError: this.lastProtocolError || null,
@@ -491,7 +584,8 @@ export class Bridge {
   }
 
   private statusSnapshot() {
-    return { connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence,
+    return { connected: this.connected && this.initializingGeneration !== this.generation, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence,
+      connectionMode: this.connectionMode, independentDaemon: this.options.mode === 'proxy',
       hostId: this.host.id, releasedThreadIds: [...this.releasedThreads.keys()], mode: this.mode, userAgent: this.userAgent,
       codexHome: this.codexHome, error: this.lastError, pendingRequests: [...this.approvals.values()].map(a => a.message),
       activeProcesses: [...this.processes.values()].map(({ requestId: _requestId, decoders, ...process }) => ({ ...process, pendingOutputBase64: this.pendingProcessOutput(decoders) })) }
@@ -638,8 +732,11 @@ export class Bridge {
     if (['initialize', 'initialized'].includes(message.method)) { reply(rpcError(message.id!, 'The bridge owns initialization', -32600)); return }
     if (message.method === 'bridge/ping') {
       const full = (message.params as { includeState?: unknown } | undefined)?.includeState === true
+      // A full heartbeat must describe the complete recovered subscription set,
+      // even if approval replay arrives before the final thread is rejoined.
+      if (full && this.initializingGeneration === this.generation) await (this.connecting || this.reconnecting)?.catch(() => {})
       reply({ id: message.id, result: { ...(full ? { ...this.statusSnapshot(), stateIncluded: true } : {
-        connected: this.connected, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence }),
+        connected: this.connected && this.initializingGeneration !== this.generation, paused: this.paused, engineId: this.engineId, eventSequence: this.eventSequence }),
         loadedThreadIds: [...this.subscribedThreads].filter(id => !this.internalThreads.has(id)) } })
       return
     }
@@ -686,12 +783,24 @@ export class Bridge {
     }
   }
 
-  private forgetDeletedThread(threadId: string) {
+  /** A native unload retires runtime state, not persisted history or grants.
+   * Keep a bounded revision so an older resume ACK cannot revive that actor. */
+  private retireThreadRuntime(threadId: string) {
+    this.closedRuntimeSequences.delete(threadId)
+    this.closedRuntimeSequences.set(threadId, ++this.runtimeSequence)
+    while (this.closedRuntimeSequences.size > 1024) {
+      const [id, sequence] = this.closedRuntimeSequences.entries().next().value!
+      this.closedRuntimeSequences.delete(id)
+      this.runtimeSequenceFloor = Math.max(this.runtimeSequenceFloor, sequence)
+    }
     this.subscribedThreads.delete(threadId)
     this.activeThreads.delete(threadId)
-    this.threadNames.delete(threadId)
-    this.contexts.delete(threadId)
+    this.nativeActiveThreads.delete(threadId)
+    this.recoverableThreads.delete(threadId)
+    this.recoveryFailures.delete(threadId)
     this.compactions.delete(threadId)
+    const context = this.contexts.get(threadId)
+    if (context) this.contexts.set(threadId, { ...context, compacting: false })
     for (const [key, approval] of this.approvals) {
       const params = approval.message.params as { threadId?: string; conversationId?: string } | undefined
       if ((params?.threadId || params?.conversationId) !== threadId) continue
@@ -701,6 +810,16 @@ export class Bridge {
       if (JSON.parse(key)[0] !== threadId) continue
       this.approvalItems.delete(key); this.approvalItemBytes -= item.bytes
     }
+  }
+
+  private staleRuntimeResponse(pending: Pending, threadId: string) {
+    return pending.runtimeSnapshot < this.runtimeSequenceFloor || (this.closedRuntimeSequences.get(threadId) || 0) > pending.runtimeSnapshot
+  }
+
+  private forgetDeletedThread(threadId: string) {
+    this.retireThreadRuntime(threadId)
+    this.threadNames.delete(threadId)
+    this.contexts.delete(threadId)
   }
 
   private receive(message: RpcMessage) {
@@ -720,6 +839,7 @@ export class Bridge {
     if (activity?.threadId) {
       if (message.method === 'turn/started' && (!activity.turn?.status || activity.turn.status === 'inProgress') || message.method === 'thread/status/changed' && activity.status?.type === 'active') this.nativeActiveThreads.add(activity.threadId)
       if (['turn/completed', 'thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/status/changed' && activity.status?.type !== 'active') this.nativeActiveThreads.delete(activity.threadId)
+      if (['thread/closed', 'thread/archived', 'thread/deleted'].includes(message.method || '') || message.method === 'thread/status/changed' && activity.status?.type === 'notLoaded') this.retireThreadRuntime(activity.threadId)
     }
     this.rememberApprovalItem(message)
     if (message.method === 'thread/archived' && this.archiveCapture) {
@@ -728,6 +848,8 @@ export class Bridge {
       if (id) this.hiddenArchiveEvents.add(id)
     }
     const pending = message.id !== undefined && !message.method ? this.pending.get(String(message.id)) : undefined
+    const responseThreadId = (message.result as { thread?: { id?: unknown } } | undefined)?.thread?.id
+    const staleSubscription = pending && ['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && typeof responseThreadId === 'string' && this.staleRuntimeResponse(pending, responseThreadId)
     const startedThread = message.method === 'thread/started' ? (message.params as any)?.thread : undefined
     const returnedThread = pending?.method === 'thread/start' ? (message.result as any)?.thread : undefined
     if (typeof startedThread?.id === 'string' && startedThread.ephemeral === true && startedThread.threadSource === 'thread_title') this.rememberInternalThread(startedThread.id)
@@ -740,7 +862,7 @@ export class Bridge {
         return
       }
     }
-    this.observeProtocol(message, pending?.method)
+    this.observeProtocol(message, staleSubscription ? undefined : pending?.method)
     if (message.id !== undefined && !message.method) {
       if (!pending) return
       this.pending.delete(String(message.id)); clearTimeout(pending.timer)
@@ -762,7 +884,7 @@ export class Bridge {
             if (['agentMessage', 'reasoning'].includes(item.type || '')) this.rememberContextItem(history.id, item)
         if (result?.thread?.id && (result.thread.name || result.thread.preview)) this.threadNames.set(result.thread.id, (result.thread.name || result.thread.preview || '').slice(0, 160))
         if (pending.method === 'thread/name/set' && params?.threadId && (pending.params as any)?.name) this.threadNames.set(params.threadId, (pending.params as any).name.slice(0, 160))
-        if (['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
+        if (!staleSubscription && ['thread/start', 'thread/resume', 'thread/fork'].includes(pending.method) && result?.thread?.id) {
           this.subscribedThreads.add(result.thread.id)
           if (result.thread.status?.type === 'active') this.activeThreads.add(result.thread.id)
         }
@@ -771,7 +893,7 @@ export class Bridge {
         // Otherwise an ACK followed by a disconnect could hide a lost result.
         if (pending.originalId !== undefined) pending.respond?.({ id: pending.originalId, result: message.result })
         if (pending.method === 'thread/delete' && params?.threadId) this.forgetDeletedThread(params.threadId)
-        if (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method)) this.broadcastThreadChange(pending, message.result, String(message.id))
+        if (!staleSubscription && (!this.hiddenArchiveEvents.has(params?.threadId || '') || !['thread/archive', 'thread/unarchive'].includes(pending.method))) this.broadcastThreadChange(pending, message.result, String(message.id))
         pending.resolve(message.result)
       }
       return
@@ -855,6 +977,12 @@ export class Bridge {
   }
 
   private disconnect(error: Error, category: DisconnectCategory) {
+    this.startupAbort?.abort()
+    this.startupAbort = undefined
+    if (this.options.daemonManaged) {
+      for (const id of this.subscribedThreads) if (!this.internalThreads.has(id)) this.recoverableThreads.add(id)
+      while (this.recoverableThreads.size > 512) this.recoverableThreads.delete(this.recoverableThreads.values().next().value!)
+    }
     this.lastDisconnectedAt = Date.now()
     // Keep only a fixed category and count after recovery; raw native errors
     // can contain prompts, command arguments, paths or SSH diagnostics.
@@ -877,6 +1005,9 @@ export class Bridge {
     this.subscribedThreads.clear()
     this.activeThreads.clear()
     this.nativeActiveThreads.clear()
+    this.closedRuntimeSequences.clear()
+    this.runtimeSequence = 0
+    this.runtimeSequenceFloor = 0
     this.internalThreads.clear()
     this.contexts.clear()
     this.compactions.clear()
@@ -885,7 +1016,7 @@ export class Bridge {
     for (const key of this.clients.keys()) this.status(key)
   }
 
-  /** Unsubscribe retains a native writer for 30 minutes. Archive shuts down
+  /** Unsubscribe retains a native writer until its inactivity grace expires. Archive shuts down
    * just this thread family, then unarchive restores its durable history without
    * reacquiring writers. Journal the restoration set before moving any logs. */
   async releaseThread(threadId: string, persist: () => Promise<void>) {
@@ -994,12 +1125,12 @@ export class Bridge {
     await this.connect()
   }
 
-  private assertRuntimeIdle() {
+  private assertRuntimeIdle(transportOnly = false) {
     const conflict = (message: string) => Object.assign(new Error(message), { status: 409, code: 'runtime_busy' })
     if (this.disposed) throw Object.assign(new Error('Host connection was closed'), { status: 409 })
     if (this.pausing || this.releasing.size) throw conflict('正在释放会话连接，请稍后重试')
-    if (this.activeThreads.size || this.nativeActiveThreads.size) throw conflict('此主机仍有对话或子智能体正在运行，请等待完成后重新连接')
-    if (this.approvals.size) throw conflict('此主机仍有待处理的审批或问题，请先处理后重新连接')
+    if (!transportOnly && (this.activeThreads.size || this.nativeActiveThreads.size)) throw conflict('此主机仍有对话或子智能体正在运行，请等待完成后重新连接')
+    if (!transportOnly && this.approvals.size) throw conflict('此主机仍有待处理的审批或问题，请先处理后重新连接')
     if (this.processes.size) throw conflict('此主机仍有终端正在运行，请先关闭终端后重新连接')
     if (this.pending.size || this.connecting) throw conflict('此主机仍有请求或命令未完成，请稍后重新连接')
   }
@@ -1007,6 +1138,14 @@ export class Bridge {
   get reconnectStatus() {
     try {
       if (this.runtimeMaintenance) throw new Error('正在重新连接 Codex，请稍后重试')
+      this.assertRuntimeIdle(this.options.daemonManaged === true)
+      return { canReconnect: true, reconnectDisabledReason: null }
+    } catch (error) { return { canReconnect: false, reconnectDisabledReason: (error as Error).message } }
+  }
+
+  get maintenanceStatus() {
+    try {
+      if (this.runtimeMaintenance) throw new Error('正在更新 Codex 运行状态，请稍后重试')
       this.assertRuntimeIdle()
       return { canReconnect: true, reconnectDisabledReason: null }
     } catch (error) { return { canReconnect: false, reconnectDisabledReason: (error as Error).message } }
@@ -1065,7 +1204,7 @@ export class Bridge {
 
   /** Idle host maintenance for configuration and native device login. The
    * transport stays open, so account/login/start is not canceled by a restart. */
-  withRuntimeMaintenance<T>(work: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<T>): Promise<T> {
+  withRuntimeMaintenance<T>(work: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<T>, options: { checkQueuedInputs?: boolean } = {}): Promise<T> {
     try {
       if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
       this.assertRuntimeIdle()
@@ -1073,7 +1212,7 @@ export class Bridge {
     } catch (error) { return Promise.reject(error) }
     this.runtimeMaintenance = true
     return (async () => {
-      await this.assertNativeRuntimeIdle()
+      await this.assertNativeRuntimeIdle(options.checkQueuedInputs === true)
       return work((method, params, timeout = 10000) => this.rawRequest(method, params, undefined, undefined, timeout))
     })().finally(() => { this.runtimeMaintenance = false })
   }
@@ -1082,16 +1221,17 @@ export class Bridge {
    * is never terminated: disposing its transport closes only our proxy client. */
   reconnect(prepare?: (request: (method: string, params?: unknown, timeout?: number) => Promise<unknown>) => Promise<void>, options: { checkQueuedInputs?: boolean } = {}): Promise<void> {
     if (this.reconnecting) return prepare ? Promise.reject(Object.assign(new Error('另一项 Codex 更新正在进行，请稍后重试'), { status: 409 })) : this.reconnecting
+    const transportOnly = this.options.daemonManaged === true && !prepare
     try {
       if (this.runtimeMaintenance) throw Object.assign(new Error('正在更新 Codex 运行状态，请稍后重试'), { status: 409, code: 'runtime_reconnecting' })
-      this.assertRuntimeIdle()
+      this.assertRuntimeIdle(transportOnly)
     } catch (error) { return Promise.reject(error) }
     this.runtimeMaintenance = true
     const wasPaused = this.paused
     const operation = (async () => {
       try {
-        await this.assertNativeRuntimeIdle(options.checkQueuedInputs === true)
-        this.assertRuntimeIdle()
+        if (!transportOnly) await this.assertNativeRuntimeIdle(options.checkQueuedInputs === true)
+        this.assertRuntimeIdle(transportOnly)
         if (prepare) {
           if (!this.connected) throw Object.assign(new Error('请先连接 Codex 后再更新配置'), { status: 409 })
           await prepare((method, params, timeout = 10000) => this.rawRequest(method, params, undefined, undefined, timeout))

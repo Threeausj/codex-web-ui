@@ -21,6 +21,7 @@
 .chat-tabs-scroll {
   display: flex;
   align-items: center;
+  flex: 0 1 var(--tabs-width);
   gap: 4px;
   min-width: 0;
   height: 100%;
@@ -33,7 +34,7 @@
 .chat-tab {
   display: flex;
   align-items: center;
-  flex: 0 0 auto;
+  flex: 1 1 224px;
   max-width: 224px;
   min-width: 112px;
   height: 32px;
@@ -48,11 +49,11 @@
   background: var(--soft);
   border-color: var(--border);
 }
-.chat-tab.pinned { min-width: 104px; max-width: 200px; }
 .chat-tab-select {
   display: flex;
   align-items: center;
   align-self: stretch;
+  flex: 1 1 0;
   min-width: 0;
   gap: 7px;
   padding: 0 8px;
@@ -113,9 +114,8 @@
   }
   .chat-tabs-header .header-left { gap: 3px; }
   .chat-tabs { gap: 2px; }
-  .chat-tabs-scroll { gap: 3px; }
-  .chat-tab { min-width: 104px; max-width: 196px; height: 34px; }
-  .chat-tab.pinned { min-width: 104px; max-width: 176px; }
+  .chat-tabs-scroll { gap: 3px; flex-basis: var(--tabs-width-mobile); }
+  .chat-tab { flex-basis: 196px; min-width: 104px; max-width: 196px; height: 34px; }
   .chat-tab-select { gap: 5px; font-size: 12px; padding-inline: 6px; }
   .chat-tab-close { flex-basis: 25px; width: 25px; height: 28px; }
   .chat-tab-menu .thread-menu-wrapper > .icon-button { width: 26px; height: 28px; }
