@@ -423,7 +423,7 @@ async function refreshCurrentRuntimeMetadata() {
       metadataReconnectChoices = null;
   }
 }
-async function reconnectRuntime(hostId = state.hostId) {
+async function reconnectRuntime(hostId = state.hostId, restartDaemon = false) {
   if (!hostId || !state.hosts.some(host => host.id === hostId)) throw new Error('请先添加或启用一个执行主机');
   if (state.runtimeReconnectingHostId) throw new Error('正在重新连接主机，请稍候');
   const authentication = authenticationGeneration;
@@ -437,7 +437,7 @@ async function reconnectRuntime(hostId = state.hostId) {
   settingsApi.invalidateHostSettings(hostId);
   if (currentHost()) { ++configGeneration; verifiedConfiguration = null; configurationRequest = null; }
   try {
-    const response = await http(`/hosts/${encodeURIComponent(hostId)}/runtime/reconnect`, { method: 'POST', body: '{}' }, false);
+    const response = await http(`/hosts/${encodeURIComponent(hostId)}/runtime/${restartDaemon ? 'daemon/restart' : 'reconnect'}`, { method: 'POST', body: restartDaemon ? '{"confirmed":true}' : '{}' }, false);
     assertAuthenticated();
     const reconnectedEngine = response.runtime?.engineId;
     const information = await settingsApi.refreshRuntimeInformation(hostId);
@@ -6358,6 +6358,7 @@ export function useCodex() {
   return {
     ...settingsApi,
     reconnectRuntime,
+    restartDaemonRuntime: (hostId = state.hostId) => reconnectRuntime(hostId, true),
     messageQueue,
     state,
     initialize,

@@ -1,6 +1,6 @@
 import type { Express } from 'express'
 import type { Bridge, BridgeOptions } from './bridge.js'
-import { NativeCapabilitiesService, nativeRuntimeVersion } from './native-capabilities.js'
+import { NativeCapabilitiesService, nativeRuntimeVersion, externalProxyRuntime } from './native-capabilities.js'
 import type { Host } from './types.js'
 
 export type DiagnosticsDependencies = { getHost: (id: string) => Host | undefined; getExistingBridge: (id: string) => Bridge | undefined; bridgeOptions?: BridgeOptions; capabilities?: NativeCapabilitiesService }
@@ -15,7 +15,7 @@ export function registerDiagnostics(app: Express, dependencies: DiagnosticsDepen
     try {
       const selected = host(String(req.params.id)); const bridge = dependencies.getExistingBridge(selected.id)
       const runtime = bridge?.diagnostics() || null
-      const capabilityNotice = dependencies.bridgeOptions?.mode === 'proxy' || runtime?.connectionMode === 'proxy' ? 'proxy_runtime' : runtime && !nativeRuntimeVersion(runtime.userAgent) ? 'runtime_version_unknown' : null
+      const capabilityNotice = externalProxyRuntime(selected, runtime || {}, dependencies.bridgeOptions) ? 'proxy_runtime' : runtime && !nativeRuntimeVersion(runtime.userAgent) ? 'runtime_version_unknown' : null
       res.json({ hostId: selected.id, sampledAt: Date.now(), runtime, capabilityNotice })
     } catch (error) { next(error) }
   })

@@ -46,6 +46,38 @@ test('connection failures classify SSH and Codex diagnostics without exposing pr
   assert.equal(connectionFailure(new Error('Timed out'), '', 'protocol', true).stage, 'timeout')
 })
 
+test('daemon lifecycle failures keep their actual stage and never expose private CLI diagnostics', () => {
+  const cases = [
+    ['daemon_host_key', 'ssh'], ['daemon_ssh_auth', 'ssh'], ['daemon_timeout', 'timeout'],
+    ['daemon_unmanaged', 'codex'], ['daemon_unsupported', 'codex'], ['daemon_not_executable', 'codex'],
+    ['daemon_unavailable', 'codex'], ['daemon_invalid_response', 'protocol'], ['daemon_output_limit', 'protocol'],
+    ['daemon_cancelled', 'codex'], ['daemon_command_failed', 'codex'],
+  ] as const
+  for (const [code, expected] of cases) {
+    const error = Object.assign(new Error('private token-secret account=/private'), { code })
+    const result = connectionFailure(error, 'private token-secret startup banner', 'ssh')
+    assert.equal(result.stage, expected, code)
+    assert.ok(!/token-secret|\/private/.test(result.message))
+    if (code === 'daemon_host_key') assert.equal(result.hostKeyRequired, true)
+  }
+  assert.equal(connectionFailure(new Error('Codex daemon 操作超时，private token-secret'), '', 'ssh').stage, 'timeout')
+  assert.equal(connectionFailure(new Error('已有非托管 App Server 占用 daemon 连接，private token-secret'), '', 'ssh').stage, 'codex')
+  assert.equal(connectionFailure(new Error('此安装不支持 daemon 命令，private token-secret'), '', 'ssh').stage, 'codex')
+})
+
+test('an unmanaged daemon connection probe returns an actionable Codex failure without opening a proxy', async () => {
+  let proxyOpened = false
+  const result = await testHostConnection({ ...remote, connectionMode: 'daemon' }, {
+    prepareDaemon: async () => { throw Object.assign(new Error('private token-secret'), { code: 'daemon_unmanaged' }) },
+    transportFactory: () => { proxyOpened = true; throw new Error('must not open') },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.stage, 'codex')
+  assert.match(result.message, /非托管/)
+  assert.ok(!result.message.includes('token-secret'))
+  assert.equal(proxyOpened, false)
+})
+
 test('identity-file preflight rejects unreadable or non-file drafts without opening a transport', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-probe-identity-'))
   let connected = false

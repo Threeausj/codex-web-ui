@@ -13,7 +13,9 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { WebSocketHeartbeat } from './websocket-heartbeat.js'
 import { z } from 'zod'
 import { Auth, trustedOrigins } from './auth.js'
-import { Storage, hostInput, writePrivateJson } from './storage.js'
+import { Storage, hostInput, hostUpdateInput, writePrivateJson } from './storage.js'
+import { DaemonSessions } from './daemon-sessions.js'
+import { hostConnectionMode } from './connection-mode.js'
 import { Bridge, RpcFailure, normalizeCodexClientName, type BridgeOptions } from './bridge.js'
 import { registerPreferences } from './preferences.js'
 import { registerBookmarks } from './bookmarks.js'
@@ -66,6 +68,8 @@ export async function createApp(options: AppOptions = {}) {
   const clientName = normalizeCodexClientName(options.bridgeOptions?.clientName ?? process.env.CODEX_CLIENT_NAME)
   const storage = new Storage(dataDir, codexHome, cwd)
   await storage.init()
+  const daemonSessions = new DaemonSessions(dataDir, { localIdentity: JSON.stringify([codexHome, options.bridgeOptions?.codexBin || process.env.CODEX_BIN || 'codex', cwd]) })
+  await daemonSessions.init()
   const runtimePausedHosts = await readRuntimePausedHosts(dataDir)
   const runtimeReleasedThreads = await readRuntimeReleasedThreads(dataDir)
   const recoverAtStartup = new Map([...runtimeReleasedThreads].map(([hostId, entries]) => [hostId, [...entries].filter(([, entry]) => entry.restoreThreadIds.length).map(([id]) => id)]))
@@ -93,13 +97,47 @@ export async function createApp(options: AppOptions = {}) {
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
   const sshPool = options.bridgeOptions?.sshPool || new SshConnectionPool()
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
+  bridgeOptions.recoverThreadIds ??= host => daemonSessions.threadIds({ ...host, connectionMode: 'daemon' })
   bridgeOptions.sshPool ??= sshPool
   bridgeOptions.resolveSshHostKeyPin ??= async host => (await sshHostKeys.connectionKnownHosts(host)) ?? bridgeOptions.sshHostKeyPin
+  const daemonReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const daemonReconnectFailures = new Map<string, number>()
+  let daemonRecoveryStopped = false
+  const scheduleDaemonRecovery = (hostId: string, delay = 0) => {
+    const host = storage.host(hostId)
+    if (daemonRecoveryStopped || !host || runtimePausedHosts.has(hostId) || hostConnectionMode(host, bridgeOptions) !== 'daemon' || daemonReconnectTimers.has(hostId)) return
+    const timer = setTimeout(() => {
+      daemonReconnectTimers.delete(hostId)
+      const selected = storage.host(hostId)
+      if (daemonRecoveryStopped || !selected || runtimePausedHosts.has(hostId)) return
+      if (selected !== host) { scheduleDaemonRecovery(hostId); return }
+      void getBridge(hostId).then(async bridge => {
+        await bridge.connect()
+        await bridge.retryDaemonSubscriptions()
+        if (bridge.runtime.recoveryPending.length) throw new Error('Daemon subscription recovery is pending')
+      }).then(() => { daemonReconnectFailures.delete(hostId) }, () => {
+        const failures = (daemonReconnectFailures.get(hostId) || 0) + 1
+        daemonReconnectFailures.set(hostId, failures)
+        scheduleDaemonRecovery(hostId, Math.min(60000, 1000 * 2 ** Math.min(failures, 6)))
+      })
+    }, delay)
+    timer.unref()
+    daemonReconnectTimers.set(hostId, timer)
+  }
+  const stopDaemonRecovery = () => {
+    daemonRecoveryStopped = true
+    for (const timer of daemonReconnectTimers.values()) clearTimeout(timer)
+    daemonReconnectTimers.clear()
+  }
   let automations: AutomationService | undefined;
   let threadTitles: ThreadTitleService | undefined
   let pushObservers: PushObservers | undefined
   const externalProtocolObserver = bridgeOptions.onProtocolMessage
   bridgeOptions.onProtocolMessage = (host, message, responseMethod) => {
+    if (storage.host(host.id) === host && hostConnectionMode(host, bridgeOptions) === 'daemon') {
+      void daemonSessions.observe({ ...host, connectionMode: 'daemon' }, message, responseMethod)
+      if (message.method === 'bridge/disconnected') scheduleDaemonRecovery(host.id, 1000)
+    }
     push.observe(host, message, responseMethod)
     pushObservers?.observe(host, message, responseMethod)
     automations?.observe(host, message)
@@ -109,6 +147,7 @@ export async function createApp(options: AppOptions = {}) {
   const bridges = new Map<string, Bridge>()
   const changingHosts = new Set<string>()
   const getBridge = async (hostId = 'local') => {
+    if (daemonRecoveryStopped) throw Object.assign(new Error('Web 服务正在更新，请稍后重连。'), { status: 503 })
     if (changingHosts.has(hostId)) throw Object.assign(new Error('正在更新此主机的连接状态，请稍后重试'), { status: 409 })
     const host = storage.host(hostId)
     if (!host) throw Object.assign(new Error('Host not found'), { status: 404 })
@@ -138,6 +177,7 @@ export async function createApp(options: AppOptions = {}) {
   if (options.trustProxy ?? process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
   app.use((_req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'SAMEORIGIN' }); next() })
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next() })
+  app.use('/api', (_req, res, next) => { if (daemonRecoveryStopped) { res.status(503).json({ error: 'Web 服务正在更新，请稍后重连。' }); return } next() })
   const parseJson = express.json({ limit: '64kb' })
   // Development services own their request bodies and limits. Parsing here
   // would consume or reserialize uploads and signed JSON before forwarding.
@@ -259,14 +299,22 @@ export async function createApp(options: AppOptions = {}) {
     if (changingHosts.has(id)) throw Object.assign(new Error('此主机连接正在修改，请稍后重试。'), { status: 409 })
     changingHosts.add(id)
     try {
-      const previousIdentityFile = storage.host(id)?.identityFile
-      const result = await storage.updateHost(id, req.body)
+      const previous = storage.host(id)
+      const previousIdentityFile = previous?.identityFile
+      const fields = hostUpdateInput.parse(req.body)
+      const changesMode = previous && Object.hasOwn(fields, 'connectionMode') && previous.connectionMode !== fields.connectionMode
+      const bridge = bridges.get(id)
+      const update = () => storage.updateHost(id, req.body)
+      // A spawn-to-daemon migration must first release this process's writer
+      // while idle. It must never stop a model turn or skip a pending approval.
+      const result = changesMode && bridge?.connected ? await bridge.withRuntimeMaintenance(update, { checkQueuedInputs: true }) : await update()
       if (result.connectionReset) {
         titleService.cancelHost(id)
         developmentPreview.deleteHost(id)
         bridgeOptions.sshPool!.closeHost(id)
         bridges.get(id)?.close('Host settings changed', 4001)
         bridges.delete(id)
+        scheduleDaemonRecovery(id, 0)
       }
       if (previousIdentityFile !== result.host.identityFile) await sshKeys.removeUnused(previousIdentityFile).catch(() => {})
       res.json({ ...result, hosts: storage.hosts })
@@ -285,6 +333,7 @@ export async function createApp(options: AppOptions = {}) {
       developmentPreview.deleteHost(id)
       bridgeOptions.sshPool!.closeHost(id)
       bridges.get(id)?.close(); bridges.delete(id)
+      await daemonSessions.forgetHost(id)
       res.json({ ok: true })
     } finally { changingHosts.delete(id) }
   })))
@@ -346,7 +395,8 @@ export async function createApp(options: AppOptions = {}) {
   app.use(errorHandler)
   if (options.pushObserverOptions?.autoStart !== false) notificationObservers.start()
   tmuxMonitors.start()
-  return { app, auth, storage, bridges, getBridge, dataDir, automations, codexUpdates, threadTitles: titleService, developmentPreview, push, notificationObservers, sshHostKeys, threadReadReceipts, promptPresets, tmuxMonitors, sshPool, stopPushLogoutListener, stopPushPasswordListener, stopPushSubscriptionListener }
+  for (const host of storage.hosts) scheduleDaemonRecovery(host.id)
+  return { app, auth, storage, bridges, getBridge, dataDir, automations, codexUpdates, daemonSessions, stopDaemonRecovery, threadTitles: titleService, developmentPreview, push, notificationObservers, sshHostKeys, threadReadReceipts, promptPresets, tmuxMonitors, sshPool, stopPushLogoutListener, stopPushPasswordListener, stopPushSubscriptionListener }
 }
 
 export async function createServer(options: AppOptions = {}) {
@@ -450,6 +500,7 @@ export async function createServer(options: AppOptions = {}) {
   }, 30000)
   heartbeat.unref()
   const close = async () => {
+    context.stopDaemonRecovery()
     clearInterval(heartbeat)
     stopListeningForRevocation()
     stopListeningForReadReceipts()
@@ -467,6 +518,7 @@ export async function createServer(options: AppOptions = {}) {
     await context.tmuxMonitors.close()
     context.developmentPreview.close()
     for (const bridge of context.bridges.values()) bridge.close()
+    await context.daemonSessions.close().catch(() => { console.error('无法持久保存 daemon 会话恢复记录，请检查私有数据目录。') })
     await context.sshPool.close()
     await closingPushObservers
     for (const ws of wss.clients) ws.terminate()

@@ -27,6 +27,7 @@ const hostFields = z.object({
   identityFile: optionalField(cleanText.refine(s => path.isAbsolute(s), 'Identity file must be absolute')),
   codexPath: optionalField(cleanText),
   cwd: optionalField(cleanText.refine(s => s.startsWith('/'), 'Remote directory must be absolute')),
+  connectionMode: optionalField(z.enum(['spawn', 'proxy', 'daemon'])),
 }).strict()
 function normalizeAddress<T extends { hostname?: string; username?: string }>(value: T, context: z.RefinementCtx): T {
   if (!value.hostname) return value
@@ -53,7 +54,7 @@ const projectOrderEntry = z.object({
 export const projectOrderInput = z.object({
   projects: z.array(projectOrderEntry).max(2000).refine(entries => new Set(entries.map(projectOrderKey)).size === entries.length, 'Project identities must be unique'),
 }).strict()
-const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'codexPath', 'cwd'] as const
+const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'codexPath', 'cwd', 'connectionMode'] as const
 
 export async function writePrivateJson(file: string, value: unknown) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })

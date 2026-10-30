@@ -10,6 +10,7 @@ export type Host = {
   identityFile?: string
   codexPath?: string
   cwd?: string
+  connectionMode?: 'spawn' | 'proxy' | 'daemon'
 }
 
 export type Project = { id: string; name: string; path: string; rootPaths?: string[]; hostId: string; source: 'desktop' | 'web' }

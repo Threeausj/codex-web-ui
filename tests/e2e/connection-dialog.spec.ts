@@ -55,6 +55,7 @@ test("test connection checks an unsaved draft without creating or selecting a ho
     hostname: "dev@host.example.test",
     identityFile: "/keys/dev",
     codexPath: "",
+    connectionMode: "daemon",
   });
   expect(mock.hosts).toHaveLength(1);
   expect(mock.hostMocks.size).toBe(0);
@@ -67,6 +68,63 @@ test("test connection checks an unsaved draft without creating or selecting a ho
   await expect(
     page.getByRole("dialog", { name: "设置", exact: true }),
   ).toBeVisible();
+});
+
+test("new SSH connections use an independent daemon and connection tests follow the selected runtime mode", async ({ page }) => {
+  const probes: any[] = [];
+  await page.route("**/api/hosts/test", async route => {
+    probes.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true, stage: "ready" } });
+  });
+  const dialog = await openConnections(page);
+  await dialog.getByLabel("SSH 主机地址", { exact: true }).fill("build.example.test");
+  await dialog.locator("summary").filter({ hasText: "高级选项" }).click();
+  const mode = dialog.getByLabel("Codex 运行方式", { exact: true });
+  await expect(mode).toHaveValue("daemon");
+  await expect(dialog).toContainText("更新网页服务后会重新连接");
+  await dialog.getByRole("button", { name: "测试连接", exact: true }).click();
+  await expect(dialog.getByRole("status")).toContainText("连接成功");
+  expect(probes[0].connectionMode).toBe("daemon");
+  await mode.selectOption("proxy");
+  await expect(dialog.getByRole("status")).toHaveCount(0);
+  await expect(dialog).toContainText("需要先在主机上启动");
+  await dialog.getByRole("button", { name: "测试连接", exact: true }).click();
+  await expect(dialog.getByRole("status")).toContainText("连接成功");
+  expect(probes[1].connectionMode).toBe("proxy");
+});
+
+test("existing SSH connections keep inherited settings and can explicitly return from daemon to inheritance", async ({ page, mock }) => {
+  const host = { id: "ssh-mode-test", kind: "ssh", name: "现有服务器", hostname: "existing.example.test" };
+  mock.hosts.push(host);
+  const writes: any[] = [];
+  await page.route("**/api/hosts/ssh-mode-test", async route => {
+    const body = route.request().postDataJSON();
+    writes.push(body);
+    Object.assign(host, body);
+    if (body.connectionMode === null) delete (host as any).connectionMode;
+    await route.fulfill({ json: { host, hosts: mock.hosts, connectionReset: false } });
+  });
+  const added = await openConnections(page);
+  await added.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "编辑 现有服务器", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑 SSH 连接", exact: true });
+  await dialog.locator("summary").filter({ hasText: "高级选项" }).click();
+  await expect(dialog.getByLabel("Codex 运行方式", { exact: true })).toHaveValue("inherit");
+  await expect(dialog).toContainText("此主机空闲后可切换运行方式");
+  await dialog.getByLabel("Codex 运行方式", { exact: true }).selectOption("daemon");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(writes[0].connectionMode).toBe("daemon");
+  await page.getByRole("button", { name: "编辑 现有服务器", exact: true }).click();
+  await dialog.locator("summary").filter({ hasText: "高级选项" }).click();
+  await expect(dialog.getByLabel("Codex 运行方式", { exact: true })).toHaveValue("daemon");
+  await dialog.getByLabel("Codex 运行方式", { exact: true }).selectOption("inherit");
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(writes[1].connectionMode).toBeNull();
+  await page.getByRole("button", { name: "编辑 现有服务器", exact: true }).click();
+  await dialog.locator("summary").filter({ hasText: "高级选项" }).click();
+  await expect(dialog.getByLabel("Codex 运行方式", { exact: true })).toHaveValue("inherit");
 });
 
 test("connection dialog reports failures and ignores a test after it is closed", async ({

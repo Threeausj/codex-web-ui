@@ -22,11 +22,12 @@ async function until(predicate: () => boolean) {
   while (!predicate() && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 5))
   assert.ok(predicate())
 }
-async function fixture(options: { proxy?: boolean; installed?: string; runtimeAfter?: string; fail?: boolean; nativeBusy?: boolean; queued?: boolean; automationBusy?: boolean; changing?: boolean } = {}) {
+async function fixture(options: { proxy?: boolean; daemon?: boolean; daemonFail?: boolean; daemonVersion?: string; installed?: string; runtimeAfter?: string; fail?: boolean; nativeBusy?: boolean; queued?: boolean; automationBusy?: boolean; changing?: boolean } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-host-update-'))
-  const hosts: Host[] = [{ id: 'local', name: 'Local', kind: 'local' }, { id: 'remote', name: 'Remote', kind: 'ssh', hostname: 'offline.invalid' }, { id: 'offline', name: 'Offline', kind: 'local' }]
+  const hosts: Host[] = [{ id: 'local', name: 'Local', kind: 'local' }, { id: 'remote', name: 'Remote', kind: 'ssh', hostname: 'offline.invalid', ...(options.daemon ? { connectionMode: 'daemon' } : {}) }, { id: 'offline', name: 'Offline', kind: 'local' }]
   const bridges = new Map<string, Bridge>(), peers = new Map<string, { output: PassThrough; disposed: boolean; sent: RpcMessage[] }[]>()
   const installed = new Map([['local', '0.164.0'], ['remote', '0.163.0']]); const calls: { hostId: string; phase: string }[] = []
+  const daemonVersions = new Map(installed); const daemonCalls: { hostId: string; daemonHome?: string; installedVersion: string }[] = []
   let hold: (() => Promise<void>) | undefined, holdPersistence: (() => Promise<void>) | undefined, persistenceCalls = 0, failure = !!options.fail, reserved = 0
   for (const host of hosts.slice(0, 2)) {
     const collection: { output: PassThrough; disposed: boolean; sent: RpcMessage[] }[] = []; peers.set(host.id, collection)
@@ -41,7 +42,7 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
           if (message.id === undefined) continue
           if (message.method === 'command/exec') continue
           const params = message.params as any
-          const result = message.method === 'initialize' ? { userAgent: `codex_cli_rs/${collection.length > 1 && options.runtimeAfter ? options.runtimeAfter : installed.get(host.id)} (fixture)`, codexHome: '/fixture/home' }
+          const result = message.method === 'initialize' ? { userAgent: `codex_cli_rs/${collection.length > 1 && options.runtimeAfter ? options.runtimeAfter : (host.connectionMode === 'daemon' ? daemonVersions : installed).get(host.id)} (fixture)`, codexHome: '/fixture/home' }
             : message.method === 'thread/loaded/list' ? { data: options.nativeBusy || options.queued ? ['native-running'] : [], nextCursor: null }
             : message.method === 'thread/read' ? { thread: { id: params.threadId, status: { type: options.nativeBusy ? 'active' : 'idle' } } }
             : message.method === 'thread/resume' ? { thread: { id: params.threadId, status: { type: 'idle' } } }
@@ -64,6 +65,13 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
       calls.push({ hostId: host.id, phase });
       if (phase === 'update') { if (hold) await hold(); if (failure) throw new Error('更新失败，原有连接未重启。'); installed.set(host.id, options.installed || '0.165.0') }
       return { version: installed.get(host.id)! }
+    },
+    executeDaemonUpdate: async (host: Host, settings: { daemonHome?: string }) => {
+      daemonCalls.push({ hostId: host.id, daemonHome: settings.daemonHome, installedVersion: installed.get(host.id)! })
+      if (options.daemonFail) throw new Error('独立后台服务更新结果待核对。')
+      const runningVersion = options.daemonVersion || installed.get(host.id)!
+      daemonVersions.set(host.id, runningVersion)
+      return { installedVersion: installed.get(host.id)!, runningVersion }
     } }
   const updates = await registerHostCodexUpdates(app, directory, dependencies)
   registerHostResources(app, { ...dependencies, dataDir: directory, pausedHosts, getBridge: async id => bridges.get(id)!,
@@ -80,7 +88,7 @@ async function fixture(options: { proxy?: boolean; installed?: string; runtimeAf
   const headers = { cookie, origin, 'content-type': 'application/json', 'x-csrf-token': csrfToken }
   const request = (hostId = 'remote', body?: unknown, custom = headers) => fetch(base + `/api/hosts/${hostId}/codex-update`, { method: body === undefined ? 'GET' : 'POST', headers: custom, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) })
   const resource = (action: string, body: unknown) => fetch(`${base}/api/hosts/remote/runtime/${action}`, { method: 'POST', headers, body: JSON.stringify(body) })
-  return { directory, hosts, bridges, peers, installed, calls, updates, dependencies, request, base, headers,
+  return { directory, hosts, bridges, peers, installed, calls, daemonCalls, updates, dependencies, request, base, headers,
     resource, pausedHosts, get persistenceCalls() { return persistenceCalls },
     setHold(value: () => Promise<void>) { hold = value }, setPersistenceHold(value: () => Promise<void>) { holdPersistence = value }, setFailure(value: boolean) { failure = value }, get reserved() { return reserved },
     async close() { await updates.close(); await maintenance.close(); for (const bridge of bridges.values()) bridge.close(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() }); await fs.rm(directory, { recursive: true, force: true }) } }
@@ -109,6 +117,77 @@ test('updating an idle host executes the fixed update once and restarts only tha
   assert.deepEqual(f.calls, [{ hostId: 'remote', phase: 'version' }, { hostId: 'remote', phase: 'update' }])
   assert.equal((await fs.stat(path.join(f.directory, 'codex-updates.json'))).mode & 0o777, 0o600)
   await f.request('remote', { requestId: firstId }); assert.equal(f.calls.length, 2)
+})
+
+test('an explicit managed daemon update installs the CLI then updates the selected daemon and reconnects exactly once', async t => {
+  const f = await fixture({ daemon: true }); t.after(() => f.close())
+  assert.equal(f.bridges.get('remote')!.options.daemonManaged, true)
+  assert.equal(f.updates.status('remote').canUpdate, true)
+  const engineId = f.bridges.get('remote')!.runtime.engineId
+  assert.deepEqual(f.daemonCalls, [], 'connecting an existing daemon must not update its package')
+  assert.equal((await f.request('remote', { requestId: firstId })).status, 202)
+  await until(() => !f.updates.isUpdating('remote'))
+  const result = f.updates.status('remote')
+  assert.equal(result.operation?.state, 'completed')
+  assert.equal(result.operation?.beforeVersion, '0.163.0')
+  assert.equal(result.operation?.installedVersion, '0.165.0')
+  assert.equal(result.operation?.runtimeVersion, '0.165.0')
+  assert.deepEqual(f.calls, [{ hostId: 'remote', phase: 'version' }, { hostId: 'remote', phase: 'update' }])
+  assert.deepEqual(f.daemonCalls, [{ hostId: 'remote', daemonHome: '/fixture/home', installedVersion: '0.165.0' }])
+  assert.notEqual(f.bridges.get('remote')!.runtime.engineId, engineId)
+  assert.equal(f.peers.get('remote')!.length, 2)
+  assert.equal(f.peers.get('local')!.length, 1)
+  await f.request('remote', { requestId: firstId })
+  assert.equal(f.daemonCalls.length, 1, 'an acknowledgement retry cannot dispatch another daemon update')
+  assert.equal(f.calls.length, 2)
+})
+
+test('a failed daemon update records the installed CLI and does not retry or claim the old proxy is a new runtime', async t => {
+  const f = await fixture({ daemon: true, daemonFail: true }); t.after(() => f.close())
+  await f.request('remote', { requestId: firstId }); await until(() => !f.updates.isUpdating('remote'))
+  const operation = f.updates.status('remote').operation!
+  assert.equal(operation.state, 'failed')
+  assert.equal(operation.installedVersion, '0.165.0')
+  assert.match(operation.error!, /后台服务/)
+  assert.equal(f.peers.get('remote')![0]!.disposed, false)
+  assert.equal(f.peers.get('remote')!.length, 1)
+  await f.request('remote', { requestId: firstId })
+  assert.equal(f.daemonCalls.length, 1)
+  assert.equal(f.calls.length, 2)
+})
+
+test('a daemon package mismatch stops before reconnecting and preserves a failed operation for inspection', async t => {
+  const f = await fixture({ daemon: true, daemonVersion: '0.164.0' }); t.after(() => f.close())
+  await f.request('remote', { requestId: firstId }); await until(() => !f.updates.isUpdating('remote'))
+  const operation = f.updates.status('remote').operation!
+  assert.equal(operation.state, 'failed')
+  assert.match(operation.error!, /后台服务的版本/)
+  assert.equal(f.peers.get('remote')!.length, 1)
+  assert.equal(f.daemonCalls.length, 1)
+})
+
+for (const blocked of [{ nativeBusy: true }, { queued: true }]) test(`a managed daemon with ${blocked.nativeBusy ? 'an active native turn' : 'queued input'} cannot dispatch CLI or daemon upgrades`, async t => {
+  const f = await fixture({ daemon: true, ...blocked }); t.after(() => f.close())
+  await f.request('remote', { requestId: firstId }); await until(() => !f.updates.isUpdating('remote'))
+  assert.equal(f.updates.status('remote').operation?.state, 'failed')
+  assert.deepEqual(f.calls, [])
+  assert.deepEqual(f.daemonCalls, [])
+  assert.equal(f.peers.get('remote')![0]!.disposed, false)
+})
+
+for (const condition of ['active turn', 'approval'] as const) test(`a daemon's reconnectable transport does not enable package updates while it has an ${condition}`, async t => {
+  const f = await fixture({ daemon: true }); t.after(() => f.close())
+  const peer = f.peers.get('remote')![0]!, bridge = f.bridges.get('remote')!
+  peer.output.write(JSON.stringify(condition === 'active turn'
+    ? { method: 'turn/started', params: { threadId: 'work', turn: { id: 'running', status: 'inProgress' } } }
+    : { id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'work', itemId: 'item' } }) + '\n')
+  assert.equal(bridge.reconnectStatus.canReconnect, true)
+  assert.equal(bridge.maintenanceStatus.canReconnect, false)
+  assert.equal(f.updates.status('remote').canUpdate, false)
+  assert.equal((await f.request('remote', { requestId: firstId })).status, 409)
+  assert.deepEqual(f.calls, [])
+  assert.deepEqual(f.daemonCalls, [])
+  assert.equal(peer.disposed, false)
 })
 
 test('concurrent requests share a durable operation, reject competing updates and retain the old connection until installation finishes', async t => {
