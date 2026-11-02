@@ -412,6 +412,139 @@ test("the settings host controls configuration and policy without selecting anot
   expect(mock.hostMocks.get(remoteHostId)?.request("thread/resume")).toBeUndefined();
 });
 
+test("a pending provider read never presents an unverified official account as the active configuration", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  let pending = false, release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  await page.route(`**/api/hosts/${remoteHostId}/codex-settings?*`, async route => {
+    pending = true;
+    await hold;
+    await route.fulfill({ json: codexInformation({ provider: "custom", providerId: "threecode", baseUrl: "https://gateway.fixture.test/v1" }) });
+  });
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const codex = settings.getByRole("region", { name: "Codex 设置", exact: true });
+  await expect.poll(() => pending).toBe(true);
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toBeDisabled();
+  await expect(codex.getByRole("button", { name: "保存提供方", exact: true })).toBeDisabled();
+  await expect(codex.getByRole("region", { name: "当前生效提供方", exact: true })).toHaveCount(0);
+  await expect(codex.getByText(/使用 OpenAI 官方服务/)).toHaveCount(0);
+  release();
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByRole("region", { name: "当前生效提供方", exact: true })).toContainText("threecode");
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toEqual([]);
+});
+
+for (const width of [1280, 390]) test(`${width}px: a custom HTTP provider is shown as the active gateway without changing its native configuration`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const wire = await wireSettings(page, mock);
+  wire.codex.set(remoteHostId, codexInformation({
+    provider: "custom", providerId: "threecode", providerName: "Threecode Gateway",
+    baseUrl: "https://gateway.fixture.test/v1", configPath: "/fixture/nas/.codex/config.toml",
+    hasApiKey: true, canReuseGatewayKey: false, canChange: false,
+    disabledReason: "共享代理进程的配置需要在服务端修改；直接连接后可切换提供方",
+    account: { type: "chatgpt", email: "dormant-official@example.test" },
+  }));
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const codex = settings.getByRole("region", { name: "Codex 设置", exact: true });
+  const current = codex.getByRole("region", { name: "当前生效提供方", exact: true });
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(current).toContainText("中转站");
+  await expect(current).toContainText("Threecode Gateway");
+  await expect(current).toContainText("threecode");
+  await expect(current).toContainText("https://gateway.fixture.test/v1");
+  await expect(current).toContainText("/fixture/nas/.codex/config.toml");
+  await expect(codex.getByLabel("中转站 URL", { exact: true })).toHaveValue("https://gateway.fixture.test/v1");
+  await expect(codex.getByLabel("中转站 URL", { exact: true })).toBeDisabled();
+  await expect(codex.getByLabel("中转站 API 密钥", { exact: true })).toHaveValue("");
+  await expect(codex.getByRole("button", { name: "保存提供方", exact: true })).toBeDisabled();
+  await expect(codex.getByRole("button", { name: "登录 ChatGPT", exact: true })).toHaveCount(0);
+  await expect(codex.getByText("dormant-official@example.test", { exact: true })).toHaveCount(0);
+  await expect(codex.getByText(/使用 OpenAI 官方服务/)).toHaveCount(0);
+  await codex.getByRole("button", { name: "刷新 Codex 设置", exact: true }).click();
+  await expect(codex.getByRole("button", { name: "刷新 Codex 设置", exact: true })).toBeEnabled();
+  await expect(current).toContainText("threecode");
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toEqual([]);
+  expect(wire.calls.filter(call => call.path === "settings/rpc" && call.body?.method === "config/batchWrite")).toEqual([]);
+  expect(mock.hostMocks.get(remoteHostId)!.requests.filter(request => request.method === "turn/start")).toEqual([]);
+  expect(await settings.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await settings.locator(".settings-content").evaluate(element => { element.scrollTop = 0; });
+  await settings.screenshot({ path: `.data/custom-provider-${width}.png` });
+});
+
+test("a custom provider without an HTTP endpoint remains visibly custom instead of falling back to official", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  wire.codex.set(remoteHostId, codexInformation({
+    provider: "custom", providerId: "local-custom", providerName: "Custom Endpoint", baseUrl: "",
+    hasApiKey: true, canReuseGatewayKey: false,
+  }));
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const codex = settings.getByRole("region", { name: "Codex 设置", exact: true });
+  await expect(codex.getByRole("button", { name: "自定义提供方", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(codex.getByRole("region", { name: "当前生效提供方", exact: true })).toContainText("local-custom");
+  await expect(codex.getByRole("button", { name: "保存提供方", exact: true })).toBeDisabled();
+  await expect(codex.getByRole("button", { name: "登录 ChatGPT", exact: true })).toHaveCount(0);
+  await expect(codex.getByText(/使用 OpenAI 官方服务/)).toHaveCount(0);
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toEqual([]);
+});
+
+test("switching settings hosts discards a custom gateway edit and refresh restores the actual provider without writing it", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  wire.codex.set(remoteHostId, codexInformation({
+    provider: "custom", providerId: "threecode", providerName: "Threecode Gateway",
+    baseUrl: "https://gateway.fixture.test/v1", hasApiKey: true, canReuseGatewayKey: false,
+  }));
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const codex = settings.getByRole("region", { name: "Codex 设置", exact: true });
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await codex.getByLabel("中转站 API 密钥", { exact: true }).fill("unsaved-custom-gateway-secret");
+  await settings.getByRole("combobox", { name: "设置主机", exact: true }).selectOption("local");
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByRole("region", { name: "当前生效提供方", exact: true })).not.toContainText("threecode");
+  await settings.getByRole("combobox", { name: "设置主机", exact: true }).selectOption(remoteHostId);
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByLabel("中转站 API 密钥", { exact: true })).toHaveValue("");
+  await codex.getByRole("button", { name: "官方账户", exact: true }).click();
+  await expect(codex.getByRole("button", { name: "官方账户", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByRole("region", { name: "当前生效提供方", exact: true })).toContainText("threecode");
+  await codex.getByRole("button", { name: "刷新 Codex 设置", exact: true }).click();
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(codex.getByLabel("中转站 URL", { exact: true })).toHaveValue("https://gateway.fixture.test/v1");
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toEqual([]);
+  expect(await settings.innerText()).not.toContain("unsaved-custom-gateway-secret");
+});
+
+test("an existing custom gateway credential cannot be silently reused for a new Web-managed gateway", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  wire.codex.set(remoteHostId, codexInformation({
+    provider: "custom", providerId: "threecode", providerName: "Threecode Gateway",
+    baseUrl: "https://gateway.fixture.test/v1", hasApiKey: true, canReuseGatewayKey: false,
+  }));
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const codex = settings.getByRole("region", { name: "Codex 设置", exact: true });
+  await expect(codex.getByRole("button", { name: "中转站", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await codex.getByRole("button", { name: "保存提供方", exact: true }).click();
+  await expect(codex.getByRole("alert")).toContainText(/密钥|Key/i);
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toEqual([]);
+  await codex.getByLabel("中转站 API 密钥", { exact: true }).fill("new-web-gateway-secret");
+  await codex.getByRole("button", { name: "保存提供方", exact: true }).click();
+  await expect.poll(() => wire.calls.filter(call => call.path === "codex-settings/provider").length).toBe(1);
+  expect(wire.calls.find(call => call.path === "codex-settings/provider")).toMatchObject({
+    hostId: remoteHostId, body: { provider: "gateway", baseUrl: "https://gateway.fixture.test/v1", apiKey: "new-web-gateway-secret" },
+  });
+  await expect(codex.getByLabel("中转站 API 密钥", { exact: true })).toHaveValue("");
+  expect(await settings.innerText()).not.toContain("new-web-gateway-secret");
+});
+
 test("gateway settings send a new key only to the selected host, clear it, and preserve the configured key on a later edit", async ({ page, mock }) => {
   const wire = await wireSettings(page, mock);
   await login(page);
@@ -425,13 +558,23 @@ test("gateway settings send a new key only to the selected host, clear it, and p
   await settings.getByRole("button", { name: "保存提供方", exact: true }).click();
   await expect(settings.getByRole("status")).toContainText("模型提供方已更新");
   await expect(key).toHaveValue("");
-  await settings.getByLabel("中转站 URL", { exact: true }).fill("https://new-gateway.fixture.test/v1");
   await settings.getByRole("button", { name: "保存提供方", exact: true }).click();
   await expect.poll(() => wire.calls.filter(call => call.path === "codex-settings/provider").length).toBe(2);
+  await expect(settings.getByRole("button", { name: "保存提供方", exact: true })).toBeEnabled();
+  await settings.getByLabel("中转站 URL", { exact: true }).fill("https://new-gateway.fixture.test/v1");
+  await settings.getByRole("button", { name: "保存提供方", exact: true }).click();
+  await expect(settings.locator(".codex-settings").getByRole("alert")).toContainText("请输入中转站 API 密钥");
+  expect(wire.calls.filter(call => call.path === "codex-settings/provider")).toHaveLength(2);
+  await key.fill("replacement-gateway-secret");
+  await settings.getByRole("button", { name: "保存提供方", exact: true }).click();
+  await expect.poll(() => wire.calls.filter(call => call.path === "codex-settings/provider").length).toBe(3);
   const writes = wire.calls.filter(call => call.path === "codex-settings/provider");
   expect(writes[0]).toMatchObject({ hostId: remoteHostId, body: { provider: "gateway", baseUrl: "https://gateway.fixture.test/v1", apiKey: "fixture-secret-key", model: "new-remote-model" } });
   expect(writes[1]!.body).not.toHaveProperty("apiKey");
+  expect(writes[2]).toMatchObject({ hostId: remoteHostId, body: { provider: "gateway", baseUrl: "https://new-gateway.fixture.test/v1", apiKey: "replacement-gateway-secret", model: "new-remote-model" } });
+  await expect(key).toHaveValue("");
   expect(await settings.innerText()).not.toContain("fixture-secret-key");
+  expect(await settings.innerText()).not.toContain("replacement-gateway-secret");
 });
 
 test("device-code login can be cancelled and a completed official account is detected", async ({ page, mock }) => {
