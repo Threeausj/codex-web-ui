@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import VirtualTimeline from "./VirtualTimeline.vue";
 import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
@@ -16,11 +16,12 @@ import { messageEditDraft, releaseEditAttachments, uploadedEditAttachments, type
 import { uniqueClipboardFiles } from '../lib/clipboard';
 import { conversationTimelineRows, type ConversationTimelineRow } from '../lib/conversation-timeline';
 import type { ReadingPosition } from '../lib/reading-positions';
-import { captureConversationReading, nearConversationBottom } from '../lib/conversation-reading';
+import { captureConversationReading, nearConversationBottom, restoreConversationReading } from '../lib/conversation-reading';
 
 const props = defineProps<{
   items: DisplayItem[];
   turns: any[];
+  initialReading?: ReadingPosition;
   busy: boolean;
   hideFork?: boolean;
   forkDisabled?: boolean;
@@ -123,8 +124,22 @@ async function revealItem(itemId: string, turnId: string) {
 }
 const timeline = ref<InstanceType<typeof VirtualTimeline>>();
 const location = ref<HTMLElement>();
-const initialReading = ref<ReadingPosition | null>(null);
-const virtualActivated = ref(false);
+const initialReading = ref<ReadingPosition | null>(props.initialReading || null);
+const virtualActivated = ref(props.initialReading !== undefined && props.items.length > 80);
+watch(() => props.initialReading, position => {
+  if (position) initialReading.value = position;
+}, { flush: 'sync' });
+onMounted(async () => {
+  // The conversation viewport is reused while its keyed contents change. Apply
+  // the target thread's cached position before the browser paints that content
+  // at the previous thread's scrollTop; native history can hydrate afterwards.
+  await nextTick();
+  const viewport = location.value?.closest<HTMLElement>('.conversation-scroll, .side-chat-transcript');
+  if (!viewport || virtualActivated.value) return;
+  const position = initialReading.value;
+  if (position?.bottom === false) restoreConversationReading(viewport, position);
+  else viewport.scrollTop = viewport.scrollHeight;
+});
 async function restoreReading(position: ReadingPosition) { if (virtualActivated.value) await timeline.value?.restoreReading(position); }
 function scrollToLatest() { if (virtualActivated.value) timeline.value?.scrollToLatest(); }
 function refreshVirtual() { if (virtualActivated.value) timeline.value?.refresh(); }
@@ -200,7 +215,7 @@ const rows = computed(() => conversationTimelineRows(blocks.value, {
 watch(() => rows.value.length, count => {
   if (count > 80 && !virtualActivated.value) {
     const viewport = location.value?.closest<HTMLElement>('.conversation-scroll, .side-chat-transcript');
-    if (viewport) initialReading.value = captureConversationReading(viewport, nearConversationBottom(viewport));
+    if (!initialReading.value && viewport) initialReading.value = captureConversationReading(viewport, nearConversationBottom(viewport));
     virtualActivated.value = true;
   }
 }, { immediate: true, flush: 'sync' });

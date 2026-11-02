@@ -44,6 +44,93 @@ async function inCenter(element: Locator) {
 const chatTab = (page: Page, title = '已有测试历史') => page.getByRole('tab', { name: title, exact: true });
 const fileTab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
 
+for (const width of [1440, 390]) test(`${width}px: conversation links and existing file tabs preview in the center without opening the workspace sidebar`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });
+  mock.turns.get('thread-existing')![0].items[1].text = `[阅读文档](${readme}) [查看源码](${html}:1)`;
+  files(mock, { [readme]: '# Center-only document\n\n从聊天打开文件不应弹出工作区侧栏。', [html]: '<h1>Center-only source</h1>' });
+  await login(page); await openConversation(page);
+  const workspace = page.locator('#workspace-panel');
+  await expect(workspace).toBeHidden();
+  await page.evaluate(() => {
+    const visibleFrames: boolean[] = [];
+    (window as any).centerPreviewSidebarFrames = visibleFrames;
+    (window as any).stopCenterPreviewSidebarFrames = false;
+    const sample = () => {
+      if ((window as any).stopCenterPreviewSidebarFrames) return;
+      const panel = document.querySelector<HTMLElement>('#workspace-panel');
+      visibleFrames.push(!!panel?.getClientRects().length && getComputedStyle(panel).visibility !== 'hidden');
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+  await page.getByRole('link', { name: '阅读文档', exact: true }).click();
+  const preview = page.getByRole('region', { name: 'Markdown 文件预览' });
+  await inCenter(preview);
+  await expect(preview.getByRole('heading', { name: 'Center-only document', exact: true })).toBeVisible();
+  await expect(workspace).toBeHidden();
+  await expect(fileTab(page, 'README.md')).toHaveAttribute('aria-selected', 'true');
+  await chatTab(page).click();
+  await page.getByRole('link', { name: '查看源码', exact: true }).click();
+  const source = page.getByRole('textbox', { name: 'index.html 文件内容', exact: true });
+  await inCenter(source);
+  await expect(page.locator('.file-editor-footer')).toContainText('定位第 1 行');
+  await expect(workspace).toBeHidden();
+  await chatTab(page).click();
+  await fileTab(page, 'README.md').click();
+  await inCenter(preview);
+  await expect(workspace).toBeHidden();
+  await fileTab(page, 'index.html').click();
+  await inCenter(source);
+  await expect(workspace).toBeHidden();
+  // Sample through the two following paint frames so a transient drawer flash
+  // is caught even when preview readiness precedes its next layout.
+  const panelFrames = await page.evaluate(() => new Promise<boolean[]>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => {
+    (window as any).stopCenterPreviewSidebarFrames = true;
+    resolve((window as any).centerPreviewSidebarFrames);
+  }))));
+  expect(panelFrames.length).toBeGreaterThan(0);
+  expect(panelFrames.some(Boolean), 'opening a chat file or existing file tab must not flash the workspace sidebar').toBe(false);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(mock.request('turn/start')).toBeUndefined();
+});
+
+for (const width of [1440, 390]) test(`${width}px: a side-chat file link opens the center preview without revealing the workspace sidebar`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const sideId = 'center-file-side-branch';
+  const receive = (mock as any).receive.bind(mock);
+  (mock as any).receive = (socket: { send: (raw: string) => void }, request: Request) => {
+    if (request.method === 'thread/fork' && request.params?.ephemeral) {
+      mock.requests.push(request);
+      mock.turns.set(sideId, []);
+      return socket.send(JSON.stringify({ id: request.id, result: {
+        thread: { ...mock.threads[0], id: sideId, ephemeral: true, forkedFromId: 'thread-existing', turns: [] },
+        model: mock.config.model, reasoningEffort: 'medium', sandbox: { type: 'readOnly' },
+      } }));
+    }
+    return receive(socket, request);
+  };
+  files(mock, { [readme]: '# Side-chat document' });
+  mock.holdFinalMessage = true;
+  await login(page); await openConversation(page);
+  await page.getByRole('button', { name: '新建侧边聊天', exact: true }).click();
+  await page.getByRole('textbox', { name: '基于当前对话提问', exact: true }).fill('给出文件链接');
+  await page.getByRole('button', { name: '发送侧边问题', exact: true }).click();
+  await expect.poll(() => mock.turns.get(sideId)?.length || 0).toBeGreaterThan(0);
+  const turn = mock.turns.get(sideId)!.at(-1)!;
+  mock.emit('item/completed', { threadId: sideId, turnId: turn.id, item: {
+    id: 'center-side-file-answer', type: 'agentMessage', text: `[侧边文件](${readme})`,
+  } });
+  const side = page.locator('#side-chat-panel');
+  await side.getByRole('link', { name: '侧边文件', exact: true }).click();
+  const preview = page.getByRole('region', { name: 'Markdown 文件预览' });
+  await inCenter(preview);
+  await expect(preview.getByRole('heading', { name: 'Side-chat document', exact: true })).toBeVisible();
+  await expect(side).toBeHidden();
+  await expect(page.locator('#workspace-panel')).toBeHidden();
+  await expect(fileTab(page, 'README.md')).toHaveAttribute('aria-selected', 'true');
+  expect(mock.requests.filter(request => request.method === 'turn/interrupt')).toEqual([]);
+});
+
 for (const width of [1440, 390]) test(`${width}px: opening a workspace file uses the middle column and switching back retains the chat draft`, async ({ page, mock }) => {
   await page.setViewportSize({ width, height: 900 });
   files(mock, { [readme]: '# Middle column document\n\n内容应显示在聊天同级的中间栏。' });
