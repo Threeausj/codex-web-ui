@@ -154,6 +154,7 @@ test('late saves of a different file cannot replace the editor or unlock another
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => pending.has('/workspace/demo/README.md')).toBe(true);
   page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('tab', { name: '已有测试历史', exact: true }).click();
   await page.getByRole('link', { name: '打开另一个文件', exact: true }).click();
   const second = page.getByRole('textbox', { name: 'index.html 文件内容' });
   await expect(second).toHaveText('<h1>Demo preview</h1>');

@@ -81,7 +81,7 @@ test('switching hosts discards the previous host directory and pending file-link
   await switchConversation(page, 'host-b', 'Beta 会话');
   await expect(page.getByRole('textbox', { name: '目录路径', exact: true })).toHaveValue('/srv/beta');
   await expect(page.locator('.file-tree-row')).toHaveText(['beta.ts']);
-  await expect(page.getByRole('navigation', { name: '已打开文件' })).toHaveCount(0);
+  await expect(page.locator('.chat-tabs .file-tab')).toHaveCount(0);
   await expect(page.locator('.workspace-panel .panel-error')).toHaveCount(0);
   await expect(page.locator('.global-error')).toHaveCount(0);
   expect(remote.requests.filter(request => request.method?.startsWith('fs/') && request.params?.path?.startsWith('/srv/alpha'))).toEqual([]);
@@ -103,9 +103,11 @@ test('the same path on two hosts keeps separate unsaved tabs and restores each d
   await expect(page.getByRole('textbox', { name: 'shared.ts 文件内容', exact: true })).toHaveText('const source = "beta";');
   await editSource(page, 'shared.ts 文件内容', 'const draft = "beta unsaved";');
   await switchConversation(page, 'local', 'Alpha 会话');
+  await page.getByRole('tab', { name: 'shared.ts', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'shared.ts 文件内容', exact: true })).toHaveText('const draft = "alpha unsaved";');
   await expect(page.locator('.file-editor-footer')).toContainText('未保存');
   await switchConversation(page, 'host-b', 'Beta 会话');
+  await page.getByRole('tab', { name: 'shared.ts', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'shared.ts 文件内容', exact: true })).toHaveText('const draft = "beta unsaved";');
   await expect(page.locator('.file-editor-footer')).toContainText('未保存');
   expect([...mock.requests, ...remote.requests].filter(request => request.method === 'fs/writeFile')).toEqual([]);
@@ -130,7 +132,7 @@ test('late directory and file responses from Alpha cannot replace the selected B
   await page.locator('.file-tree-row').filter({ hasText: 'beta.ts' }).click();
   await expect(page.getByRole('textbox', { name: 'beta.ts 文件内容', exact: true })).toHaveText('const beta = true;');
   await expect(page.getByRole('textbox', { name: '目录路径', exact: true })).toHaveValue('/srv/beta');
-  await expect(page.getByRole('navigation', { name: '已打开文件' })).not.toContainText('late.ts');
+  await expect(page.getByRole('tab', { name: 'late.ts', exact: true })).toHaveCount(0);
   await expect(page.locator('.workspace-panel .panel-error')).toHaveCount(0);
 });
 

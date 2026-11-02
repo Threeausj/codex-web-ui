@@ -148,6 +148,19 @@ let foregroundTimer: ReturnType<typeof setTimeout> | undefined;
 const sidebarOpen = ref(false);
 const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
+const workspaceMounted = ref(false);
+type CenterFileTab = { path: string; title: string; dirty: boolean; saving: boolean };
+type FileWorkspaceState = { scope: string; hostId: string; projectPath: string; files: CenterFileTab[]; activePath: string };
+const fileWorkspace = ref<FileWorkspaceState | null>(null);
+const selectedFilePath = ref<string | null>(null);
+const centerFileVisible = computed(() => !!selectedFilePath.value && fileWorkspace.value?.scope === workspaceScope() &&
+  fileWorkspace.value.files.some(file => file.path === selectedFilePath.value));
+const centerFileTabs = computed(() => fileWorkspace.value?.scope === workspaceScope() ? fileWorkspace.value.files : []);
+watch(workspaceOpen, open => { if (open) workspaceMounted.value = true; }, { flush: 'sync' });
+watch(() => [state.hostId, state.projectPath, state.authenticationGeneration], () => {
+  selectedFilePath.value = null; fileWorkspace.value = null;
+});
+watch(() => state.authenticated, authenticated => { if (!authenticated) { workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; } });
 const composer = ref<InstanceType<typeof Composer>>();
 const movingProject = ref<{ thread: any; hostId: string } | null>(null);
 const attachedThreads = ref<{ thread: any; hostId: string } | null>(null);
@@ -157,6 +170,7 @@ const settingsOpen = ref(false);
 const settingsPanel = ref<InstanceType<typeof SettingsPanel>>();
 useMobilePanelBack(() => state.authenticated, [
   { id: 'sidebar', visible: () => sidebarOpen.value, close: () => { sidebarOpen.value = false; } },
+  { id: 'center-file', visible: () => centerFileVisible.value, close: () => { void showCenterChat(); } },
   { id: 'workspace', visible: () => workspaceOpen.value && !sideChat.state.open, close: () => { workspaceOpen.value = false; } },
   // Back hides the side chat so its question and running answer remain intact.
   { id: 'side-chat', visible: () => sideChat.state.open, close: () => sideChat.hide() },
@@ -516,7 +530,7 @@ async function action(fn: () => any) {
 function saveScroll() {
   // Cached history paints before native hydration finishes. Its initial layout
   // must not replace the reading position saved by the previous app window.
-  if (state.loading || state.selectingThread || (state.activeThread && !state.threadReady)) return;
+  if (centerFileVisible.value || state.loading || state.selectingThread || (state.activeThread && !state.threadReady)) return;
   if (!state.authenticated || !scroll.value || !state.activeThread?.id) return;
   const key = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
   if (key !== restoredScrollKey) return;
@@ -527,7 +541,7 @@ function saveScroll() {
 async function restoreScroll(id: string, generation = navigationSelection) {
   const hostId = state.hostId, authentication = api.runtimeIdentity().authenticationGeneration;
   const key = `codex.scroll.${hostId}.${id}`;
-  const current = () => generation === navigationSelection && hostId === state.hostId &&
+  const current = () => !centerFileVisible.value && generation === navigationSelection && hostId === state.hostId &&
     id === state.activeThread?.id && authentication === api.runtimeIdentity().authenticationGeneration;
   let position: ReadingPosition | null = null;
   try {
@@ -552,6 +566,7 @@ async function selectThread(
   selection: string | { id: string; hostId: string },
 ) {
   if (state.editingMessage) return false;
+  await showCenterChat();
   threadMenu.value = false;
   const generation = ++navigationSelection;
   const id = typeof selection === "string" ? selection : selection.id;
@@ -575,8 +590,49 @@ async function selectThread(
   return generation === navigationSelection && hostId === state.hostId &&
     id === state.activeThread?.id && state.threadReady && !state.threadConflict;
 }
+async function showCenterChat() {
+  const wasFile = selectedFilePath.value !== null;
+  selectedFilePath.value = null;
+  await nextTick();
+  if (wasFile && state.activeThread?.id) await restoreScroll(state.activeThread.id);
+}
+function updateFileWorkspace(value: FileWorkspaceState) {
+  if (value.scope !== workspaceScope() || value.hostId !== state.hostId || !state.authenticated) return;
+  fileWorkspace.value = value;
+  if (selectedFilePath.value && !value.files.some(file => file.path === selectedFilePath.value)) {
+    if (value.activePath && value.files.some(file => file.path === value.activePath)) selectedFilePath.value = value.activePath;
+    else void showCenterChat();
+  }
+  else if (selectedFilePath.value && !value.activePath) void showCenterChat();
+}
+function previewCenterFile(value: { path: string; hostId: string; projectPath: string }) {
+  if (!state.authenticated || value.hostId !== state.hostId || value.projectPath !== state.projectPath) return;
+  if (!centerFileVisible.value) saveScroll();
+  selectedFilePath.value = value.path;
+  threadMenu.value = false;
+  sidebarOpen.value = false;
+  if (window.matchMedia('(max-width: 760px)').matches) workspaceOpen.value = false;
+}
+async function selectFileTab(path: string) {
+  if (chatTabsDisabled.value) return;
+  await workspace.value?.activateFile(path);
+}
+async function closeFileTab(path: string) {
+  if (chatTabsDisabled.value) return;
+  if (await workspace.value?.closeEditor(path) === false) return;
+  await nextTick();
+  chatTabsView.value?.focusSelected();
+}
+function filePreviewFailed(value: { path: string; hostId: string; projectPath: string }) {
+  if (value.hostId !== state.hostId || value.projectPath !== state.projectPath) return;
+  void showCenterChat();
+  workspaceOpen.value = true;
+  workspaceTab.value = 'files';
+}
 async function selectChatTab(tab: ChatTabTarget) {
-  if (chatTabsDisabled.value || sameChatTab(tab, selectedChatTab.value)) return;
+  if (chatTabsDisabled.value) return;
+  await showCenterChat();
+  if (sameChatTab(tab, selectedChatTab.value)) return;
   await selectThread({ hostId: tab.hostId, id: tab.threadId });
 }
 async function closeChatTab(tab: ChatTabTarget) {
@@ -617,6 +673,7 @@ async function toggleChatTabPin() {
 }
 async function newThread() {
   if (state.editingMessage) return;
+  await showCenterChat();
   ++navigationSelection;
   saveScroll();
   sidebarOpen.value = false;
@@ -632,6 +689,7 @@ async function forceEnterThread() {
 }
 async function selectProject(project: any) {
   if (state.editingMessage) return;
+  await showCenterChat();
   const generation = ++navigationSelection;
   const hostId = project.hostId || "local";
   saveScroll();
@@ -673,7 +731,7 @@ async function chooseNewContext(hostId: string, path?: string | null) {
 function openWorkspace(tab = "files", path = "", line?: number) {
   sideChat.hide();
   const targetScope = workspaceScope();
-  const samePath = workspaceOpen.value && workspacePathScope.value === targetScope && workspacePath.value === path;
+  const samePath = workspaceMounted.value && workspacePathScope.value === targetScope && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceOpen.value = true;
   workspacePath.value = path;
@@ -706,7 +764,9 @@ function selectedSource(value: ConversationSelectionSource) {
 function addToConversation(value: ConversationSelectionSource) {
   const source = selectedSource(value);
   if (!source) return;
-  if (composer.value?.addContext(source)) api.toast('已添加到对话');
+  void showCenterChat().then(() => {
+    if (selectedSource(source) && composer.value?.addContext(source)) api.toast('已添加到对话');
+  });
 }
 function openSideChat() {
   try {
@@ -1044,6 +1104,7 @@ function onPageShow(event: PageTransitionEvent) {
   if (event.persisted) onForeground();
 }
 function onScroll() {
+  if (centerFileVisible.value) return;
   if (scroll.value) {
     const element = scroll.value;
     const changedLayout = element.scrollHeight !== lastScrollHeight;
@@ -1083,7 +1144,7 @@ function onReadingTouchMove(event: TouchEvent) {
     pauseFollowing();
 }
 function readingLayoutReady() {
-  return !!state.activeThread && restoredScrollKey === `codex.scroll.${state.hostId}.${state.activeThread.id}` &&
+  return !centerFileVisible.value && !!state.activeThread && restoredScrollKey === `codex.scroll.${state.hostId}.${state.activeThread.id}` &&
     !state.loading && !state.selectingThread && state.threadReady;
 }
 function queueReadingLayout() {
@@ -1106,6 +1167,7 @@ function queueReadingLayout() {
   });
 }
 function scrollBottom() {
+  if (centerFileVisible.value) return;
   if (scroll.value) {
     if (state.activeThread && !state.loading && !state.selectingThread && state.threadReady)
       restoredScrollKey = `codex.scroll.${state.hostId}.${state.activeThread.id}`;
@@ -1450,8 +1512,8 @@ watch(() => [state.authenticated, state.loading], () => {
             <Icon name="PanelLeft" />
           </button>
           <ChatTabs ref="chatTabsView" :tabs="chatTabs.state.entries" :active-key="activeChatTabKey"
-            :draft="!state.activeThread" :disabled="chatTabsDisabled"
-            @select="selectChatTab" @close="closeChatTab" @new="newThread">
+            :draft="!state.activeThread" :disabled="chatTabsDisabled" :file-tabs="centerFileTabs" :active-file-path="centerFileVisible ? selectedFilePath : null"
+            @select="selectChatTab" @close="closeChatTab" @new="newThread" @select-draft="showCenterChat" @select-file="selectFileTab" @close-file="closeFileTab">
             <template #menu>
           <div class="thread-menu-wrapper">
             <button
@@ -1633,7 +1695,8 @@ watch(() => [state.authenticated, state.loading], () => {
         <button class="button button-small button-secondary" @click="showChoices">查看问题</button>
         <button class="icon-button dismiss-choice-reminder" aria-label="关闭问题提醒" title="关闭问题提醒" :disabled="api.asyncQuestionNoticesState.busy" @click="dismissChoiceReminder"><Icon :name="api.asyncQuestionNoticesState.busy ? 'LoaderCircle' : 'X'" :size="16" :class="{ spin: api.asyncQuestionNoticesState.busy }" /></button>
       </div>
-      <div class="conversation-shell" :class="{ 'welcome-state': welcome }">
+      <div id="center-file-preview-target" v-show="centerFileVisible" class="center-file-preview-target"></div>
+      <div v-show="!centerFileVisible" class="conversation-shell" :class="{ 'welcome-state': welcome }">
         <div ref="scroll" class="conversation-scroll" @scroll="onScroll" @wheel.passive="onReadingWheel" @touchstart.passive="onReadingTouchStart" @touchmove.passive="onReadingTouchMove">
           <div v-if="!state.hosts.length" class="welcome no-host-welcome">
             <div class="welcome-mark"><Icon name="Network" :size="27" /></div>
@@ -1817,28 +1880,33 @@ watch(() => [state.authenticated, state.loading], () => {
       </div>
     </section>
     <ConversationImageViewer v-if="conversationImages.image.value" :image="conversationImages.image.value" @close="conversationImages.close" />
-    <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="!state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
+    <ConversationSelectionToolbar :container="scroll" :host-id="state.hostId" :thread-id="state.activeThread?.id" :thread-name="threadTitle" :disabled="centerFileVisible || !state.authenticated || state.selectingThread || state.switchingHost || state.changingContext || state.editingMessage" @add="addToConversation" @ask="askInSideChat" @bookmark="bookmarkSelection" />
     <BookmarksPanel v-if="bookmarks.state.open && state.authenticated" :entries="bookmarks.state.entries" :project-name="bookmarks.state.projectName" :all-projects="bookmarks.state.allProjects" :projects="state.projects" :hosts="state.hosts" :loading="bookmarks.state.loading" :error="bookmarks.state.error" :busy-id="bookmarks.state.busyId" @close="bookmarks.close" @open="openBookmark" @rename="renameBookmark" @remove="bookmarks.remove" @refresh="bookmarks.refresh" />
     <BookmarkNameDialog v-if="bookmarkNaming && state.authenticated" :mode="bookmarkNaming.mode" :kind="bookmarkNaming.input.kind === 'thread' ? 'thread' : 'message'" :initial-name="bookmarkNaming.initialName" :excerpt="bookmarkNaming.input.kind === 'thread' ? undefined : bookmarkNaming.input.source.text" :busy="bookmarkSaving" :error="bookmarkError" @close="bookmarkNaming = null" @save="saveBookmark" />
     <ThreadProjectMoveDialog v-if="movingProject && state.authenticated" :key="`${movingProject.hostId}:${movingProject.thread.id}`" :thread="movingProject.thread" :host-id="movingProject.hostId" :state="state" :api="api" @close="movingProject = null" />
     <AttachedThreadsPanel v-if="attachedThreads && state.authenticated" :key="`${attachedThreads.hostId}:${attachedThreads.thread.id}`" :thread="attachedThreads.thread" :host-id="attachedThreads.hostId" :state="state" :api="api" @close="attachedThreads = null" @open="selection => { attachedThreads = null; selectThread(selection); }" />
-    <ResizableWorkspace v-if="workspaceOpen && currentHost" v-show="!sideChat.state.open">
+    <ResizableWorkspace v-if="workspaceMounted && currentHost" v-show="workspaceOpen && !sideChat.state.open" :active="workspaceOpen && !sideChat.state.open">
       <WorkspacePanel
         id="workspace-panel"
         ref="workspace"
         :api="api"
         :state="state"
+        file-preview-target="#center-file-preview-target"
+        :file-preview-visible="centerFileVisible"
         :initial-tab="workspaceTab"
         :open-path="scopedWorkspacePath"
         :open-line="scopedWorkspacePath ? workspaceLine : undefined"
         :tmux-target="workspaceTmuxTarget?.hostId === state.hostId ? workspaceTmuxTarget : undefined"
         @close="workspaceOpen = false"
+        @file-tabs-change="updateFileWorkspace"
+        @preview-file="previewCenterFile"
+        @file-open-failed="filePreviewFailed"
         @error="showError"
         @add="addToConversation"
         @ask="askInSideChat"
       />
     </ResizableWorkspace>
-    <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" panel-id="side-chat-panel">
+    <ResizableWorkspace v-if="sideChat.state.source" v-show="sideChat.state.open" :active="sideChat.state.open" panel-id="side-chat-panel">
       <SideChatPanel id="side-chat-panel" ref="sideChatPanel" :controller="sideChat" :api="api" :main-state="state" @quote="addToConversation" @open-parent="returnSideChatParent" @open-file="openSideChatFile" />
     </ResizableWorkspace>
     <ProjectDialog
@@ -1980,4 +2048,5 @@ watch(() => [state.authenticated, state.loading], () => {
 .compaction-progress { display: flex; align-items: center; gap: 7px; padding: 6px 4px; color: var(--muted); font-size: 12px; }
 :global(::highlight(conversation-bookmark)) { background: #dba62966; color: inherit; }
 :global(.bookmark-location) { outline: 2px solid #dba62988; outline-offset: 6px; border-radius: 4px; }
+.center-file-preview-target { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
 </style>

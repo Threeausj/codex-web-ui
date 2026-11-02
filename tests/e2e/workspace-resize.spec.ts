@@ -50,7 +50,7 @@ test("dragging the divider changes real workspace width, keeps chat usable and p
   await send(page, "拖动后聊天仍可用");
   await expect(page.locator(".agent-message")).toContainText("流式回复完成");
   await page.getByRole("button", { name: "关闭工作区", exact: true }).click();
-  await expect(panel(page)).toHaveCount(0);
+  await expect(panel(page)).toBeHidden();
   await page.getByRole("button", { name: "切换工作区", exact: true }).click();
   await expect.poll(() => width(page)).toBe(590);
   await page.reload();
@@ -144,10 +144,11 @@ test("dragging across a preview iframe, cancelling with Escape and closing mid-d
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
+  await page.route("https://preview-resize.invalid/**", route => route.fulfill({ contentType: "text/html", body: "<!doctype html><p>External preview surface</p>" }));
   await login(page);
   await slash(page, "terminal");
   await page.getByRole("button", { name: "预览", exact: true }).click();
-  await page.getByRole("textbox", { name: "预览地址" }).fill("index.html");
+  await page.getByRole("textbox", { name: "预览地址" }).fill("https://preview-resize.invalid/page");
   await page.getByRole("button", { name: "打开预览", exact: true }).click();
   const frame = page.locator('iframe[title="项目预览"]');
   await expect(frame).toBeVisible();
@@ -187,7 +188,7 @@ test("dragging across a preview iframe, cancelling with Escape and closing mid-d
     page.getByRole("button", { name: "关闭工作区", exact: true }),
   ).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(panel(page)).toHaveCount(0);
+  await expect(panel(page)).toBeHidden();
   await expect(page.locator(".workspace-drag-overlay")).toHaveCount(0);
   expect(
     await page.evaluate(() => ({
@@ -236,10 +237,11 @@ test("workspace drag resizes the existing PTY's columns without starting another
 
 test("preview focus changes and unexpected pointer capture loss keep the last dragged width", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
+  await page.route("https://preview-resize.invalid/**", route => route.fulfill({ contentType: "text/html", body: "<!doctype html><p>External preview surface</p>" }));
   await login(page);
   await slash(page, "terminal");
   await page.getByRole("button", { name: "预览", exact: true }).click();
-  await page.getByRole("textbox", { name: "预览地址" }).fill("index.html");
+  await page.getByRole("textbox", { name: "预览地址" }).fill("https://preview-resize.invalid/page");
   await page.getByRole("button", { name: "打开预览", exact: true }).click();
   const frame = page.locator('iframe[title="项目预览"]');
   await expect(frame).toBeVisible();

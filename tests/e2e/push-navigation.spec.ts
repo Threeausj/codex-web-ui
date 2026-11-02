@@ -31,7 +31,7 @@ test("notification navigation opens a remote chat from an existing window and ig
     detail: { hostId: "ssh-test", threadId: "thread-existing" },
   })));
   await expect(page.locator(".agent-message")).toContainText("远程通知对应的内容");
-  await expect(page.locator("#workspace-panel")).toHaveCount(0);
+  await expect(page.locator("#workspace-panel")).toBeHidden();
   const requests = remote.requests.length;
   await page.evaluate(() => window.dispatchEvent(new CustomEvent("codex:push-navigate", {
     detail: { hostId: "https://attacker.invalid", threadId: "thread-existing" },

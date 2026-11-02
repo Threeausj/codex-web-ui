@@ -113,7 +113,7 @@ test("a failed Markdown save preserves the draft and can be retried from preview
   await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
   await editSource(page, "README.md 文件内容", "# Retained draft");
   await page.getByRole("button", { name: "保存", exact: true }).click();
-  await expect(page.locator(".panel-error")).toContainText("写入失败");
+  await expect(page.locator(".center-file-preview .panel-error")).toContainText("写入失败");
   await page.locator(".file-view-switch").getByRole("button", { name: "预览", exact: true }).click();
   await expect(page.getByRole("region", { name: "Markdown 文件预览" }).getByRole("heading", { name: "Retained draft" })).toBeVisible();
   await expect(page.getByText("未保存", { exact: true })).toBeVisible();
