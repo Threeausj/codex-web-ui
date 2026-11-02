@@ -113,7 +113,7 @@ test("JSON draft preview and tab switches do not rewrite or save original source
   await page.getByRole("button", { name: "返回文件列表", exact: true }).click();
   await page.locator(".file-tree-row").filter({ hasText: "other.json" }).click();
   await expect(page.getByRole("textbox", { name: "other.json 文件内容", exact: true })).toHaveAttribute("aria-readonly", "true");
-  await page.getByRole("navigation", { name: "已打开文件" }).getByRole("button", { name: "datasets.json", exact: true }).click();
+  await page.getByRole("tab", { name: "datasets.json", exact: true }).click();
   await expect(editor).toContainText("新数据/测试.nii.gz");
   await expect(editor).toHaveAttribute("aria-readonly", "true");
   await viewSwitch(page).getByRole("button", { name: "源码", exact: true }).click();

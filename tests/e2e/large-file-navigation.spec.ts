@@ -82,6 +82,7 @@ test('a failed preview replaces the previous editor and clears a stale filename 
   await page.getByRole('textbox', { name: '搜索文件名', exact: true }).fill('README');
   await page.locator('.file-tree-row').filter({ hasText: 'README.md' }).click();
   await expect(page.getByRole('region', { name: 'Markdown 文件预览' })).toBeVisible();
+  await page.getByRole('tab', { name: '已有测试历史', exact: true }).click();
   await page.getByRole('link', { name: '更新后的 13 例 ZIP（1.17 GiB）', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '目录路径', exact: true })).toHaveValue(directory);
   await expect(page.getByRole('textbox', { name: '搜索文件名', exact: true })).toHaveValue('');
@@ -89,7 +90,7 @@ test('a failed preview replaces the previous editor and clears a stale filename 
   await expect(page.getByRole('region', { name: 'Markdown 文件预览' })).toHaveCount(0);
   // The tab survives for later reading; only the failed link's containing
   // directory becomes active, so an unsaved file cannot be silently discarded.
-  await expect(page.getByRole('navigation', { name: '已打开文件' })).toContainText('README.md');
+  await expect(page.getByRole('tab', { name: 'README.md', exact: true })).toBeVisible();
   const downloadReady = page.waitForEvent('download');
   await page.getByRole('button', { name: `下载 ${filename}`, exact: true }).click();
   const download = await downloadReady;
@@ -129,6 +130,7 @@ for (const outcome of ['success', 'failure'] as const) {
     await page.getByRole('link', { name: '已缓存 B', exact: true }).click();
     const cachedEditor = page.getByRole('textbox', { name: 'cached.txt 文件内容', exact: true });
     await expect(cachedEditor).toHaveText('cached B remains selected');
+    await page.getByRole('tab', { name: '已有测试历史', exact: true }).click();
     await page.getByRole('link', { name: '挂起 A', exact: true }).click();
     await expect.poll(() => !!release).toBe(true);
     await page.getByRole('link', { name: '已缓存 B', exact: true }).click();
@@ -145,7 +147,7 @@ for (const outcome of ['success', 'failure'] as const) {
     // frame before checking that the stale success/error had no effect.
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await expect(cachedEditor).toHaveText('cached B remains selected');
-    await expect(page.getByRole('navigation', { name: '已打开文件' })).not.toContainText('late.txt');
+    await expect(page.getByRole('tab', { name: 'late.txt', exact: true })).toHaveCount(0);
     await expect(page.locator('.workspace-panel .panel-error, .global-error')).toHaveCount(0);
     expect(mock.requests.filter(request => request.method === 'fs/readFile' && request.params.path === cachedPath)).toHaveLength(1);
   });

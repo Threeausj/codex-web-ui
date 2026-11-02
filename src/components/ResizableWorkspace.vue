@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-withDefaults(defineProps<{ panelId?: string }>(), { panelId: 'workspace-panel' });
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+const props = withDefaults(defineProps<{ panelId?: string; active?: boolean }>(), { panelId: 'workspace-panel', active: true });
 
 const storageKey = "codex.workspaceWidth";
 const widthChangeEvent = "codex:workspace-width";
@@ -58,7 +58,7 @@ function syncPreferredWidth(event: Event) {
     preferredWidth.value = value;
 }
 function begin(event: PointerEvent) {
-  if (mobile.value || event.button !== 0 || dragging.value) return;
+  if (!props.active || mobile.value || event.button !== 0 || dragging.value) return;
   event.preventDefault();
   measure();
   startX = event.clientX;
@@ -103,11 +103,13 @@ function interruptPointer(event: PointerEvent) {
 // Escape and explicit cancellation still restore the width from before dragging.
 function interruptDrag() { finish(); }
 function reset() {
+  if (!props.active) return;
   finish(false);
   preferredWidth.value = null;
   persist();
 }
 function keydown(event: KeyboardEvent) {
+  if (!props.active) return;
   if (event.key === "Escape" && dragging.value) {
     event.preventDefault();
     event.stopPropagation();
@@ -123,6 +125,9 @@ function keydown(event: KeyboardEvent) {
     clamp(width.value + (event.key === "ArrowLeft" ? step : -step));
   persist();
 }
+// A retained workspace can be hidden without unmounting. Release capture
+// and the page-wide overlay before its separator disappears.
+watch(() => props.active, active => { if (!active) finish(false); }, { flush: "sync" });
 onMounted(() => {
   measure();
   const parent = element.value?.parentElement;

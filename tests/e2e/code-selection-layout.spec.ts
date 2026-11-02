@@ -56,10 +56,11 @@ for (const size of [
     await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).click();
     await page.getByRole('link', { name: '长源码', exact: true }).click();
     const editor = page.getByRole('textbox', { name: 'selection-layout.ts 文件内容', exact: true });
-    const scroller = page.locator('#workspace-panel .cm-scroller');
-    const toolbar = page.locator('#workspace-panel .code-selection-toolbar');
+    const preview = page.locator('.center-file-preview');
+    const scroller = preview.locator('.cm-scroller');
+    const toolbar = preview.locator('.code-selection-toolbar');
     await expect(editor).toBeVisible();
-    await expect(page.locator('#workspace-panel').getByRole('button', { name: '添加到对话', exact: true })).toHaveCount(0);
+    await expect(preview.getByRole('button', { name: '添加到对话', exact: true })).toHaveCount(0);
     await scroller.evaluate(element => { element.scrollTop = 1400; });
     await nextPaint(page);
     await expect.poll(async () => {
@@ -74,7 +75,7 @@ for (const size of [
       })?.textContent;
     });
     expect(line).toBeTruthy();
-    await page.locator('#workspace-panel .cm-line').filter({ hasText: line! }).click({ position: { x: 85, y: 6 } });
+    await preview.locator('.cm-line').filter({ hasText: line! }).click({ position: { x: 85, y: 6 } });
     await editor.press('Home');
     await editor.press('ArrowRight');
     await editor.press('ArrowRight');
@@ -91,7 +92,7 @@ for (const size of [
       await expect(add).toBeVisible();
       await expect(ask).toBeVisible();
       await expectUnmoved(scroller, before);
-      const [bar, panel, addBox, askBox] = await Promise.all([toolbar.boundingBox(), page.locator('#workspace-panel').boundingBox(), add.boundingBox(), ask.boundingBox()]);
+      const [bar, panel, addBox, askBox] = await Promise.all([toolbar.boundingBox(), preview.boundingBox(), add.boundingBox(), ask.boundingBox()]);
       expect(bar!.y).toBeGreaterThanOrEqual(before.top + before.height - 1);
       expect(bar!.height).toBeCloseTo(inactiveBox!.height, 0);
       expect(addBox!.x).toBeGreaterThanOrEqual(panel!.x);
@@ -106,17 +107,17 @@ for (const size of [
     await selectCode(page, editor);
     await add.click();
     await expect(page.locator('.composer-quote')).toContainText('selection-layout.ts');
-    if (!await page.locator('#workspace-panel').isVisible()) {
-      await page.getByRole('link', { name: '长源码', exact: true }).click();
+    if (!await preview.isVisible()) {
+      await page.getByRole('tab', { name: 'selection-layout.ts', exact: true }).click();
       await expect(editor).toBeVisible();
-      await page.locator('#workspace-panel .cm-line').first().click();
+      await preview.locator('.cm-line').first().click();
       await editor.press('Home');
       await selectCode(page, editor);
     }
-    await expect(page.locator('#workspace-panel')).toBeVisible();
+    await expect(preview).toBeVisible();
     await expect(ask).toBeVisible();
     if (process.env.EDITOR_TOOLBAR_SCREENSHOT_DIR && (size.name === 'desktop' || size.name === 'mobile')) {
-      await page.locator('#workspace-panel').screenshot({ path: `${process.env.EDITOR_TOOLBAR_SCREENSHOT_DIR}/editor-toolbar-${size.name}.png` });
+      await preview.screenshot({ path: `${process.env.EDITOR_TOOLBAR_SCREENSHOT_DIR}/editor-toolbar-${size.name}.png` });
     }
     await ask.click();
     await expect(page.getByRole('region', { name: '侧边聊天', exact: true })).toBeVisible();

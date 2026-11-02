@@ -43,15 +43,15 @@ async function openWorkspace(page: Page, name: "变更" | "预览") {
   await panel(page).getByRole("button", { name: new RegExp(`^${name}`) }).click();
 }
 
-async function boundedPreview(page: Page, title = "项目预览", containerSelector = ".preview-frame-container") {
-  const frame = panel(page).locator(`iframe[title="${title}"]`);
+async function boundedPreview(page: Page, title = "项目预览", containerSelector = ".preview-frame-container", previewPanel = panel(page)) {
+  const frame = previewPanel.locator(`iframe[title="${title}"]`);
   await expect(frame).toBeVisible();
   await expect
     .poll(async () => {
       const [frameBox, containerBox, panelBox] = await Promise.all([
         frame.boundingBox(),
-        panel(page).locator(containerSelector).boundingBox(),
-        panel(page).boundingBox(),
+        previewPanel.locator(containerSelector).boundingBox(),
+        previewPanel.boundingBox(),
       ]);
       if (!frameBox || !containerBox || !panelBox) return false;
       return (
@@ -120,7 +120,7 @@ for (const viewport of [
     await actualDiffLines(last.locator(".diff-code"), changes.at(-1)!.diff);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
     await last.getByRole("button", { name: `打开文件 ${changes.at(-1)!.path}`, exact: true }).click();
-    await expect(panel(page).getByRole("textbox", { name: "long-component-name-45.vue 文件内容" })).toHaveText(/文件读取正常/);
+    await expect(page.locator('.center-file-preview').getByRole("textbox", { name: "long-component-name-45.vue 文件内容" })).toHaveText(/文件读取正常/);
     expect(mock.request("fs/readFile")?.params.path).toBe(changes.at(-1)!.path);
   });
 }
@@ -144,22 +144,24 @@ for (const viewport of [
   { label: "desktop", width: 1440, height: 480 },
   { label: "phone", width: 390, height: 480 },
 ]) {
-  test(`${viewport.label}: short-screen HTML preview keeps toolbar controls usable and iframe within the workspace`, async ({ page }) => {
+  test(`${viewport.label}: short-screen local HTML preview keeps file controls usable and iframe within the middle column`, async ({ page }) => {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await login(page);
     await openWorkspace(page, "预览");
     const input = panel(page).getByRole("textbox", { name: "预览地址" });
     await input.fill("index.html");
     await panel(page).getByRole("button", { name: "打开预览", exact: true }).click();
-    await expect(input).toBeInViewport();
-    const toolbarBox = await panel(page).locator(".preview-toolbar").boundingBox();
-    expect(toolbarBox!.height).toBeGreaterThanOrEqual(40);
-    await expect(panel(page).getByRole("button", { name: "刷新预览", exact: true })).toBeInViewport();
-    await boundedPreview(page);
-    await panel(page).getByRole("button", { name: "手机预览", exact: true }).click();
-    await boundedPreview(page);
-    await panel(page).getByRole("button", { name: "刷新预览", exact: true }).click();
-    await boundedPreview(page);
+    const preview = page.locator('.center-file-preview');
+    await expect(preview).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'index.html', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await expect(preview.getByRole('button', { name: '下载文件', exact: true })).toBeInViewport();
+    const source = preview.locator('[aria-label="HTML 显示方式"]').getByRole('button', { name: '源码', exact: true });
+    await expect(source).toBeInViewport();
+    await boundedPreview(page, '项目预览', '.file-html-preview', preview);
+    await source.click();
+    await expect(preview.getByRole('textbox', { name: 'index.html 文件内容', exact: true })).toBeVisible();
+    await preview.locator('[aria-label="HTML 显示方式"]').getByRole('button', { name: '预览', exact: true }).click();
+    await boundedPreview(page, '项目预览', '.file-html-preview', preview);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   });
 
