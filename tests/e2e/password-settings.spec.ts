@@ -9,7 +9,7 @@ async function openPasswordSettings(page: Page) {
   const sidebar = page.getByRole('button', { name: '打开侧边栏', exact: true });
   if (await sidebar.isVisible()) await sidebar.click();
   await page.locator('.settings-button').click();
-  await page.locator('.settings-nav').getByRole('button', { name: '账户', exact: true }).click();
+  await page.locator('.settings-nav').getByRole('button', { name: '通用', exact: true }).click();
   await page.getByRole('button', { name: '修改访问密码', exact: true }).click();
   await expect(page.locator('#password-change-form')).toBeVisible();
 }
@@ -148,8 +148,8 @@ test('cancel, switching settings sections and closing the settings panel discard
   await page.getByRole('button', { name: '修改访问密码', exact: true }).click();
   await expectEmptyPasswords(page);
   await fillPasswords(page);
+  await page.locator('.settings-nav').getByRole('button', { name: 'Codex', exact: true }).click();
   await page.locator('.settings-nav').getByRole('button', { name: '通用', exact: true }).click();
-  await page.locator('.settings-nav').getByRole('button', { name: '账户', exact: true }).click();
   await page.getByRole('button', { name: '修改访问密码', exact: true }).click();
   await expectEmptyPasswords(page);
   await fillPasswords(page);

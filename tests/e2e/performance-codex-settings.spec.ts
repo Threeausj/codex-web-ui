@@ -96,7 +96,7 @@ async function wireSettings(page: Page, mock: MockCodex) {
   });
   return wire;
 }
-async function openSettings(page: Page, section: "性能" | "Codex" | "配置" | "权限预设", hostId = "local") {
+async function openSettings(page: Page, section: "Codex" | "配置" | "权限预设", hostId = "local") {
   const sidebar = page.getByRole("button", { name: "打开侧边栏", exact: true });
   if (await sidebar.isVisible()) await sidebar.click();
   await page.locator(".settings-button").click();
@@ -118,6 +118,77 @@ function pagedModels(mock: MockCodex) {
   return catalogue;
 }
 
+for (const width of [1280, 390]) test(`${width}px: Codex combines provider, connection and update controls for the selected host without separate performance or account tabs`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const wire = await wireSettings(page, mock);
+  wire.codex.get("local").account = { type: "chatgpt", email: "local@example.test", planType: "plus" };
+  wire.codex.get(remoteHostId).account = { type: "chatgpt", email: "nas@example.test", planType: "plus" };
+  wire.information.get("local").config.model_context_window = 128000;
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  const nav = settings.getByRole("navigation", { name: "设置类别", exact: true });
+  await expect(nav.getByRole("button", { name: "性能", exact: true })).toHaveCount(0);
+  await expect(nav.getByRole("button", { name: "账户", exact: true })).toHaveCount(0);
+  await expect(nav.getByRole("button", { name: "Codex", exact: true })).toHaveClass(/active/);
+  await expect(settings.getByRole("region", { name: "Codex 设置", exact: true })).toBeVisible();
+  await expect(settings.getByRole("heading", { name: "运行与连接", exact: true })).toBeVisible();
+  await expect(settings.getByRole("region", { name: "主机 Codex 更新", exact: true })).toHaveCount(1);
+  await expect(settings.getByText("nas@example.test", { exact: true })).toBeVisible();
+  await expect(settings.getByText("256k tokens", { exact: true })).toBeVisible();
+  const reconnect = settings.getByRole("button", { name: "重新连接 Codex", exact: true });
+  await expect(reconnect).toBeEnabled();
+  let release!: () => void;
+  wire.delay = new Promise<void>(resolve => { release = resolve; });
+  await reconnect.click();
+  await expect(settings.getByRole("combobox", { name: "设置主机", exact: true })).toBeDisabled();
+  for (const label of ["官方账户", "中转站", "保存提供方", "刷新 Codex 设置"]) {
+    await expect(settings.getByRole("button", { name: label, exact: true })).toBeDisabled();
+  }
+  expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toEqual([{ hostId: remoteHostId, path: "runtime/reconnect", method: "POST", body: {} }]);
+  release();
+  await expect(settings.getByRole("combobox", { name: "设置主机", exact: true })).toBeEnabled();
+  await settings.getByRole("combobox", { name: "设置主机", exact: true }).selectOption("local");
+  await expect(settings.getByText("local@example.test", { exact: true })).toBeVisible();
+  await expect(settings.getByText("128k tokens", { exact: true })).toBeVisible();
+  await expect(settings.getByText("nas@example.test", { exact: true })).toHaveCount(0);
+  expect(mock.request("thread/resume")).toBeUndefined();
+  expect(mock.hostMocks.get(remoteHostId)?.request("thread/resume")).toBeUndefined();
+  expect(await settings.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await settings.screenshot({ path: `.data/settings-merged-${width}.png` });
+  await settings.locator(".settings-content").evaluate(element => { element.scrollTop = 0; });
+  await settings.screenshot({ path: `.data/settings-merged-${width}-top.png` });
+  await nav.getByRole("button", { name: "通用", exact: true }).click();
+  const webAccess = settings.getByRole("region", { name: "网页访问", exact: true });
+  await expect(webAccess.getByRole("button", { name: "修改访问密码", exact: true })).toBeVisible();
+  await expect(webAccess.getByRole("button", { name: "退出网页", exact: true })).toBeVisible();
+});
+
+test("saving a Codex provider locks reconnect, information refresh and updates until the selected host write finishes", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  let started = false;
+  await page.route("**/api/hosts/*/codex-settings/provider", async route => {
+    started = true;
+    await hold;
+    return route.fulfill({ json: codexInformation() });
+  });
+  await login(page);
+  const settings = await openSettings(page, "Codex", remoteHostId);
+  await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
+  await settings.getByRole("button", { name: "保存提供方", exact: true }).click();
+  await expect.poll(() => started).toBe(true);
+  for (const label of ["重新连接 Codex", "刷新信息", "更新并重启 Codex"]) {
+    await expect(settings.getByRole("button", { name: label, exact: true })).toBeDisabled();
+  }
+  await expect(settings.getByRole("combobox", { name: "设置主机", exact: true })).toBeDisabled();
+  expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toHaveLength(0);
+  release();
+  await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
+  await expect(settings.getByRole("button", { name: "刷新信息", exact: true })).toBeEnabled();
+  await expect(settings.getByRole("combobox", { name: "设置主机", exact: true })).toBeEnabled();
+});
+
 test("reconnecting the current host refreshes a paginated model catalogue while preserving thread, draft, choices and actual context measurement", async ({ page, mock }) => {
   const wire = await wireSettings(page, mock);
   const catalogue = pagedModels(mock);
@@ -131,7 +202,7 @@ test("reconnecting the current host refreshes a paginated model catalogue while 
   await page.getByRole("combobox", { name: "选择模型", exact: true }).selectOption("mock-model-b");
   await page.getByRole("combobox", { name: "推理强度", exact: true }).selectOption("high");
   await page.getByRole("combobox", { name: "选择权限", exact: true }).selectOption("read-only");
-  const settings = await openSettings(page, "性能");
+  const settings = await openSettings(page, "Codex");
   catalogue.updated = true;
   await settings.getByRole("button", { name: "重新连接 Codex", exact: true }).click();
   await expect(settings.getByRole("status")).toContainText("Codex 已重新连接");
@@ -180,12 +251,12 @@ test("performance reconnection refreshes version, models and a 500k window witho
   const input = page.getByRole("textbox", { name: "消息输入框", exact: true });
   await input.fill("保留当前主机的草稿");
   const resumes = mock.requests.filter(request => request.method === "thread/resume").length;
-  const settings = await openSettings(page, "性能", remoteHostId);
+  const settings = await openSettings(page, "Codex", remoteHostId);
   await expect(settings.getByText("256k tokens", { exact: true })).toBeVisible();
-  await expect(settings.getByText("codex_cli_rs/0.160.1", { exact: true })).toBeVisible();
+  await expect(settings.locator(".performance-settings").getByText("codex_cli_rs/0.160.1", { exact: true })).toBeVisible();
   await settings.getByRole("button", { name: "重新连接 Codex", exact: true }).click();
   await expect(settings.getByText("500k tokens", { exact: true })).toBeVisible();
-  await expect(settings.getByText("codex_cli_rs/0.161.0", { exact: true })).toBeVisible();
+  await expect(settings.locator(".performance-settings").getByText("codex_cli_rs/0.161.0", { exact: true })).toBeVisible();
   await expect(settings.getByText("3 个", { exact: true })).toBeVisible();
   await settings.screenshot({ path: ".data/settings-performance-desktop.png" });
   expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toEqual([{ hostId: remoteHostId, path: "runtime/reconnect", method: "POST", body: {} }]);
@@ -199,7 +270,7 @@ test("performance reconnection refreshes version, models and a 500k window witho
 test("performance disables reconnect for active tasks, terminals and released runtimes but supports reconnecting to an external proxy", async ({ page, mock }) => {
   const wire = await wireSettings(page, mock);
   await login(page);
-  const settings = await openSettings(page, "性能", remoteHostId);
+  const settings = await openSettings(page, "Codex", remoteHostId);
   const reconnect = settings.getByRole("button", { name: "重新连接 Codex", exact: true });
   for (const [override, text] of [
     [{ activeThreadCount: 1 }, "主机上有正在运行的任务"],
@@ -221,7 +292,7 @@ test("performance disables reconnect for active tasks, terminals and released ru
 test("duplicate reconnect clicks issue one request, show an error and can retry", async ({ page, mock }) => {
   const wire = await wireSettings(page, mock);
   await login(page);
-  const settings = await openSettings(page, "性能", remoteHostId);
+  const settings = await openSettings(page, "Codex", remoteHostId);
   await expect(settings.getByText("256k tokens", { exact: true })).toBeVisible();
   let release!: () => void;
   wire.delay = new Promise<void>(resolve => { release = resolve; });
@@ -250,7 +321,7 @@ test("an active independent daemon permits transport reconnect while keeping its
   await page.getByRole("textbox", { name: "消息输入框", exact: true }).fill("继续运行中的 daemon 任务");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
-  const settings = await openSettings(page, "性能");
+  const settings = await openSettings(page, "Codex");
   await expect(settings.getByText("独立 daemon", { exact: true })).toBeVisible();
   await expect(settings.getByText("重新连接只恢复网页代理", { exact: false })).toBeVisible();
   await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
@@ -280,7 +351,7 @@ test("daemon restart requires the server's idle permission and explicit confirma
   });
   await login(page);
   await page.getByRole("textbox", { name: "消息输入框", exact: true }).fill("当前主机草稿不因另一个主机重启而变化");
-  const settings = await openSettings(page, "性能", remoteHostId);
+  const settings = await openSettings(page, "Codex", remoteHostId);
   const restart = settings.getByRole("button", { name: "重启 daemon", exact: true });
   await expect(restart).toBeEnabled();
   page.once("dialog", async dialog => {
@@ -316,7 +387,7 @@ test("a reused external native service remains reconnectable and explicitly disa
     canRestartDaemon: false, daemonRestartDisabledReason: disabledReason,
   }));
   await login(page);
-  const settings = await openSettings(page, "性能", remoteHostId);
+  const settings = await openSettings(page, "Codex", remoteHostId);
   await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
   await expect(settings.getByRole("button", { name: "重启 daemon", exact: true })).toBeDisabled();
   await expect(settings.getByRole("button", { name: "重启 daemon", exact: true })).toHaveAttribute("title", disabledReason);

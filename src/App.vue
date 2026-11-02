@@ -160,7 +160,7 @@ watch(workspaceOpen, open => { if (open) workspaceMounted.value = true; }, { flu
 watch(() => [state.hostId, state.projectPath, state.authenticationGeneration], () => {
   selectedFilePath.value = null; fileWorkspace.value = null;
 });
-watch(() => state.authenticated, authenticated => { if (!authenticated) { workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; } });
+watch(() => state.authenticated, authenticated => { if (!authenticated) { workspaceOpen.value = false; workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; } });
 const composer = ref<InstanceType<typeof Composer>>();
 const movingProject = ref<{ thread: any; hostId: string } | null>(null);
 const attachedThreads = ref<{ thread: any; hostId: string } | null>(null);

@@ -72,7 +72,7 @@ test('all visited host transports close on logout and cannot inject private even
   await login(page); await visitBoth(page);
   await page.locator('.sidebar-footer').getByRole('button', { name: /设置/ }).click();
   const settings = page.getByRole('dialog', { name: '设置', exact: true });
-  await settings.getByRole('button', { name: '账户', exact: true }).click();
+  await settings.getByRole('button', { name: '通用', exact: true }).click();
   await settings.getByRole('button', { name: '退出网页', exact: true }).click();
   await expect(page.locator('input[type="password"]').first()).toBeVisible();
   await login(page); await expect(editor(page)).toBeVisible();
