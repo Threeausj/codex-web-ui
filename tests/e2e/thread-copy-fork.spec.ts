@@ -64,7 +64,7 @@ test('a delayed export cannot download private conversation history after logout
  await page.addInitScript(()=>{(window as any).conversationDownloads=[];HTMLAnchorElement.prototype.click=function(){(window as any).conversationDownloads.push(this.download);};});
  await login(page);await row(page,'ssh-copy').locator('.nav-row-menu').click();await row(page,'ssh-copy').getByRole('button',{name:'导出 Markdown',exact:true}).click();
  await expect.poll(()=>held).toBe(true);
- await page.getByRole('button',{name:/^设置\s/}).click();await page.getByRole('button',{name:'账户',exact:true}).click();await page.getByRole('button',{name:'退出网页',exact:true}).click();
+ await page.getByRole('button',{name:/^设置\s/}).click();await page.getByRole('button',{name:'通用',exact:true}).click();await page.getByRole('button',{name:'退出网页',exact:true}).click();
  await expect(page.locator('input[type="password"]')).toBeVisible();
  const response=page.waitForResponse(r=>r.url().includes('/api/navigation/ssh-copy')&&r.request().postDataJSON()?.method==='thread/turns/list');
  release();await (await response).finished();await page.waitForTimeout(150);
@@ -135,7 +135,7 @@ test('a delayed clipboard rejection after logout cannot copy private history thr
  });
  await login(page);await copy(page,'local','复制为 Markdown');
  await expect.poll(()=>page.evaluate(()=>(window as any).clipboardStarted)).toBe(true);
- await page.getByRole('button',{name:/^设置\s/}).click();await page.getByRole('button',{name:'账户',exact:true}).click();await page.getByRole('button',{name:'退出网页',exact:true}).click();
+ await page.getByRole('button',{name:/^设置\s/}).click();await page.getByRole('button',{name:'通用',exact:true}).click();await page.getByRole('button',{name:'退出网页',exact:true}).click();
  await expect(page.locator('input[type="password"]')).toBeVisible();
  await page.evaluate(()=>(window as any).rejectClipboard());
  // Let the clipboard promise and its copy handler finish after authentication was revoked.

@@ -79,7 +79,7 @@ test('context menu closes on outside clicks, Escape, conversation changes and lo
   await expect(menu(page)).toHaveCount(0);
   await indicator(page).click();
   await page.getByRole('button', { name: /^设置(?: |$)/ }).evaluate((element: HTMLButtonElement) => element.click());
-  await page.getByRole('button', { name: '账户', exact: true }).evaluate((element: HTMLButtonElement) => element.click());
+  await page.getByRole('button', { name: '通用', exact: true }).evaluate((element: HTMLButtonElement) => element.click());
   await expect(menu(page)).toBeVisible();
   await page.getByRole('button', { name: '退出网页', exact: true }).evaluate((element: HTMLButtonElement) => element.click());
   await expect(page.locator('input[type="password"]').first()).toBeVisible();

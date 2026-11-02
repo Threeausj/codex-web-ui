@@ -94,7 +94,7 @@ This changes only the client compatibility identifier. It does not make this web
 
 ## Access password and login
 
-Web login lasts **30 days**. Sessions live in the server process, so restarting it requires login again. Under Settings → Account → Web access → Change access password (Chinese UI: “设置 → 账户 → 网页访问 → 修改访问密码”), enter the current password and confirm a new password of 12–1024 characters. Saving renews the current login for 30 days and preserves its connections, while immediately revoking other devices' logins and push authorizations. This does not change the Codex model account.
+Web login lasts **30 days**. Sessions live in the server process, so restarting it requires login again. Under Settings → General → Web access → Change access password (Chinese UI: “设置 → 通用 → 网页访问 → 修改访问密码”), enter the current password and confirm a new password of 12–1024 characters. Saving renews the current login for 30 days and preserves its connections, while immediately revoking other devices' logins and push authorizations. This does not change the Codex model account.
 
 The first start initializes credentials from `CODEX_WEB_PASSWORD`; afterward, the scrypt hash in `/app/data/web-password.json` takes precedence over environment variables. The file uses mode `0600`. Changes in settings are not written to `.env.docker`, the plaintext bootstrap file, or logs. Preserve `webdata` to retain the password across restarts. The initial values in `.env.docker` and `bootstrap-password.txt` may no longer be the current password.
 
