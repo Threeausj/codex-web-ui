@@ -105,7 +105,9 @@ test('runtime settings reads target only the chosen host, redact stored keys, an
   const f = await fixture({ config: { model_provider: 'custom', model_providers: { custom: { base_url: 'https://user:private-url-key@api.example.invalid/v1?token=private-query#private-fragment', experimental_bearer_token: 'private-api-key', auth: { command: 'echo', args: ['private-command-key'] }, http_headers: { Authorization: 'Bearer private-header-key' }, env: { OPAQUE: 'private-env-key' } } } } }); t.after(() => f.close())
   const localBefore = f.peers.get('local')![0]!.sent.length
   const setting = await (await f.request()).json()
-  assert.equal(setting.provider, 'custom'); assert.equal(setting.baseUrl, 'https://api.example.invalid/v1')
+  assert.equal(setting.provider, 'custom'); assert.equal(setting.providerId, 'custom'); assert.equal(setting.providerName, 'custom')
+  assert.equal(setting.baseUrl, 'https://api.example.invalid/v1'); assert.equal(setting.hasApiKey, true); assert.equal(setting.canReuseGatewayKey, false)
+  assert.equal(setting.configPath, '/fixture/remote/.codex/config.toml')
   assert.equal(setting.account.email, 'remote@example.invalid')
   assert.doesNotMatch(JSON.stringify(setting), /private-/)
   const config = await (await f.request('settings/rpc', { method: 'config/read', params: { includeLayers: true } })).json()
@@ -115,6 +117,70 @@ test('runtime settings reads target only the chosen host, redact stored keys, an
   const offline = await (await f.request('codex-settings', undefined, 'offline')).json()
   assert.equal(offline.connected, false); assert.equal(offline.canChange, false); assert.equal(f.bridges.has('offline'), false)
   assert.equal((await f.request('codex-settings/provider', { provider: 'official' }, 'offline')).status, 409)
+})
+
+test('inactive Web Gateway settings do not become the official provider endpoint or credential status', async t => {
+  const f = await fixture({ config: { model_providers: { web_gateway: { name: 'Unused gateway', base_url: 'https://unused.example.invalid/v1', auth: { command: 'private-unused-command' } } } } }); t.after(() => f.close())
+  const setting = await (await f.request()).json()
+  assert.equal(setting.provider, 'official'); assert.equal(setting.providerId, 'openai'); assert.equal(setting.baseUrl, '')
+  assert.equal(setting.hasApiKey, false); assert.equal(setting.canReuseGatewayKey, false)
+  assert.doesNotMatch(JSON.stringify(setting), /unused\.example|Unused gateway|private-unused-command/)
+  assert.equal(f.peers.get('remote')![0]!.sent.some(message => message.method === 'config/batchWrite'), false)
+})
+
+test('effective provider metadata wins over the user-file layer while the displayed path remains the user configuration file', async t => {
+  const f = await fixture({
+    config: { model_provider: 'threecode', model_providers: { threecode: { name: 'Threecode', base_url: 'https://user-file.example.invalid/v1', env_key: 'private-file-env' } } },
+    override: { model_provider: 'company', model_providers: { company: { name: 'Company Gateway', base_url: 'https://effective.example.invalid/v1', http_headers: { 'X-API-Key': 'private-effective-header' } } } },
+  }); t.after(() => f.close())
+  const setting = await (await f.request()).json()
+  assert.equal(setting.provider, 'custom'); assert.equal(setting.providerId, 'company'); assert.equal(setting.providerName, 'Company Gateway')
+  assert.equal(setting.baseUrl, 'https://effective.example.invalid/v1'); assert.equal(setting.hasApiKey, true)
+  assert.equal(setting.configPath, '/fixture/remote/.codex/config.toml'); assert.equal(setting.canReuseGatewayKey, false)
+  assert.doesNotMatch(JSON.stringify(setting), /private-|user-file\.example|threecode/)
+  assert.equal(f.writes.length, 0); assert.equal(f.reserved, 0)
+})
+
+for (const [name, credential, expected] of [
+  ['command credentials', { auth: { command: 'private-credential-command', args: ['private-command-argument'] } }, true],
+  ['bearer token', { experimental_bearer_token: 'private-bearer-token' }, true],
+  ['environment key', { env_key: 'THREECODE_API_KEY' }, true],
+  ['static headers', { http_headers: { 'X-Key': 'private-header-key' } }, true],
+  ['environment headers', { env_http_headers: { 'X-Key': 'private-environment-header-name' } }, true],
+  ['empty references', { auth: {}, env_key: ' ', http_headers: {}, env_http_headers: { 'X-Key': '' } }, false],
+] as const) {
+  test(`active custom provider reports ${name} presence without exposing its values or borrowing Web Gateway credentials`, async t => {
+    const f = await fixture({ config: { model_provider: 'threecode', model_providers: {
+      threecode: { name: 'Threecode', base_url: 'https://threecode.example.invalid/v1', ...credential },
+      web_gateway: { base_url: 'https://unused.example.invalid/v1', auth: { command: 'private-unused-command' } },
+    } } }); t.after(() => f.close())
+    const setting = await (await f.request()).json()
+    assert.equal(setting.providerId, 'threecode'); assert.equal(setting.providerName, 'Threecode')
+    assert.equal(setting.hasApiKey, expected); assert.equal(setting.canReuseGatewayKey, false)
+    assert.equal(setting.baseUrl, 'https://threecode.example.invalid/v1')
+    assert.doesNotMatch(JSON.stringify(setting), /private-|unused\.example|THREECODE_API_KEY/)
+    const config = await (await f.request('settings/rpc', { method: 'config/read', params: { includeLayers: true } })).json()
+    assert.doesNotMatch(JSON.stringify(config), /private-/)
+  })
+}
+
+test('OpenAI provider URL overrides remain active metadata and Web Gateway key reuse requires its own command credential', async t => {
+  const f = await fixture({ config: { openai_base_url: 'https://user:private-url@openai-route.example.invalid/v1?token=private-query#private-fragment', model_providers: { web_gateway: { base_url: 'https://unused.example.invalid/v1', auth: { command: 'private-unused-command' } } } } }); t.after(() => f.close())
+  let setting = await (await f.request()).json()
+  assert.equal(setting.provider, 'official'); assert.equal(setting.baseUrl, 'https://openai-route.example.invalid/v1')
+  assert.equal(setting.hasApiKey, false); assert.equal(setting.canReuseGatewayKey, false)
+  f.configurations.get('remote')!.model_providers.openai = { name: 'OpenAI override', base_url: 'https://active-openai.example.invalid/v1', env_key: 'private-openai-key' }
+  setting = await (await f.request()).json()
+  assert.equal(setting.baseUrl, 'https://active-openai.example.invalid/v1'); assert.equal(setting.hasApiKey, true)
+  assert.equal(setting.providerName, 'OpenAI override'); assert.equal(setting.canReuseGatewayKey, false)
+  f.configurations.get('remote')!.model_provider = 'web_gateway'
+  setting = await (await f.request()).json()
+  assert.equal(setting.provider, 'gateway'); assert.equal(setting.hasApiKey, true); assert.equal(setting.canReuseGatewayKey, true)
+  f.configurations.get('remote')!.model_providers.web_gateway.auth = {}
+  f.configurations.get('remote')!.model_providers.web_gateway.env_key = 'WEB_GATEWAY_API_KEY'
+  setting = await (await f.request()).json()
+  assert.equal(setting.hasApiKey, true); assert.equal(setting.canReuseGatewayKey, false)
+  assert.doesNotMatch(JSON.stringify(setting), /private-/)
 })
 
 for (const url of ['invalid url', 'javascript:alert(1)', 'file:///tmp/config', 'https://user:password@api.example.invalid', 'https://api.example.invalid/v1?api_key=secret', 'https://api.example.invalid/v1#secret']) {

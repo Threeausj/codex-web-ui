@@ -7,7 +7,7 @@ import { copyText } from "../lib/copy-text";
 const props = defineProps<{ api: any; state: any; hostId: string; maintenanceBusy?: boolean }>();
 const emit = defineEmits<{ busy: [value: boolean] }>();
 const information = ref<any>(null);
-const provider = ref<"official" | "gateway" | "gcp">("official");
+const provider = ref<"official" | "gateway" | "gcp" | "custom">("custom");
 const baseUrl = ref("");
 const apiKey = ref("");
 const model = ref("");
@@ -21,6 +21,18 @@ let pollTimer: ReturnType<typeof setTimeout> | undefined;
 let loginChecks = 0;
 let disposed = false;
 const account = computed(() => information.value?.account?.account || information.value?.account || null);
+function providerChoice(value: any): 'official' | 'gateway' | 'gcp' | 'custom' {
+  if (value?.provider === 'gateway' || value?.provider === 'gcp') return value.provider;
+  if (value?.provider === 'custom') return /^https?:\/\//i.test(value?.baseUrl || '') ? 'gateway' : 'custom';
+  return value?.provider === 'official' ? 'official' : 'custom';
+}
+const currentProvider = computed(() => providerChoice(information.value));
+const providerName = computed(() => information.value?.providerName || information.value?.providerId || '未报告');
+const currentProviderLabel = computed(() => information.value?.provider === 'unknown' ? '未读取' :
+  ({ official: '官方账户', gateway: '中转站', gcp: 'Vertex AI', custom: '自定义提供方' })[currentProvider.value]);
+const customProvider = computed(() => information.value?.provider === 'custom');
+const reusableGatewayKey = computed(() => information.value?.provider === 'gateway' &&
+  (information.value?.canReuseGatewayKey ?? information.value?.hasApiKey) && baseUrl.value.replace(/\/+$/, '') === information.value?.baseUrl?.replace(/\/+$/, ''));
 const runtimeReconnecting = computed(() => props.state.runtimeReconnectingHostId === props.hostId);
 const blocked = computed(() => {
   if (props.maintenanceBusy) return "此主机正在更新 Codex，请等待更新并重启完成。";
@@ -43,7 +55,7 @@ function stopPolling() { clearTimeout(pollTimer); pollTimer = undefined; }
 function applyInformation(value: any, initializeForm = false) {
   information.value = value;
   if (initializeForm) {
-    provider.value = value?.provider === "gateway" ? "gateway" : value?.provider === "gcp" ? "gcp" : "official";
+    provider.value = providerChoice(value);
     baseUrl.value = value?.baseUrl || "";
     model.value = value?.model || "";
     apiKey.value = "";
@@ -98,12 +110,13 @@ function gatewayAddress(value: string) {
   return input.replace(/\/+$/, "");
 }
 async function save() {
+  if (provider.value === 'custom') return;
   const result = await run("save", async hostId => {
     const update: Record<string, string> = { provider: provider.value };
     if (provider.value === "gateway") {
       try { update.baseUrl = gatewayAddress(baseUrl.value); }
       catch (cause: any) { throw new Error(cause.message?.startsWith("请输入") ? cause.message : "请输入有效的中转地址，例如 https://api.example.com/v1"); }
-      if (!apiKey.value.trim() && !information.value?.hasApiKey) throw new Error("请输入中转站 API 密钥");
+      if (!apiKey.value.trim() && !reusableGatewayKey.value) throw new Error("请输入中转站 API 密钥");
       if (apiKey.value.trim()) update.apiKey = apiKey.value.trim();
       if (model.value.trim()) update.model = model.value.trim();
     }
@@ -186,6 +199,7 @@ watch(() => [props.hostId, props.state.authenticated, props.state.authentication
   stopPolling();
   ++generation;
   information.value = null;
+  provider.value = 'custom';
   deviceLogin.value = null;
   apiKey.value = "";
   baseUrl.value = "";
@@ -212,25 +226,35 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); apiKey.val
   <section class="codex-settings" aria-label="Codex 设置">
     <div class="settings-title-row"><h3>Codex</h3><button class="icon-button" :disabled="pending" aria-label="刷新 Codex 设置" title="刷新 Codex 设置" @click="refresh()"><Icon :name="loading ? 'LoaderCircle' : 'RefreshCw'" :class="{ spin: loading }" :size="16" /></button></div>
     <p class="settings-description">切换所选主机的模型提供方和账户。更改会影响这台主机的 Codex，网页访问密码保持独立。</p>
-    <p v-if="information?.provider && !['official', 'gateway', 'gcp'].includes(information.provider)" class="codex-note">当前使用自定义提供方 {{ information.providerId || information.provider }}。保存后切换为所选提供方。</p>
+    <section v-if="information" class="codex-current-provider" aria-label="当前生效提供方">
+      <div><span>当前使用</span><strong>{{ currentProviderLabel }}<template v-if="information.providerId"> · {{ providerName }}</template></strong></div>
+      <div v-if="information.providerId && providerName !== information.providerId"><span>提供方 ID</span><code>{{ information.providerId }}</code></div>
+      <div v-if="information.baseUrl"><span>API 地址</span><code>{{ information.baseUrl }}</code></div>
+      <div v-if="information.configPath"><span>用户配置</span><code>{{ information.configPath }}</code></div>
+      <p>读取所选主机当前生效的配置；配置档和启动参数也可能影响结果。</p>
+    </section>
     <div class="codex-provider-options" role="group" aria-label="模型提供方">
       <button :class="{ active: provider === 'official' }" :aria-pressed="provider === 'official'" :disabled="pending || !!deviceLogin" @click="provider = 'official'; apiKey = ''"><Icon name="Bot" :size="17" />官方账户</button>
       <button :class="{ active: provider === 'gateway' }" :aria-pressed="provider === 'gateway'" :disabled="pending || !!deviceLogin" @click="provider = 'gateway'"><Icon name="Globe" :size="17" />中转站</button>
       <button :class="{ active: provider === 'gcp' }" :aria-pressed="provider === 'gcp'" :disabled="pending || !!deviceLogin || !information?.supportsGcp" :title="information?.supportsGcp ? '使用所选主机的 Google Cloud 认证' : '需要 Codex 0.165.0 或更新版本'" @click="provider = 'gcp'; apiKey = ''"><Icon name="Cloud" :size="17" />Vertex AI</button>
+      <button v-if="customProvider && currentProvider === 'custom'" :class="{ active: provider === 'custom' }" :aria-pressed="provider === 'custom'" :disabled="pending || !!deviceLogin" @click="provider = 'custom'; apiKey = ''"><Icon name="Settings2" :size="17" />自定义提供方</button>
     </div>
     <form class="codex-provider-form" @submit.prevent="save">
       <template v-if="provider === 'gateway'">
         <label class="form-label">中转站 URL<input v-model="baseUrl" class="text-input" type="url" aria-label="中转站 URL" placeholder="https://api.example.com/v1" autocomplete="off" :disabled="pending || !!blocked" required /></label>
-        <label class="form-label">API 密钥<input v-model="apiKey" class="text-input" type="password" aria-label="中转站 API 密钥" :placeholder="information?.hasApiKey ? '已配置，留空保留现有密钥' : '输入中转站 API 密钥'" autocomplete="new-password" spellcheck="false" :disabled="pending || !!blocked" /></label>
+        <p v-if="customProvider" class="codex-note">当前中转配置 {{ information.providerId }} 由主机管理。保存到网页中转设置时需要输入密钥，原有配置会保留。</p>
+        <label class="form-label">API 密钥<input v-model="apiKey" class="text-input" type="password" aria-label="中转站 API 密钥" :placeholder="reusableGatewayKey ? '已配置，留空保留现有密钥' : '输入中转站 API 密钥'" autocomplete="new-password" spellcheck="false" :disabled="pending || !!blocked" /></label>
         <label class="form-label">模型<span class="optional">可选</span><input v-model="model" class="text-input" aria-label="中转站默认模型" placeholder="保留主机当前默认模型" autocomplete="off" :disabled="pending || !!blocked" /></label>
       </template>
       <template v-else-if="provider === 'gcp'">
         <p class="codex-note">使用 Google Cloud Vertex AI。请先在所选主机配置 <code>GOOGLE_CLOUD_PROJECT</code> 和 gcloud Application Default Credentials。区域可通过 <code>GOOGLE_CLOUD_LOCATION</code> 设置，留空使用原生默认值。网页沿用该主机的认证，保存后使用原生 <code>gcp</code> 提供方。</p>
         <label class="form-label">模型<span class="optional">可选</span><input v-model="model" class="text-input" aria-label="Vertex AI 默认模型" placeholder="保留主机当前默认模型" autocomplete="off" :disabled="pending || !!blocked" /></label>
       </template>
+      <p v-else-if="provider === 'custom' && customProvider" class="codex-note">当前使用主机上的自定义提供方 {{ providerName }}。可在配置文件中调整，或选择上方提供方后保存切换。</p>
+      <p v-else-if="provider === 'custom'" class="codex-note">连接主机后读取当前提供方。</p>
       <p v-else class="codex-note">使用 OpenAI 官方服务。先保存提供方，再登录 ChatGPT 账户。</p>
       <p v-if="blocked && !loading" class="codex-note">{{ blocked }}</p>
-      <button class="button button-primary" type="submit" :disabled="pending || !!blocked || !!deviceLogin"><Icon :name="operation === 'save' ? 'LoaderCircle' : 'Save'" :class="{ spin: operation === 'save' }" :size="15" />{{ operation === 'save' ? '保存中…' : '保存提供方' }}</button>
+      <button class="button button-primary" type="submit" :disabled="pending || !!blocked || !!deviceLogin || provider === 'custom'"><Icon :name="operation === 'save' ? 'LoaderCircle' : 'Save'" :class="{ spin: operation === 'save' }" :size="15" />{{ operation === 'save' ? '保存中…' : '保存提供方' }}</button>
     </form>
     <div v-if="information?.provider === 'official' && provider === 'official'" class="codex-official-account">
       <h4>ChatGPT 账户</h4>
@@ -250,6 +274,13 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); apiKey.val
 </template>
 
 <style scoped>
+.codex-current-provider { margin-top: 18px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--soft); }
+.codex-current-provider > div { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 8px; margin-bottom: 8px; font-size: 11px; line-height: 1.6; }
+.codex-current-provider span, .codex-current-provider p { color: var(--muted); }
+.codex-current-provider strong { font-weight: 550; }
+.codex-current-provider code { overflow-wrap: anywhere; white-space: pre-wrap; }
+.codex-current-provider p { margin: 8px 0 0; font-size: 10px; line-height: 1.7; }
+@media (max-width: 760px) { .codex-current-provider > div { font-size: 13px; } .codex-current-provider p { font-size: 12px; } }
 .codex-provider-options { display:flex; flex-wrap:wrap; gap:8px; margin:20px 0; }
 .codex-provider-options button { display:flex; align-items:center; justify-content:center; gap:8px; flex:1; min-width:110px; border:1px solid var(--border); border-radius:9px; padding:12px; font-size:12px; color:var(--muted); }
 .codex-provider-options button.active { color:var(--text); background:var(--selected); border-color:var(--text); }

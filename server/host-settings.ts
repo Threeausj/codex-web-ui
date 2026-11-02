@@ -24,12 +24,18 @@ function safeUrl(value: string) {
     throw Object.assign(new Error('请输入不含密码、查询参数或片段的 HTTP(S) API 根地址'), { status: 400 })
   return url.href.replace(/\/$/, '')
 }
+function configuredCredential(provider: any) {
+  const present = (value: unknown) => typeof value === 'string' && !!value.trim()
+  const headers = (value: unknown) => !!value && typeof value === 'object' && !Array.isArray(value) && Object.values(value).some(present)
+  return present(provider?.env_key) || present(provider?.experimental_bearer_token) || present(provider?.auth?.command)
+    || headers(provider?.http_headers) || headers(provider?.env_http_headers)
+}
 /** Config views must never return stored bearer credentials to the browser. */
 export function redactSettings(value: unknown): any {
   if (Array.isArray(value)) return value.map(redactSettings)
   if (!value || typeof value !== 'object') return value
   return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
-    if (/api_?key|bearer|authorization|password|secret|credentials|private_?key|^(auth|env|http_headers|headers)$|(?:^|_)(?:access|refresh|id|client|auth)_?token$|(?:^|_)token$/i.test(key))
+    if (/api_?key|bearer|authorization|password|secret|credentials|private_?key|^(auth|env|http_headers|env_http_headers|headers)$|(?:^|_)(?:access|refresh|id|client|auth)_?token$|(?:^|_)token$/i.test(key))
       return [key, entry ? '[已保存]' : entry]
     if (/^base_?url$/i.test(key) && typeof entry === 'string') {
       try { const url = new URL(entry); url.username = ''; url.password = ''; url.search = ''; url.hash = ''; return [key, url.href.replace(/\/$/, '')] }
@@ -96,13 +102,13 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
   }
   const connected = (id: string) => {
     const result = resolve(id)
-    if (!result.bridge?.connected || result.bridge.paused) throw busy('请先在性能设置中连接此主机的 Codex')
+    if (!result.bridge?.connected || result.bridge.paused) throw busy('请先在 Codex 设置中连接此主机的 Codex')
     return { host: result.host, bridge: result.bridge }
   }
   const read = async (id: string) => {
     const { bridge } = resolve(id)
     if (!bridge?.connected || bridge.paused) return { provider: 'unknown', connected: false, canChange: false,
-      disabledReason: '请先在性能设置中连接此主机的 Codex', hasApiKey: false }
+      disabledReason: '请先在 Codex 设置中连接此主机的 Codex', hasApiKey: false }
     const engineId = bridge.runtime.engineId
     const [configuration, account] = await Promise.all([
       bridge.request('config/read', { includeLayers: true }),
@@ -111,14 +117,21 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
     if (!bridge.connected || bridge.runtime.engineId !== engineId) throw busy('Codex 连接已改变，请重新读取设置')
     const config = configuration.config || {}
     const currentProvider = config.model_provider || 'openai'
-    const gateway = config.model_providers?.[providerId]
+    const activeProvider = config.model_providers?.[currentProvider]
+    const user = [...(configuration.layers || [])].reverse().find((layer: any) => layer.name?.type === 'user' && !layer.name.profile)
+    const configFile = user?.name?.file
+    const configPath = typeof configFile === 'string' && configFile.length <= 4096 && path.isAbsolute(configFile) && !/[\x00-\x1f\x7f]/.test(configFile) ? configFile : ''
+    const providerName = typeof activeProvider?.name === 'string' ? activeProvider.name.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160) : ''
     const proxy = !bridge.runtime.managed
-    let baseUrl = (currentProvider === 'openai' ? gateway?.base_url : config.model_providers?.[currentProvider]?.base_url) || ''
+    // The effective provider is authoritative. A configured but inactive Web
+    // Gateway must not supply the current endpoint or credential status.
+    let baseUrl = activeProvider?.base_url || (currentProvider === 'openai' ? config.openai_base_url : '') || ''
     try { const url = new URL(baseUrl); url.username = ''; url.password = ''; url.search = ''; url.hash = ''; baseUrl = ['http:', 'https:'].includes(url.protocol) ? url.href.replace(/\/$/, '') : '' } catch { baseUrl = '' }
     return { provider: currentProvider === 'openai' ? 'official' : currentProvider === providerId ? 'gateway' : currentProvider === 'gcp' ? 'gcp' : 'custom',
-      providerId: currentProvider, baseUrl,
+      providerId: currentProvider, providerName: providerName || currentProvider, configPath, baseUrl,
       supportsGcp: supportsGcp(bridge.userAgent, currentProvider),
-      hasApiKey: !!gateway?.auth || !!gateway?.experimental_bearer_token || !!gateway?.env_key,
+      hasApiKey: configuredCredential(activeProvider),
+      canReuseGatewayKey: currentProvider === providerId && typeof activeProvider?.auth?.command === 'string' && !!activeProvider.auth.command.trim(),
       model: config.model || '', account: redactSettings(account?.account || null), userAgent: bridge.userAgent,
       connected: true, canChange: !proxy && bridge.maintenanceStatus.canReconnect,
       disabledReason: proxy ? '共享代理进程的配置需要在服务端修改；直接连接后可切换提供方' : bridge.maintenanceStatus.reconnectDisabledReason,
