@@ -14,6 +14,7 @@ import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
 import { useMobilePanelBack } from "./lib/mobile-panel-back";
 import { ReadingPositions, isReadingPosition, type ReadingPosition } from "./lib/reading-positions";
+import { privateState } from "./lib/private-state";
 import { captureConversationReading, nearConversationBottom, restoreConversationReading } from './lib/conversation-reading';
 import { normalizeConversationSelection, type ConversationSelectionSource } from "./lib/conversation-selection";
 import { bookmarkTextRange, matchesBookmark, threadBookmarkActionsKey, useConversationBookmarks, type ThreadBookmarkTarget } from './lib/conversation-bookmarks';
@@ -119,8 +120,22 @@ let bookmarkNavigation = 0;
 let bookmarkHighlightTimer: ReturnType<typeof setTimeout> | undefined;
 const readingPositions = new ReadingPositions(() => api.privateSessionReady(), () => api.runtimeIdentity().authenticationGeneration);
 let restoredScrollKey = '';
+const initialConversationReading = ref<{ hostId: string; threadId: string; position: ReadingPosition } | null>(null);
+function rememberedReading(hostId: string, id: string) {
+  const key = `codex.scroll.${hostId}.${id}`;
+  try {
+    const value = JSON.parse(sessionStorage.getItem(key) || 'null');
+    if (isReadingPosition(value)) return value as ReadingPosition;
+  } catch { /* Durable and in-memory positions remain available. */ }
+  return readingPositions.peek(hostId, id);
+}
+function primeConversationReading(hostId: string, id: string) {
+  const position = rememberedReading(hostId, id);
+  initialConversationReading.value = position ? { hostId, threadId: id, position } : null;
+}
 function clearWindowReadingPositions() {
   restoredScrollKey = '';
+  initialConversationReading.value = null;
   try {
     for (let i = sessionStorage.length - 1; i >= 0; i--) {
       const key = sessionStorage.key(i);
@@ -150,18 +165,45 @@ const sidebarCollapsed = ref(false);
 const workspaceOpen = ref(false);
 const workspaceMounted = ref(false);
 type CenterFileTab = { path: string; title: string; dirty: boolean; saving: boolean };
-type FileWorkspaceState = { scope: string; hostId: string; projectPath: string; files: CenterFileTab[]; activePath: string };
+type CenterFileTabTarget = CenterFileTab & { scope: string; hostId: string; projectPath: string; threadId?: string };
+type FileWorkspaceState = { scope: string; hostId: string; projectPath: string; threadId?: string; ready: boolean; files: CenterFileTab[]; activePath: string };
 const fileWorkspace = ref<FileWorkspaceState | null>(null);
+const fileWorkspaceCatalog = ref(new Map<string, FileWorkspaceState>());
 const selectedFilePath = ref<string | null>(null);
 const centerFileVisible = computed(() => !!selectedFilePath.value && fileWorkspace.value?.scope === workspaceScope() &&
   fileWorkspace.value.files.some(file => file.path === selectedFilePath.value));
-const centerFileTabs = computed(() => fileWorkspace.value?.scope === workspaceScope() ? fileWorkspace.value.files : []);
+const centerFileTabs = computed(() => [...fileWorkspaceCatalog.value.values()].flatMap(workspace => workspace.files.map(file => ({
+  ...file, scope: workspace.scope, hostId: workspace.hostId, projectPath: workspace.projectPath, threadId: workspace.threadId,
+}))));
 watch(workspaceOpen, open => { if (open) workspaceMounted.value = true; }, { flush: 'sync' });
 watch(() => [state.hostId, state.projectPath, state.authenticationGeneration], () => {
-  selectedFilePath.value = null; fileWorkspace.value = null;
+  selectedFilePath.value = null;
+  fileWorkspace.value = fileWorkspaceCatalog.value.get(workspaceScope()) || null;
   clearWorkspaceReveal();
 });
-watch(() => state.authenticated, authenticated => { if (!authenticated) { workspaceOpen.value = false; workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; } });
+let fileCatalogGeneration = 0;
+watch(() => [state.authenticated, state.authenticationGeneration], () => {
+  const generation = ++fileCatalogGeneration;
+  if (!state.authenticated) {
+    workspaceOpen.value = false; workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; fileWorkspaceCatalog.value = new Map();
+    return;
+  }
+  fileWorkspaceCatalog.value = new Map();
+  void (async () => {
+    await api.privateSessionReady();
+    const saved = await privateState.read<FileWorkspaceState[]>("file-workspace-tabs", "catalog");
+    if (generation !== fileCatalogGeneration || !state.authenticated || !Array.isArray(saved)) return;
+    const catalog = new Map(fileWorkspaceCatalog.value);
+    for (const entry of saved) {
+      if (!entry || entry.scope !== `${entry.hostId}\0${entry.projectPath}` || !Array.isArray(entry.files)) continue;
+      if (!catalog.has(entry.scope)) catalog.set(entry.scope, { ...entry, ready: true,
+        files: entry.files.filter(file => typeof file?.path === 'string' && typeof file.title === 'string')
+          .map(file => ({ ...file, saving: false })),
+      });
+    }
+    fileWorkspaceCatalog.value = catalog;
+  })().catch(() => { /* Current workspace tabs remain usable without the catalog. */ });
+});
 const composer = ref<InstanceType<typeof Composer>>();
 const movingProject = ref<{ thread: any; hostId: string } | null>(null);
 const attachedThreads = ref<{ thread: any; hostId: string } | null>(null);
@@ -549,13 +591,10 @@ async function restoreScroll(id: string, generation = navigationSelection) {
   const key = `codex.scroll.${hostId}.${id}`;
   const current = () => !centerFileVisible.value && generation === navigationSelection && hostId === state.hostId &&
     id === state.activeThread?.id && authentication === api.runtimeIdentity().authenticationGeneration;
-  let position: ReadingPosition | null = null;
-  try {
-    const saved = JSON.parse(sessionStorage.getItem(key) || "null");
-    if (isReadingPosition(saved)) position = saved;
-  } catch { /* A new app window restores from private durable storage. */ }
+  let position = rememberedReading(hostId, id);
   position ??= await readingPositions.read(hostId, id);
   if (!current()) return;
+  if (position) initialConversationReading.value = { hostId, threadId: id, position };
   restoredScrollKey = key;
   followLatest.value = !position || position.bottom;
   lastScrollHeight = scroll.value?.scrollHeight || 0;
@@ -574,10 +613,12 @@ async function selectThread(
   if (state.editingMessage) return false;
   await showCenterChat();
   threadMenu.value = false;
-  const generation = ++navigationSelection;
   const id = typeof selection === "string" ? selection : selection.id;
   const hostId =
     typeof selection === "string" ? state.hostId : selection.hostId;
+  if (hostId === state.hostId && id === state.activeThread?.id && state.threadReady && !state.threadConflict) return true;
+  primeConversationReading(hostId, id);
+  const generation = ++navigationSelection;
   saveScroll();
   sidebarOpen.value = false;
   showScrollBottom.value = true;
@@ -607,7 +648,16 @@ async function showCenterChat(cancelPending = true) {
   if (wasFile && state.activeThread?.id) await restoreScroll(state.activeThread.id);
 }
 function updateFileWorkspace(value: FileWorkspaceState) {
-  if (value.scope !== workspaceScope() || value.hostId !== state.hostId || !state.authenticated) return;
+  if (value.scope !== `${value.hostId}\0${value.projectPath}` || !state.authenticated) return;
+  // WorkspacePanel emits a not-ready snapshot while restoring the scoped
+  // editor state. Keep the last known tab list until that read completes.
+  if (!value.ready) return;
+  const catalog = new Map(fileWorkspaceCatalog.value);
+  const threadId = value.hostId === state.hostId && state.activeThread?.cwd === value.projectPath ? state.activeThread.id : catalog.get(value.scope)?.threadId;
+  catalog.set(value.scope, { ...value, threadId, files: value.files.map(file => ({ ...file })) });
+  fileWorkspaceCatalog.value = catalog;
+  void privateState.write("file-workspace-tabs", "catalog", [...catalog.values()].map(({ ready: _ready, ...entry }) => entry)).catch(() => {});
+  if (value.scope !== workspaceScope() || value.hostId !== state.hostId) return;
   fileWorkspace.value = value;
   if (selectedFilePath.value && !value.files.some(file => file.path === selectedFilePath.value)) {
     if (value.activePath && value.files.some(file => file.path === value.activePath)) selectedFilePath.value = value.activePath;
@@ -626,17 +676,66 @@ function previewCenterFile(value: { path: string; hostId: string; projectPath: s
   sidebarOpen.value = false;
   if (window.matchMedia('(max-width: 760px)').matches) workspaceOpen.value = false;
 }
-async function selectFileTab(path: string) {
+let fileTabNavigation = 0;
+async function selectFileTab(tab: CenterFileTabTarget) {
   if (chatTabsDisabled.value) return;
-  await workspace.value?.activateFile(path);
+  const generation = ++fileTabNavigation;
+  await showCenterChat();
+  if (generation !== fileTabNavigation) return;
+  if (tab.scope !== workspaceScope()) {
+    if (!state.hosts.some(host => host.id === tab.hostId)) { showError('此文件所属的主机已移除'); return; }
+    try {
+      if (tab.threadId && !await selectThread({ hostId: tab.hostId, id: tab.threadId })) return;
+      if (generation !== fileTabNavigation) return;
+      if (state.hostId !== tab.hostId) await api.setHost(tab.hostId);
+      if (generation !== fileTabNavigation || state.hostId !== tab.hostId) return;
+      if (state.projectPath !== tab.projectPath)
+        await api.setProject(tab.projectPath, !tab.projectPath);
+    } catch (cause: any) {
+      if (generation === fileTabNavigation) showError(cause.message || '切换文件工作区失败');
+      return;
+    }
+    if (generation !== fileTabNavigation || workspaceScope() !== tab.scope) return;
+  }
+  sideChat.hide();
+  workspaceMounted.value = true;
+  workspaceTab.value = 'files';
+  await nextTick();
+  if (generation !== fileTabNavigation || !await workspace.value?.waitForScope(tab.scope)) return;
+  if (generation !== fileTabNavigation || workspaceScope() !== tab.scope) return;
+  await workspace.value?.activateFile(tab.path);
 }
-async function closeFileTab(path: string) {
+async function closeFileTab(tab: CenterFileTabTarget) {
   if (chatTabsDisabled.value) return;
-  if (await workspace.value?.closeEditor(path) === false) return;
+  const authentication = api.runtimeIdentity().authenticationGeneration;
+  // Reload restores the tab catalog before the workspace is first needed.
+  // Mount it invisibly so closing still edits the actual scoped draft owner.
+  workspaceMounted.value = true;
+  await nextTick();
+  const current = tab.scope === workspaceScope();
+  if (current && !await workspace.value?.waitForScope(tab.scope)) return;
+  if (!state.authenticated || authentication !== api.runtimeIdentity().authenticationGeneration || current && tab.scope !== workspaceScope()) return;
+  let closed: boolean | undefined;
+  try {
+    closed = current ? await workspace.value?.closeEditor(tab.path) : await workspace.value?.closeEditorFromScope(tab.scope, tab.path);
+  } catch (cause: any) {
+    if (state.authenticated && authentication === api.runtimeIdentity().authenticationGeneration) showError(cause.message || '关闭文件标签失败');
+    return;
+  }
+  if (closed !== true || !state.authenticated || authentication !== api.runtimeIdentity().authenticationGeneration) return;
+  if (!current) {
+    const catalog = new Map(fileWorkspaceCatalog.value), workspace = catalog.get(tab.scope);
+    if (workspace) {
+      const files = workspace.files.filter(file => file.path !== tab.path);
+      catalog.set(tab.scope, { ...workspace, files, activePath: workspace.activePath === tab.path ? files.at(-1)?.path || '' : workspace.activePath });
+      fileWorkspaceCatalog.value = catalog;
+      void privateState.write("file-workspace-tabs", "catalog", [...catalog.values()].map(({ ready: _ready, ...entry }) => entry)).catch(() => {});
+    }
+  }
   await nextTick();
   chatTabsView.value?.focusSelected();
 }
-function filePreviewFailed(value: { path: string; hostId: string; projectPath: string }) {
+function filePreviewFailed(value: { hostId: string; projectPath: string }) {
   if (value.hostId !== state.hostId || value.projectPath !== state.projectPath) return;
   void showCenterChat();
   workspaceOpen.value = true;
@@ -741,12 +840,13 @@ async function chooseNewContext(hostId: string, path?: string | null) {
     composer.value?.focus();
   }
 }
-function openWorkspace(tab = "files", path = "", line?: number) {
+function openWorkspace(tab = "files", path = "", line?: number, revealPanel = true) {
   sideChat.hide();
   const targetScope = workspaceScope();
   const samePath = workspaceMounted.value && workspacePathScope.value === targetScope && workspacePath.value === path;
   workspaceTab.value = tab;
-  workspaceOpen.value = true;
+  workspaceMounted.value = true;
+  if (revealPanel) workspaceOpen.value = true;
   workspacePath.value = path;
   workspaceLine.value = line;
   workspacePathScope.value = targetScope;
@@ -811,7 +911,7 @@ async function openSideChatFile(path: string, line?: number) {
     await selectThread({ hostId: source.hostId, id: source.threadId });
     if (state.hostId !== source.hostId || state.activeThread?.id !== source.threadId) return;
   }
-  openWorkspace('files', path, line);
+  openWorkspace('files', path, line, false);
 }
 function bookmarkSelection(value: ConversationSelectionSource) {
   const source = selectedSource(value);
@@ -1122,6 +1222,11 @@ function onScroll() {
     const element = scroll.value;
     const changedLayout = element.scrollHeight !== lastScrollHeight;
     lastScrollHeight = element.scrollHeight;
+    // The keyed output may already contain the target thread's cached history
+    // while native resume/read is still pending. Do not interpret its initial
+    // layout correction as a user scroll or persist the outgoing thread's
+    // viewport under the target key.
+    if (!readingLayoutReady()) return;
     if (conversationOutput.value?.isVirtual) {
       // The virtualizer owns prepend/streaming compensation. This handler only
       // records reading intent; a second scroll writer would fight its anchor.
@@ -1526,6 +1631,7 @@ watch(() => [state.authenticated, state.loading], () => {
           </button>
           <ChatTabs ref="chatTabsView" :tabs="chatTabs.state.entries" :active-key="activeChatTabKey"
             :draft="!state.activeThread" :disabled="chatTabsDisabled" :file-tabs="centerFileTabs" :active-file-path="centerFileVisible ? selectedFilePath : null"
+            :active-file-scope="centerFileVisible ? workspaceScope() : null" :current-workspace-scope="workspaceScope()"
             @select="selectChatTab" @close="closeChatTab" @new="newThread" @select-draft="showCenterChat" @select-file="selectFileTab" @close-file="closeFileTab">
             <template #menu>
           <div class="thread-menu-wrapper">
@@ -1794,6 +1900,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :cwd="state.activeThread?.cwd || state.projectPath"
               :items="state.items"
               :turns="state.turns"
+              :initial-reading="state.activeThread && initialConversationReading?.hostId === state.hostId && initialConversationReading?.threadId === state.activeThread.id ? initialConversationReading.position : undefined"
               :busy="state.busy"
               :fork-disabled="forkActionsDisabled"
               :editable-item-id="editableItemId"
@@ -1808,7 +1915,7 @@ watch(() => [state.authenticated, state.loading], () => {
               :answer-async-question="api.answerAsyncQuestion"
               :async-questions-disabled="asyncQuestionsDisabled"
               @fork="fork"
-              @open-file="(path, line) => openWorkspace('files', path, line)"
+              @open-file="(path, line) => openWorkspace('files', path, line, false)"
               @error="showError"
               @edit-session-active="messageEditOpen = $event"
               @retain-turns="api.retainHistoryTurns($event.threadId, $event.turnIds, $event.hostId)"
@@ -1914,6 +2021,7 @@ watch(() => [state.authenticated, state.loading], () => {
         @file-tabs-change="updateFileWorkspace"
         @preview-file="previewCenterFile"
         @file-open-failed="filePreviewFailed"
+        @reveal-directory="filePreviewFailed"
         @error="showError"
         @add="addToConversation"
         @ask="askInSideChat"
