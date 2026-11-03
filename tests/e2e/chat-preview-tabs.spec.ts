@@ -1,5 +1,5 @@
 import { test, expect, login, MockCodex } from './fixtures';
-import type { Page } from '@playwright/test';
+import type { Page, WebSocketRoute } from '@playwright/test';
 
 const editor = (page: Page) => page.getByRole('textbox', { name: '消息输入框', exact: true });
 const strip = (page: Page) => page.getByRole('tablist', { name: '聊天标签页', exact: true });
@@ -206,26 +206,25 @@ test('project rows and search results use the same single-preview and double-kee
   untouched(mock);
 });
 
-test('a remote preview title appears immediately while its destination initialization is still pending', async ({ page, mock }) => {
+test('a remote preview title appears immediately while its destination handshake is still pending', async ({ page, mock }) => {
   const remote = new MockCodex();
   remote.threads[0]!.name = remote.threads[0]!.preview = '仍在连接的远端会话';
   mock.hosts.push({ id: 'slow-preview-remote', name: '缓慢预览远端', kind: 'ssh', hostname: 'fixture.invalid' });
   mock.hostMocks.set('slow-preview-remote', remote);
-  const receive = (remote as any).receive.bind(remote);
-  const held: { socket: any; request: any }[] = [];
-  (remote as any).receive = (socket: any, request: any) => {
-    if (request.method === 'initialize') { held.push({ socket, request }); return; }
-    return receive(socket, request);
-  };
+  const connections: WebSocketRoute[] = [];
+  await page.routeWebSocket(url => url.pathname === '/api/rpc' && url.searchParams.get('host') === 'slow-preview-remote', socket => {
+    connections.push(socket); remote.sockets.push(socket);
+    socket.onMessage(raw => (remote as any).receive(socket, JSON.parse(raw.toString())));
+  });
   await login(page); await preview(page, '已有测试历史');
   await row(page, '仍在连接的远端会话', 'slow-preview-remote').click();
-  await expect.poll(() => held.length).toBeGreaterThan(0);
+  await expect.poll(() => connections.length).toBeGreaterThan(0);
   await expect(tab(page, '仍在连接的远端会话')).toHaveAttribute('aria-selected', 'true');
   await expect(tab(page, '已有测试历史')).toHaveCount(0);
   await expect(strip(page).locator('.chat-tab.preview')).toHaveCount(1);
   await expect(editor(page)).toBeDisabled();
   expect(await storedTabs(page)).toEqual([]);
-  for (const entry of held.splice(0)) receive(entry.socket, entry.request);
+  for (const socket of connections) socket.send(JSON.stringify({ method: 'bridge/status', params: { connected: true, activeProcesses: [], pendingRequests: [], hostId: 'slow-preview-remote', mode: 'spawn' } }));
   await expect(editor(page)).toBeEnabled();
   await expect(strip(page).locator('.chat-tab.preview')).toHaveCount(1);
   expect(await storedTabs(page)).toEqual([]);
