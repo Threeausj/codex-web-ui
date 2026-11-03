@@ -56,6 +56,7 @@ async function openConversation(page: Page, title: string) {
   await page.locator('[data-section="recent"] .nav-thread[data-host-id="local"] .thread-row').filter({ hasText: title }).first().click();
   await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await page.getByRole('tab', { name: title, exact: true }).dblclick();
 }
 async function painted(page: Page) {
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -172,6 +173,7 @@ test('top chat tabs keep three conversations selected across two hosts and two r
     await page.locator(`[data-section="recent"] .nav-thread[data-host-id="${hostId}"] .thread-row`).filter({ hasText: title }).first().click();
     await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
     await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+    await page.getByRole('tab', { name: title, exact: true }).dblclick();
   };
   await login(page); await openConversation(page, 'Alpha 主机会话');
   await page.getByRole('link', { name: 'Alpha 源文件', exact: true }).click();

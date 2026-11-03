@@ -59,16 +59,22 @@ let chatTabPinOperation = 0;
 const selectedChatTab = computed(() => state.activeThread ? { hostId: state.hostId, threadId: state.activeThread.id } : null);
 const activeChatTabKey = computed(() => selectedChatTab.value ? JSON.stringify([selectedChatTab.value.hostId, selectedChatTab.value.threadId]) : null);
 const chatTabPinned = computed(() => chatTabs.state.entries.find(tab => sameChatTab(tab, selectedChatTab.value))?.pinned === true);
+const chatTabPreview = computed(() => sameChatTab(chatTabs.state.preview, selectedChatTab.value));
 const chatTabsDisabled = computed(() => state.editingMessage || state.loading || chatTabSaving.value);
 watch(() => [state.authenticated, state.authenticationGeneration], () => {
   ++chatTabPinOperation; chatTabSaving.value = false;
   if (state.authenticated) void chatTabs.load();
   else chatTabs.clear();
 }, { immediate: true });
-watch([() => state.authenticated, () => state.hostId, () => state.activeThread?.id, () => state.switchingHost], () => {
-  if (state.authenticated && state.activeThread && !state.switchingHost)
-    chatTabs.open({ hostId: state.hostId, threadId: state.activeThread.id,
-      title: state.activeThread.name?.trim() || state.activeThread.preview?.trim() || undefined });
+watch([() => state.authenticated, () => state.hostId, () => state.activeThread?.id, () => state.switchingHost], (_, previous) => {
+  if (state.authenticated && state.activeThread) {
+    const target = { hostId: state.hostId, threadId: state.activeThread.id,
+      title: state.activeThread.name?.trim() || state.activeThread.preview?.trim() || undefined };
+    // Sending a new draft creates a kept tab directly. Passing through the
+    // preview slot first would discard the unrelated chat being previewed.
+    if (!previous?.[2] && !state.loading && !state.selectingThread && !state.switchingHost) chatTabs.open(target);
+    else chatTabs.preview(target);
+  }
 });
 // Catalog pages are partial. Update known titles without treating missing rows
 // as deletion or opening every background chat as a tab.
@@ -356,7 +362,8 @@ const projectName = computed(
     "选择项目",
 );
 const threadTitle = computed(() => threadLabel(state.activeThread,
-  chatTabs.state.entries.find(tab => sameChatTab(tab, selectedChatTab.value))?.title || '新对话', 70));
+  chatTabs.state.entries.find(tab => sameChatTab(tab, selectedChatTab.value))?.title ||
+  (chatTabPreview.value ? chatTabs.state.preview?.title : '') || '新对话', 70));
 const visibleThreads = computed(() =>
   state.threads.filter(
     (thread: any) =>
@@ -747,12 +754,24 @@ async function selectChatTab(tab: ChatTabTarget) {
   if (sameChatTab(tab, selectedChatTab.value)) return;
   await selectThread({ hostId: tab.hostId, id: tab.threadId });
 }
+async function keepChatTab(target: ChatTabTarget & { title?: string } | { hostId: string; id: string; title?: string }) {
+  if (chatTabsDisabled.value || !state.authenticated) return;
+  const threadId = 'threadId' in target ? target.threadId : target.id;
+  const thread = api.navigationThreads().find(thread => thread.hostId === target.hostId && thread.id === threadId);
+  const active = state.hostId === target.hostId && state.activeThread?.id === threadId ? state.activeThread : null;
+  const preview = sameChatTab(chatTabs.state.preview, { hostId: target.hostId, threadId }) ? chatTabs.state.preview : null;
+  chatTabs.open({ hostId: target.hostId, threadId,
+    title: active?.name?.trim() || thread?.name?.trim() || target.title?.trim() || preview?.title || active?.preview?.trim() || thread?.preview?.trim() || undefined });
+  threadMenu.value = false;
+  await chatTabs.flush();
+}
 async function closeChatTab(tab: ChatTabTarget) {
   if (chatTabsDisabled.value) return;
   threadMenu.value = false;
   const authentication = api.runtimeIdentity().authenticationGeneration;
   if (sameChatTab(tab, selectedChatTab.value)) {
-    const entries = chatTabs.state.entries, index = entries.findIndex(entry => sameChatTab(entry, tab));
+    const entries = [...chatTabs.state.entries, ...(chatTabs.state.preview ? [chatTabs.state.preview] : [])],
+      index = entries.findIndex(entry => sameChatTab(entry, tab));
     const next = entries[index + 1] || entries[index - 1];
     if (next) {
       if (!await selectThread({ hostId: next.hostId, id: next.threadId })) return;
@@ -1589,6 +1608,7 @@ watch(() => [state.authenticated, state.loading], () => {
           :state="state"
           :bookmarks="bookmarks"
           @select="selectThread"
+          @keep="keepChatTab"
           @bookmark="openSavedBookmark"
           @project="selectProject"
           @project-action="projectAction"
@@ -1630,9 +1650,10 @@ watch(() => [state.authenticated, state.loading], () => {
             <Icon name="PanelLeft" />
           </button>
           <ChatTabs ref="chatTabsView" :tabs="chatTabs.state.entries" :active-key="activeChatTabKey"
+            :preview="chatTabs.state.preview"
             :draft="!state.activeThread" :disabled="chatTabsDisabled" :file-tabs="centerFileTabs" :active-file-path="centerFileVisible ? selectedFilePath : null"
             :active-file-scope="centerFileVisible ? workspaceScope() : null" :current-workspace-scope="workspaceScope()"
-            @select="selectChatTab" @close="closeChatTab" @new="newThread" @select-draft="showCenterChat" @select-file="selectFileTab" @close-file="closeFileTab">
+            @select="selectChatTab" @keep="keepChatTab" @close="closeChatTab" @new="newThread" @select-draft="showCenterChat" @select-file="selectFileTab" @close-file="closeFileTab">
             <template #menu>
           <div class="thread-menu-wrapper">
             <button
@@ -1648,6 +1669,9 @@ watch(() => [state.authenticated, state.loading], () => {
             </button>
             <Teleport to="body">
             <div v-if="threadMenu" ref="threadMenuPanel" id="active-chat-menu" class="thread-menu chat-tabs-menu" :style="threadMenuPosition" role="group" aria-label="当前聊天操作" @keydown="threadMenuKeys">
+              <button v-if="chatTabPreview" :disabled="!selectedChatTab || chatTabsDisabled" @click="selectedChatTab && keepChatTab(selectedChatTab)">
+                <Icon name="MessagesSquare" :size="16" />保留在标签栏
+              </button>
               <button :disabled="!selectedChatTab || chatTabsDisabled" @click="toggleChatTabPin">
                 <Icon :name="chatTabPinned ? 'PinOff' : 'Pin'" :size="16" />{{ chatTabPinned ? '取消固定标签页' : '固定标签页' }}
               </button>
