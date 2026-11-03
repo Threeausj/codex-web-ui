@@ -15,6 +15,7 @@ import { createThreadReadSync } from '../lib/thread-read-sync';
 const props = defineProps<{ api: any; state: any; bookmarks: ReturnType<typeof useConversationBookmarks> }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
+  keep: [selection: { id: string; hostId: string; title: string }];
   project: [project: any];
   settings: [tab: string];
   error: [message: string];
@@ -329,6 +330,7 @@ onBeforeUnmount(() => {
         :api="api"
         :archived="archived"
         @select="emit('select', $event)"
+        @keep="emit('keep', $event)"
         @error="emit('error', $event)"
         @renamed="resultChanged($event)"
         @deleted="resultChanged($event, true)"
@@ -378,6 +380,7 @@ onBeforeUnmount(() => {
               @project="emit('project', $event)"
               @project-action="emit('projectAction', $event)"
               @select="emit('select', $event)"
+              @keep="emit('keep', $event)"
               @error="emit('error', $event)"
             />
             <ThreadRow
@@ -386,6 +389,7 @@ onBeforeUnmount(() => {
               :state="state"
               :api="api"
               @select="emit('select', $event)"
+              @keep="emit('keep', $event)"
               @error="emit('error', $event)"
             />
           </template>
@@ -437,6 +441,7 @@ onBeforeUnmount(() => {
             @project="emit('project', $event)"
             @project-action="emit('projectAction', $event)"
             @select="emit('select', $event)"
+            @keep="emit('keep', $event)"
             @error="emit('error', $event)"
           />
           <button
@@ -495,6 +500,7 @@ onBeforeUnmount(() => {
             :state="state"
             :api="api"
             @select="emit('select', $event)"
+            @keep="emit('keep', $event)"
             @error="emit('error', $event)"
           />
           <p v-if="!recentThreads.length" class="nav-empty">{{ recentHost ? "此设备暂无最近对话" : "暂无最近对话" }}</p>

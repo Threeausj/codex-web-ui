@@ -16,6 +16,8 @@ async function open(page: Page, name: string, hostId = 'local') {
   await page.locator(`[data-section="recent"] .nav-thread[data-host-id="${hostId}"] .thread-row`).filter({ hasText: name }).click();
   await expect(tab(page, name)).toHaveAttribute('aria-selected', 'true');
   await expect(editor(page)).toBeEnabled();
+  // These regressions exercise durable multi-tab navigation explicitly.
+  await tab(page, name).dblclick();
 }
 function add(mock: MockCodex, id: string, name: string, text = `${name}的内容`) {
   mock.threads.push({ ...mock.threads[0]!, id, name, preview: name, status: { type: 'idle' } });
@@ -80,6 +82,7 @@ test('identical native IDs and titles on different hosts create independent tabs
   await sidebar(page);
   await page.locator('[data-section="recent"] .nav-thread[data-host-id="tabs-remote"] .thread-row').click();
   await expect(wrapper(page, 'tabs-remote').getByRole('tab')).toHaveAttribute('aria-selected', 'true');
+  await wrapper(page, 'tabs-remote').getByRole('tab').dblclick();
   await expect(page.locator('.agent-message')).toContainText('远端同名聊天内容');
   await editor(page).fill('远端同名聊天草稿');
   await expect(strip(page).getByRole('tab', { name: '已有测试历史', exact: true })).toHaveCount(2);

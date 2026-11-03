@@ -46,6 +46,7 @@ async function choose(page: Page, title: string, host = 'local') {
   if (await sidebar.isVisible()) await sidebar.click();
   await page.locator(`[data-section="recent"] [data-host-id="${host}"] .thread-row`).filter({ hasText: title }).first().click();
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await page.getByRole('tab', { name: title, exact: true }).dblclick();
 }
 async function topTab(page: Page, title: string) {
   await page.getByRole('tab', { name: title, exact: true }).click();

@@ -16,6 +16,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
+  keep: [selection: { id: string; hostId: string; title: string }];
   error: [message: string];
   renamed: [thread: { id: string; hostId: string; name: string }];
   deleted: [thread: { id: string; hostId: string }];
@@ -165,6 +166,7 @@ async function submitDialog() {
           ? restoreThread()
           : emit('select', { id: thread.id, hostId })
       "
+      @dblclick.prevent="!archived && !pending && !state.editingMessage && emit('keep', { id: thread.id, hostId, title: label })"
       :title="label"
       :disabled="pending"
     >

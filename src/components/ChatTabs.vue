@@ -6,6 +6,7 @@ type ChatTab = { hostId: string; threadId: string; title: string; pinned: boolea
 type FileTab = { scope: string; hostId: string; projectPath: string; threadId?: string; path: string; title: string; dirty: boolean; saving: boolean };
 const props = defineProps<{
   tabs: ChatTab[];
+  preview?: ChatTab | null;
   activeKey: string | null;
   draft: boolean;
   disabled: boolean;
@@ -14,8 +15,11 @@ const props = defineProps<{
   activeFileScope?: string | null;
   currentWorkspaceScope?: string | null;
 }>();
-const emit = defineEmits<{ select: [tab: ChatTab]; close: [tab: ChatTab]; new: []; selectDraft: []; selectFile: [tab: FileTab]; closeFile: [tab: FileTab] }>();
+const emit = defineEmits<{ select: [tab: ChatTab]; keep: [tab: ChatTab]; close: [tab: ChatTab]; new: []; selectDraft: []; selectFile: [tab: FileTab]; closeFile: [tab: FileTab] }>();
 const key = (tab: ChatTab) => JSON.stringify([tab.hostId, tab.threadId]);
+const displayTabs = computed(() => props.preview && !props.tabs.some(tab => key(tab) === key(props.preview!))
+  ? [...props.tabs, props.preview] : props.tabs);
+const isPreview = (tab: ChatTab) => !!props.preview && key(tab) === key(props.preview) && !props.tabs.some(entry => key(entry) === key(tab));
 const draftKey = 'new-chat';
 const fileKey = (tab: Pick<FileTab, 'hostId' | 'projectPath' | 'path'>) => JSON.stringify(['file', tab.hostId, tab.projectPath, tab.path]);
 const isActiveFile = (tab: FileTab) => props.activeFilePath === tab.path && props.activeFileScope === tab.scope;
@@ -27,7 +31,7 @@ const fileTabLabel = (tab: FileTab) => {
 };
 const viewport = ref<HTMLElement>();
 const focusedKey = ref<string | null>(null);
-const visibleKeys = computed(() => [...props.tabs.map(key), ...(props.draft ? [draftKey] : []), ...(props.fileTabs || []).map(fileKey)]);
+const visibleKeys = computed(() => [...displayTabs.value.map(key), ...(props.draft ? [draftKey] : []), ...(props.fileTabs || []).map(fileKey)]);
 const stripWidths = computed(() => ({
   '--tabs-width': `${Math.max(0, visibleKeys.value.length * 228 - 4)}px`,
   '--tabs-width-mobile': `${Math.max(0, visibleKeys.value.length * 199 - 3)}px`,
@@ -77,7 +81,7 @@ function keydown(event: KeyboardEvent, value: string) {
       : (index + (event.key === 'ArrowRight' ? 1 : -1) + keys.length) % keys.length;
     if (keys[next]) focusTab(keys[next]);
   } else if (event.key === 'Delete') {
-    const tab = props.tabs.find(tab => key(tab) === value);
+    const tab = displayTabs.value.find(tab => key(tab) === value);
     if (tab && !tab.pinned) { event.preventDefault(); event.stopPropagation(); closeTab(tab); }
     const file = props.fileTabs?.find(tab => fileKey(tab) === value);
     if (file && !file.saving) { event.preventDefault(); event.stopPropagation(); emit('closeFile', file); }
@@ -89,7 +93,7 @@ function closeMiddle(event: MouseEvent, tab: ChatTab) {
   closeTab(tab);
 }
 watch(selectedKey, selected => { focusedKey.value = selected; });
-watch(() => [selectedKey.value, ...props.tabs.map(tab => `${key(tab)}:${tab.title}:${tab.pinned}`), ...(props.fileTabs || []).map(tab => `${fileKey(tab)}:${tab.title}:${tab.dirty}`), props.draft], async () => {
+watch(() => [selectedKey.value, ...displayTabs.value.map(tab => `${key(tab)}:${tab.title}:${tab.pinned}:${isPreview(tab)}`), ...(props.fileTabs || []).map(tab => `${fileKey(tab)}:${tab.title}:${tab.dirty}`), props.draft], async () => {
   if (!visibleKeys.value.includes(focusedKey.value || '')) focusedKey.value = selectedKey.value;
   void showSelected();
   if (closingFocus && !visibleKeys.value.includes(closingFocus)) {
@@ -109,14 +113,15 @@ defineExpose({ focusSelected: () => { if (selectedKey.value) focusTab(selectedKe
 <template>
   <div class="chat-tabs">
     <div ref="viewport" class="chat-tabs-scroll" role="tablist" aria-label="聊天标签页" :style="stripWidths">
-      <div v-for="tab in tabs" :key="key(tab)" class="chat-tab"
-        :class="{ active: !activeFilePath && !draft && key(tab) === activeKey, pinned: tab.pinned }"
-        :data-host-id="tab.hostId" :data-thread-id="tab.threadId"
+      <div v-for="tab in displayTabs" :key="key(tab)" class="chat-tab"
+        :class="{ active: !activeFilePath && !draft && key(tab) === activeKey, pinned: tab.pinned, preview: isPreview(tab) }"
+        :data-host-id="tab.hostId" :data-thread-id="tab.threadId" :data-preview="isPreview(tab) || undefined"
         @auxclick="closeMiddle($event, tab)">
         <button type="button" class="chat-tab-select" role="tab" :data-tab-key="key(tab)"
           :aria-selected="!activeFilePath && !draft && key(tab) === activeKey"
+          :aria-description="isPreview(tab) ? '临时预览，双击保留在标签栏' : undefined"
           :tabindex="tabStop === key(tab) ? 0 : -1" :disabled="disabled"
-          :title="tab.title" @click="emit('select', tab)" @focus="focusedKey = key(tab)"
+          :title="tab.title" @click="emit('select', tab)" @dblclick.prevent="!disabled && emit('keep', tab)" @focus="focusedKey = key(tab)"
           @keydown="keydown($event, key(tab))">
           <Icon :name="tab.pinned ? 'Pin' : 'MessagesSquare'" :size="14" />
           <span class="chat-tab-title">{{ tab.title }}</span>
@@ -152,3 +157,7 @@ defineExpose({ focusSelected: () => { if (selectedKey.value) focusTab(selectedKe
       aria-label="新建聊天标签页" title="新建聊天标签页" @click="emit('new')"><Icon name="Plus" :size="17" /></button>
   </div>
 </template>
+
+<style scoped>
+.chat-tab.preview .chat-tab-title { font-style: italic; }
+</style>

@@ -27,7 +27,7 @@ const titleText = (value: unknown) => typeof value === 'string' && value.trim() 
 /** Tabs contain only navigation metadata. Drafts, history and running tasks stay
  * with their existing owners, and closing a tab never sends an interrupt. */
 export class ChatTabs {
-  readonly state = reactive({ entries: [] as ChatTab[], hydrated: false });
+  readonly state = reactive({ entries: [] as ChatTab[], preview: null as ChatTab | null, hydrated: false });
   private readonly persistence: TabPersistence;
   private readonly now: () => number;
   private authentication: number;
@@ -38,6 +38,7 @@ export class ChatTabs {
   private pending: ((entries: ChatTab[]) => ChatTab[])[] = [];
   private revision = 0;
   private savedRevision = 0;
+  private previewTitle: string | undefined;
   constructor(private options: Options) {
     this.persistence = options.persistence || privateState;
     this.now = options.now || Date.now;
@@ -96,6 +97,10 @@ export class ChatTabs {
       this.pending = [];
       this.state.entries = entries;
       this.state.hydrated = true;
+      // Navigation may have displayed a preview before the stored catalog was
+      // ready. A kept tab retains its identity and must not appear twice.
+      if (this.state.preview && entries.some(entry => sameChatTab(entry, this.state.preview)))
+        this.open({ hostId: this.state.preview.hostId, threadId: this.state.preview.threadId });
     })().catch(() => {
       // If IndexedDB is unavailable the current window remains usable.
       if (this.current(generation, authentication)) { this.pending = []; this.state.hydrated = true; }
@@ -103,11 +108,33 @@ export class ChatTabs {
     this.loading = loading;
     return loading;
   }
+  /** A single selection reuses one temporary slot. Its metadata is never
+   * serialized until the user explicitly keeps or pins the tab. */
+  preview(target: ChatTabTarget & { title?: string }) {
+    if (!validTarget(target)) return;
+    this.owned();
+    if (this.state.entries.some(entry => sameChatTab(entry, target))) {
+      this.open(target);
+      return;
+    }
+    const previous = sameChatTab(this.state.preview, target) ? this.state.preview : null;
+    const title = target.title?.trim() ? titleText(target.title) : undefined;
+    this.previewTitle = title ?? (previous ? this.previewTitle : undefined);
+    this.state.preview = {
+      hostId: target.hostId, threadId: target.threadId,
+      title: title ?? previous?.title ?? '未命名对话',
+      pinned: false,
+      lastOpened: Math.max(this.now(), previous?.lastOpened ? previous.lastOpened + 1 : 0),
+    };
+  }
   open(target: ChatTabTarget & { title?: string }) {
     if (!validTarget(target)) return;
+    this.owned();
     const owner = { hostId: target.hostId, threadId: target.threadId };
-    const title = target.title?.trim() ? titleText(target.title) : undefined;
+    const preview = sameChatTab(this.state.preview, owner) ? this.state.preview : null;
+    const title = target.title?.trim() ? titleText(target.title) : preview ? this.previewTitle : undefined;
     const timestamp = this.now();
+    if (preview) { this.state.preview = null; this.previewTitle = undefined; }
     this.change(entries => {
       const existing = entries.find(entry => sameChatTab(entry, owner));
       // Monotonic recency also works with fixed clocks and rapid selections.
@@ -120,17 +147,22 @@ export class ChatTabs {
   }
   close(target: ChatTabTarget, active?: ChatTabTarget | null): ChatTab | null {
     this.owned();
+    if (sameChatTab(this.state.preview, target)) {
+      this.remove(target);
+      return sameChatTab(target, active) ? this.state.entries.at(-1) || null : null;
+    }
     const index = this.state.entries.findIndex(entry => sameChatTab(entry, target));
     if (index < 0) return null;
     const wasActive = sameChatTab(target, active);
     this.remove(target);
-    return wasActive ? this.state.entries[Math.min(index, this.state.entries.length - 1)] || null : null;
+    return wasActive ? this.state.entries[Math.min(index, this.state.entries.length - 1)] || this.state.preview || null : null;
   }
   /** Explicit native deletion/archive notifications can remove one tab. Never
    * infer deletion from a paginated or temporarily disconnected thread list. */
   remove(target: ChatTabTarget) {
     if (!validTarget(target)) return;
     this.owned();
+    if (sameChatTab(this.state.preview, target)) { this.state.preview = null; this.previewTitle = undefined; }
     if (this.state.hydrated && !this.state.entries.some(entry => sameChatTab(entry, target))) return;
     const owner = { ...target };
     this.change(entries => entries.filter(entry => !sameChatTab(entry, owner)));
@@ -138,6 +170,7 @@ export class ChatTabs {
   removeHost(hostId: string) {
     if (!validId(hostId)) return;
     this.owned();
+    if (this.state.preview?.hostId === hostId) { this.state.preview = null; this.previewTitle = undefined; }
     if (this.state.hydrated && !this.state.entries.some(entry => entry.hostId === hostId)) return;
     this.change(entries => entries.filter(entry => entry.hostId !== hostId));
   }
@@ -145,15 +178,18 @@ export class ChatTabs {
     if (!validTarget(target) || !title.trim()) return;
     this.owned();
     const owner = { ...target }, name = titleText(title);
+    if (sameChatTab(this.state.preview, owner)) { this.state.preview!.title = name; this.previewTitle = name; }
     const existing = this.state.entries.find(entry => sameChatTab(entry, owner));
     if (existing?.title === name || this.state.hydrated && !existing) return;
     this.change(entries => entries.map(entry => sameChatTab(entry, owner) ? { ...entry, title: name } : entry));
   }
   togglePinned(target: ChatTabTarget): boolean {
     this.owned();
-    const tab = this.state.entries.find(entry => sameChatTab(entry, target));
+    const tab = this.state.entries.find(entry => sameChatTab(entry, target)) ||
+      (sameChatTab(this.state.preview, target) ? this.state.preview : null);
     if (!tab || !tab.pinned && this.state.entries.filter(entry => entry.pinned).length >= maxPinnedChatTabs) return false;
     const owner = { ...target }, pinned = !tab.pinned;
+    if (sameChatTab(this.state.preview, target)) this.open(tab);
     this.change(entries => {
       if (pinned && entries.filter(entry => entry.pinned && !sameChatTab(entry, owner)).length >= maxPinnedChatTabs) return entries;
       return this.normalize(entries.map(entry => sameChatTab(entry, owner) ? { ...entry, pinned } : entry));
@@ -185,6 +221,8 @@ export class ChatTabs {
     this.pending = [];
     this.revision = this.savedRevision = 0;
     this.state.entries = [];
+    this.state.preview = null;
+    this.previewTitle = undefined;
     this.state.hydrated = false;
   }
 }
