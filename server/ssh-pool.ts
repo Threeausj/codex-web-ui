@@ -1,5 +1,5 @@
 import { spawn, execFile } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import type { Host } from './types.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import { sshKnownHostsArgs, type SSHConnectionControl } from './ssh.js'
+import { createSshAskpass } from './ssh-askpass.js'
 
 const execute = promisify(execFile)
 type Master = { ready: Promise<void>; closed: Promise<void>; close(): void }
@@ -18,9 +19,11 @@ export type SSHConnectionLease = { control: SSHConnectionControl; closed?: Promi
 export type SshLease = SSHConnectionLease
 type PoolOptions = {
   idleMs?: number; maximumConnections?: number; directory?: string;
+  /** Server-only credential lookup. Neither Host nor diagnostics contain it. */
+  password?: (host: Host) => Promise<string | undefined>;
   /** Isolated test dependencies, never populated from HTTP input. */
   identity?: (host: Host, pin?: SSHHostKeyPin) => Promise<string>;
-  start?: (host: Host, pin: SSHHostKeyPin | undefined, control: SSHConnectionControl) => Master;
+  start?: (host: Host, pin: SSHHostKeyPin | undefined, control: SSHConnectionControl, password?: string) => Master | Promise<Master>;
 }
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex')
 function destination(host: Host) {
@@ -29,10 +32,13 @@ function destination(host: Host) {
     throw new Error('SSH 主机配置无效')
   return `${host.username ? `${host.username}@` : ''}${host.hostname}`
 }
-function authenticationArgs(host: Host, pin?: SSHHostKeyPin) {
-  return ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15',
+export function sshPoolAuthenticationArgs(host: Host, pin?: SSHHostKeyPin) {
+  return ['-o', host.authentication === 'password' ? 'BatchMode=no' : 'BatchMode=yes',
+    ...(host.authentication === 'password' ? ['-o', 'PreferredAuthentications=password,keyboard-interactive', '-o', 'PubkeyAuthentication=no',
+      '-o', 'PasswordAuthentication=yes', '-o', 'KbdInteractiveAuthentication=yes', '-o', 'NumberOfPasswordPrompts=1'] : []),
+    '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15',
     '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-o', 'LogLevel=ERROR',
-    ...sshKnownHostsArgs(pin), ...(host.port ? ['-p', String(host.port)] : []), ...(host.identityFile ? ['-i', host.identityFile] : [])]
+    ...sshKnownHostsArgs(pin), ...(host.port ? ['-p', String(host.port)] : []), ...(host.authentication !== 'password' && host.identityFile ? ['-i', host.identityFile] : [])]
 }
 async function fileIdentity(file: string, required = false) {
   const expanded = file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file
@@ -49,7 +55,7 @@ async function fileIdentity(file: string, required = false) {
 }
 /** Resolve ssh_config locally, without contacting or trusting a remote server. */
 export async function sshConnectionIdentity(host: Host, pin?: SSHHostKeyPin) {
-  const resolved = await execute('ssh', ['-G', ...authenticationArgs(host, pin), '--', destination(host)], {
+  const resolved = await execute('ssh', ['-G', ...sshPoolAuthenticationArgs(host, pin), '--', destination(host)], {
     timeout: 5000, maxBuffer: 512 * 1024, encoding: 'utf8', windowsHide: true,
   })
   const files = new Set<string>([...(host.identityFile ? [host.identityFile] : []), ...(pin ? [pin.file] : [])])
@@ -62,22 +68,30 @@ export async function sshConnectionIdentity(host: Host, pin?: SSHHostKeyPin) {
       for (const value of values) if (value && value !== 'none') files.add(value)
   }
   const identities = await Promise.all([...files].sort().map(file => fileIdentity(file, file === pin?.file)))
-  return digest(JSON.stringify([host.id, host.hostname, host.username, host.port, host.identityFile,
+  return digest(JSON.stringify([host.id, host.hostname, host.username, host.port, host.identityFile, host.authentication,
     pin?.hostKeyAlias, resolved.stdout, identities, process.env.SSH_AUTH_SOCK || '']))
 }
 
-function startMaster(host: Host, pin: SSHHostKeyPin | undefined, control: SSHConnectionControl): Master {
+async function startMaster(host: Host, pin: SSHHostKeyPin | undefined, control: SSHConnectionControl, password?: string): Promise<Master> {
   // Command-line options are first-wins. Override the no-multiplexing fallback
   // before the common strict trust arguments, never through an external socket.
   const args = ['-M', '-N', '-T', '-o', `ControlPath=${control.socketPath}`, '-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
-    ...authenticationArgs(host, pin), '--', destination(host)]
-  const child = spawn('ssh', args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
+    ...sshPoolAuthenticationArgs(host, pin), '--', destination(host)]
+  const askpass = host.authentication === 'password' ? await createSshAskpass(password || '', path.dirname(control.socketPath)) : undefined
+  let child: ReturnType<typeof spawn>
+  try {
+    child = spawn('ssh', args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, ...(askpass?.env || {}), LANG: 'C', LC_ALL: 'C' } })
+  } catch {
+    await askpass?.dispose()
+    throw new Error('无法启动 SSH 连接')
+  }
   let stderr = '', exited = false, failure: Error | undefined
   const closed = new Promise<void>(resolve => {
     child.once('error', error => { failure = error; exited = true; resolve() })
     child.once('close', () => { exited = true; resolve() })
   })
-  child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-4096) })
+  child.stderr!.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-4096) })
   let forceClose: ReturnType<typeof setTimeout> | undefined
   void closed.then(() => clearTimeout(forceClose))
   const close = () => {
@@ -85,18 +99,20 @@ function startMaster(host: Host, pin: SSHHostKeyPin | undefined, control: SSHCon
     if (!forceClose && !exited) { forceClose = setTimeout(() => child.kill('SIGKILL'), 1000); forceClose.unref() }
   }
   const ready = (async () => {
-    const deadline = Date.now() + 16000
-    while (!exited && Date.now() < deadline) {
-      try {
-        const stat = await fs.lstat(control.socketPath)
-        if (stat.isSocket() && !stat.isSymbolicLink()) return
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-      await new Promise(resolve => setTimeout(resolve, 20))
-    }
-    close()
-    throw new Error(/host key|identification has changed/i.test(stderr) ? 'SSH 主机指纹校验失败，请确认服务器指纹后重试' :
-      /permission denied|authentication failed/i.test(stderr) ? 'SSH 认证失败，请检查账户和私钥' :
-      failure && (failure as NodeJS.ErrnoException).code === 'ENOENT' ? '服务端未安装 OpenSSH 客户端' : 'SSH 连接失败或超时，请检查主机网络和认证配置')
+    try {
+      const deadline = Date.now() + 16000
+      while (!exited && Date.now() < deadline) {
+        try {
+          const stat = await fs.lstat(control.socketPath)
+          if (stat.isSocket() && !stat.isSymbolicLink()) return
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      close()
+      throw new Error(/host key|identification has changed/i.test(stderr) ? 'SSH 主机指纹校验失败，请确认服务器指纹后重试' :
+        /permission denied|authentication failed/i.test(stderr) ? 'SSH 认证失败，请检查账户、密码或私钥' :
+        failure && (failure as NodeJS.ErrnoException).code === 'ENOENT' ? '服务端未安装 OpenSSH 客户端' : 'SSH 连接失败或超时，请检查主机网络和认证配置')
+    } finally { await askpass?.dispose() }
   })()
   return { ready, closed, close }
 }
@@ -111,6 +127,7 @@ export class SshConnectionPool {
   private closed = false
   private closing?: Promise<void>
   private background = new Map<string, { tail: Promise<unknown>; queued: number; failures: number; retryAt: number; cancelled: boolean }>()
+  private readonly credentialKey = randomBytes(32)
   constructor(private readonly options: PoolOptions = {}) {}
   private directory() {
     return this.root ||= (async () => {
@@ -125,7 +142,13 @@ export class SshConnectionPool {
     const epoch = this.epoch
     const hostEpoch = this.hostEpochs.get(host.id) || 0
     const current = () => !this.closed && epoch === this.epoch && hostEpoch === (this.hostEpochs.get(host.id) || 0)
-    const key = await (this.options.identity || sshConnectionIdentity)(host, pin)
+    const password = host.authentication === 'password' ? await this.options.password?.(host) : undefined
+    if (host.authentication === 'password' && !password) throw new Error('请填写 SSH 登录密码')
+    const identity = await (this.options.identity || sshConnectionIdentity)(host, pin)
+    // An in-memory keyed digest invalidates reuse after password rotation without
+    // exposing a reusable password hash in socket names or pool status.
+    const key = host.authentication === 'password'
+      ? createHmac('sha256', this.credentialKey).update(identity).update('\0').update(password!).digest('hex') : identity
     if (!current()) throw new Error('SSH 连接状态已变化，请重试')
     let entry = this.entries.get(key)
     if (entry?.retired) { this.entries.delete(key); entry = undefined }
@@ -153,11 +176,12 @@ export class SshConnectionPool {
         this.entries.set(key, entry)
         this.allEntries.add(entry)
         const created = entry
-        created.master = Promise.resolve().then(() => {
+        created.master = Promise.resolve().then(async () => {
           if (created.stopping || !current()) throw new Error('SSH 连接状态已变化，请重试')
-          const master = (this.options.start || startMaster)(host, pin, control)
+          const master = await (this.options.start || startMaster)(host, pin, control, password)
           created.rawMaster = master
           void master.closed.then(() => { if (this.entries.get(key) === created) this.entries.delete(key); this.allEntries.delete(created); clearTimeout(created.timer); created.retired = true; void fs.rm(control.socketPath, { force: true }).catch(() => {}) })
+          if (created.stopping || !current()) { master.close(); await master.ready.catch(() => {}); throw new Error('SSH 连接状态已变化，请重试') }
           return master.ready.then(() => master, error => { master.close(); if (this.entries.get(key) === created) this.entries.delete(key); throw error })
         }).catch(error => { if (this.entries.get(key) === created) this.entries.delete(key); if (!created.rawMaster) this.allEntries.delete(created); throw error })
       }

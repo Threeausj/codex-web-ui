@@ -95,7 +95,7 @@ export async function createApp(options: AppOptions = {}) {
   const stopPushLogoutListener = auth.onLogout(sessionId => push.revokeSession(sessionId))
   const stopPushPasswordListener = auth.onPasswordChanged((sessionId, version) => push.changeCredentialVersion(version, sessionId))
   const mode = options.bridgeOptions?.mode || (process.env.CODEX_CONNECTION_MODE === 'proxy' ? 'proxy' : 'spawn')
-  const sshPool = options.bridgeOptions?.sshPool || new SshConnectionPool()
+  const sshPool = options.bridgeOptions?.sshPool || new SshConnectionPool({ password: host => storage.sshPassword(host) })
   const bridgeOptions: BridgeOptions = { codexBin: process.env.CODEX_BIN || 'codex', codexHome, cwd, mode, socketPath: process.env.CODEX_SOCKET_PATH, ...options.bridgeOptions, clientName }
   bridgeOptions.recoverThreadIds ??= host => daemonSessions.threadIds({ ...host, connectionMode: 'daemon' })
   bridgeOptions.sshPool ??= sshPool
@@ -270,7 +270,7 @@ export async function createApp(options: AppOptions = {}) {
       res.json({ ok: true, localEnabled: storage.localEnabled, hosts: storage.hosts, projects: await storage.projects() })
     } finally { changingHosts.delete('local') }
   }))
-  registerHostConnection(app, bridgeOptions)
+  registerHostConnection(app, bridgeOptions, storage)
   const sshKeys = new SshKeys(dataDir, storage)
   registerSshKeys(app, sshKeys)
   const fingerprintFields = z.object({ hostname: z.string(), port: z.number().int().min(1).max(65535).nullish() })

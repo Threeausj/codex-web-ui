@@ -7,6 +7,7 @@ import { z } from 'zod'
 import type { Host, Project } from './types.js'
 import { orderHosts } from '../shared/host-order.js'
 import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../shared/project-order.js'
+import { SshPasswordStorage, type EncryptedSshPassword } from './ssh-password-storage.js'
 
 const cleanText = z.string().trim().min(1).max(256).refine(s => !/[\x00-\x1f]/.test(s), 'Control characters are not allowed')
 const optionalField = <T extends z.ZodType>(schema: T) => z.preprocess(value => value === null || (typeof value === 'string' && !value.trim()) ? undefined : value, schema.optional())
@@ -25,6 +26,10 @@ const hostFields = z.object({
   username: optionalField(z.string().trim().min(1).max(64).regex(validUsername, 'SSH 用户名格式不正确')),
   port: optionalField(z.number().int().min(1).max(65535)),
   identityFile: optionalField(cleanText.refine(s => path.isAbsolute(s), 'Identity file must be absolute')),
+  authentication: optionalField(z.enum(['key', 'password'])),
+  // Preserve spaces. An omitted/empty password means retain the saved value.
+  password: z.preprocess(value => value === '' || value === null ? undefined : value,
+    z.string().min(1).max(1024).refine(value => !/[\x00\r\n]/.test(value), 'SSH 密码不能包含换行或空字符').optional()),
   codexPath: optionalField(cleanText),
   cwd: optionalField(cleanText.refine(s => s.startsWith('/'), 'Remote directory must be absolute')),
   connectionMode: optionalField(z.enum(['spawn', 'proxy', 'daemon'])),
@@ -54,7 +59,11 @@ const projectOrderEntry = z.object({
 export const projectOrderInput = z.object({
   projects: z.array(projectOrderEntry).max(2000).refine(entries => new Set(entries.map(projectOrderKey)).size === entries.length, 'Project identities must be unique'),
 }).strict()
-const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'codexPath', 'cwd', 'connectionMode'] as const
+const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'authentication', 'codexPath', 'cwd', 'connectionMode'] as const
+/** Bind ciphertext and reuse to an exact account/endpoint, never only a host ID. */
+export const sshPasswordScope = (host: Pick<Host, 'id' | 'hostname' | 'username' | 'port' | 'authentication'>) =>
+  JSON.stringify([host.id, host.hostname, host.username || null, host.port || null, host.authentication || 'key'])
+const passwordRequired = () => Object.assign(new Error('请输入 SSH 密码；修改主机地址、账户或端口后需要重新输入。'), { status: 400 })
 
 export async function writePrivateJson(file: string, value: unknown) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -88,7 +97,12 @@ export class Storage {
   private webProjects: (Project & { hidden?: boolean })[] = []
   // Host deletion changes both collections, so they must share one write queue.
   private writes: Promise<unknown> = Promise.resolve()
-  constructor(readonly dataDir: string, readonly codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), readonly cwd = process.cwd()) {}
+  private passwordRecords = new Map<string, EncryptedSshPassword>()
+  private credentialGenerations = new WeakMap<Host, object>()
+  private readonly passwords: SshPasswordStorage
+  constructor(readonly dataDir: string, readonly codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), readonly cwd = process.cwd()) {
+    this.passwords = new SshPasswordStorage(dataDir)
+  }
 
   async init() {
     await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 })
@@ -98,8 +112,21 @@ export class Storage {
     const hosts = await readJson(path.join(this.dataDir, 'hosts.json'))
     if (Array.isArray(hosts)) {
       for (const host of hosts) {
-        const validated = hostInput.safeParse(host && typeof host === 'object' ? Object.fromEntries(Object.entries(host).filter(([k]) => k !== 'id' && k !== 'kind')) : null)
-        if (validated.success && typeof host.id === 'string' && /^ssh-[a-f0-9-]+$/.test(host.id)) this.configuredHosts.push({ ...validated.data, id: host.id, kind: 'ssh' })
+        const validated = hostInput.safeParse(host && typeof host === 'object' ? Object.fromEntries(Object.entries(host).filter(([k]) => !['id', 'kind', 'encryptedPassword'].includes(k))) : null)
+        if (validated.success && typeof host.id === 'string' && /^ssh-[a-f0-9-]+$/.test(host.id)) {
+          const { password: plaintext, ...fields } = validated.data
+          if (plaintext !== undefined) throw new Error('SSH 主机记录不能包含明文密码。')
+          const saved: Host = { ...fields, id: host.id, kind: 'ssh' }
+          if (saved.authentication === 'password') {
+            delete saved.identityFile
+            const record = this.passwords.parse(host.encryptedPassword)
+            await this.passwords.decrypt(record, sshPasswordScope(saved))
+            this.passwordRecords.set(saved.id, record)
+            saved.hasPassword = true
+          } else if (host.encryptedPassword !== undefined) throw new Error('SSH 密码记录与认证方式不匹配。')
+          this.credentialGenerations.set(saved, {})
+          this.configuredHosts.push(saved)
+        } else if (host?.encryptedPassword !== undefined) throw new Error('SSH 密码主机记录无效。')
       }
     }
     let storedOrder: string | undefined
@@ -115,6 +142,20 @@ export class Storage {
   }
 
   host(id: string) { return this.hosts.find(h => h.id === id) }
+
+  async sshPassword(host: Host): Promise<string | undefined> {
+    if (host.authentication !== 'password') return undefined
+    const current = this.host(host.id)
+    const generation = this.credentialGenerations.get(host)
+    if (!current || !generation || generation !== this.credentialGenerations.get(current) || sshPasswordScope(current) !== sshPasswordScope(host))
+      throw new Error('SSH 连接凭据已变化，请重新连接主机。')
+    const record = this.passwordRecords.get(host.id)
+    const password = await this.passwords.decrypt(record, sshPasswordScope(host))
+    const latest = this.host(host.id)
+    if (!latest || generation !== this.credentialGenerations.get(latest) || record !== this.passwordRecords.get(host.id))
+      throw new Error('SSH 连接凭据已变化，请重新连接主机。')
+    return password
+  }
 
   subscribeHostOrder(listener: (hostIds: string[]) => void) {
     this.hostOrderListeners.add(listener)
@@ -181,27 +222,54 @@ export class Storage {
   }
 
   async addHost(input: unknown) {
-    const fields = hostInput.parse(input)
+    const { password, ...fields } = hostInput.parse(input)
     return this.mutate(async () => {
       const host: Host = { ...fields, id: `ssh-${randomUUID()}`, kind: 'ssh' }
+      const records = new Map(this.passwordRecords)
+      if (host.authentication === 'password') {
+        if (password === undefined) throw passwordRequired()
+        delete host.identityFile
+        records.set(host.id, await this.passwords.encrypt(password, sshPasswordScope(host)))
+        host.hasPassword = true
+      } else if (password !== undefined) throw Object.assign(new Error('请先选择 SSH 密码登录。'), { status: 400 })
       const hosts = [...this.configuredHosts, host]
-      await this.saveHosts(hosts)
+      await this.saveHosts(hosts, records)
+      this.passwordRecords = records
+      this.credentialGenerations.set(host, {})
       this.configuredHosts = hosts
       return host
     })
   }
 
   async updateHost(id: string, input: unknown) {
-    const fields = hostUpdateInput.parse(input)
+    const { password, ...fields } = hostUpdateInput.parse(input)
     return this.mutate(async () => {
       const current = this.host(id)
       if (!current) throw Object.assign(new Error('Host not found'), { status: 404 })
       if (current.kind !== 'ssh') throw Object.assign(new Error('Only SSH hosts can be edited'), { status: 400 })
       const host: Host = { ...current, ...fields }
+      // The original SSH config/agent mode had no explicit authentication field.
+      // Saving its new UI label must not retire an unchanged live connection.
+      if (fields.authentication === 'key' && current.authentication === undefined) delete host.authentication
       for (const key of connectionFields) if (host[key] === undefined) delete host[key]
-      const connectionReset = connectionFields.some(key => current[key] !== host[key])
+      const records = new Map(this.passwordRecords)
+      if (host.authentication === 'password') {
+        delete host.identityFile
+        if (password !== undefined) records.set(host.id, await this.passwords.encrypt(password, sshPasswordScope(host)))
+        else if (current.authentication !== 'password' || sshPasswordScope(current) !== sshPasswordScope(host) || !records.has(host.id)) throw passwordRequired()
+        host.hasPassword = true
+      } else {
+        if (password !== undefined) throw Object.assign(new Error('请先选择 SSH 密码登录。'), { status: 400 })
+        records.delete(host.id)
+        delete host.hasPassword
+      }
+      const passwordChanged = records.get(id) !== this.passwordRecords.get(id)
+      const connectionReset = passwordChanged || connectionFields.some(key => current[key] !== host[key])
       const hosts = this.configuredHosts.map(value => value.id === id ? host : value)
-      await this.saveHosts(hosts)
+      await this.saveHosts(hosts, records)
+      this.passwordRecords = records
+      const sameCredential = !passwordChanged && sshPasswordScope(current) === sshPasswordScope(host)
+      this.credentialGenerations.set(host, sameCredential ? this.credentialGenerations.get(current) || {} : {})
       this.configuredHosts = hosts
       return { host, connectionReset }
     })
@@ -212,18 +280,24 @@ export class Storage {
       if (id === 'local') throw Object.assign(new Error('The local host cannot be removed'), { status: 400 })
       if (!this.host(id)) throw Object.assign(new Error('Host not found'), { status: 404 })
       const hosts = this.configuredHosts.filter(h => h.id !== id)
+      const records = new Map(this.passwordRecords)
+      records.delete(id)
       const projects = this.webProjects.filter(p => p.hostId !== id)
       await writePrivateJson(path.join(this.dataDir, 'projects.json'), projects)
-      try { await this.saveHosts(hosts) } catch (error) {
+      try { await this.saveHosts(hosts, records) } catch (error) {
         await writePrivateJson(path.join(this.dataDir, 'projects.json'), this.webProjects)
         throw error
       }
       this.configuredHosts = hosts
+      this.passwordRecords = records
       this.webProjects = projects
     })
   }
 
-  private saveHosts(hosts = this.configuredHosts) { return writePrivateJson(path.join(this.dataDir, 'hosts.json'), hosts.filter(h => h.kind === 'ssh')) }
+  private saveHosts(hosts = this.configuredHosts, records = this.passwordRecords) {
+    return writePrivateJson(path.join(this.dataDir, 'hosts.json'), hosts.filter(h => h.kind === 'ssh').map(({ hasPassword: _hasPassword, ...host }) =>
+      ({ ...host, ...(records.has(host.id) ? { encryptedPassword: records.get(host.id) } : {}) })))
+  }
   private mutate<T>(work: () => Promise<T>): Promise<T> {
     const pending = this.writes.then(work)
     this.writes = pending.catch(() => {})

@@ -37,7 +37,7 @@ const PREFIX = '/api/dev-preview/'
 const TTL = 60 * 60 * 1000
 
 export function sshForwardArgs(host: Host, localPort: number, targetPort: number, knownHostsFile?: SSHHostKeyPin, control?: SSHConnectionControl) {
-  const fields = hostInput.parse(Object.fromEntries(Object.entries(host).filter(([key]) => key !== 'id' && key !== 'kind')))
+  const fields = hostInput.parse(Object.fromEntries(Object.entries(host).filter(([key]) => !['id', 'kind', 'hasPassword'].includes(key))))
   for (const port of [localPort, targetPort]) if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid forward port')
   const args = ['-N', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-L', `127.0.0.1:${localPort}:127.0.0.1:${targetPort}`]
   if (knownHostsFile || control) args.push(...sshKnownHostsArgs(knownHostsFile, control))

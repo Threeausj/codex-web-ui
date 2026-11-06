@@ -80,7 +80,7 @@ print(json.dumps(result,allow_nan=False,separators=(',',':')))
 
 export function registerThreadContext(app: Express, deps: Dependencies) {
   type Source = { bridge: ContextBridge; engineId?: string; hostIdentity: string }
-  const identity = (host: Host) => JSON.stringify([host.kind, host.hostname, host.port, host.username, host.identityFile, host.codexPath, host.cwd, host.connectionMode])
+  const identity = (host: Host) => JSON.stringify([host.kind, host.hostname, host.port, host.username, host.identityFile, host.codexPath, host.cwd, host.connectionMode, host.authentication])
   const sameSource = (a: Source, b: Source) => a.bridge === b.bridge && a.engineId === b.engineId && a.hostIdentity === b.hostIdentity
   const fallback = new Map<string, { source: Source; expiresAt: number; value: ThreadTokenUsage | null }>()
   const pending = new Map<string, { source: Source; promise: Promise<ThreadTokenUsage | null> }>()

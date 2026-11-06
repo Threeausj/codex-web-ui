@@ -3,8 +3,9 @@ import { constants } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import type { Express } from 'express'
 import { Bridge, type BridgeOptions } from './bridge.js'
-import { hostInput } from './storage.js'
+import { hostInput, sshPasswordScope, type Storage } from './storage.js'
 import type { Host } from './types.js'
+import { SshConnectionPool } from './ssh-pool.js'
 
 export type ConnectionTestResult = {
   ok: boolean
@@ -23,7 +24,7 @@ export function connectionFailure(error: unknown, diagnostic: string, stage: 'ss
   // Lifecycle helpers already classify the fixed CLI's private stderr. Map
   // stable codes to public text rather than copying an arbitrary Error.message.
   if (code === 'daemon_host_key') return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更，请确认服务器指纹后重试。' }
-  if (code === 'daemon_ssh_auth') return { stage: 'ssh', message: 'SSH 身份验证失败，请检查主机账户和私钥。' }
+  if (code === 'daemon_ssh_auth') return { stage: 'ssh', message: 'SSH 身份验证失败，请检查主机账户、密码或私钥。' }
   if (code === 'daemon_timeout' || /daemon.*(?:操作超时|连接超时|未及时响应)/i.test(text))
     return { stage: 'timeout', message: 'Codex daemon 操作超时，结果待确认；请同步主机状态后检查。' }
   if (code === 'daemon_unmanaged' || /(?:非托管|未托管).*App.?Server|daemon.*(?:非托管|未托管)/i.test(text))
@@ -39,8 +40,8 @@ export function connectionFailure(error: unknown, diagnostic: string, stage: 'ss
   if (code === 'daemon_command_failed')
     return { stage: 'codex', message: '无法完成 Codex daemon 操作，请检查目标主机的配置与账户权限。' }
   if (/UNPROTECTED PRIVATE KEY FILE|bad permissions|Load key .*?(?:Permission denied|invalid format)|Identity file .*?not accessible/i.test(text)) return { stage: 'identity', message: '无法使用身份文件，请检查文件路径、格式与权限。' }
-  if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .*host key is known|strict checking/i.test(text)) return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更。请在此窗口获取服务器指纹，确认并信任后再连接。' }
-  if (/Permission denied \(|Authentication failed|Too many authentication failures|sign_and_send_pubkey: signing failed/i.test(text)) return { stage: 'ssh', message: 'SSH 身份验证失败。请检查用户名、身份文件或服务器上的 SSH agent；测试不支持交互输入密码。' }
+  if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .*host key is known|strict checking|SSH 主机指纹校验失败/i.test(text)) return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更。请在此窗口获取服务器指纹，确认并信任后再连接。' }
+  if (/Permission denied \(|Authentication failed|Too many authentication failures|sign_and_send_pubkey: signing failed|SSH 认证失败/i.test(text)) return { stage: 'ssh', message: 'SSH 身份验证失败，请检查用户名、密码、身份文件或服务器上的 SSH agent。' }
   if (/Could not resolve hostname|Name or service not known|nodename nor servname provided/i.test(text)) return { stage: 'ssh', message: '无法解析主机名或 SSH 别名，请检查地址和服务器的 SSH 配置。' }
   if (/Connection refused|No route to host|Network is unreachable/i.test(text)) return { stage: 'ssh', message: '无法连接 SSH 端口，请检查主机地址、端口与网络。' }
   if (/Bad file descriptor/i.test(text)) return { stage: 'codex', message: 'SSH 已连接，但远端登录环境无法启动 Codex，请检查登录 Shell 的初始化配置。' }
@@ -83,14 +84,35 @@ export async function testHostConnection(host: Host, options: BridgeOptions = {}
   }
 }
 
-export function registerHostConnection(app: Express, options: BridgeOptions) {
+export function registerHostConnection(app: Express, options: BridgeOptions, storage?: Storage) {
   // Registered after the application's auth and CSRF middleware, before host-ID routes.
   app.post('/api/hosts/test', (req, res, next) => {
-    const input = { name: '临时 SSH 连接', ...req.body }
-    if (input.name === '') input.name = '临时 SSH 连接'
-    const parsed = hostInput.safeParse(input)
-    if (!parsed.success) { res.status(400).json({ error: parsed.error.issues.map(issue => issue.message).join('；') }); return }
-    const host: Host = { ...parsed.data, id: `probe-${randomUUID()}`, kind: 'ssh' }
-    void testHostConnection(host, options).then(result => res.json(result)).catch(next)
+    void (async () => {
+      const { hostId, ...body } = req.body || {}
+      if (hostId !== undefined && (typeof hostId !== 'string' || !/^ssh-[a-f0-9-]+$/.test(hostId)))
+        throw Object.assign(new Error('SSH 主机标识无效。'), { status: 400 })
+      const input = { name: '临时 SSH 连接', ...body }
+      if (input.name === '') input.name = '临时 SSH 连接'
+      const parsed = hostInput.safeParse(input)
+      if (!parsed.success) { res.status(400).json({ error: parsed.error.issues.map(issue => issue.message).join('；') }); return }
+      const { password: enteredPassword, ...fields } = parsed.data
+      const host: Host = { ...fields, id: `probe-${randomUUID()}`, kind: 'ssh' }
+      let password = enteredPassword
+      if (host.authentication === 'password') {
+        delete host.identityFile
+        if (password === undefined) {
+          const saved = typeof hostId === 'string' ? storage?.host(hostId) : undefined
+          if (!saved || !saved.hasPassword || sshPasswordScope(saved) !== sshPasswordScope({ ...host, id: saved.id }))
+            throw Object.assign(new Error('请输入 SSH 密码；修改主机地址、账户或端口后需要重新输入。'), { status: 400 })
+          password = await storage!.sshPassword(saved)
+        }
+        host.hasPassword = true
+      } else if (password !== undefined) throw Object.assign(new Error('请先选择 SSH 密码登录。'), { status: 400 })
+      // A draft owns its transport. Closing this probe cannot retire a live
+      // account's shared connection or leave a draft password in the main pool.
+      const pool = new SshConnectionPool({ password: selected => selected === host ? Promise.resolve(password) : Promise.resolve(undefined) })
+      try { res.json(await testHostConnection(host, { ...options, sshPool: pool })) }
+      finally { await pool.close(); password = undefined }
+    })().catch(next)
   })
 }
