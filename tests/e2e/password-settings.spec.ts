@@ -127,7 +127,7 @@ test('the web access password can be changed while the selected Codex host is di
   await capturePasswordApi(page, calls);
   await login(page);
   mock.emit('bridge/status', { connected: false, hostId: 'local', error: 'Selected Codex host is offline' });
-  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
   await openPasswordSettings(page);
   await fillPasswords(page);
   const save = page.getByRole('button', { name: '保存访问密码', exact: true });

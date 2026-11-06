@@ -89,7 +89,7 @@ test("different images with matching filenames and timestamps are both uploaded"
   expect(bodies[0].toString().match(/filename=/g)).toHaveLength(2);
 });
 
-test("switching conversations during clipboard comparison cancels the stale upload", async ({ page, mock }) => {
+test("switching conversations during clipboard comparison keeps the upload in its original draft", async ({ page, mock }) => {
   await login(page);
   await page.getByRole("textbox", { name: "消息输入框" }).evaluate(element => {
     const clipboard = new DataTransfer();
@@ -108,7 +108,11 @@ test("switching conversations during clipboard comparison cancels the stale uplo
   await page.evaluate(() => (window as any).releaseClipboardRead());
   await expect(page.getByRole("button", { name: "上传文件或图片", exact: true })).toBeEnabled();
   await expect(page.locator(".attachment")).toHaveCount(0);
-  expect(mock.uploads).toHaveLength(0);
+  expect(mock.uploads).toHaveLength(1);
+  expect(mock.uploads[0]!.body.toString('utf8')).toContain('name="hostId"\r\n\r\nlocal');
+  await page.locator('.new-thread-button').click();
+  await expect(page.locator('.attachment')).toHaveCount(2);
+  expect(mock.uploads).toHaveLength(1);
 });
 
 test("overlapping pastes cannot enable sending until every upload finishes", async ({ page }) => {

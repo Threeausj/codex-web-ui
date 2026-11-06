@@ -222,7 +222,9 @@ test('a remote preview title appears immediately while its destination handshake
   await expect(tab(page, '仍在连接的远端会话')).toHaveAttribute('aria-selected', 'true');
   await expect(tab(page, '已有测试历史')).toHaveCount(0);
   await expect(strip(page).locator('.chat-tab.preview')).toHaveCount(1);
-  await expect(editor(page)).toBeDisabled();
+  await expect(editor(page)).toBeEnabled();
+  await editor(page).fill("连接期间可编写的预览草稿");
+  await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeDisabled();
   expect(await storedTabs(page)).toEqual([]);
   for (const socket of connections) socket.send(JSON.stringify({ method: 'bridge/status', params: { connected: true, activeProcesses: [], pendingRequests: [], hostId: 'slow-preview-remote', mode: 'spawn' } }));
   await expect(editor(page)).toBeEnabled();

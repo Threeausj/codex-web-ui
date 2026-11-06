@@ -137,7 +137,8 @@ test("an offline host still allows choosing the local host to continue the draft
   await host.selectOption("ssh-context");
   await expect(host).toBeEnabled();
   remote.emit("bridge/status", { connected: false, hostId: "ssh-context", mode: "spawn" });
-  await expect(input).toBeDisabled();
+  await expect(input).toBeEnabled();
+  await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeDisabled();
   await expect(host).toBeEnabled();
   await host.selectOption("local");
   await expect(input).toBeEnabled();

@@ -47,7 +47,7 @@ To regenerate, run `npm ci`, `npx playwright install chromium`, and `npm run doc
 
 Conversations can be moved between projects on the same host from their menu, using native project membership while retaining the working directory. Settings includes archived chat management for the selected host. Workspace files and unsaved drafts stay isolated by host and project when switching conversations. See [project membership](docs/native-projects.md) and [host settings](docs/host-settings.md).
 
-The header supports [chat tabs](docs/chat-tabs.md): switch between open chats, keep frequently used chats fixed, create a draft with `+`, and access actions from the active tab. Closing a tab keeps its task running and preserves drafts and reading positions.
+The header supports [chat tabs](docs/chat-tabs.md): switch between open chats, keep frequently used chats fixed, create a draft with `+`, and access actions from the active tab. Closing a tab keeps its task running and preserves drafts and reading positions. Keep typing while chats, hosts, or projects load; send once the destination is ready.
 
 ## Docker quick start
 
