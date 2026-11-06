@@ -8,6 +8,9 @@ export type Host = {
   username?: string
   port?: number
   identityFile?: string
+  authentication?: 'key' | 'password'
+  /** Public metadata only. Password bytes never belong on Host. */
+  hasPassword?: boolean
   codexPath?: string
   cwd?: string
   connectionMode?: 'spawn' | 'proxy' | 'daemon'

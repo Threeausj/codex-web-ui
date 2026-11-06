@@ -25,6 +25,7 @@ function fingerprint(host: Host, localIdentity?: string) {
     host.kind, host.hostname || null, host.username || null, host.port || null,
     host.identityFile || null, host.codexPath || null, host.cwd || null, host.connectionMode || null,
     host.kind === 'local' ? localIdentity || null : null,
+    ...(host.authentication === 'password' ? ['password'] : []),
   ])).digest('hex')
 }
 function id(value: unknown): string | undefined {
