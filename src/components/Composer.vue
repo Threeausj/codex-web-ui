@@ -415,6 +415,8 @@ const canSend = computed(
     (delivery.value !== "queue" || props.state.compacting && queue.value?.state.status === 'supported' || queue.value?.canMutate.value) &&
     (!props.state.activeThread || props.state.threadReady !== false) &&
     !props.state.runtimePaused &&
+    !props.state.loading &&
+    props.state.online &&
     props.state.connected &&
     !props.state.selectingThread &&
     !props.state.switchingHost &&
@@ -1097,7 +1099,9 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         v-model="draft"
         :placeholder="
           !state.connected
-            ? '连接 Codex 后即可开始对话'
+            ? '可先输入，连接完成后发送'
+            : contextBusy || state.switchingHost || state.selectingThread
+              ? '可先输入，加载完成后发送'
             : state.busy
               ? delivery === 'queue' ? '输入下一轮要执行的任务…' : '追加指令，调整当前任务…'
               : welcome
@@ -1115,7 +1119,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         @keydown="onKeydown"
         @beforeinput="onBeforeInput"
         @paste="paste"
-        :disabled="!state.connected || contextBusy"
+        :disabled="!state.authenticated || !state.hostId"
       />
       <section v-if="markdownPreview" ref="previewElement" class="composer-markdown-preview" tabindex="0"
         role="region" aria-label="Markdown 草稿预览" @keydown.esc.prevent="editDraft" @paste="paste">

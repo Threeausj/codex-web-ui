@@ -827,7 +827,10 @@ async function selectProject(project: any) {
   sidebarOpen.value = false;
   await action(async () => {
     try {
-      if (hostId !== state.hostId) await api.setHost(hostId);
+      if (hostId !== state.hostId) {
+        await api.setHost(hostId, { projectPath: project.path, noProject: false });
+        return;
+      }
       if (generation !== navigationSelection || hostId !== state.hostId) return;
       await api.setProject(project.path);
     } catch (error) {
@@ -844,14 +847,15 @@ async function chooseNewContext(hostId: string, path?: string | null) {
   sidebarOpen.value = false;
   await action(async () => {
     try {
-      await api.chooseNewContext(hostId, path);
+      const switching = api.chooseNewContext(hostId, path);
+      // The API selects its destination synchronously, before loading the host.
+      // Carry the unsent new-chat text now so later keystrokes stay on that
+      // destination; an awaited restore would overwrite typing during loading.
+      if (generation === navigationSelection && !state.activeThread && draft)
+        composer.value?.setDraft(draft);
+      await switching;
     } catch (error) {
       if (generation === navigationSelection) throw error;
-    } finally {
-      if (generation === navigationSelection && !state.activeThread && draft) {
-        await nextTick();
-        composer.value?.setDraft(draft);
-      }
     }
   });
   if (generation === navigationSelection && !state.activeThread && !sideChat.state.open) {
