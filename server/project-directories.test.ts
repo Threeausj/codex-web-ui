@@ -98,6 +98,18 @@ async function fixture(
   };
 }
 
+test('file explorer directory browsing includes files only when explicitly requested, retaining safe names and directory ordering', async t => {
+  const endpoint = await fixture(async ({ method }) => method === 'fs/getMetadata' ? { isDirectory: true } : {
+    entries: [{ fileName: 'notes.txt', isDirectory: false }, { fileName: 'source', isDirectory: true }, { fileName: '../escape', isDirectory: false }],
+  });
+  t.after(endpoint.close);
+  const normal = await endpoint.get('remote');
+  assert.deepEqual((await normal.json()).entries, [{ fileName: 'source', isDirectory: true }]);
+  const explorer = await endpoint.get('remote', '?includeFiles=1');
+  assert.deepEqual((await explorer.json()).entries, [{ fileName: 'source', isDirectory: true }, { fileName: 'notes.txt', isDirectory: false }]);
+  assert.equal((await endpoint.get('remote', '?includeFiles=unexpected')).status, 400);
+});
+
 test("directory browsing requires authentication and reads only the requested host's explicit directory entries", async (t) => {
   const entry = (fileName: string, isDirectory: unknown, isFile = false) => ({
     fileName,

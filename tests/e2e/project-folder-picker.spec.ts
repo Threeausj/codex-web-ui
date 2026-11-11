@@ -32,7 +32,7 @@ test("browse and typed paths select a project and extra workspace roots, excludi
   await expect(dialog.getByRole("button", { name: "进入 README.md", exact: true })).toHaveCount(0);
   await dialog.getByRole("button", { name: "进入 中文项目", exact: true }).click();
   await expect(dialog.getByRole("textbox", { name: "文件夹路径", exact: true })).toHaveValue("/workspace/中文项目");
-  await expect(dialog.getByText("此文件夹没有子文件夹", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("此文件夹为空", { exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "上级文件夹", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "进入 中文项目", exact: true })).toBeVisible();
   await dialog.getByRole("textbox", { name: "文件夹路径", exact: true }).fill("/workspace/手输项目");
@@ -73,7 +73,7 @@ test("typing an extra directory while the initial folder is loading preserves th
   const address = dialog.getByRole("textbox", { name: "文件夹路径", exact: true });
   await address.fill("/workspace/共享");
   releaseInitial!();
-  await expect(dialog.getByText("此文件夹没有子文件夹", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("此文件夹为空", { exact: true })).toBeVisible();
   await expect(address).toHaveValue("/workspace/共享");
   await expect(dialog.getByRole("button", { name: "使用文件夹", exact: true })).toBeDisabled();
   await address.press("Enter");

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+import FileExplorerActions from './FileExplorerActions.vue';
+import type { FileEntryChange } from '../../shared/file-entries';
 
 const props = defineProps<{
   api: any;
@@ -15,11 +17,21 @@ const currentPath = ref("");
 const entries = ref<Array<{ fileName: string; isDirectory: boolean }>>([]);
 const loading = ref(false);
 const error = ref("");
+const mutating = ref(0);
+const fileActionRefs = new Map<string, InstanceType<typeof FileExplorerActions>>();
+function mutationWorking(value: boolean) { mutating.value = Math.max(0, mutating.value + (value ? 1 : -1)); }
+function entryKey(event: KeyboardEvent, name: string) {
+  if (event.target instanceof HTMLElement && !event.target.classList.contains('folder-entry')) return;
+  if (event.key === 'F2' || event.key === 'Delete') { event.preventDefault(); void fileActionRefs.get(name)?.start(event.key === 'F2' ? 'rename' : 'delete'); }
+}
+async function changed(change: FileEntryChange) {
+  if (change.hostId === props.hostId && currentPath.value === change.directory) await navigate(currentPath.value);
+}
 let generation = 0;
 let mounted = false;
 const canSelect = computed(
   () =>
-    !loading.value &&
+    !loading.value && !mutating.value &&
     !error.value &&
     !!currentPath.value &&
     address.value.trim() === currentPath.value,
@@ -39,15 +51,14 @@ async function navigate(path?: string) {
   entries.value = [];
   address.value = requestedAddress;
   try {
-    const result = await props.api.browseDirectory(hostId, requestedAddress || undefined);
+    const result = await props.api.browseDirectory(hostId, requestedAddress || undefined, true);
     if (!mounted || requestGeneration !== generation || hostId !== props.hostId) return;
     currentPath.value = result.path;
     // A folder response may arrive after the user starts typing the next path.
     // Keep that draft; it must be navigated before the folder can be selected.
     if (address.value === requestedAddress) address.value = result.path;
     entries.value = result.entries
-      .filter((entry: any) => entry.isDirectory)
-      .sort((a: any, b: any) => a.fileName.localeCompare(b.fileName));
+      .sort((a: any, b: any) => Number(b.isDirectory) - Number(a.isDirectory) || a.fileName.localeCompare(b.fileName));
   } catch (cause: any) {
     if (!mounted || requestGeneration !== generation || hostId !== props.hostId) return;
     error.value = cause.message || "无法读取文件夹";
@@ -137,6 +148,7 @@ onBeforeUnmount(() => {
       <div class="current-folder">
         <span>选择当前文件夹</span>
         <span v-if="currentPath" class="folder-name">{{ currentPath === '/' ? '/' : currentPath.split('/').pop() }}</span>
+        <div class="picker-file-tools"><FileExplorerActions :api="api" :host-id="hostId" :directory="currentPath" :disabled="loading || !!mutating || !currentPath" @changed="changed" @working="mutationWorking" /><button type="button" class="icon-button" aria-label="刷新文件夹" title="刷新文件夹" :disabled="loading || !!mutating" @click="navigate(currentPath || address)"><Icon name="RefreshCw" :size="15" /></button></div>
       </div>
       <div class="picker-list" :aria-busy="loading">
         <p v-if="loading" class="picker-notice" role="status"><Icon name="LoaderCircle" :size="16" class="spin" />正在读取文件夹…</p>
@@ -145,15 +157,16 @@ onBeforeUnmount(() => {
           <button type="button" class="button button-small button-secondary" @click="navigate(address)">重试</button>
         </div>
         <template v-else>
-          <button
-            v-for="entry in entries"
-            :key="entry.fileName"
+          <div v-for="entry in entries" :key="entry.fileName" class="picker-entry" @contextmenu.prevent="fileActionRefs.get(entry.fileName)?.openMenu()" @keydown="entryKey($event, entry.fileName)"><button
             type="button"
             class="folder-entry"
-            :aria-label="`进入 ${entry.fileName}`"
-            @click="openFolder(entry.fileName)"
-          ><Icon name="Folder" :size="19" /><span>{{ entry.fileName }}</span><Icon name="ChevronRight" :size="15" /></button>
-          <p v-if="!entries.length" class="picker-notice">此文件夹没有子文件夹</p>
+            :aria-label="`${entry.isDirectory ? '进入' : '文件'} ${entry.fileName}`"
+            :aria-disabled="!entry.isDirectory"
+            @click="entry.isDirectory && openFolder(entry.fileName)"
+          ><Icon :name="entry.isDirectory ? 'Folder' : 'FileText'" :size="19" /><span>{{ entry.fileName }}</span><Icon v-if="entry.isDirectory" name="ChevronRight" :size="15" /></button>
+          <FileExplorerActions :ref="(value: any) => value ? fileActionRefs.set(entry.fileName, value) : fileActionRefs.delete(entry.fileName)" :api="api" :host-id="hostId" :directory="currentPath" :entry="{ name: entry.fileName, isDirectory: entry.isDirectory }" :disabled="loading || !!mutating" @changed="changed" @working="mutationWorking" />
+          </div>
+          <p v-if="!entries.length" class="picker-notice">此文件夹为空</p>
         </template>
       </div>
       <footer>
@@ -186,6 +199,10 @@ h2 { font-size: 20px; font-weight: 600; letter-spacing: -.3px; }
 .picker-address input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .current-folder { display: flex; align-items: center; gap: 12px; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 18px 2px 10px; }
 .folder-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-file-tools { display: flex; align-items: center; margin-left: auto; flex-shrink: 0; }
+.picker-entry { display: flex; align-items: center; min-width: 0; }
+.picker-entry .folder-entry { flex: 1; min-width: 0; }
+.folder-entry[aria-disabled="true"] { color: var(--muted); cursor: default; }
 .picker-list { height: clamp(180px, 34dvh, 310px); overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; padding: 6px; }
 .folder-entry { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 43px; padding: 9px 11px; text-align: left; border-radius: 7px; font-size: 13px; }
 .folder-entry:hover, .folder-entry:focus-visible { background: var(--hover); }
