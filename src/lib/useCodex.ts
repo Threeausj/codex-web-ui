@@ -1,6 +1,7 @@
 import { methodAccepts } from "./integration-capabilities";
 import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
+import type { FileEntryChange, FileEntryRequest } from '../../shared/file-entries';
 import { useHostSettings } from './host-settings';
 import { usePromptPresets } from './prompt-presets';
 import { interactiveShellCommand } from '../../shared/terminal-shell';
@@ -4738,9 +4739,32 @@ async function addProject(
   if (hostId === state.hostId && generation === selectionGeneration)
     await setProject(path);
 }
-async function browseDirectory(hostId: string, path?: string) {
-  const query = path === undefined ? "" : `?path=${encodeURIComponent(path)}`;
+async function browseDirectory(hostId: string, path?: string, includeFiles = false) {
+  const params = new URLSearchParams();
+  if (path !== undefined) params.set('path', path);
+  if (includeFiles) params.set('includeFiles', '1');
+  const query = params.size ? `?${params}` : '';
   return http(`/hosts/${encodeURIComponent(hostId)}/directories${query}`, {}, false);
+}
+const fileEntryListeners = new Set<(change: FileEntryChange) => void | Promise<void>>();
+function subscribeFileEntries(listener: (change: FileEntryChange) => void | Promise<void>) {
+  fileEntryListeners.add(listener);
+  return () => { fileEntryListeners.delete(listener); };
+}
+async function inspectFileEntry(hostId: string, directory: string, name: string) {
+  return http(`/hosts/${encodeURIComponent(hostId)}/file-entries/inspect`, {
+    method: 'POST', body: JSON.stringify({ directory, name }),
+  }, false);
+}
+async function changeFileEntry(hostId: string, input: FileEntryRequest) {
+  const authentication = authenticationGeneration;
+  const result = await http(`/hosts/${encodeURIComponent(hostId)}/file-entries`, {
+    method: 'POST', body: JSON.stringify(input),
+  }, false) as FileEntryChange;
+  if (authentication === authenticationGeneration && state.authenticated) {
+    await Promise.allSettled([...fileEntryListeners].map(listener => listener(result)));
+  }
+  return result;
 }
 /** Choosing the destination of an unsent chat must never reuse file paths from
  * another machine. Keep local project attachments, and upload original files
@@ -6575,6 +6599,7 @@ export function useCodex() {
     setProject,
     addProject,
     browseDirectory,
+    inspectFileEntry, changeFileEntry, subscribeFileEntries,
     chooseNewContext,
     updateProject,
     removeProject,

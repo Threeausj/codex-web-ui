@@ -35,6 +35,7 @@ import { registerTmuxMonitors } from './tmux-monitors.js'
 import { SshConnectionPool } from './ssh-pool.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
+import { registerFileEntries } from './file-entries.js'
 import { readBoundedHostFile, registerFileDownloads } from './file-download.js'
 import { registerUploads } from './uploads.js'
 import { registerDiagnostics } from './diagnostics.js'
@@ -234,6 +235,7 @@ export async function createApp(options: AppOptions = {}) {
     return readBoundedHostFile(host, file, maximum, { bridgeOptions })
   })
   registerFileDownloads(app, { getHost: id => storage.host(id), bridgeOptions })
+  registerFileEntries(app, { getHost: id => storage.host(id), bridgeOptions })
   registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions,
     withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),

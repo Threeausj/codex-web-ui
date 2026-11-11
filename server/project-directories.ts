@@ -26,6 +26,7 @@ const absolutePath = z
 const query = z
   .object({
     path: absolutePath.optional(),
+    includeFiles: z.literal('1').optional(),
     // The shared browser HTTP client adds this nonce to private GET requests.
     _request: z.string().uuid().optional(),
   })
@@ -151,12 +152,12 @@ export function registerProjectDirectories(
       }
       const entries = result.entries
         .filter(
-          (entry) => entry?.isDirectory === true && validName(entry.fileName),
+          (entry) => (parsed.data.includeFiles === '1' || entry?.isDirectory === true) && validName(entry?.fileName),
         )
-        .map((entry) => ({ fileName: entry.fileName, isDirectory: true }))
+        .map((entry) => ({ fileName: entry.fileName, isDirectory: entry.isDirectory === true }))
         .sort(
           (left, right) =>
-            collator.compare(left.fileName, right.fileName) ||
+            Number(right.isDirectory) - Number(left.isDirectory) || collator.compare(left.fileName, right.fileName) ||
             left.fileName.localeCompare(right.fileName),
         );
       res.json({ path: directory, entries } satisfies ProjectDirectoryResult);
