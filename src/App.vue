@@ -9,6 +9,7 @@ import {
   watch,
 } from "vue";
 import { useCodex } from "./lib/useCodex";
+import { isAbsoluteHostPath } from '../shared/host-path';
 import { browserStorage } from "./lib/browser-storage";
 import { useSubagentPrefetch } from "./lib/subagent-prefetch";
 import { useSideChat } from "./lib/side-chat";
@@ -940,7 +941,7 @@ function bookmarkSelection(value: ConversationSelectionSource) {
   const source = selectedSource(value);
   if (!source?.itemId || !source.turnId || source.path) return;
   const projectPath = currentProject.value?.path || state.activeThread?.cwd || state.projectPath;
-  if (!projectPath?.startsWith('/')) { showError('请先选择此会话所属的项目'); return; }
+  if (!isAbsoluteHostPath(projectPath)) { showError('请先选择此会话所属的项目'); return; }
   bookmarkError.value = '';
   bookmarkNaming.value = { mode: 'add', authentication: api.runtimeIdentity().authenticationGeneration,
     initialName: source.text.split('\n').find(line => line.trim())?.trim().replace(/\s+/g, ' ').slice(0, 80) || '新收藏',
@@ -969,7 +970,7 @@ async function toggleChatBookmark(thread: ThreadBookmarkTarget, hostId = state.h
     }
     const project = state.projects.find(project => (project.hostId || 'local') === hostId && api.threadMatchesProject(target, project));
     const projectPath = project?.path || target.cwd;
-    if (!projectPath?.startsWith('/')) throw new Error('无法确定聊天所属目录，请同步对话后重试');
+    if (!isAbsoluteHostPath(projectPath)) throw new Error('无法确定聊天所属目录，请同步对话后重试');
     const threadName = searchableThreadTitle(target).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 1000) || '未命名对话';
     bookmarkError.value = '';
     bookmarkNaming.value = { mode: 'add', authentication, initialName: threadName.slice(0, 160),

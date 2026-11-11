@@ -187,7 +187,7 @@ test('a late file search for an old mention token cannot replace the current mod
   // Release immediately after the edit, before the 180ms current-query debounce.
   releaseOldSearch!();
   await expect(input(page)).toHaveValue('保留草稿 @plan');
-  const picker = page.getByRole('listbox', { name: '模式与项目文件', exact: true });
+  const picker = page.getByRole('listbox', { name: '插件、应用、模式与文件', exact: true });
   const plan = picker.getByRole('option').filter({ hasText: 'Plan 模式' });
   await expect(plan).toBeDisabled();
   await expect.poll(() => typeof releaseCurrentSearch).toBe('function');
@@ -231,7 +231,7 @@ test('same-thread metadata refresh and task completion preserve the open mobile 
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect(page.getByRole('button', { name: '停止生成', exact: true })).toBeVisible();
   await fillAtEnd(page, '继续保留草稿 @plan');
-  const picker = page.getByRole('listbox', { name: '模式与项目文件', exact: true });
+  const picker = page.getByRole('listbox', { name: '插件、应用、模式与文件', exact: true });
   const plan = picker.getByRole('option').filter({ hasText: 'Plan 模式' });
   await expect(plan).toBeDisabled();
   // Metadata can replace the active thread object without changing its identity.

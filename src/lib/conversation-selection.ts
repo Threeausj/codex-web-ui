@@ -1,3 +1,4 @@
+import { isAbsoluteHostPath } from '../../shared/host-path';
 /** A plain-text quotation from one message in the currently visible thread. */
 export type ConversationSelectionSource = {
   hostId: string;
@@ -33,7 +34,7 @@ export function normalizeConversationSelection(value: unknown): ConversationSele
   const itemId = identifier(input.itemId);
   if (turnId) result.turnId = turnId;
   if (itemId) result.itemId = itemId;
-  if (typeof input.path === 'string' && input.path.startsWith('/') && input.path.length <= 4096 && !/[\x00-\x1f\x7f]/.test(input.path)) {
+  if (isAbsoluteHostPath(input.path) && input.path.length <= 4096) {
     result.path = input.path;
     if (Number.isSafeInteger(input.startLine) && input.startLine! > 0) result.startLine = input.startLine;
     if (Number.isSafeInteger(input.endLine) && input.endLine! >= (result.startLine || 1)) result.endLine = input.endLine;

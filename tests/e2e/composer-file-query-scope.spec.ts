@@ -1,8 +1,9 @@
 import { test, expect, login, setComposerSelection } from './fixtures';
 
-test('refreshing the same conversation in another directory rejects file results from its previous scope', async ({ page, mock }) => {
+test('returning to a conversation in another directory rejects file results from its previous scope', async ({ page, mock }) => {
   const originalDirectory = '/workspace/demo', nextDirectory = '/workspace/second';
   mock.projects.push({ id: 'second', name: '项目 B', path: nextDirectory, hostId: 'local', source: 'web' });
+  mock.threads.push({ ...structuredClone(mock.threads[0]!), id: 'thread-control', name: '用于切换的会话', preview: '用于切换的会话' });
   const receive = mock.receive.bind(mock);
   let releaseOldSearch: (() => void) | undefined;
   let releaseCurrentSearch: (() => void) | undefined;
@@ -28,14 +29,14 @@ test('refreshing the same conversation in another directory rejects file results
   await setComposerSelection(input, draft.length);
   await expect.poll(() => typeof releaseOldSearch).toBe('function');
 
-  // A native history refresh can change cwd without changing the thread ID.
-  // Reopening the current sidebar entry exercises that ordinary app-server
-  // response, rather than modifying Vue state from a test-only browser hook.
+  // Native changes to cwd are picked up when navigating away and back. Clicking
+  // an already active conversation intentionally avoids a redundant refresh.
   mock.threads[0]!.cwd = nextDirectory;
+  await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '用于切换的会话' }).click();
   await currentConversation.click();
   await expect(page.locator('.main-header')).toHaveAttribute('data-project-name', '项目 B');
   await expect(input).toHaveValue(draft);
-  const picker = page.getByRole('listbox', { name: '模式与项目文件', exact: true });
+  const picker = page.getByRole('listbox', { name: '插件、应用、模式与文件', exact: true });
   releaseOldSearch!();
   // This notification follows the old reply on the same ordered WebSocket.
   // Its visible title confirms the reply was processed before asserting that

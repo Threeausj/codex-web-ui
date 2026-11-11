@@ -26,9 +26,9 @@ export type HostResources = {
   runtime: Bridge['runtime']
 }
 
-/** Fixed, read-only Linux counters. GPU failure is isolated from CPU/RAM/I/O. */
+/** Fixed, read-only platform counters. GPU failure is isolated from CPU/RAM/I/O. */
 export const HOST_RESOURCE_HELPER = String.raw`
-import csv,io,json,os,pathlib,shutil,subprocess,time
+import csv,io,json,os,pathlib,shutil,subprocess,time,sys
 P=pathlib.Path('/proc')
 def read(name):
     try: return (P/name).read_text()
@@ -67,6 +67,46 @@ try:
             counters.append((int(f[5])*512,int(f[9])*512))
     if counters: disk={'readBytes':sum(x[0] for x in counters),'writeBytes':sum(x[1] for x in counters)}
 except (ValueError,IndexError): pass
+if sys.platform!='linux':
+    try:
+        import psutil
+        counters=psutil.cpu_times();cpu.update(total=sum(counters),idle=counters.idle)
+        mem=psutil.virtual_memory();memory.update(totalBytes=mem.total,usedBytes=mem.total-mem.available)
+        net=psutil.net_io_counters(pernic=True);net={n:v for n,v in net.items() if n not in ('lo','lo0')}
+        if net: network={'rxBytes':sum(v.bytes_recv for v in net.values()),'txBytes':sum(v.bytes_sent for v in net.values()),'interfaces':list(net)[:1000]}
+        io_counters=psutil.disk_io_counters()
+        if io_counters: disk={'readBytes':io_counters.read_bytes,'writeBytes':io_counters.write_bytes}
+    except (ImportError,OSError,AttributeError): pass
+    if sys.platform=='darwin':
+        try:
+            import ctypes,re
+            lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib');lib.mach_host_self.restype=ctypes.c_uint
+            ticks=(ctypes.c_uint*4)();count=ctypes.c_uint(4)
+            if lib.host_statistics(lib.mach_host_self(),3,ticks,ctypes.byref(count))==0: cpu.update(total=sum(ticks),idle=ticks[2])
+            cpu['load']=list(os.getloadavg())
+            total=int(subprocess.check_output(['/usr/sbin/sysctl','-n','hw.memsize'],timeout=2))
+            vm=subprocess.check_output(['/usr/bin/vm_stat'],text=True,timeout=2)
+            page=int(re.search(r'page size of (\d+) bytes',vm).group(1));pages=dict((k,int(v)) for k,v in re.findall(r'^([^:]+):\s+(\d+)\.',vm,re.M))
+            available=sum(pages.get(k,0) for k in ('Pages free','Pages inactive','Pages speculative'))*page
+            memory.update(totalBytes=total,usedBytes=max(0,total-available))
+            rows=subprocess.check_output(['/usr/sbin/netstat','-ibn'],text=True,timeout=2).splitlines();header=rows[0].split();rx=header.index('Ibytes');tx=header.index('Obytes');net={}
+            for line in rows[1:]:
+                fields=line.split()
+                if len(fields)>max(rx,tx) and fields[0]!='lo0' and fields[2].startswith('<Link#') and fields[rx].isdigit() and fields[tx].isdigit(): net[fields[0]]=(int(fields[rx]),int(fields[tx]))
+            if net: network={'rxBytes':sum(v[0] for v in net.values()),'txBytes':sum(v[1] for v in net.values()),'interfaces':list(net)}
+        except (OSError,ValueError,IndexError,AttributeError,subprocess.SubprocessError): pass
+    elif os.name=='nt':
+        try:
+            import ctypes
+            from ctypes import wintypes as w
+            idle=w.FILETIME();kernel=w.FILETIME();user=w.FILETIME()
+            value=lambda t:(t.dwHighDateTime<<32)|t.dwLowDateTime
+            if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle),ctypes.byref(kernel),ctypes.byref(user)): cpu.update(total=value(kernel)+value(user),idle=value(idle))
+            class MemoryStatus(ctypes.Structure):
+                _fields_=[('length',w.DWORD),('load',w.DWORD)]+[(name,ctypes.c_ulonglong) for name in ('total','available','pageTotal','pageAvailable','virtualTotal','virtualAvailable','extended')]
+            mem=MemoryStatus();mem.length=ctypes.sizeof(mem)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)): memory.update(totalBytes=mem.total,usedBytes=mem.total-mem.available)
+        except (OSError,AttributeError): pass
 gpus={'available':False,'reason':'未检测到 NVIDIA 显卡或 nvidia-smi；其他显卡暂不支持','devices':[]}
 def number(value):
     try:
@@ -95,7 +135,8 @@ if shutil.which('nvidia-smi'):
 if gpus['available']:
     gpus['processes']=[]
     try:
-        import pwd
+        try: import pwd
+        except ImportError: pwd=None
         def text_limit(value,limit): return value.encode('utf-16-le','surrogatepass')[:limit*2].decode('utf-16-le','ignore')
         mapping={}
         index_result=subprocess.run(['nvidia-smi','--query-gpu=uuid,index','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=1.5)
@@ -109,7 +150,7 @@ if gpus['available']:
             boot=None
             try: boot=int(next(line.split()[1] for line in read('stat').splitlines() if line.startswith('btime ')))
             except (ValueError,IndexError,StopIteration): pass
-            clock=float(os.sysconf('SC_CLK_TCK'))
+            clock=float(os.sysconf('SC_CLK_TCK')) if sys.platform=='linux' else 100
             seen=set()
             for row in csv.reader(io.StringIO(processes.stdout)):
                 if len(row)!=4 or not row[1].strip().isdigit(): raise ValueError('Invalid GPU process')

@@ -5,8 +5,10 @@ import type { Host } from './types.js';
 import type { BridgeOptions } from './bridge.js';
 import { runHostPython } from './host-helper.js';
 import { validFileEntryName, type FileEntryChange } from '../shared/file-entries.js';
+import { isAbsoluteHostPath, normalizeHostPath, joinHostPath } from '../shared/host-path.js';
+import { windowsFileEntryScript } from './windows-files.js';
 
-const directory = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\\\x00-\x1f\x7f-\x9f]/.test(value)).transform(value => path.posix.normalize(value));
+const directory = z.string().min(1).max(4096).refine(isAbsoluteHostPath).transform(normalizeHostPath);
 const name = z.string().refine(validFileEntryName, '名称不能为空，且不能包含路径分隔符或控制字符');
 const version = z.string().regex(/^[a-f0-9]{64}$/);
 const inspect = z.object({ directory, name }).strict();
@@ -70,6 +72,7 @@ print(json.dumps(result,separators=(',',':')))
 `;
 }
 const failures: Record<string, { status: number; error: string }> = {
+  INVALID_NAME: { status: 400, error: '此名称不适用于 Windows，请避免保留设备名、特殊字符以及结尾的空格或句点。' },
   EXISTS: { status: 409, error: '同名文件或文件夹已存在，请使用其他名称。' },
   MISSING: { status: 404, error: '文件或目录已不存在，请刷新列表后重试。' },
   CONFLICT: { status: 409, error: '文件或目录已被其他程序修改，请刷新后重新操作。' },
@@ -89,15 +92,16 @@ export function registerFileEntries(app: Express, dependencies: Dependencies) {
       if (!host) { res.status(404).json({ error: '主机不存在或已停用' }); return; }
       const fields = parsed.data;
       const input = { ...fields, ...(inspection ? { operation: 'inspect' } : {}) };
-      const key = JSON.stringify([hostId, fields.directory]);
+      const key = JSON.stringify([hostId, host.platform === 'windows' ? fields.directory.toLowerCase() : fields.directory]);
       const work = (operations.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
         if (dependencies.getHost(hostId) !== host) throw Object.assign(new Error('主机配置已变化，请重新操作。'), { status: 409 });
-        const result = JSON.parse(await (dependencies.run ? dependencies.run(host, fileEntryScript(input)) : runHostPython(host, fileEntryScript(input), dependencies.bridgeOptions, { timeoutMs: 45000 })));
+        const script = host.platform === 'windows' ? windowsFileEntryScript(input) : fileEntryScript(input);
+        const result = JSON.parse(await (dependencies.run ? dependencies.run(host, script) : runHostPython(host, script, dependencies.bridgeOptions, { timeoutMs: 45000 })));
         if (result.ok !== true) { const failure = failures[result.code] || failures.FAILED!; res.status(failure.status).json({ error: failure.error, code: result.code }); return; }
         if (inspection) { res.json({ version: result.version, isDirectory: result.isDirectory, isSymlink: result.isSymlink }); return; }
         const operation = (fields as z.infer<typeof mutation>).operation;
-        const source = path.posix.join(fields.directory, fields.name);
-        const target = operation === 'rename' ? path.posix.join(fields.directory, (fields as any).newName) : source;
+        const source = joinHostPath(fields.directory, fields.name);
+        const target = operation === 'rename' ? joinHostPath(fields.directory, (fields as any).newName) : source;
         res.json({ hostId, directory: fields.directory, operation, path: target,
           ...(['rename', 'delete'].includes(operation) ? { previousPath: source } : {}), isDirectory: result.isDirectory } satisfies FileEntryChange);
       });

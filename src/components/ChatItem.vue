@@ -163,8 +163,9 @@ function onLink(event: MouseEvent) {
   if (image) { event.preventDefault(); event.stopPropagation(); previewMarkdownImage(image); return }
   const anchor = (event.target as Element).closest('a')
   if (!anchor) return
-  const href = anchor.getAttribute('href') || ''
-  if (href.startsWith('/') && !href.startsWith('//')) { event.preventDefault(); const location = fileLinkLocation(href); if (location) emit('openFile', location.path, location.line); }
+  const href = anchor.getAttribute('href') === '#' ? anchor.dataset.filePath || '#' : anchor.getAttribute('href') || ''
+  const location = fileLinkLocation(href);
+  if (location) { event.preventDefault(); emit('openFile', location.path, location.line); }
   else { anchor.setAttribute('target', '_blank'); anchor.setAttribute('rel', 'noopener noreferrer') }
 }
 </script>

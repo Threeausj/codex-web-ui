@@ -63,6 +63,7 @@ const makeTurn = (id: string, items: any[] = [], status = "completed") => ({
 export class MockCodex {
   unresponsiveSockets = new Set<WebSocketRoute>();
   hosts: any[] = [{ id: "local", name: "本机", kind: "local" }];
+  plugins: any[] = [];
   hostMocks = new Map<string, MockCodex>();
   requests: Rpc[] = [];
   responses: Rpc[] = [];
@@ -161,6 +162,12 @@ export class MockCodex {
       const url = new URL(request.url());
       const respond = (body: unknown, status = 200) =>
         route.fulfill({ status, json: body });
+      const pluginsRoute = /^\/api\/hosts\/([^/]+)\/plugins$/.exec(url.pathname);
+      if (pluginsRoute) {
+        const hostId=decodeURIComponent(pluginsRoute[1]!);
+        const target=hostId==='local'?this:this.hostMocks.get(hostId);
+        return target ? respond({supported:true,plugins:target.plugins}) : respond({error:'Host not found'},404);
+      }
       const hostSettingsRoute = /^\/api\/hosts\/([^/]+)\/(runtime\/(?:information|reconnect)|codex-update|settings\/rpc|codex-settings(?:\/(?:provider|login(?:\/cancel)?|logout))?)$/.exec(url.pathname);
       if (hostSettingsRoute) {
         const hostId = decodeURIComponent(hostSettingsRoute[1]!);

@@ -11,6 +11,10 @@ function files(mock: MockCodex, values: Record<string, string>) {
   const writes: { path: string; text: string }[] = [];
   (mock as any).receive = (socket: { send: (raw: string) => void }, request: Request) => {
     const path = request.params?.path;
+    if (request.method === 'fs/getMetadata' && Object.hasOwn(values, path)) {
+      mock.requests.push(request);
+      return socket.send(JSON.stringify({ id: request.id, result: { isDirectory: false, isFile: true, isSymlink: false, createdAtMs: 0, modifiedAtMs: 0 } }));
+    }
     if (request.method === 'fs/readFile' && Object.hasOwn(values, path)) {
       mock.requests.push(request);
       return socket.send(JSON.stringify({ id: request.id, result: { dataBase64: Buffer.from(values[path]!).toString('base64') } }));
@@ -43,6 +47,27 @@ async function inCenter(element: Locator) {
 }
 const chatTab = (page: Page, title = '已有测试历史') => page.getByRole('tab', { name: title, exact: true });
 const fileTab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
+
+test('Windows drive links open files in the center and preserve Chinese paths', async ({ page, mock }) => {
+  const directory = 'C:/Users/Test/项目';
+  const path = `${directory}/说明.md`;
+  mock.hosts[0].platform = 'windows';
+  mock.projects[0].path = directory;
+  mock.threads[0]!.cwd = directory;
+  mock.turns.get('thread-existing')![0].items[1].text = `[Windows 文档](<${path}>)\n\n[不安全链接](javascript:alert(1))`;
+  files(mock, { [path]: '# Windows 中文预览\n\n同一主机中的文件。' });
+  await login(page); await openConversation(page);
+  const link = page.getByRole('link', { name: 'Windows 文档', exact: true });
+  await expect(link).toHaveAttribute('href', '#');
+  expect(decodeURIComponent((await link.getAttribute('data-file-path'))!)).toBe(path);
+  await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
+  await link.click();
+  const preview = page.getByRole('region', { name: 'Markdown 文件预览' });
+  await inCenter(preview);
+  await expect(preview.getByRole('heading', { name: 'Windows 中文预览', exact: true })).toBeVisible();
+  await expect(fileTab(page, '说明.md')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#workspace-panel')).toBeHidden();
+});
 
 for (const width of [1440, 390]) test(`${width}px: conversation links and existing file tabs preview in the center without opening the workspace sidebar`, async ({ page, mock }) => {
   await page.setViewportSize({ width, height: 900 });

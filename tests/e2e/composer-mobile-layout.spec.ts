@@ -38,7 +38,7 @@ test("mobile touch can choose a file without losing input focus or text", async 
   await login(page);
   const input = page.getByRole("textbox", { name: "消息输入框" });
   await input.fill("请查看 ");
-  await page.getByRole("button", { name: "选择模式或引用项目文件", exact: true }).click();
+  await page.getByRole("button", { name: "选择插件、应用、模式或引用项目文件", exact: true }).click();
   const option = page.getByRole("listbox").getByRole("option").filter({ hasText: "README.md" });
   await expect(option).toBeVisible();
   await option.dispatchEvent("click");

@@ -9,8 +9,10 @@ import type { BridgeOptions } from './bridge.js'
 import { resourceSshArgs } from './host-resources.js'
 import { sharedSshPool } from './ssh-pool.js'
 import type { Host } from './types.js'
+import { isAbsoluteHostPath, normalizeHostPath } from '../shared/host-path.js'
+import { hostPythonInput } from './ssh.js'
 
-const absolutePath = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f\\]/.test(value), '需要绝对文件路径').transform(value => path.posix.normalize(value))
+const absolutePath = z.string().min(1).max(4096).refine(isAbsoluteHostPath, '需要绝对文件路径').transform(normalizeHostPath)
 type ByteRange = { start?: number; end?: number; suffix?: number }
 type FileOptions = {
   bridgeOptions?: BridgeOptions
@@ -61,7 +63,7 @@ def header(value):
     out.write((json.dumps(value,separators=(',',':'))+'\n').encode('utf-8'))
     out.flush()
 try:
-    fd=os.open(p['path'],os.O_RDONLY|os.O_NONBLOCK)
+    fd=os.open(p['path'],os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_BINARY',0))
     info=os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         header({'error':'NOT_REGULAR'})
@@ -149,7 +151,7 @@ async function remoteFile(host: Host, file: string, range: ByteRange | undefined
   // Rejections are also awaited by the body generator; keep an early SSH exit
   // from becoming an unhandled rejection while its bounded header is parsed.
   void exited.catch(() => {})
-  child.stdin.end(remoteFileDownloadSource(file, range, head, maximum))
+  child.stdin.end(hostPythonInput(host, remoteFileDownloadSource(file, range, head, maximum)))
   const iterator = child.stdout[Symbol.asyncIterator]()
   let header = Buffer.alloc(0)
   let remainder = Buffer.alloc(0)

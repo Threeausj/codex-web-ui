@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { z } from 'zod'
 import type { Host, Project } from './types.js'
+import { isAbsoluteHostPath } from '../shared/host-path.js'
 import { orderHosts } from '../shared/host-order.js'
 import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../shared/project-order.js'
 import { SshPasswordStorage, type EncryptedSshPassword } from './ssh-password-storage.js'
@@ -27,11 +28,12 @@ const hostFields = z.object({
   port: optionalField(z.number().int().min(1).max(65535)),
   identityFile: optionalField(cleanText.refine(s => path.isAbsolute(s), 'Identity file must be absolute')),
   authentication: optionalField(z.enum(['key', 'password'])),
+  platform: optionalField(z.enum(['posix', 'windows'])),
   // Preserve spaces. An omitted/empty password means retain the saved value.
   password: z.preprocess(value => value === '' || value === null ? undefined : value,
     z.string().min(1).max(1024).refine(value => !/[\x00\r\n]/.test(value), 'SSH 密码不能包含换行或空字符').optional()),
   codexPath: optionalField(cleanText),
-  cwd: optionalField(cleanText.refine(s => s.startsWith('/'), 'Remote directory must be absolute')),
+  cwd: optionalField(cleanText.refine(isAbsoluteHostPath, 'Remote directory must be absolute')),
   connectionMode: optionalField(z.enum(['spawn', 'proxy', 'daemon'])),
 }).strict()
 function normalizeAddress<T extends { hostname?: string; username?: string }>(value: T, context: z.RefinementCtx): T {
@@ -54,12 +56,12 @@ export const hostOrderInput = hostOrderDocument(1000)
 const savedHostOrderInput = hostOrderDocument(1001)
 const projectOrderEntry = z.object({
   hostId: hostIdentifier,
-  path: z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value)),
+  path: z.string().min(1).max(4096).refine(isAbsoluteHostPath),
 }).strict()
 export const projectOrderInput = z.object({
   projects: z.array(projectOrderEntry).max(2000).refine(entries => new Set(entries.map(projectOrderKey)).size === entries.length, 'Project identities must be unique'),
 }).strict()
-const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'authentication', 'codexPath', 'cwd', 'connectionMode'] as const
+const connectionFields = ['hostname', 'username', 'port', 'identityFile', 'authentication', 'codexPath', 'cwd', 'connectionMode', 'platform'] as const
 /** Bind ciphertext and reuse to an exact account/endpoint, never only a host ID. */
 export const sshPasswordScope = (host: Pick<Host, 'id' | 'hostname' | 'username' | 'port' | 'authentication'>) =>
   JSON.stringify([host.id, host.hostname, host.username || null, host.port || null, host.authentication || 'key'])
@@ -337,7 +339,7 @@ export class Storage {
   async addProject(hostId: string, projectPath: string, name?: string, rootPaths?: string[]) {
     return this.mutate(async () => {
       if (!this.host(hostId)) throw Object.assign(new Error('Host not found'), { status: 404 })
-      const project: Project = { id: `web-${randomUUID()}`, name: name || path.posix.basename(projectPath), path: projectPath, rootPaths: [...new Set([projectPath, ...(rootPaths || [])])], hostId, source: 'web' }
+      const project: Project = { id: `web-${randomUUID()}`, name: name || projectPath.replace(/\\/g, '/').split('/').filter(Boolean).at(-1) || projectPath, path: projectPath, rootPaths: [...new Set([projectPath, ...(rootPaths || [])])], hostId, source: 'web' }
       await this.persistProject(project)
       return project
     })

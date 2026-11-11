@@ -40,6 +40,14 @@ test("project and thread pins remain distinct and are scoped to the host", () =>
   assert.equal(pins[0].kind, "thread");
   assert.equal(pins[1].hostId, "ssh-other");
 });
+test('Windows conversations keep their project across native and browser path formats', () => {
+  const project = { hostId: 'windows', path: 'C:/Users/Test/项目', rootPaths: ['\\\\server\\share\\项目'] };
+  assert.equal(matchesProject({ hostId: 'windows', cwd: 'c:\\users\\test\\项目\\' }, project), true);
+  assert.equal(matchesProject({ hostId: 'windows', cwd: '\\\\SERVER\\share\\项目' }, project), true);
+  assert.equal(matchesProject({ hostId: 'other', cwd: project.path }, project), false);
+  assert.equal(matchesProject({ cwd: 'C:/Users/Test/项目-copy' }, project), false);
+  assert.equal(matchesProject({ cwd: '/Users/Test/项目' }, { path: '/users/test/项目' }), false);
+});
 test('native project membership wins over the unchanged working directory after a move', () => {
   const source = { hostId: 'nas', path: '/project/a', nativeProjectId: 'native-a' };
   const destination = { hostId: 'nas', path: '/project/b', nativeProjectId: 'native-b' };

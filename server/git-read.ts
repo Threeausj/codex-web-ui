@@ -2,10 +2,11 @@ import type { BridgeOptions } from './bridge.js'
 import type { Host } from './types.js'
 import type { CommandExecResponse } from '../shared/protocol/v2/CommandExecResponse.js'
 import { runHostPython } from './host-helper.js'
+import { isAbsoluteHostPath } from '../shared/host-path.js'
 
 const MAX_OUTPUT = 2 * 1024 * 1024
 const same = (value: string[], expected: string[]) => value.length === expected.length && value.every((part, index) => part === expected[index])
-const relativeFile = (value: string) => !!value && value.length <= 4096 && !value.startsWith('/') && !value.startsWith('-') && !/[\x00-\x1f\x7f\\]/.test(value) && !value.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
+const relativeFile = (value: string) => !!value && value.length <= 4096 && !value.startsWith('/') && !value.startsWith('-') && !/[\x00-\x1f\x7f\\:]/.test(value) && !value.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
 
 /** This backend file reader accepts Git's fixed query commands, never arbitrary commands or writes. */
 export function isReadOnlyGitQuery(args: string[]): boolean {
@@ -30,7 +31,7 @@ export function isReadOnlyGitQuery(args: string[]): boolean {
 }
 
 export async function readHostGit(host: Host, cwd: string, args: string[], options: BridgeOptions = {}): Promise<CommandExecResponse> {
-  if (!cwd.startsWith('/') || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd) || !isReadOnlyGitQuery(args))
+  if (!isAbsoluteHostPath(cwd) || cwd.length > 4096 || !isReadOnlyGitQuery(args))
     throw Object.assign(new Error('不支持的 Git 只读查询'), { status: 400 })
   const payload = Buffer.from(JSON.stringify({ cwd, args })).toString('base64')
   // The source travels on stdin, never through the login shell. Git receives

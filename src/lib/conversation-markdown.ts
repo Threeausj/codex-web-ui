@@ -1,4 +1,5 @@
 import DOMPurify from 'dompurify';
+import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
 import { isImagePath, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
 import { clearConversationMathCache, createConversationMarkdownParser, plainMessageMath } from './conversation-math';
@@ -14,18 +15,31 @@ function markImage(image: HTMLImageElement) {
 }
 
 function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
+  // Drive paths are not browser URL schemes. Preserve their literal value as
+  // data while keeping the normal sanitizer's URL policy unchanged.
+  if (/(?:href|src)=["'][a-z]:[\\/]/i.test(html)) {
+    const template = document.createElement('template'); template.innerHTML = html;
+    for (const element of template.content.querySelectorAll<HTMLAnchorElement | HTMLImageElement>('a[href],img[src]')) {
+      const attribute = element.tagName === 'A' ? 'href' : 'src';
+      const value = element.getAttribute(attribute) || '';
+      if (!isWindowsHostPath(value) || !isAbsoluteHostPath(value)) continue;
+      element.dataset.filePath = value;
+      if (attribute === 'href') element.setAttribute('href', '#'); else element.removeAttribute('src');
+    }
+    html = template.innerHTML;
+  }
   const fragment = DOMPurify.sanitize(html, {
     RETURN_DOM_FRAGMENT: true, ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'],
   });
   for (const image of fragment.querySelectorAll<HTMLImageElement>('img')) {
-    const source = image.getAttribute('src') || '';
+    const source = image.getAttribute('src') || image.dataset.filePath || '';
     // Host-local assets use the authenticated image endpoint. Relative paths are
     // resolved inside the conversation's workspace, never the website's origin.
     if (/^(?:https?:|data:|blob:)/i.test(source)) {
       if (safeConversationImageSource(source, hostId)) markImage(image);
       continue;
     }
-    const path = previewFilePath(source, `${cwd || '/'}/.conversation.md`, source.startsWith('/') ? '/' : cwd);
+    const path = previewFilePath(source, joinHostPath(cwd || '/', '.conversation.md'), isWindowsHostPath(source) ? source.slice(0, 3) : source.startsWith('/') ? '/' : cwd);
     image.removeAttribute('src');
     if (path && isImagePath(path)) {
       image.src = `/api/hosts/${encodeURIComponent(hostId)}/images?path=${encodeURIComponent(path)}`;

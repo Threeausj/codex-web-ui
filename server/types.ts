@@ -9,6 +9,7 @@ export type Host = {
   port?: number
   identityFile?: string
   authentication?: 'key' | 'password'
+  platform?: 'posix' | 'windows'
   /** Public metadata only. Password bytes never belong on Host. */
   hasPassword?: boolean
   codexPath?: string
