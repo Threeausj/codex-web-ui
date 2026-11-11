@@ -39,6 +39,10 @@ function commandFailure(action: CodexDaemonAction, diagnostic: string, timedOut:
     return failure('请确认并信任 SSH 主机指纹后重试。', 'daemon_host_key')
   if (/Permission denied \(|Authentication failed|Too many authentication failures/i.test(diagnostic))
     return failure('SSH 身份验证失败，请检查主机账户和私钥。', 'daemon_ssh_auth')
+  if (/start the Windows daemon from a non-elevated terminal/i.test(diagnostic))
+    return failure('Windows SSH 当前使用管理员权限。请在该用户的普通终端运行 codex app-server daemon start，再重新连接；未自动提高权限或结束桌面会话。', 'daemon_windows_elevated')
+  if (/this CLI has no complete local package/i.test(diagnostic))
+    return failure('此主机只有桌面应用附带的精简 Codex，缺少独立 daemon 所需的完整安装包。请安装官方完整版 CLI 后重试，或选择“随网页服务启动”。', 'daemon_incomplete_package')
   if (/not managed|unmanaged|not a managed|no daemon package is selected/i.test(diagnostic))
     return failure('已有非托管 App Server 占用 daemon 连接；请先核对其启动方式，未自动结束任何进程。', 'daemon_unmanaged')
   if (/unknown (?:command|subcommand)|unrecognized subcommand|unexpected argument/i.test(diagnostic))
@@ -115,7 +119,15 @@ async function parsed<T>(host: Host, options: CodexDaemonOptions, action: CodexD
 
 /** Idempotent attachment preparation. Reconnects never upgrade or restart an
  * already running daemon; version changes require an explicit user action. */
-export function ensureCodexDaemon(host: Host, options: CodexDaemonOptions = {}, signal?: AbortSignal) {
+export async function ensureCodexDaemon(host: Host, options: CodexDaemonOptions = {}, signal?: AbortSignal): Promise<CodexDaemonStarted> {
+  // Windows SSH commonly uses an elevated token. An already running daemon
+  // was started by the desktop user and needs only a client attachment.
+  if (host.platform === 'windows') {
+    try { const result = await readCodexDaemonVersion(host, options, signal); return { ...result, status: 'alreadyRunning' } }
+    catch (error) {
+      if (!['daemon_unavailable', 'daemon_command_failed'].includes((error as any).code)) throw error
+    }
+  }
   return parsed(host, options, 'start', started, signal)
 }
 export function readCodexDaemonVersion(host: Host, options: CodexDaemonOptions = {}, signal?: AbortSignal) {

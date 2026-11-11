@@ -36,6 +36,8 @@ import { SshConnectionPool } from './ssh-pool.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
 import { registerFileEntries } from './file-entries.js'
+import { registerPlugins } from './plugins.js'
+import { isAbsoluteHostPath, withinHostPath } from '../shared/host-path.js'
 import { readBoundedHostFile, registerFileDownloads } from './file-download.js'
 import { registerUploads } from './uploads.js'
 import { registerDiagnostics } from './diagnostics.js'
@@ -60,7 +62,7 @@ export type AppOptions = {
 }
 
 const asyncRoute = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
-const absolutePath = z.string().min(1).max(4096).refine(s => s.startsWith('/') && !/[\x00-\x1f]/.test(s), 'An absolute path is required')
+const absolutePath = z.string().min(1).max(4096).refine(isAbsoluteHostPath, 'An absolute path is required')
 
 export async function createApp(options: AppOptions = {}) {
   const cwd = path.resolve(options.cwd || process.cwd())
@@ -213,7 +215,7 @@ export async function createApp(options: AppOptions = {}) {
       for (const entry of active) {
         const result = await bridge.request('thread/read', { threadId: entry.id, includeTurns: false }) as { thread?: { cwd?: string } }
         if (!result.thread?.cwd) throw Object.assign(new Error('无法确认运行中会话的工作目录，请稍后重试'), { status: 409 })
-        if (result.thread.cwd === directory || result.thread.cwd.startsWith(directory + '/')) matched.push(entry.id)
+        if (withinHostPath(directory, result.thread.cwd)) matched.push(entry.id)
       }
       const host = storage.host(hostId)
       if (!host) throw Object.assign(new Error('主机不存在'), { status: 404 })
@@ -236,6 +238,7 @@ export async function createApp(options: AppOptions = {}) {
   })
   registerFileDownloads(app, { getHost: id => storage.host(id), bridgeOptions })
   registerFileEntries(app, { getHost: id => storage.host(id), bridgeOptions })
+  registerPlugins(app, { getHost: id => storage.host(id), bridgeOptions })
   registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions,
     withRuntimeMaintenance: (hostId, work) => automations!.withHostRuntimeMaintenance(hostId, work),

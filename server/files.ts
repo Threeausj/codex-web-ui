@@ -3,10 +3,11 @@ import { createHash } from 'node:crypto';
 import type { Express } from 'express';
 import multer from 'multer';
 import { z } from 'zod';
+import { isAbsoluteHostPath, isWindowsHostPath, normalizeHostPath } from '../shared/host-path.js';
 import type { Bridge } from './bridge.js';
 
 export const fileVersion = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-const filePath = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\\]/.test(value), '需要绝对文件路径').transform(value => path.posix.normalize(value));
+const filePath = z.string().min(1).max(4096).refine(isAbsoluteHostPath, '需要绝对文件路径').transform(normalizeHostPath);
 const maximum = 8 * 1024 * 1024;
 
 /** Serialize web saves on a host/path. Codex fs/writeFile has no CAS parameter:
@@ -46,7 +47,7 @@ export function registerFiles(app: Express, getBridge: (hostId: string) => Promi
       const input = z.object({ path: filePath, expectedVersion: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
       if (!req.file) { res.status(400).json({ error: '缺少文件内容' }); return; }
       const id = String(req.params.id);
-      await exclusive(`${id}\0${input.path}`, async () => {
+      await exclusive(`${id}\0${isWindowsHostPath(input.path) ? input.path.toLowerCase() : input.path}`, async () => {
         const original = await read(id, input.path);
         if (original.version !== input.expectedVersion) {
           res.status(409).json({ code: 'FILE_CONFLICT', error: '文件已被其他程序修改；你的草稿已保留，请先比较或重新载入。' });

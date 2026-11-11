@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { FsReadDirectoryEntry } from "../shared/protocol/v2/FsReadDirectoryEntry.js";
 import type { Bridge } from "./bridge.js";
 import type { Storage } from "./storage.js";
+import { isAbsoluteHostPath, normalizeHostPath } from '../shared/host-path.js';
 
 export type ProjectDirectoriesOptions = {
   getBridge: (hostId: string) => Promise<Pick<Bridge, "request">>;
@@ -20,7 +21,7 @@ const absolutePath = z
   .max(4096)
   .refine(
     (value) =>
-      path.posix.isAbsolute(value) && !/[\x00-\x1f\x7f-\x9f]/.test(value),
+      isAbsoluteHostPath(value),
     "请提供绝对目录路径，且不能包含控制字符。",
   );
 const query = z
@@ -36,8 +37,7 @@ const collator = new Intl.Collator("zh-CN", {
   sensitivity: "base",
 });
 function normalize(value: string) {
-  const normalized = path.posix.normalize(value);
-  return normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+  return normalizeHostPath(value);
 }
 function validName(value: unknown): value is string {
   return (
@@ -118,7 +118,7 @@ export function registerProjectDirectories(
     }
     const requested =
       parsed.data.path ??
-      (host.cwd || (host.kind === "local" ? options.cwd : "/"));
+      (host.cwd || (host.kind === "local" ? options.cwd : host.platform === "windows" ? "C:/" : "/"));
     if (!absolutePath.safeParse(requested).success) {
       res
         .status(400)

@@ -4,6 +4,7 @@ import type { Bridge, BridgeOptions } from './bridge.js'
 import type { Host } from './types.js'
 import type { ThreadTokenUsage } from './context-types.js'
 import { runHostPython } from './host-helper.js'
+import { isAbsoluteHostPath } from '../shared/host-path.js'
 
 type Context = { tokenUsage: ThreadTokenUsage | null; compacting: boolean; runtimeStatus?: 'active' | 'idle' | 'notLoaded' | 'systemError'; engineId?: string }
 type ContextBridge = Pick<Bridge, 'request' | 'threadContext'> & {
@@ -42,12 +43,12 @@ export function parseRolloutTokenUsage(value: unknown): ThreadTokenUsage | null 
 
 /** Read a bounded tail, ignoring partial writes and returning only token counters. */
 export function rolloutContextHelper(filename: string): string {
-  if (!filename.startsWith('/') || !filename.endsWith('.jsonl') || filename.length > 4096 || /[\x00-\x1f\x7f]/.test(filename)) throw new Error('无效的 Codex 会话记录路径')
+  if (!isAbsoluteHostPath(filename) || !filename.endsWith('.jsonl') || filename.length > 4096) throw new Error('无效的 Codex 会话记录路径')
   const encoded = Buffer.from(filename).toString('base64')
   return `import base64,json,os,stat\nfilename=base64.b64decode('${encoded}').decode('utf-8')\n` + String.raw`
 result=None
 try:
-    fd=os.open(filename,os.O_RDONLY|os.O_NONBLOCK|getattr(os,'O_NOFOLLOW',0))
+    fd=os.open(filename,os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0))
     with os.fdopen(fd,'rb') as source:
         metadata=os.fstat(source.fileno())
         if not stat.S_ISREG(metadata.st_mode): raise ValueError('Not a regular rollout')

@@ -12,6 +12,7 @@ import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
 import FileExplorerActions from './FileExplorerActions.vue';
 import { changedFilePath, type FileEntryChange, type FileEntryOperation } from '../../shared/file-entries';
+import { isAbsoluteHostPath, normalizeHostPath, joinHostPath, hostDirname } from '../../shared/host-path';
 import { privateState } from "../lib/private-state";
 import type { ConversationSelectionSource } from "../lib/conversation-selection";
 import { isImagePath, isMarkdownPath, officeFileKind } from "../lib/file-preview";
@@ -190,7 +191,7 @@ const isHtml = computed(() => !file.value?.binary && /\.html?$/i.test(file.value
 const htmlPreviewUrl = computed(() => file.value && isHtml.value ? `/api/preview?host=${encodeURIComponent(props.state.hostId)}&path=${encodeURIComponent(file.value.path)}&root=${encodeURIComponent(props.state.projectPath)}` : "");
 const jsonPreviewContent = computed(() => isJsonPreview.value ? jsonUnicodePreview(content.value) : "");
 function join(base: string, name: string) {
-  return `${base.replace(/\/$/, "")}/${name}`;
+  return joinHostPath(base, name);
 }
 async function beforeFileChange(operation: FileEntryOperation, path: string) {
   const affected = editorTabs.value.filter(entry => entry.file.path === path || entry.file.path.startsWith(path + '/'));
@@ -255,6 +256,7 @@ async function fileEntryChanged(change: FileEntryChange) {
 }
 async function readDirectory(path: string, interruptReveal = true) {
   if (!path) return;
+  path = normalizeHostPath(path);
   if (interruptReveal) {
     ++revealGeneration; revealedFile.value = "";
     // Directory browsing does not replace the middle column's selected file.
@@ -280,6 +282,7 @@ async function readDirectory(path: string, interruptReveal = true) {
 }
 async function openFile(path: string, destination = "files", line?: number, parentDirectory?: Promise<void>, activate = true) {
   if (!path) return;
+  path = normalizeHostPath(path);
   ++revealGeneration;
   if (file.value?.path === path && (!file.value.binary && !/^image\//.test(file.value.mime) || file.value.dataUrl || file.value.dataBase64)) {
     ++fileGeneration;
@@ -328,7 +331,7 @@ async function openFile(path: string, destination = "files", line?: number, pare
       fileSearch.value = "";
       revealedFile.value = path;
       const message = cause.message || "读取文件失败";
-      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      const parent = hostDirname(path);
       if (parentDirectory) await parentDirectory;
       else if (directory.value !== parent) await readDirectory(parent, false);
       if (generation === fileGeneration && scope === fileScope()) {
@@ -371,7 +374,7 @@ async function revealPath(path: string, line?: number) {
       previewDocument.value = false;
       fileSearch.value = "";
       revealedFile.value = path;
-      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      const parent = hostDirname(path);
       const directoryLoad = readDirectory(parent, false);
       await Promise.all([directoryLoad, openFile(path, "files", line, directoryLoad)]);
     }
@@ -411,8 +414,7 @@ function openEntry(entry: any) {
   else void openFile(path);
 }
 function up() {
-  const path =
-    directory.value.replace(/\/$/, "").split("/").slice(0, -1).join("/") || "/";
+  const path = hostDirname(directory.value);
   void readDirectory(path);
 }
 async function save() {
@@ -528,11 +530,11 @@ async function preview(path?: string) {
     previewDocument.value = false;
     previewUrl.value = input;
     previewInput.value = input;
-  } else if (/^[a-z][a-z0-9+.-]*:/i.test(input)) {
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(input) && !isAbsoluteHostPath(input)) {
     error.value = "预览地址必须为 HTTP(S) URL 或文件路径";
     return;
   } else {
-    const filePath = input.startsWith("/")
+    const filePath = isAbsoluteHostPath(input)
       ? input
       : join(props.state.projectPath, input);
     if (externalFilePreview.value && /\.html?$/i.test(filePath)) {

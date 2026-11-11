@@ -159,7 +159,7 @@ npm start
 | 资源管理 | 侧栏设置上方进入二级主机菜单，实时 CPU / 内存 / 网络 / 磁盘趋势、NVIDIA GPU 使用率／显存及进程的用户／PID／用时／命令、会话名称及对应 Codex PID、按会话释放/恢复连接 | Linux 需 Python 3；GPU 需 nvidia-smi；容器展示可见资源，完整宿主负载使用 SSH；按会话关闭保留其他任务。暂停主机保留暂停状态，需显式恢复；独立 daemon / proxy 只关闭本客户端连接，spawn 会结束 Web 管理的进程 |
 | 手机 UI / PWA | 会话抽屉、全屏工作区、统一字号/触控间距、主题切换、安装到主屏幕、手动检查更新与任务结束后更新 | Service Worker 只缓存公开界面资源；私人历史使用独立会话缓存，不支持离线发送/审批/执行 |
 | 后台通知 | 用户主动启用标准 Web Push；回复完成、审批/补充输入、运行失败分类与测试通知，点击回到对应主机/对话 | 设备授权最长 30 天，明确退出撤销当前登录关联的订阅；后台观察独立重连，已跟踪任务重启后只读核对；要求服务器与任务继续运行；[通知恢复](docs/background-notifications.md)、[PWA 指南](docs/pwa.md) |
-| Skills/Apps/MCP | `/` 搜索当前主机和项目的可用 Skills，选中后发送原生 Skill 输入；查看和使用已有 Apps/MCP | 不同主机的技能独立加载；插件市场不在范围内，复杂 OAuth 与桌面宿主能力另行实现 |
+| 插件 / Skills / Apps / MCP | `@` 选择当前主机已安装的插件和已连接应用，发送官方引用与原生 mention；`/` 搜索技能和预设；保留模式与文件引用 | 支持键盘和手机触控，停用/不可访问项不可选；不安装插件或注入桌面专有工具。[插件与跨平台说明](docs/platform-plugins.md) |
 | Plan / Goal | `@` 选择默认、规划或目标模式；原生规划模式和持久化对话目标，支持目标暂停、继续、清除及可选 token 预算 | 依赖当前主机 Codex 的协议与功能开关；规划模式暂停目标推进，目标继续由 Codex 自身调度，权限设置仍然生效 |
 | 定时自动化 | 每日、每周指定日期或间隔执行；指定主机、目录、模型、权限和时区；持久执行记录、执行前重试与结果核对 | Web 服务端调度，关闭网页后继续；同主机不重叠，漏掉的周期合并一次；原生提交结果未知时保留会话 ID，停止重复提交；[说明](docs/automations-and-editor.md) |
 | 侧栏拓扑 | 本机与所有远端同页显示置顶/项目/最近，最近下方可按设备筛选；置顶项目和普通项目各默认显示 4 个，项目内对话默认显示 4 条，可展开/收起；项目菜单提供编辑、收藏对话、文件定位、归档和移除 | 当前选中项目/对话保留在 4 个显示项内；完整历史仍可分页加载。编辑/移除只改变 Web 元数据，不改桌面配置或删除磁盘文件；归档可恢复 |
@@ -183,7 +183,7 @@ CODEX_CONNECTION_MODE=proxy
 # CODEX_SOCKET_PATH=/absolute/path/app-server-control.sock
 ```
 
-`proxy` 调用 `codex app-server proxy`，要求对应 daemon 已运行。它不会自动启动桌面程序或寻找任意桌面私有 socket。只有两个客户端连接到同一 app-server 进程才具备加入同一活动 thread 的条件。当前开发机的默认 daemon 控制 socket未发现，原桌面活动模型 turn/审批互通仍需目标桌面环境验证；隔离真实 daemon 的双客户端事件、活动 shell turn 和 Bridge 重连已经通过。proxy 采用 WebSocket-over-pipes，未分片消息受 daemon 的 16 MiB 通告限制。
+`proxy` 调用 `codex app-server proxy`，要求对应 daemon 已运行。它不会自动启动桌面程序或寻找任意桌面私有 socket。只有两个客户端连接到同一 app-server 进程才具备加入同一活动 thread 的条件。Windows 实机已通过两个独立客户端共同操作同一 daemon 会话的验证；Mac/Windows 桌面的“此电脑”入口仍使用独立进程，不能仅凭相同数据目录实时共享。详见[跨平台说明](docs/platform-plugins.md)。proxy 采用 WebSocket-over-pipes，未分片消息受 daemon 的 16 MiB 通告限制。
 
 Web bridge 不提供跨机器云同步。把 Node 服务部署到另一台服务器，会使用那台服务器的历史；SSH 工作站也使用远端用户自己的配置和存储。协议版本、分页、输入与同步边界详见 [协议说明](docs/protocol.md)。
 

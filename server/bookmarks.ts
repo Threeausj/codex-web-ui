@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { isAbsoluteHostPath, normalizeHostPath } from '../shared/host-path.js';
 import { writePrivateJson } from './storage.js';
 import type { BookmarkScope, ConversationBookmark, ConversationBookmarkInput } from '../shared/bookmarks.js';
 
@@ -11,8 +12,8 @@ export const MAX_BOOKMARK_BYTES = 8 * 1024 * 1024;
 const identifier = z.string().min(1).max(256).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'Control characters are not allowed');
 const name = z.string().trim().min(1).max(160).refine(value => !/[\x00-\x1f\x7f]/.test(value), 'Control characters are not allowed');
 const projectPath = z.string().min(1).max(4096)
-  .refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value), 'An absolute project path is required')
-  .transform(value => path.posix.normalize(value).replace(/\/$/, '') || '/');
+  .refine(isAbsoluteHostPath, 'An absolute project path is required')
+  .transform(normalizeHostPath);
 const scopeSchema = z.object({ hostId: identifier, projectPath }).strict();
 const queryScopeSchema = scopeSchema.extend({ _request: z.string().max(256).optional() })
   .transform(({ hostId, projectPath }) => ({ hostId, projectPath }));

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { Express } from 'express';
 import { z } from 'zod';
+import { isAbsoluteHostPath } from '../shared/host-path.js';
 import type { Bridge } from './bridge.js';
 
 const mime: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp', '.avif': 'image/avif', '.ico': 'image/x-icon', '.svg': 'image/svg+xml' };
@@ -9,7 +10,7 @@ const mime: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg'
 export function registerConversationImages(app: Express, getBridge: (hostId: string) => Promise<Bridge>) {
   app.get('/api/hosts/:id/images', (req, res, next) => {
     void (async () => {
-      const file = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f]/.test(value)).parse(req.query.path);
+      const file = z.string().min(1).max(4096).refine(isAbsoluteHostPath).parse(req.query.path);
       const type = mime[path.posix.extname(file).toLowerCase()];
       if (!type) { res.status(415).json({ error: '此文件不是支持的图片' }); return; }
       const bridge = await getBridge(String(req.params.id));

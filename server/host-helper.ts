@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { BridgeOptions } from './bridge.js'
-import { sshPythonArgs } from './ssh.js'
+import { sshPythonArgs, hostPythonInput } from './ssh.js'
 import { sharedSshPool } from './ssh-pool.js'
 import type { Host } from './types.js'
 
@@ -21,7 +21,7 @@ export async function runHostPython(host: Host, source: string, options: BridgeO
       finished = true; clearTimeout(timer)
       if (error) reject(error); else resolve(Buffer.concat(chunks).toString('utf8'))
     }
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, limits.timeoutMs ?? 15000)
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); child.stdout.destroy(); child.stderr.destroy(); finish(new Error('主机读取超时')) }, limits.timeoutMs ?? 15000)
     timer.unref()
     child.on('error', () => finish(new Error(host.kind === 'ssh' ? '无法启动主机读取 SSH' : '主机读取需要 Python 3')))
     child.stdin.on('error', () => {})
@@ -35,6 +35,6 @@ export async function runHostPython(host: Host, source: string, options: BridgeO
       if (code === 0) finish()
       else finish(new Error(timedOut ? '主机读取超时' : /host key|identification has changed/i.test(stderr) ? '请确认并信任 SSH 主机指纹' : /python3.*not found/i.test(stderr) ? '目标主机需要 Python 3' : '无法读取主机数据，请检查 SSH 连接及账户权限'))
     })
-    child.stdin.end(source)
+    child.stdin.end(hostPythonInput(host, source))
   }) } finally { lease?.release() }
 }

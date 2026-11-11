@@ -1,8 +1,9 @@
 import type { Host } from './types.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
+import { windowsPythonCommand, windowsCodexCommand } from './windows-shell.js'
 
 /** Only the server-owned pool may supply an application-private control socket. */
-export type SSHConnectionControl = { socketPath: string }
+export type SSHConnectionControl = { socketPath: string; windowsShell?: 'cmd' | 'powershell' }
 
 export function shellQuote(value: string) { return `'${value.replace(/'/g, `'"'"'`)}'` }
 
@@ -28,18 +29,19 @@ export function codexDaemonArgs(action: CodexDaemonAction) {
  * first, then start a POSIX launcher with the resulting PATH. Its startup output
  * goes to stderr; fd 3 temporarily preserves the app-server protocol stdout.
  */
-export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, daemonManaged = false) {
-  return remoteCodexLaunch(host, codexAppServerArgs(mode, undefined, daemonManaged), probeVersion)
+export function remoteCodexCommand(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, daemonManaged = false, windowsShell?: SSHConnectionControl['windowsShell']) {
+  return remoteCodexLaunch(host, codexAppServerArgs(mode, undefined, daemonManaged), probeVersion, undefined, windowsShell)
 }
 
 /** The official daemon owns its lifetime; this command only starts/queries it.
  * It deliberately never installs OS services or stops an existing daemon. */
-export function remoteCodexDaemonCommand(host: Host, action: CodexDaemonAction, codexHome?: string) {
-  return remoteCodexLaunch(host, codexDaemonArgs(action), false, codexHome)
+export function remoteCodexDaemonCommand(host: Host, action: CodexDaemonAction, codexHome?: string, windowsShell?: SSHConnectionControl['windowsShell']) {
+  return remoteCodexLaunch(host, codexDaemonArgs(action), false, codexHome, windowsShell)
 }
 
-function remoteCodexLaunch(host: Host, args: string[], probeVersion: boolean, codexHome?: string) {
+function remoteCodexLaunch(host: Host, args: string[], probeVersion: boolean, codexHome?: string, windowsShell?: SSHConnectionControl['windowsShell']) {
   const command = host.codexPath?.trim() || 'codex'
+  if (host.platform === 'windows') return windowsCodexCommand(command, args, host.cwd, codexHome, probeVersion, windowsShell)
   const launch = [
     ...(host.cwd ? [`cd ${shellQuote(host.cwd)} || exit 126`] : []),
     `codex_bin=${shellQuote(command)}`,
@@ -71,12 +73,14 @@ export function sshKnownHostsArgs(pin?: SSHHostKeyPin, control?: SSHConnectionCo
 }
 
 export function sshAppServerArgs(host: Host, mode: 'spawn' | 'proxy' = 'spawn', probeVersion = false, knownHostsFile?: SSHHostKeyPin, control?: SSHConnectionControl, daemonManaged = false) {
+  if (host.platform === 'windows' && control?.windowsShell === 'powershell')
+    throw new Error('Windows SSH 默认 PowerShell 会截留持续输入。请将 OpenSSH DefaultShell 设为 cmd.exe 后重试；网页终端仍使用 PowerShell。')
   const args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'TCPKeepAlive=yes', '-o', 'LogLevel=ERROR']
   args.push(...sshKnownHostsArgs(knownHostsFile, control))
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)
   const destination = `${host.username ? `${host.username}@` : ''}${host.hostname}`
-  args.push('--', destination, remoteCodexCommand(host, mode, probeVersion, daemonManaged))
+  args.push('--', destination, remoteCodexCommand(host, mode, probeVersion, daemonManaged, control?.windowsShell))
   return args
 }
 
@@ -85,7 +89,7 @@ export function sshCodexDaemonArgs(host: Host, action: CodexDaemonAction, knownH
     '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'LogLevel=ERROR', ...sshKnownHostsArgs(knownHostsFile, control)]
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)
-  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, remoteCodexDaemonCommand(host, action, codexHome))
+  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, remoteCodexDaemonCommand(host, action, codexHome, control?.windowsShell))
   return args
 }
 
@@ -95,6 +99,12 @@ export function sshPythonArgs(host: Host, pin?: SSHHostKeyPin, control?: SSHConn
     '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', '-o', 'LogLevel=ERROR', ...sshKnownHostsArgs(pin, control)]
   if (host.port) args.push('-p', String(host.port))
   if (host.identityFile) args.push('-i', host.identityFile)
-  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, `exec /bin/sh -c ${shellQuote('exec python3 -')}`)
+  const command = host.platform === 'windows' ? windowsPythonCommand(
+    `import sys,os,pathlib\nhome=pathlib.Path.home();local=pathlib.Path(os.environ.get('LOCALAPPDATA',home/'AppData'/'Local'));bins=local/'OpenAI'/'Codex'/'bin';dependencies=home/'.cache'/'codex-runtimes'/'codex-primary-runtime'/'dependencies'\npaths=[home/'.codex'/'packages'/'standalone'/'current'/'bin',home/'.codex'/'packages'/'app-server-daemon'/'current'/'bin',local/'Programs'/'OpenAI'/'Codex'/'bin',dependencies/'node'/'bin',dependencies/'native'/'git'/'cmd',pathlib.Path(os.environ.get('ProgramFiles','C:/Program Files'))/'Git'/'cmd']\nif bins.is_dir(): paths+=sorted((p.parent for p in bins.glob('*/codex.exe') if p.is_file()),key=lambda p:p.stat().st_mtime,reverse=True)\nos.environ['PATH']=os.pathsep.join(str(p) for p in paths)+os.pathsep+os.environ.get('PATH','')\nimport base64;exec(base64.b64decode(sys.stdin.buffer.readline()))`
+  , control?.windowsShell) : `exec /bin/sh -c ${shellQuote('exec python3 -')}`
+  args.push('--', `${host.username ? `${host.username}@` : ''}${host.hostname}`, command)
   return args
 }
+/** Windows OpenSSH does not always propagate stdin EOF to native children. A
+ * single Base64 line gives fixed Python helpers an explicit framing boundary. */
+export function hostPythonInput(host: Host, source: string) { return host.platform === 'windows' ? Buffer.from(source).toString('base64') + '\n' : source; }

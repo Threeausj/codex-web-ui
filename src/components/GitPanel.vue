@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+import { isAbsoluteHostPath } from '../../shared/host-path';
 import { repositoryCandidates, missingRepository } from '../lib/git-context';
 
 type GitFile = {
@@ -193,7 +194,7 @@ async function refresh() {
   }
 }
 function chooseDirectory() {
-  if (busy.value || loading.value || !directoryDraft.value.trim().startsWith('/')) return;
+  if (busy.value || loading.value || !isAbsoluteHostPath(directoryDraft.value.trim())) return;
   ++generation; ++diffGeneration;
   directory.value = directoryDraft.value.trim(); resolvedFromConversation.value = false;
   repository.value = null; selected.value = []; diff.value = ''; diffFile.value = ''; message.value = ''; notice.value = '';
@@ -375,7 +376,7 @@ defineExpose({ refresh });
     </div>
     <form class="git-directory" @submit.prevent="chooseDirectory">
       <label for="git-repository-directory">仓库目录</label>
-      <div><input id="git-repository-directory" v-model="directoryDraft" list="git-directory-choices" aria-label="Git 仓库目录" :disabled="busy || loading" placeholder="输入仓库的绝对路径" /><button class="button button-small button-secondary" :disabled="busy || loading || !state.connected || !directoryDraft.trim().startsWith('/')">打开</button></div>
+      <div><input id="git-repository-directory" v-model="directoryDraft" list="git-directory-choices" aria-label="Git 仓库目录" :disabled="busy || loading" placeholder="输入仓库的绝对路径" /><button class="button button-small button-secondary" :disabled="busy || loading || !state.connected || !isAbsoluteHostPath(directoryDraft.trim())">打开</button></div>
       <datalist id="git-directory-choices"><option v-for="path in directoryChoices" :key="path" :value="path" /></datalist>
       <p v-if="resolvedFromConversation" class="git-note" role="status">已根据对话中的操作目录找到仓库；对话工作目录保持为 {{ state.projectPath }}。</p>
     </form>

@@ -61,7 +61,7 @@ try:
         env=dict(os.environ); env['CODEX_HOME']=str(home)
         def command(arguments):
             args=[config['executable']]+arguments
-            if config['remote']:
+            if config['remote'] and os.name!='nt':
                 # Reapply the temporary home after login profiles, which may
                 # export their own CODEX_HOME. Profiles supply only CLI PATH.
                 launcher='cd '+shlex.quote(directory)+' && exec '+ ' '.join(shlex.quote(arg) for arg in ['/usr/bin/env','CODEX_HOME='+str(home)]+args)

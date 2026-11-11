@@ -126,8 +126,8 @@ test("existing slash commands still work and Escape closes suggestions without s
 test("at menu selects native Plan mode and keeps file mentions available", async ({ page, mock }) => {
   composerWire(mock);
   await login(page);
-  await page.getByRole("button", { name: "选择模式或引用项目文件", exact: true }).click();
-  const picker = page.getByRole("listbox", { name: "模式与项目文件" });
+  await page.getByRole("button", { name: "选择插件、应用、模式或引用项目文件", exact: true }).click();
+  const picker = page.getByRole("listbox", { name: "插件、应用、模式与文件" });
   await expect(picker.getByRole("option").filter({ hasText: "Plan 模式" })).toBeEnabled();
   await expect(picker).toContainText("README.md");
   await picker.getByRole("option").filter({ hasText: "Plan 模式" }).click();
@@ -143,7 +143,7 @@ test("at menu selects native Plan mode and keeps file mentions available", async
 test("unsupported Plan and Goal are disabled with an explanation", async ({ page, mock }) => {
   composerWire(mock, { plan: false, goal: false });
   await login(page);
-  await page.getByRole("button", { name: "选择模式或引用项目文件", exact: true }).click();
+  await page.getByRole("button", { name: "选择插件、应用、模式或引用项目文件", exact: true }).click();
   const picker = page.getByRole("listbox");
   await expect(picker.getByRole("option").filter({ hasText: "Plan 模式" })).toBeDisabled();
   await expect(picker.getByRole("option").filter({ hasText: "Goal 模式" })).toBeDisabled();
@@ -355,7 +355,7 @@ test("busy tasks explain why changing collaboration modes must wait", async ({ p
   await page.getByRole("textbox", { name: "消息输入框" }).fill("运行期间不切换协作模式");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "选择模式或引用项目文件", exact: true }).click();
+  await page.getByRole("button", { name: "选择插件、应用、模式或引用项目文件", exact: true }).click();
   const picker = page.getByRole("listbox");
   await expect(picker.getByRole("option").filter({ hasText: "Plan 模式" })).toBeDisabled();
   await expect(picker.getByRole("option").filter({ hasText: "Goal 模式" })).toBeDisabled();

@@ -1,4 +1,5 @@
 import { isProjectlessThread } from '../../shared/project-context';
+import { isWindowsHostPath, normalizeHostPath } from '../../shared/host-path';
 
 export type Pin = {
   kind: "project" | "thread";
@@ -19,9 +20,13 @@ export function matchesProject(
   // project identity, leaving tools in the conversation's original directory.
   if (thread.projectId) return thread.projectId === project.nativeProjectId;
   if (isProjectlessThread(thread)) return false;
-  const cwd = thread.cwd?.replace(/\/$/, "");
+  const comparablePath = (path: string) => {
+    const normalized = normalizeHostPath(path);
+    return isWindowsHostPath(normalized) ? normalized.toLowerCase() : normalized;
+  };
+  const cwd = thread.cwd && comparablePath(thread.cwd);
   return [project.path, ...(project.rootPaths || [])].some(
-    (root) => root.replace(/\/$/, "") === cwd,
+    (root) => comparablePath(root) === cwd,
   );
 }
 type ThreadActivity = { recencyAt?: number | null; createdAt?: number };

@@ -7,3 +7,4 @@ export const interactiveShellCommand = [
   "/bin/sh", "-c",
   'terminal_shell=${SHELL:-}; case "$terminal_shell" in */bash|*/zsh|*/fish|*/ksh) if [ -x "$terminal_shell" ]; then exec "$terminal_shell" -i; fi ;; esac; if command -v bash >/dev/null 2>&1; then exec bash -i; fi; if [ -n "$terminal_shell" ] && [ -x "$terminal_shell" ]; then exec "$terminal_shell" -i; fi; exec /bin/sh -i',
 ];
+export const windowsInteractiveShellCommand = ['powershell.exe', '-NoLogo', '-NoExit'];

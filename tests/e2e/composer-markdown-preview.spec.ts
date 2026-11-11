@@ -67,7 +67,7 @@ test('returning to source restores the caret and keeps Enter, Shift+Enter and me
   await input.press('x');
   await expect(input).toHaveValue('第一行\nx');
   await openPreview(page);
-  await page.getByRole('button', { name: '选择模式或引用项目文件', exact: true }).click();
+  await page.getByRole('button', { name: '选择插件、应用、模式或引用项目文件', exact: true }).click();
   await expect(preview(page)).toHaveCount(0);
   await expect(input).toBeFocused();
   await expect(page.getByRole('listbox')).toBeVisible();
