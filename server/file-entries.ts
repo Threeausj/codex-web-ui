@@ -1,4 +1,3 @@
-import path from 'node:path';
 import type { Express } from 'express';
 import { z } from 'zod';
 import type { Host } from './types.js';
@@ -7,6 +6,7 @@ import { runHostPython } from './host-helper.js';
 import { validFileEntryName, type FileEntryChange } from '../shared/file-entries.js';
 import { isAbsoluteHostPath, normalizeHostPath, joinHostPath } from '../shared/host-path.js';
 import { windowsFileEntryScript } from './windows-files.js';
+import { fileTransferScript } from './file-transfer.js';
 
 const directory = z.string().min(1).max(4096).refine(isAbsoluteHostPath).transform(normalizeHostPath);
 const name = z.string().refine(validFileEntryName, '名称不能为空，且不能包含路径分隔符或控制字符');
@@ -17,6 +17,7 @@ const mutation = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('createDirectory'), directory, name }).strict(),
   z.object({ operation: z.literal('rename'), directory, name, newName: name, expectedVersion: version }).strict(),
   z.object({ operation: z.literal('delete'), directory, name, expectedVersion: version, confirmed: z.literal(true) }).strict(),
+  z.object({ operation: z.enum(['copy', 'move']), directory, sourceDirectory: directory, name, newName: name, expectedVersion: version }).strict(),
 ]);
 export function fileEntryScript(input: unknown) {
   const encoded = Buffer.from(JSON.stringify(input)).toString('base64');
@@ -71,7 +72,12 @@ finally:
 print(json.dumps(result,separators=(',',':')))
 `;
 }
-const failures: Record<string, { status: number; error: string }> = {
+export const fileEntryFailures: Record<string, { status: number; error: string }> = {
+  RECURSIVE: { status: 400, error: '不能将文件夹复制或移动到自身或其子目录。' },
+  CROSS_DEVICE: { status: 409, error: '源和目标位于不同文件系统；请先复制，核对完成后再删除源文件。原文件已保留。' },
+  LIMIT: { status: 413, error: '文件操作超出时间或条目上限，请缩小范围后重试；原文件已保留。' },
+  UNSUPPORTED_ENTRY: { status: 400, error: '此项包含特殊文件或 Windows 链接，无法安全复制；请使用主机文件管理器处理。' },
+  INCOMPLETE_UPLOAD: { status: 400, error: '上传内容不完整或校验失败，目标文件未发布，请重试。' },
   INVALID_NAME: { status: 400, error: '此名称不适用于 Windows，请避免保留设备名、特殊字符以及结尾的空格或句点。' },
   EXISTS: { status: 409, error: '同名文件或文件夹已存在，请使用其他名称。' },
   MISSING: { status: 404, error: '文件或目录已不存在，请刷新列表后重试。' },
@@ -95,15 +101,16 @@ export function registerFileEntries(app: Express, dependencies: Dependencies) {
       const key = JSON.stringify([hostId, host.platform === 'windows' ? fields.directory.toLowerCase() : fields.directory]);
       const work = (operations.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
         if (dependencies.getHost(hostId) !== host) throw Object.assign(new Error('主机配置已变化，请重新操作。'), { status: 409 });
-        const script = host.platform === 'windows' ? windowsFileEntryScript(input) : fileEntryScript(input);
-        const result = JSON.parse(await (dependencies.run ? dependencies.run(host, script) : runHostPython(host, script, dependencies.bridgeOptions, { timeoutMs: 45000 })));
-        if (result.ok !== true) { const failure = failures[result.code] || failures.FAILED!; res.status(failure.status).json({ error: failure.error, code: result.code }); return; }
+        const transfer = 'operation' in input && typeof input.operation === 'string' && ['copy', 'move'].includes(input.operation);
+        const script = transfer ? fileTransferScript(input) : host.platform === 'windows' ? windowsFileEntryScript(input) : fileEntryScript(input);
+        const result = JSON.parse(await (dependencies.run ? dependencies.run(host, script) : runHostPython(host, script, dependencies.bridgeOptions, { timeoutMs: transfer ? 110000 : 45000 })));
+        if (result.ok !== true) { const failure = fileEntryFailures[result.code] || fileEntryFailures.FAILED!; res.status(failure.status).json({ error: failure.error, code: result.code }); return; }
         if (inspection) { res.json({ version: result.version, isDirectory: result.isDirectory, isSymlink: result.isSymlink }); return; }
         const operation = (fields as z.infer<typeof mutation>).operation;
-        const source = joinHostPath(fields.directory, fields.name);
-        const target = operation === 'rename' ? joinHostPath(fields.directory, (fields as any).newName) : source;
+        const source = joinHostPath((fields as any).sourceDirectory || fields.directory, fields.name);
+        const target = ['rename', 'copy', 'move'].includes(operation) ? joinHostPath(fields.directory, (fields as any).newName) : source;
         res.json({ hostId, directory: fields.directory, operation, path: target,
-          ...(['rename', 'delete'].includes(operation) ? { previousPath: source } : {}), isDirectory: result.isDirectory } satisfies FileEntryChange);
+          ...(['rename', 'delete', 'move'].includes(operation) ? { previousPath: source } : {}), isDirectory: result.isDirectory } satisfies FileEntryChange);
       });
       operations.set(key, work);
       try { await work; } finally { if (operations.get(key) === work) operations.delete(key); }

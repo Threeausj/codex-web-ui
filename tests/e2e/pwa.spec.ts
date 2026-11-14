@@ -321,6 +321,36 @@ test('a lost first worker activation request is retried without discarding the d
   } finally { workerRevision = ''; }
 });
 
+test('a workspace upload keeps a deferred app update blocked after its folder picker closes', async ({ page }) => {
+  await page.route('**/api/hosts/local/directories*', route => route.fulfill({ json: { path: '/workspace', entries: [] } }));
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let received = false;
+  await page.route('**/api/hosts/local/file-entries/upload', async route => {
+    received = true;await pending;
+    await route.fulfill({ status: 201, json: { hostId: 'local', directory: '/workspace', path: '/workspace/upload.txt', operation: 'upload', isDirectory: false } });
+  });
+  await loginBuilt(page);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('上传时保留草稿');
+  await page.locator('.settings-button').click();const settings = page.getByRole('dialog', { name: '设置', exact: true });
+  await settings.locator('.settings-nav').getByRole('button', { name: '项目', exact: true }).click();await settings.getByRole('button', { name: '浏览项目文件夹', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: '选择项目文件夹', exact: true });
+  await expect(picker.getByRole('button', { name: '使用文件夹', exact: true })).toBeEnabled();
+  await picker.getByLabel('上传到当前目录', { exact: true }).setInputFiles({ name: 'upload.txt', mimeType: 'text/plain', buffer: Buffer.from('upload fixture') });
+  await expect.poll(() => received).toBe(true);
+  await picker.getByRole('button', { name: '关闭文件夹选择', exact: true }).click();
+  await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
+  let navigations = 0;page.on('domcontentloaded', () => { navigations++; });
+  workerRevision = '\n// workspace-upload-pending-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await page.getByRole('button', { name: '完成后更新', exact: true }).click();
+    await expect(page.getByRole('button', { name: '等待更新', exact: true })).toBeDisabled();expect(navigations).toBe(0);
+    await Promise.all([page.waitForEvent('domcontentloaded'), Promise.resolve().then(release)]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('上传时保留草稿');
+  } finally { release();workerRevision = ''; }
+});
+
 test('a pending workspace file save postpones a worker update until its write is acknowledged', async ({ page, mock }) => {
   mock.turns.get('thread-existing')![0].items[1].text = '[打开文件](/workspace/demo/README.md)';
   const receive = (mock as any).receive.bind(mock);

@@ -323,7 +323,7 @@ const actionPending = ref(false);
 const actionBusy = computed(() => actionPending.value || state.editingMessage);
 const messageEditOpen = ref(false);
 const updateCanReload = computed(() => !(
-  state.busy || state.compacting || actionBusy.value || state.loading ||
+  state.busy || state.compacting || state.fileOperationsPending || actionBusy.value || state.loading ||
   state.selectingThread || state.switchingHost || state.changingContext ||
   state.modeBusy || state.modelSettingsBusy || chatTabSaving.value || bookmarkSaving.value || !!bookmarkNaming.value || !!bookmarks.state.busyId ||
   messageEditOpen.value || composer.value?.working || workspace.value?.working || settingsPanel.value?.working ||

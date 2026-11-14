@@ -2,7 +2,7 @@ import { test, expect, login, MockCodex } from './fixtures';
 import type { Page, Route } from '@playwright/test';
 import { createHash } from 'node:crypto';
 
-type Entry = { directory: boolean; content?: string; revision: number };
+type Entry = { directory: boolean; content?: string; bytes?: Buffer; revision: number };
 async function files(page: Page, mock: MockCodex) {
   const remote = new MockCodex();remote.threads[0]!.name = '另一台主机的聊天';
   mock.hosts.push({ id: 'file-remote', name: '文件远端', kind: 'ssh', cwd: '/workspace/demo' });
@@ -21,7 +21,7 @@ async function files(page: Page, mock: MockCodex) {
       const inventory = inventories.get(hostId)!, p = request.params || {};
       const reply = (result: unknown) => { target.requests.push(request);socket.send(JSON.stringify({ id: request.id, result })); };
       if (request.method === 'fs/readDirectory') return reply({ entries: list(inventory, p.path) });
-      if (request.method === 'fs/readFile') return reply({ dataBase64: Buffer.from(inventory.get(p.path)?.content || '').toString('base64') });
+      if (request.method === 'fs/readFile') return reply({ dataBase64: (inventory.get(p.path)?.bytes || Buffer.from(inventory.get(p.path)?.content || '')).toString('base64') });
       if (request.method === 'fs/writeFile') { const entry = inventory.get(p.path)!;entry.content = Buffer.from(p.dataBase64, 'base64').toString();entry.revision++;return reply({}); }
       return receive(socket, request);
     };
@@ -34,28 +34,41 @@ async function files(page: Page, mock: MockCodex) {
   const requests: { hostId: string; body: any }[] = [];
   const version = (entry: Entry) => createHash('sha256').update(JSON.stringify(entry)).digest('hex');
   let failure = '', hold: (() => Promise<void>) | undefined;
-  await page.route(/\/api\/hosts\/[^/]+\/file-entries(?:\/inspect)?$/, async (route: Route) => {
-    const hostId = new URL(route.request().url()).pathname.split('/')[3]!, inventory = inventories.get(hostId)!, body = route.request().postDataJSON();
-    const path = body.directory.replace(/\/$/, '') + '/' + body.name, entry = inventory.get(path);
+  await page.route(/\/api\/hosts\/[^/]+\/file-entries(?:\/inspect|\/upload)?$/, async (route: Route) => {
+    const hostId = new URL(route.request().url()).pathname.split('/')[3]!, inventory = inventories.get(hostId)!;
+    let body: any, uploaded: Buffer | undefined;
+    if (route.request().url().endsWith('/upload')) {
+      const form = await new Request('http://fixture.invalid', { method: 'POST', headers: { 'content-type': route.request().headers()['content-type']! }, body: new Uint8Array(route.request().postDataBuffer()!) }).formData();
+      body = { directory: form.get('directory'), name: form.get('name'), operation: 'upload' };
+      uploaded = Buffer.from(await (form.get('file') as File).arrayBuffer());
+    } else body = route.request().postDataJSON();
+    const path = (body.sourceDirectory || body.directory).replace(/\/$/, '') + '/' + body.name, entry = inventory.get(path);
     if (route.request().url().endsWith('/inspect')) return route.fulfill({ status: entry ? 200 : 404, json: entry ? { version: version(entry), isDirectory: entry.directory } : { error: '不存在' } });
     requests.push({ hostId, body });await hold?.();
     if (failure) { const message = failure;failure = '';return route.fulfill({ status: 409, json: { error: message } }); }
+    if (body.operation === 'upload') {
+      if (entry) return route.fulfill({ status: 409, json: { error: '同名文件或文件夹已存在' } });
+      inventory.set(path, { directory: false, bytes: uploaded, revision: 1 });
+      return route.fulfill({ status: 201, json: { hostId, directory: body.directory, path, operation: 'upload', isDirectory: false } });
+    }
     if (body.operation.startsWith('create')) {
       if (entry) return route.fulfill({ status: 409, json: { error: '同名文件或文件夹已存在' } });
       inventory.set(path, { directory: body.operation === 'createDirectory', content: '', revision: 1 });
     } else if (!entry || body.expectedVersion !== version(entry)) return route.fulfill({ status: 409, json: { error: '文件已变化，请刷新后重试' } });
-    const destination = body.operation === 'rename' ? body.directory.replace(/\/$/, '') + '/' + body.newName : path;
-    if (body.operation === 'rename') {
+    const destination = ['rename', 'copy', 'move'].includes(body.operation) ? body.directory.replace(/\/$/, '') + '/' + body.newName : path;
+    if (['rename', 'copy', 'move'].includes(body.operation)) {
       if (inventory.has(destination)) return route.fulfill({ status: 409, json: { error: '同名文件或文件夹已存在' } });
-      for (const [key, value] of [...inventory]) if (key === path || key.startsWith(path + '/')) { inventory.delete(key);inventory.set(destination + key.slice(path.length), value); }
+      for (const [key, value] of [...inventory]) if (key === path || key.startsWith(path + '/')) { if (body.operation !== 'copy') inventory.delete(key);inventory.set(destination + key.slice(path.length), { ...value }); }
     }
     if (body.operation === 'delete') for (const key of [...inventory.keys()]) if (key === path || key.startsWith(path + '/')) inventory.delete(key);
-    return route.fulfill({ json: { hostId, directory: body.directory, path: destination, operation: body.operation, isDirectory: body.operation === 'createDirectory' || !!entry?.directory, ...(['delete', 'rename'].includes(body.operation) ? { previousPath: path } : {}) } });
+    return route.fulfill({ json: { hostId, directory: body.directory, path: destination, operation: body.operation, isDirectory: body.operation === 'createDirectory' || !!entry?.directory, ...(['delete', 'rename', 'move'].includes(body.operation) ? { previousPath: path } : {}) } });
   });
   return { local, remoteFiles, requests, remote, fail(message: string) { failure = message; }, hold(value: () => Promise<void>) { hold = value; } };
 }
 async function workspace(page: Page) {
-  await login(page);await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).first().click();
+  await login(page);
+  if ((page.viewportSize()?.width || 1440) < 760) await page.getByRole('button', { name: '打开侧边栏', exact: true }).click();
+  await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).first().click();
   await page.getByRole('button', { name: '切换工作区', exact: true }).click();
   await page.locator('.workspace-tabs').getByRole('button', { name: '文件', exact: true }).click();
   await expect(page.locator('.file-tree-row').filter({ hasText: 'README.md' })).toBeVisible();
@@ -183,4 +196,133 @@ test('file menus stay in the viewport and support keyboard navigation without cl
   await expect(page.getByRole('menuitem', { name: /重命名/ })).toBeFocused();await page.keyboard.press('End');
   await expect(page.getByRole('menuitem', { name: /删除/ })).toBeFocused();await expect(page.getByRole('menuitem', { name: /删除/ })).toBeInViewport();
   await page.keyboard.press('Escape');await expect(page.getByRole('menu')).toHaveCount(0);await expect(picker).toBeVisible();
+});
+
+async function paste(page: Page, name: string) {
+  await page.locator('aside.workspace-panel').getByRole('button', { name: '粘贴文件', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '粘贴文件', exact: true });
+  await dialog.getByRole('textbox', { name: '文件名称', exact: true }).fill(name);
+  await dialog.getByRole('button', { name: '粘贴', exact: true }).click();
+  return dialog;
+}
+async function dragFile(page: Page, name: string, bytes: number[] = [0,1,255,13,10]) {
+  return page.evaluateHandle(({ name, bytes }) => {
+    const data = new DataTransfer();data.items.add(new File([new Uint8Array(bytes)], name, { type: 'application/octet-stream' }));return data;
+  }, { name, bytes });
+}
+
+test('file keyboard copy and paste lets users resolve a name conflict without replacing the original', async ({ page, mock }) => {
+  const f = await files(page, mock);await workspace(page);
+  const source = page.locator('.file-tree-row').filter({ hasText: 'README.md' });await source.focus();await source.press('Control+c');
+  const dialog = await paste(page, 'README.md');await expect(dialog.getByRole('alert')).toContainText('同名');
+  await dialog.getByRole('textbox', { name: '文件名称', exact: true }).fill('副本.md');await dialog.getByRole('button', { name: '粘贴', exact: true }).click();
+  await expect(dialog).toHaveCount(0);await expect(page.locator('.file-tree-row').filter({ hasText: '副本.md' })).toBeVisible();
+  expect(f.local.get('/workspace/demo/副本.md')?.content).toBe('# 原文件');expect(f.local.get('/workspace/demo/README.md')?.content).toBe('# 原文件');
+});
+
+test('cut and paste moves an open file into another folder while keeping its unsaved draft', async ({ page, mock }) => {
+  const f = await files(page, mock);f.local.set('/workspace/demo/destination', { directory: true, revision: 1 });await workspace(page);
+  await create(page, '文件', 'move.txt');await page.getByRole('textbox', { name: 'move.txt 文件内容', exact: true }).fill('尚未保存的移动草稿');
+  await page.getByRole('button', { name: 'move.txt 文件操作', exact: true }).click();await page.getByRole('menuitem', { name: /剪切/ }).click();
+  await expect(page.locator('aside.workspace-panel').getByRole('button', { name: '粘贴文件', exact: true })).toBeEnabled();
+  await page.locator('.file-tree-row').filter({ hasText: 'destination' }).click();
+  await paste(page, 'move.txt');await expect(page.getByRole('dialog', { name: '粘贴文件', exact: true })).toHaveCount(0);
+  expect(f.local.has('/workspace/demo/move.txt')).toBe(false);expect(f.local.has('/workspace/demo/destination/move.txt')).toBe(true);
+  await expect(page.locator('.chat-tabs .file-tab[data-file-path="/workspace/demo/destination/move.txt"]')).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'move.txt 文件内容', exact: true })).toHaveText('尚未保存的移动草稿');
+  await expect(page.locator('aside.workspace-panel').getByRole('button', { name: '粘贴文件', exact: true })).toBeDisabled();
+});
+
+test('file clipboard cannot paste a local path on another host', async ({ page, mock }) => {
+  const f = await files(page, mock);await workspace(page);
+  await page.getByRole('button', { name: 'README.md 文件操作', exact: true }).click();await page.getByRole('menuitem', { name: /^复制\s*Ctrl/ }).click();
+  await expect(page.locator('aside.workspace-panel').getByRole('button', { name: '粘贴文件', exact: true })).toBeEnabled();
+  await page.locator('[data-section="recent"] [data-host-id="file-remote"] .thread-row').first().click();
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'file-remote');
+  await expect(page.locator('aside.workspace-panel').getByRole('button', { name: '粘贴文件', exact: true })).toBeDisabled();
+  expect(f.requests).toHaveLength(0);
+});
+
+for (const width of [1440, 390]) test(`files accept a drag upload into the displayed directory without adding chat attachments (${width}px)`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });const f = await files(page, mock);await workspace(page);
+  const zone = page.locator('aside.workspace-panel .file-upload-zone'), dataTransfer = await dragFile(page, '拖入中文.bin');
+  await zone.dispatchEvent('dragenter', { dataTransfer });await zone.dispatchEvent('dragover', { dataTransfer });
+  await expect(zone.getByText('释放文件以上传')).toBeVisible();await expect(zone.locator('.upload-drop-target')).toContainText('/workspace/demo');
+  await zone.dispatchEvent('drop', { dataTransfer });
+  await expect(zone.getByRole('status')).toContainText('1/1 个文件上传完成');
+  await expect(page.locator('.file-tree-row').filter({ hasText: '拖入中文.bin' })).toBeVisible();
+  expect([...f.local.get('/workspace/demo/拖入中文.bin')!.bytes!]).toEqual([0,1,255,13,10]);
+  expect(f.requests.at(-1)?.hostId).toBe('local');expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(0);
+  await expect(page.locator('.composer .attachment-chip')).toHaveCount(0);await dataTransfer.dispose();
+});
+
+test('upload button reports collisions and continues the remaining files in the batch', async ({ page, mock }) => {
+  const f = await files(page, mock);await workspace(page);
+  const zone = page.locator('aside.workspace-panel .file-upload-zone');
+  await zone.getByLabel('上传到当前目录', { exact: true }).setInputFiles([{ name: 'README.md', mimeType: 'text/plain', buffer: Buffer.from('must not replace') }, { name: '新文件.csv', mimeType: 'text/csv', buffer: Buffer.from('姓名,值\n甲,1') }]);
+  await expect(zone.getByRole('alert')).toContainText('README.md：同名');await expect(zone.getByRole('status')).toContainText('1/2 个文件上传完成');
+  expect(f.local.get('/workspace/demo/README.md')?.content).toBe('# 原文件');expect(f.local.has('/workspace/demo/新文件.csv')).toBe(true);
+  await page.getByRole('button', { name: '关闭上传结果', exact: true }).click();await expect(zone.getByRole('alert')).toHaveCount(0);
+});
+
+test('switching host during an upload never writes later files to the newly selected host', async ({ page, mock }) => {
+  const f = await files(page, mock);await workspace(page);
+  let release!: () => void;const pending = new Promise<void>(resolve => { release = resolve; });f.hold(() => pending);
+  await page.locator('aside.workspace-panel').getByLabel('上传到当前目录', { exact: true }).setInputFiles([{ name: 'first.bin', mimeType: '', buffer: Buffer.from('first') }, { name: 'second.bin', mimeType: '', buffer: Buffer.from('second') }]);
+  await expect.poll(() => f.requests.length).toBe(1);
+  await page.locator('[data-section="recent"] [data-host-id="file-remote"] .thread-row').first().click();
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'file-remote');release();
+  await expect.poll(() => f.local.has('/workspace/demo/first.bin')).toBe(true);
+  await expect(page.locator('aside.workspace-panel .upload-feedback')).toContainText('2/2 个文件上传完成');
+  expect(f.requests.every(request => request.hostId === 'local')).toBe(true);expect(f.remoteFiles.has('/workspace/demo/first.bin')).toBe(false);expect(f.remoteFiles.has('/workspace/demo/second.bin')).toBe(false);
+});
+
+test('CSV renders escaped and multiline values as text with pagination and a source editor', async ({ page, mock }) => {
+  const f = await files(page, mock);
+  f.local.set('/workspace/demo/report.csv', { directory: false, revision: 1, content: '姓名,说明,值\r\n甲,"第一行\n第二行, ""引号""",=SUM(A1)\r\n乙,<img src=x onerror=alert(1)>,0\r\n' + Array.from({ length: 103 }, (_, i) => `用户${i},数据,${i}`).join('\n') });
+  await workspace(page);await page.locator('.file-tree-row').filter({ hasText: 'report.csv' }).click();
+  const preview = page.getByRole('region', { name: 'CSV 表格预览', exact: true });await expect(preview.getByRole('columnheader', { name: '姓名', exact: true })).toBeVisible();
+  await expect(preview.getByRole('cell', { name: '第一行\n第二行, "引号"', exact: true })).toBeVisible();
+  await expect(preview.getByRole('cell', { name: '=SUM(A1)', exact: true })).toBeVisible();await expect(preview.locator('img')).toHaveCount(0);
+  await expect(preview.getByText('第 1 / 2 页', { exact: true })).toBeVisible();await preview.getByRole('button', { name: 'CSV 下一页', exact: true }).click();
+  await expect(preview.getByText('第 2 / 2 页', { exact: true })).toBeVisible();await expect(preview.getByRole('cell', { name: '用户102', exact: true })).toBeVisible();
+  const file = page.getByRole('region', { name: '文件预览', exact: true });await file.getByRole('button', { name: '源码', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: 'report.csv 文件内容', exact: true });await editor.fill('姓名,值\n丙,3');
+  await file.getByRole('button', { name: '预览', exact: true }).click();await expect(preview.getByRole('cell', { name: '丙', exact: true })).toBeVisible();
+  await file.getByRole('button', { name: '保存', exact: true }).click();await expect.poll(() => f.local.get('/workspace/demo/report.csv')?.content).toBe('姓名,值\n丙,3');
+});
+
+test('legacy Chinese CSV is readable and its source remains read-only to preserve the original encoding', async ({ page, mock }) => {
+  const f = await files(page, mock);f.local.set('/workspace/demo/gb.csv', { directory: false, revision: 1, bytes: Buffer.from([0xd6,0xd0,0xce,0xc4,0x2c,0xd6,0xb5,10,0xbc,0xd7,0x2c,0x31]) });
+  await workspace(page);await page.locator('.file-tree-row').filter({ hasText: 'gb.csv' }).click();
+  const preview = page.getByRole('region', { name: 'CSV 表格预览', exact: true });await expect(preview.getByRole('columnheader', { name: '中文', exact: true })).toBeVisible();await expect(preview).toContainText('GB18030');
+  const file = page.getByRole('region', { name: '文件预览', exact: true });await file.getByRole('button', { name: '源码', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'gb.csv 文件内容', exact: true })).toHaveAttribute('contenteditable', 'false');await expect(file.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
+});
+
+for (const width of [1440, 390]) test(`project folder picker uploads into its current directory and supports clipboard paste (${width}px)`, async ({ page, mock }) => {
+  await page.setViewportSize({ width, height: 900 });const f = await files(page, mock);await login(page);
+  if (width < 760) await page.getByRole('button', { name: '打开侧边栏', exact: true }).click();
+  await page.locator('.settings-button').click();await page.locator('.settings-nav').getByRole('button', { name: '项目', exact: true }).click();await page.getByRole('button', { name: '浏览项目文件夹', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: '选择项目文件夹', exact: true });
+  await expect(picker.getByRole('button', { name: '使用文件夹', exact: true })).toBeEnabled();
+  const chooser = page.waitForEvent('filechooser');await picker.getByRole('button', { name: '上传文件到当前目录', exact: true }).click();
+  await (await chooser).setFiles({ name: '上传说明.txt', mimeType: 'text/plain', buffer: Buffer.from('项目文件夹内上传') });
+  await expect(picker.getByRole('button', { name: '文件 上传说明.txt', exact: true })).toBeVisible();
+  expect(f.local.has('/workspace/上传说明.txt')).toBe(true);
+  await picker.getByRole('button', { name: '上传说明.txt 文件操作', exact: true }).click();await page.getByRole('menuitem', { name: /^复制\s*Ctrl/ }).click();
+  await expect(picker.getByRole('button', { name: '粘贴文件', exact: true })).toBeEnabled();await picker.getByRole('button', { name: '粘贴文件', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '粘贴文件', exact: true });await dialog.getByRole('textbox', { name: '文件名称', exact: true }).fill('项目副本.txt');await dialog.getByRole('button', { name: '粘贴', exact: true }).click();
+  await expect(picker.getByRole('button', { name: '文件 项目副本.txt', exact: true })).toBeVisible();await expect(picker.getByRole('button', { name: '使用文件夹', exact: true })).toBeEnabled();
+  if (width === 390) await page.screenshot({ path: '.data/file-transfers-mobile-picker.png' });
+});
+
+test('wide TSV pages columns in a dark mobile preview and preserves the header toggle', async ({ page, mock }) => {
+  await page.setViewportSize({ width: 390, height: 900 });await page.emulateMedia({ colorScheme: 'dark' });
+  const f = await files(page, mock);f.local.set('/workspace/demo/wide.tsv', { directory: false, revision: 1, content: Array.from({ length: 46 }, (_, i) => '列' + (i + 1)).join('\t') + '\n' + Array.from({ length: 46 }, (_, i) => '数据' + (i + 1)).join('\t') });
+  await workspace(page);await page.locator('.file-tree-row').filter({ hasText: 'wide.tsv' }).click();
+  const preview = page.getByRole('region', { name: 'CSV 表格预览', exact: true });await expect(preview.getByRole('columnheader')).toHaveCount(41);
+  await preview.getByRole('button', { name: '后 40 列', exact: true }).click();await expect(preview.getByRole('columnheader', { name: '列46', exact: true })).toBeVisible();await expect(preview.getByRole('cell', { name: '数据46', exact: true })).toBeVisible();
+  await preview.getByLabel('首行为表头', { exact: true }).uncheck();await expect(preview.getByRole('cell', { name: '列1', exact: true })).toBeVisible();
+  await page.screenshot({ path: '.data/file-transfers-mobile-csv.png' });
 });
