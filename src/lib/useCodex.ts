@@ -1,7 +1,8 @@
 import { methodAccepts } from "./integration-capabilities";
 import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
-import type { FileEntryChange, FileEntryRequest } from '../../shared/file-entries';
+import type { FileEntryChange, FileEntryRequest, FileClipboard } from '../../shared/file-entries';
+import { decodeCsvBytes, isCsvPath } from './csv-preview';
 import type { InstalledPlugin, PluginInventory } from '../../shared/plugin-mentions';
 import { integrationInputs } from './plugin-mentions';
 import { validAppId } from '../../shared/plugin-mentions';
@@ -152,6 +153,8 @@ const state = reactive({
   asyncQuestionOperations: {} as Record<string, AsyncQuestionOperation>,
   agentActivity: {} as Record<string, { text?: string; status?: string; startedAt?: number; updatedAt?: number; turnId?: string; turnStatus?: string }>,
   attachments: [] as any[],
+  fileClipboard: null as FileClipboard | null,
+  fileOperationsPending: 0,
   attachmentsLoading: false,
   attachmentDraftWarning: '',
   config: null as any,
@@ -223,6 +226,8 @@ function pruneHostConnections() {
 let csrfToken = "";
 let authenticationGeneration = 0;
 function advanceAuthentication() {
+  clearFileClipboard();
+  state.fileOperationsPending = 0;
   resetAttachmentDrafts();
   state.authenticationGeneration = ++authenticationGeneration;
   retireHostConnections();
@@ -4768,13 +4773,53 @@ async function inspectFileEntry(hostId: string, directory: string, name: string)
 }
 async function changeFileEntry(hostId: string, input: FileEntryRequest) {
   const authentication = authenticationGeneration;
-  const result = await http(`/hosts/${encodeURIComponent(hostId)}/file-entries`, {
-    method: 'POST', body: JSON.stringify(input),
-  }, false) as FileEntryChange;
-  if (authentication === authenticationGeneration && state.authenticated) {
-    await Promise.allSettled([...fileEntryListeners].map(listener => listener(result)));
-  }
-  return result;
+  state.fileOperationsPending++;
+  try {
+    const result = await http(`/hosts/${encodeURIComponent(hostId)}/file-entries`, {
+      method: 'POST', body: JSON.stringify(input),
+    }, false) as FileEntryChange;
+    if (authentication === authenticationGeneration && state.authenticated)
+      await Promise.allSettled([...fileEntryListeners].map(listener => listener(result)));
+    return result;
+  } finally { if (authentication === authenticationGeneration) state.fileOperationsPending = Math.max(0, state.fileOperationsPending - 1); }
+}
+let fileClipboardGeneration = 0;
+function fileClipboardHostIdentity(hostId: string) {
+  const host = state.hosts.find(host => host.id === hostId);
+  return host ? JSON.stringify([host.id, host.kind, host.hostname, host.username, host.port, host.identityFile, host.authentication, host.platform]) : '';
+}
+async function copyFileEntry(hostId: string, directory: string, name: string, mode: 'copy' | 'move') {
+  const generation = ++fileClipboardGeneration, auth = authenticationGeneration;
+  const hostIdentity = fileClipboardHostIdentity(hostId);
+  if (!hostIdentity) throw new Error('主机不存在或已停用');
+  const metadata = await inspectFileEntry(hostId, directory, name);
+  if (generation !== fileClipboardGeneration || auth !== authenticationGeneration || !state.authenticated || hostIdentity !== fileClipboardHostIdentity(hostId)) throw new Error('连接信息已变化，请重新复制');
+  state.fileClipboard = { hostId, hostIdentity, directory, name, mode, ...metadata };
+}
+function clearFileClipboard() { ++fileClipboardGeneration; state.fileClipboard = null; }
+watch(() => state.authenticated, authenticated => { if (!authenticated) clearFileClipboard(); });
+watch(() => state.hosts.map(host => fileClipboardHostIdentity(host.id)).join('\n'), () => {
+  if (state.fileClipboard && state.fileClipboard.hostIdentity !== fileClipboardHostIdentity(state.fileClipboard.hostId)) clearFileClipboard();
+}, { flush: 'sync' });
+async function pasteFileEntry(hostId: string, directory: string, newName: string, expected: FileClipboard) {
+  const clipboard = state.fileClipboard;
+  if (!clipboard || clipboard.hostId !== hostId) throw new Error('请选择同一主机上的文件进行复制或移动');
+  if (clipboard !== expected || clipboard.hostIdentity !== fileClipboardHostIdentity(hostId)) throw new Error('剪贴板或主机已变化，请关闭窗口后重新粘贴');
+  const change = await changeFileEntry(hostId, { operation: clipboard.mode, directory, sourceDirectory: clipboard.directory,
+    name: clipboard.name, newName, expectedVersion: clipboard.version });
+  if (clipboard.mode === 'move' && state.fileClipboard === clipboard) clearFileClipboard();
+  return change;
+}
+async function uploadWorkspaceFile(hostId: string, directory: string, file: File) {
+  const authentication = authenticationGeneration;
+  const form = new FormData(); form.append('directory', directory); form.append('name', file.name); form.append('file', file, 'upload.bin');
+  state.fileOperationsPending++;
+  try {
+    const result = await http(`/hosts/${encodeURIComponent(hostId)}/file-entries/upload`, { method: 'POST', body: form }, false) as FileEntryChange;
+    if (authentication === authenticationGeneration && state.authenticated)
+      await Promise.allSettled([...fileEntryListeners].map(listener => listener(result)));
+    return result;
+  } finally { if (authentication === authenticationGeneration) state.fileOperationsPending = Math.max(0, state.fileOperationsPending - 1); }
 }
 /** Choosing the destination of an unsent chat must never reuse file paths from
  * another machine. Keep local project attachments, and upload original files
@@ -5430,16 +5475,17 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
   const mime =
     extensions[path.split(".").pop()?.toLowerCase() ?? ""] ?? officeMime(path) ?? "text/plain";
   let content = "";
-  let binary = false;
+  let binary = false, encoding: string | undefined;
   if (officeMime(path)) binary = true;
   else if (!mime.startsWith("image/")) {
     const bytes = Uint8Array.from(atob(result.dataBase64), (character) =>
       character.charCodeAt(0),
     );
     try {
-      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      if (isCsvPath(path)) ({ content, encoding } = decodeCsvBytes(bytes));
+      else content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       binary =
-        bytes.includes(0) ||
+        (!isCsvPath(path) && bytes.includes(0)) ||
         /\.(?:pdf|zip|gz|7z|tar|docx?|xlsx?|pptx?|sqlite|db|exe|woff2?|ttf|mp[34]|wav|mov)$/i.test(
           path,
         );
@@ -5454,6 +5500,7 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
     mime,
     content,
     binary,
+    encoding,
     dataBase64: mime === 'application/pdf' || officeMime(path) ? result.dataBase64 : undefined,
     dataUrl: mime.startsWith("image/")
       ? `data:${mime};base64,${result.dataBase64}`
@@ -6654,6 +6701,7 @@ export function useCodex() {
     addProject,
     browseDirectory,
     inspectFileEntry, changeFileEntry, subscribeFileEntries,
+    copyFileEntry, pasteFileEntry, clearFileClipboard, fileClipboard: () => state.fileClipboard, uploadWorkspaceFile,
     chooseNewContext,
     updateProject,
     removeProject,

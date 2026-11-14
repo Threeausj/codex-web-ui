@@ -36,6 +36,7 @@ import { SshConnectionPool } from './ssh-pool.js'
 import { registerConversationImages } from './conversation-images.js'
 import { registerFiles } from './files.js'
 import { registerFileEntries } from './file-entries.js'
+import { registerWorkspaceUploads } from './workspace-upload.js'
 import { registerPlugins } from './plugins.js'
 import { isAbsoluteHostPath, withinHostPath } from '../shared/host-path.js'
 import { readBoundedHostFile, registerFileDownloads } from './file-download.js'
@@ -238,6 +239,7 @@ export async function createApp(options: AppOptions = {}) {
   })
   registerFileDownloads(app, { getHost: id => storage.host(id), bridgeOptions })
   registerFileEntries(app, { getHost: id => storage.host(id), bridgeOptions })
+  registerWorkspaceUploads(app, { getHost: id => storage.host(id), bridgeOptions })
   registerPlugins(app, { getHost: id => storage.host(id), bridgeOptions })
   registerDiagnostics(app, { getHost: id => storage.host(id), getExistingBridge: id => bridges.get(id), bridgeOptions })
   registerHostResources(app, { getBridge, getExistingBridge: id => bridges.get(id), getHost: id => storage.host(id), dataDir, pausedHosts: runtimePausedHosts, releasedThreads: runtimeReleasedThreads, persistRuntime, bridgeOptions,
