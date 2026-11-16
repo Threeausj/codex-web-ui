@@ -15,18 +15,22 @@ import { gatewayKeyWriter, gatewayTokenReader, redactSettings, registerHostSetti
 import type { Host, RpcMessage } from './types.js'
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
-async function fixture(options: { proxy?: boolean; automationBusy?: boolean; config?: Record<string, any>; writeFailure?: boolean; override?: Record<string, any>; cliVersion?: string } = {}) {
+async function fixture(options: { proxy?: boolean; daemon?: boolean; unmanaged?: boolean; daemonRestartFailure?: boolean; automationBusy?: boolean; config?: Record<string, any>; writeFailure?: boolean; override?: Record<string, any>; cliVersion?: string; nativeBusy?: boolean } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-host-settings-'))
   const origin = 'http://localhost:8787', auth = new Auth('host-settings-fixture', new Set([origin]))
-  const hosts: Host[] = [{ id: 'local', kind: 'local', name: 'Local' }, { id: 'remote', kind: 'ssh', name: 'Remote', hostname: 'offline.invalid' }, { id: 'offline', kind: 'local', name: 'Disconnected' }]
+  const hosts: Host[] = [{ id: 'local', kind: 'local', name: 'Local' }, { id: 'remote', kind: 'ssh', name: 'Remote', hostname: 'offline.invalid', ...(options.daemon ? { connectionMode: 'daemon' } : {}) }, { id: 'offline', kind: 'local', name: 'Disconnected' }]
   const peers = new Map<string, { sent: RpcMessage[]; disposed: boolean; output: PassThrough }[]>(), bridges = new Map<string, Bridge>()
   const configurations = new Map(hosts.map(host => [host.id, { model: `${host.id}-model`, model_provider: 'openai', model_context_window: 500000, ...(options.config || {}) } as Record<string, any>]))
+  const daemonConfigurations = new Map([...configurations].map(([id, config]) => [id, structuredClone(config)]))
   const writes: { hostId: string; file: string; key: string }[] = []
   const removed: { hostId: string; file: string }[] = []
+  const daemonRestarts: { hostId: string; daemonHome?: string; provider: string }[] = []
   let reserved = 0, automationBusy = !!options.automationBusy, failWrite = !!options.writeFailure
   for (const host of hosts.slice(0, 2)) {
     const collection: { sent: RpcMessage[]; disposed: boolean; output: PassThrough }[] = []; peers.set(host.id, collection)
-    const bridge = new Bridge(host, { mode: options.proxy ? 'proxy' : 'spawn', transportFactory: () => {
+    const bridge = new Bridge(host, { mode: options.proxy ? 'proxy' : 'spawn',
+      prepareDaemon: async () => ({ status: 'alreadyRunning', cliVersion: '0.165.0', appServerVersion: '0.165.0', backend: options.unmanaged ? null : 'process', managedCodexVersion: options.unmanaged ? null : '0.165.0' }),
+      transportFactory: () => {
       const input = new PassThrough(), output = new PassThrough(), events = new EventEmitter(); let buffer = ''
       const peer = { sent: [] as RpcMessage[], disposed: false, output }; collection.push(peer)
       const transport: Transport = { input, output, events, dispose: () => { peer.disposed = true; input.destroy(); output.destroy() } }
@@ -39,8 +43,10 @@ async function fixture(options: { proxy?: boolean; automationBusy?: boolean; con
           const params = message.params as any, config = configurations.get(host.id)!
           let result: any = {}
           if (message.method === 'initialize') result = { userAgent: options.cliVersion ? `codex_cli_rs/${options.cliVersion}` : `fixture/${host.id}/${collection.length}`, codexHome: `/fixture/${host.id}/.codex` }
-          if (message.method === 'thread/loaded/list' || message.method === 'thread/backgroundTerminals/list') result = { data: [], nextCursor: null }
-          if (message.method === 'config/read') result = { config: { ...config, ...options.override }, layers: [{ name: { type: 'user', file: `/fixture/${host.id}/.codex/config.toml` }, version: 'fixture-version', config }] }
+          if (message.method === 'thread/loaded/list') result = { data: options.nativeBusy ? ['native-running'] : [], nextCursor: null }
+          if (message.method === 'thread/backgroundTerminals/list') result = { data: [], nextCursor: null }
+          if (message.method === 'thread/read') result = { thread: { id: params.threadId, status: { type: options.nativeBusy ? 'active' : 'idle' } } }
+          if (message.method === 'config/read') result = { config: { ...(host.connectionMode === 'daemon' ? daemonConfigurations.get(host.id) : config), ...options.override }, layers: [{ name: { type: 'user', file: `/fixture/${host.id}/.codex/config.toml` }, version: 'fixture-version', config }] }
           if (message.method === 'account/read') result = { account: { type: 'chatgpt', email: `${host.id}@example.invalid`, access_token: 'private-official-token' } }
           if (message.method === 'memory/status') result = { v2ConsolidatedThreads: 21, v2Ready: true }
           if (message.method === 'thread/memory/read') result = { summary: `${host.id} memory for ${params.threadId}` }
@@ -51,6 +57,7 @@ async function fixture(options: { proxy?: boolean; automationBusy?: boolean; con
               if (edit.keyPath.startsWith('model_providers.')) { config.model_providers ||= {}; config.model_providers[edit.keyPath.split('.')[1]] = edit.value }
               else config[edit.keyPath] = edit.value
             }
+            if (params.reloadUserConfig) daemonConfigurations.set(host.id, structuredClone(config))
           }
           queueMicrotask(() => receive({ id: message.id, result }))
         }
@@ -62,7 +69,13 @@ async function fixture(options: { proxy?: boolean; automationBusy?: boolean; con
   const app = express(); app.use(express.json()); app.post('/api/auth/login', auth.login); app.use('/api', auth.requireAuth, auth.requireCsrf)
   registerHostSettings(app, { getHost: id => hosts.find(host => host.id === id), getExistingBridge: id => bridges.get(id),
     withRuntimeMaintenance: async (_id, work) => { reserved++; if (automationBusy) throw Object.assign(new Error('Fixture automation running'), { status: 409 }); return work() },
-    writeKey: async (host, file, key) => { writes.push({ hostId: host.id, file, key }) }, removeKey: async (host, file) => { removed.push({ hostId: host.id, file }) } })
+    writeKey: async (host, file, key) => { writes.push({ hostId: host.id, file, key }) }, removeKey: async (host, file) => { removed.push({ hostId: host.id, file }) },
+    daemonRestart: async (host, settings) => {
+      daemonRestarts.push({ hostId: host.id, daemonHome: settings.daemonHome, provider: configurations.get(host.id)!.model_provider })
+      if (options.daemonRestartFailure) throw new Error('Fixture daemon restart failed')
+      daemonConfigurations.set(host.id, structuredClone(configurations.get(host.id)!))
+      return { status: 'restarted' }
+    } })
   app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(error instanceof z.ZodError ? 400 : error.status || 500).json({ error: error.message }))
   const server = http.createServer(app); await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
@@ -70,7 +83,7 @@ async function fixture(options: { proxy?: boolean; automationBusy?: boolean; con
   const { csrfToken } = await login.json(), cookie = login.headers.get('set-cookie')!.split(';')[0]!
   const headers = { origin, 'content-type': 'application/json', cookie, 'x-csrf-token': csrfToken }
   const request = (endpoint = 'codex-settings', body?: unknown, hostId = 'remote', custom = headers) => fetch(`${base}/api/hosts/${hostId}/${endpoint}`, { method: body === undefined ? 'GET' : 'POST', headers: custom, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
-  return { request, hosts, bridges, peers, configurations, writes, removed, base, headers, get reserved() { return reserved },
+  return { request, hosts, bridges, peers, configurations, writes, removed, daemonRestarts, base, headers, get reserved() { return reserved },
     setAutomationBusy(value: boolean) { automationBusy = value }, setWriteFailure(value: boolean) { failWrite = value },
     async close() { for (const bridge of bridges.values()) bridge.close(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() }); await fs.rm(directory, { recursive: true, force: true }) } }
 }
@@ -142,6 +155,112 @@ test('gateway settings write a host-specific private key reference, use the user
   assert.equal((await f.request('codex-settings/provider', { provider: 'official' })).status, 200)
   assert.equal(f.configurations.get('remote')!.model_provider, 'openai')
   assert.equal(f.writes.length, 1)
+})
+
+test('explicit daemon provider changes restart the selected daemon after saving and verify the live provider', async t => {
+  const f = await fixture({ daemon: true, proxy: true, cliVersion: '0.165.0' }); t.after(() => f.close())
+  const localBefore = f.peers.get('local')![0]!.sent.length
+  assert.equal((await (await f.request()).json()).canChange, true)
+  const gateway = await f.request('codex-settings/provider', { provider: 'gateway', baseUrl: 'https://api.example.invalid/v1', apiKey: 'private-daemon-key', model: 'gateway-model' })
+  assert.equal(gateway.status, 200)
+  const settings = await gateway.json()
+  assert.equal(settings.provider, 'gateway'); assert.equal(settings.applied, true); assert.equal(settings.model, 'gateway-model')
+  assert.doesNotMatch(JSON.stringify(settings), /private-daemon-key|private-official-token/)
+  assert.deepEqual(f.daemonRestarts, [{ hostId: 'remote', daemonHome: '/fixture/remote/.codex', provider: 'web_gateway' }])
+  const saved = f.peers.get('remote')![0]!.sent.find(message => message.method === 'config/batchWrite')!.params as any
+  assert.equal(saved.reloadUserConfig, false)
+  assert.equal(f.peers.get('remote')![0]!.disposed, true)
+  assert.equal(f.peers.get('remote')!.length, 2)
+  assert.equal((await f.request('codex-settings/provider', { provider: 'gcp', model: 'vertex-model' })).status, 200)
+  assert.equal((await (await f.request()).json()).provider, 'gcp')
+  assert.equal((await f.request('codex-settings/provider', { provider: 'official' })).status, 200)
+  assert.equal((await (await f.request()).json()).provider, 'official')
+  assert.deepEqual(f.daemonRestarts.map(call => call.provider), ['web_gateway', 'gcp', 'openai'])
+  assert.equal(f.peers.get('remote')!.length, 4)
+  assert.equal(f.peers.get('local')![0]!.sent.length, localBefore)
+  assert.equal(f.writes.length, 1); assert.equal(f.removed.length, 0)
+})
+
+for (const activity of ['turn', 'approval', 'native', 'automation'] as const) {
+  test(`daemon provider changes retain strict ${activity} maintenance checks`, async t => {
+    const f = await fixture({ daemon: true, automationBusy: activity === 'automation', nativeBusy: activity === 'native' }); t.after(() => f.close())
+    const bridge = f.bridges.get('remote')!, peer = f.peers.get('remote')![0]!
+    if (activity === 'turn') peer.output.write(`${JSON.stringify({ method: 'thread/started', params: { thread: { id: 'active', status: { type: 'active' } } } })}\n`)
+    if (activity === 'approval') peer.output.write(`${JSON.stringify({ id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'thread' } })}\n`)
+    if (activity === 'turn' || activity === 'approval') {
+      assert.equal(bridge.reconnectStatus.canReconnect, true)
+      const view = await (await f.request()).json()
+      assert.equal(view.canChange, false); assert.ok(view.disabledReason)
+    }
+    const response = await f.request('codex-settings/provider', { provider: 'gateway', baseUrl: 'https://api.example.invalid/v1', apiKey: 'private-key' })
+    assert.equal(response.status, 409)
+    assert.equal(f.writes.length, 0); assert.equal(f.daemonRestarts.length, 0)
+    assert.equal(peer.disposed, false); assert.equal(f.peers.get('remote')!.length, 1)
+    assert.equal(peer.sent.some(message => message.method === 'config/batchWrite'), false)
+  })
+}
+
+test('failed daemon restart reports saved configuration without discarding a committed credential', async t => {
+  const f = await fixture({ daemon: true, daemonRestartFailure: true }); t.after(() => f.close())
+  const response = await f.request('codex-settings/provider', { provider: 'gateway', baseUrl: 'https://api.example.invalid/v1', apiKey: 'private-committed-key' })
+  assert.equal(response.status, 500)
+  const body = await response.json()
+  assert.match(body.error, /配置已保存.*重启未完成/)
+  assert.doesNotMatch(JSON.stringify(body), /private-committed-key/)
+  assert.equal(body.applied, undefined)
+  assert.equal(f.configurations.get('remote')!.model_provider, 'web_gateway')
+  assert.equal(f.writes.length, 1); assert.equal(f.removed.length, 0)
+  assert.equal(f.daemonRestarts.length, 1); assert.equal(f.peers.get('remote')!.length, 1)
+  assert.equal((await (await f.request()).json()).provider, 'official')
+})
+
+test('rejected daemon provider config writes never restart the daemon and remove only the unused staged key', async t => {
+  const f = await fixture({ daemon: true, writeFailure: true }); t.after(() => f.close())
+  const response = await f.request('codex-settings/provider', { provider: 'gateway', baseUrl: 'https://api.example.invalid/v1', apiKey: 'private-staged-key' })
+  assert.equal(response.status, 500)
+  assert.equal(f.daemonRestarts.length, 0)
+  assert.equal(f.configurations.get('remote')!.model_provider, 'openai')
+  assert.deepEqual(f.removed, [{ hostId: 'remote', file: f.writes[0]!.file }])
+  assert.equal(f.peers.get('remote')!.length, 1); assert.equal(f.peers.get('remote')![0]!.disposed, false)
+})
+
+test('daemon account, live configuration, integrations and transport reconnects do not restart the daemon', async t => {
+  const f = await fixture({ daemon: true, cliVersion: '0.165.0' }); t.after(() => f.close())
+  const peer = f.peers.get('remote')![0]!
+  assert.equal((await f.request('codex-settings/login', { type: 'deviceAuth' })).status, 200)
+  assert.equal((await f.request('codex-settings/login/cancel', { loginId: 'login-remote' })).status, 200)
+  assert.equal((await f.request('codex-settings/logout', {})).status, 200)
+  for (const body of [
+    { method: 'config/batchWrite', params: { edits: [{ keyPath: 'model_context_window', value: 400000, mergeStrategy: 'replace' }], reloadUserConfig: true } },
+    { method: 'skills/config/write', params: { name: 'fixture-skill', enabled: true } },
+    { method: 'config/mcpServer/reload', params: {} },
+    { method: 'mcpServer/oauth/login', params: { name: 'fixture-server' } },
+    { method: 'memory/status', params: {} },
+  ]) assert.equal((await f.request('settings/rpc', body)).status, 200)
+  const live = await (await f.request('settings/rpc', { method: 'config/read', params: {} })).json()
+  assert.equal(live.config.model_context_window, 400000)
+  assert.equal(f.daemonRestarts.length, 0); assert.equal(peer.disposed, false)
+  await f.bridges.get('remote')!.reconnect()
+  assert.equal(f.daemonRestarts.length, 0); assert.equal(peer.disposed, true)
+  assert.equal(f.peers.get('remote')!.length, 2)
+})
+
+test('reusing an externally managed service disables provider, config and account writes while allowing transport reconnect', async t => {
+  const f = await fixture({ daemon: true, unmanaged: true }); t.after(() => f.close())
+  const settings = await (await f.request()).json()
+  assert.equal(settings.connected, true); assert.equal(settings.canChange, false)
+  assert.match(settings.disabledReason, /共享代理|服务端/)
+  for (const [endpoint, body] of [
+    ['codex-settings/provider', { provider: 'gateway', baseUrl: 'https://api.example.invalid/v1', apiKey: 'private-key' }],
+    ['settings/rpc', { method: 'config/batchWrite', params: { edits: [{ keyPath: 'model', value: 'other', mergeStrategy: 'replace' }] } }],
+    ['codex-settings/login', { type: 'deviceAuth' }],
+    ['codex-settings/logout', {}],
+  ] as const) assert.equal((await f.request(endpoint, body)).status, 409)
+  assert.equal(f.writes.length, 0); assert.equal(f.daemonRestarts.length, 0)
+  assert.equal(f.peers.get('remote')!.length, 1)
+  assert.equal(f.peers.get('remote')![0]!.sent.some(message => ['config/batchWrite', 'account/login/start', 'account/logout'].includes(message.method || '')), false)
+  await f.bridges.get('remote')!.reconnect()
+  assert.equal(f.peers.get('remote')!.length, 2); assert.equal(f.daemonRestarts.length, 0)
 })
 
 for (const [name, override] of [

@@ -26,6 +26,28 @@ function noDestructiveRequests(mock: MockCodex) {
   expect(mock.requests.filter(request => ['turn/interrupt', 'thread/archive', 'thread/delete', 'thread/unsubscribe', 'command/exec/terminate'].includes(request.method || ''))).toEqual([]);
 }
 
+test('chat tabs have equal stable widths and shrink together as the strip fills', async ({ page, mock }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  add(mock, 'short-tab', '短');
+  add(mock, 'long-tab', '一个很长的聊天标题用来验证标签的宽度');
+  for (let index = 1; index <= 5; index++) add(mock, `width-tab-${index}`, `宽度测试 ${index}`);
+  await login(page); await open(page, '已有测试历史'); await open(page, '短'); await open(page, '一个很长的聊天标题用来验证标签的宽度');
+  const dimensions = () => strip(page).locator('.chat-tab').evaluateAll(elements => elements.map(element => element.getBoundingClientRect().width));
+  const initial = await dimensions();
+  expect(Math.max(...initial) - Math.min(...initial)).toBeLessThan(1);
+  expect(initial[0]).toBeCloseTo(224, 0);
+  await tab(page, '短').click();
+  await expect(tab(page, '短')).toHaveAttribute('aria-selected', 'true');
+  const selected = await dimensions();
+  expect(selected).toEqual(initial);
+  for (let index = 1; index <= 5; index++) await open(page, `宽度测试 ${index}`);
+  const crowded = await dimensions();
+  expect(Math.max(...crowded) - Math.min(...crowded)).toBeLessThan(1);
+  expect(crowded[0]).toBeLessThan(initial[0]!);
+  await expect(page.getByRole('button', { name: '新建聊天标签页', exact: true })).toBeInViewport();
+  noDestructiveRequests(mock);
+});
+
 test('opened chats become browser tabs, retain independent drafts and use the existing connection', async ({ page, mock }) => {
   add(mock, 'second-tab', '第二条标签聊天');
   await login(page); await open(page, '已有测试历史');

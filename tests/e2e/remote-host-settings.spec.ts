@@ -107,6 +107,7 @@ test("SSH connections can be edited and empty advanced fields restore automatic 
       identityFile: "/keys/prod",
       codexPath: "/opt/codex/bin/codex",
       cwd: "/srv/project",
+      connectionMode: "daemon",
     },
   });
 

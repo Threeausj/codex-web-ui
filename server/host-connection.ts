@@ -19,6 +19,25 @@ export type ConnectionTestResult = {
 export function connectionFailure(error: unknown, diagnostic: string, stage: 'ssh' | 'protocol', timedOut = false): Pick<ConnectionTestResult, 'stage' | 'message' | 'hostKeyRequired'> {
   const message = error instanceof Error ? error.message : ''
   const text = `${diagnostic}\n${message}`.slice(-20_000)
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
+  // Lifecycle helpers already classify the fixed CLI's private stderr. Map
+  // stable codes to public text rather than copying an arbitrary Error.message.
+  if (code === 'daemon_host_key') return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更，请确认服务器指纹后重试。' }
+  if (code === 'daemon_ssh_auth') return { stage: 'ssh', message: 'SSH 身份验证失败，请检查主机账户和私钥。' }
+  if (code === 'daemon_timeout' || /daemon.*(?:操作超时|连接超时|未及时响应)/i.test(text))
+    return { stage: 'timeout', message: 'Codex daemon 操作超时，结果待确认；请同步主机状态后检查。' }
+  if (code === 'daemon_unmanaged' || /(?:非托管|未托管).*App.?Server|daemon.*(?:非托管|未托管)/i.test(text))
+    return { stage: 'codex', message: '已有非托管 App Server 占用 daemon 连接，请先核对其启动方式；未自动结束任何进程。' }
+  if (code === 'daemon_unsupported' || /(?:不支持|无法识别).*daemon|daemon.*(?:不支持|无法识别)/i.test(text))
+    return { stage: 'codex', message: '此 Codex 安装不支持所需 daemon 命令，请先更新主机上的 CLI。' }
+  if (code === 'daemon_not_executable' || code === 'daemon_unavailable')
+    return { stage: 'codex', message: '无法执行 Codex 或连接其 daemon，请检查主机的 Codex 路径和运行状态。' }
+  if (code === 'daemon_invalid_response' || code === 'daemon_output_limit')
+    return { stage: 'protocol', message: '无法确认 Codex daemon 返回的状态，请同步主机信息并检查 CLI 版本。' }
+  if (code === 'daemon_cancelled')
+    return { stage: 'codex', message: 'Codex daemon 连接检查已取消，请同步主机状态后确认。' }
+  if (code === 'daemon_command_failed')
+    return { stage: 'codex', message: '无法完成 Codex daemon 操作，请检查目标主机的配置与账户权限。' }
   if (/UNPROTECTED PRIVATE KEY FILE|bad permissions|Load key .*?(?:Permission denied|invalid format)|Identity file .*?not accessible/i.test(text)) return { stage: 'identity', message: '无法使用身份文件，请检查文件路径、格式与权限。' }
   if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .*host key is known|strict checking/i.test(text)) return { stage: 'ssh', hostKeyRequired: true, message: '主机密钥未受信任或已变更。请在此窗口获取服务器指纹，确认并信任后再连接。' }
   if (/Permission denied \(|Authentication failed|Too many authentication failures|sign_and_send_pubkey: signing failed/i.test(text)) return { stage: 'ssh', message: 'SSH 身份验证失败。请检查用户名、身份文件或服务器上的 SSH agent；测试不支持交互输入密码。' }

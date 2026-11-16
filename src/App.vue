@@ -1567,6 +1567,10 @@ watch(() => [state.authenticated, state.loading], () => {
         <button class="button button-small button-secondary" @click="openResources">资源管理中恢复连接</button>
       </div>
       <div v-else-if="state.threadReleased" class="connection-banner" role="status"><Icon name="Server" :size="15" />此会话的 Web 连接已关闭，可切换桌面端。<button class="button button-small button-secondary" :disabled="!state.connected || !state.online" @click="api.resumeThreadConnection(state.hostId, state.activeThread.id)">重新连接会话</button></div>
+      <div v-else-if="state.connected && state.activeThread?.status?.type === 'notLoaded' && !state.threadReady && !state.selectingThread && !state.error" class="connection-banner" role="status">
+        <Icon name="RefreshCw" :size="15" />会话已断开，历史和草稿已保留。
+        <button class="button button-small button-secondary" :disabled="!state.online" @click="action(() => api.selectThread(state.activeThread.id))">重新连接会话</button>
+      </div>
       <div v-else-if="state.error || state.threadConflict" class="global-error" :class="{ 'thread-conflict': state.threadConflict }" role="alert">
         <Icon name="AlertCircle" :size="16" /><span>{{ state.error || state.threadConflict?.message }}</span
         ><button

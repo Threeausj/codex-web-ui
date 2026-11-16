@@ -42,6 +42,7 @@ const draft = reactive({
   codexPath:
     props.host?.codexPath === "codex" ? "" : props.host?.codexPath || "",
   cwd: props.host?.cwd || "",
+  connectionMode: props.host?.id ? props.host.connectionMode || "inherit" : "daemon",
 });
 const title = computed(() =>
   props.host?.id ? "编辑 SSH 连接" : "添加 SSH 连接",
@@ -235,6 +236,7 @@ function payload() {
     identityFile,
     codexPath: draft.codexPath.trim(),
     cwd: draft.cwd.trim(),
+    connectionMode: draft.connectionMode === "inherit" ? null : draft.connectionMode,
   };
 }
 async function submit(kind: "test" | "save") {
@@ -510,6 +512,20 @@ onBeforeUnmount(() => {
               <summary>高级选项 <Icon name="ChevronDown" :size="14" /></summary>
               <div class="ssh-advanced-fields">
                 <label class="ssh-field">
+                  <span>Codex 运行方式</span>
+                  <select v-model="draft.connectionMode" aria-label="Codex 运行方式" :disabled="!!busy">
+                    <option value="inherit">继承服务设置</option>
+                    <option value="daemon">独立后台服务（推荐）</option>
+                    <option value="spawn">随网页服务启动</option>
+                    <option value="proxy">连接已有后台服务</option>
+                  </select>
+                  <small v-if="draft.connectionMode === 'daemon'">Codex 在远端独立运行，更新网页服务后会重新连接。</small>
+                  <small v-else-if="draft.connectionMode === 'spawn'">Codex 随网页连接启动，重启网页服务可能中断任务。</small>
+                  <small v-else-if="draft.connectionMode === 'proxy'">连接主机上已运行的 Codex 后台服务，需要先在主机上启动。</small>
+                  <small v-else>使用部署时配置的运行方式，保留此主机当前的连接行为。</small>
+                  <small v-if="props.host?.id">此主机空闲后可切换运行方式。</small>
+                </label>
+                <label class="ssh-field">
                   <span>Codex 路径 <small>（可选）</small></span>
                   <input
                     v-model="draft.codexPath"
@@ -698,7 +714,8 @@ onBeforeUnmount(() => {
 .ssh-field > span > small {
   font-size: 12px;
 }
-.ssh-field input {
+.ssh-field input,
+.ssh-field select {
   width: 100%;
   min-height: 40px;
   border: 1px solid var(--border);
@@ -717,11 +734,13 @@ onBeforeUnmount(() => {
   color: var(--muted);
   opacity: 0.7;
 }
-.ssh-field input:focus {
+.ssh-field input:focus,
+.ssh-field select:focus {
   border-color: var(--muted);
   box-shadow: 0 0 0 2px var(--hover);
 }
-.ssh-field input:disabled {
+.ssh-field input:disabled,
+.ssh-field select:disabled {
   opacity: 0.6;
 }
 .ssh-fingerprint-button,

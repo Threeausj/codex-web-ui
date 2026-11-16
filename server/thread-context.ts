@@ -5,10 +5,14 @@ import type { Host } from './types.js'
 import type { ThreadTokenUsage } from './context-types.js'
 import { runHostPython } from './host-helper.js'
 
-type Context = { tokenUsage: ThreadTokenUsage | null; compacting: boolean; runtimeStatus?: 'active' | 'idle' | 'notLoaded' | 'systemError' }
+type Context = { tokenUsage: ThreadTokenUsage | null; compacting: boolean; runtimeStatus?: 'active' | 'idle' | 'notLoaded' | 'systemError'; engineId?: string }
+type ContextBridge = Pick<Bridge, 'request' | 'threadContext'> & {
+  connect?: () => Promise<void>
+  readonly runtime?: { engineId?: string }
+}
 type Dependencies = {
   getHost: (id: string) => Host | undefined
-  getBridge: (id: string) => Promise<Pick<Bridge, 'request' | 'threadContext'>>
+  getBridge: (id: string) => Promise<ContextBridge>
   bridgeOptions?: BridgeOptions
   readRollout?: (host: Host, path: string) => Promise<ThreadTokenUsage | null>
 }
@@ -75,17 +79,21 @@ print(json.dumps(result,allow_nan=False,separators=(',',':')))
 }
 
 export function registerThreadContext(app: Express, deps: Dependencies) {
-  const fallback = new Map<string, { expiresAt: number; value: ThreadTokenUsage | null }>()
-  const pending = new Map<string, Promise<ThreadTokenUsage | null>>()
+  type Source = { bridge: ContextBridge; engineId?: string; hostIdentity: string }
+  const identity = (host: Host) => JSON.stringify([host.kind, host.hostname, host.port, host.username, host.identityFile, host.codexPath, host.cwd, host.connectionMode])
+  const sameSource = (a: Source, b: Source) => a.bridge === b.bridge && a.engineId === b.engineId && a.hostIdentity === b.hostIdentity
+  const fallback = new Map<string, { source: Source; expiresAt: number; value: ThreadTokenUsage | null }>()
+  const pending = new Map<string, { source: Source; promise: Promise<ThreadTokenUsage | null> }>()
   type Snapshot = { thread?: { id?: string; path?: string | null; status?: { type?: Context['runtimeStatus'] } } }
-  const snapshots = new Map<string, Promise<Snapshot>>()
-  const readThread = (key: string, bridge: Pick<Bridge, 'request'>, threadId: string) => {
+  const snapshots = new Map<string, { source: Source; promise: Promise<Snapshot> }>()
+  const readThread = (key: string, source: Source, threadId: string) => {
     let read = snapshots.get(key)
-    if (!read) {
-      read = bridge.request('thread/read', { threadId, includeTurns: false }, 10000).then(result => result as Snapshot).finally(() => { snapshots.delete(key) })
-      snapshots.set(key, read)
+    if (!read || !sameSource(read.source, source)) {
+      const promise = source.bridge.request('thread/read', { threadId, includeTurns: false }, 10000).then(result => result as Snapshot)
+        .finally(() => { if (snapshots.get(key) === read) snapshots.delete(key) })
+      read = { source, promise }; snapshots.set(key, read)
     }
-    return read
+    return read.promise
   }
   app.get('/api/hosts/:hostId/threads/:threadId/context', (req, res, next) => {
     void (async () => {
@@ -94,38 +102,56 @@ export function registerThreadContext(app: Express, deps: Dependencies) {
       const host = deps.getHost(hostId)
       if (!host) throw Object.assign(new Error('主机不存在'), { status: 404 })
       const bridge = await deps.getBridge(hostId)
+      // Establish transport identity before sharing a native read. This does
+      // not resume a thread or reacquire a historical writer.
+      await bridge.connect?.()
+      const source: Source = { bridge, engineId: bridge.runtime?.engineId, hostIdentity: identity(host) }
+      const assertCurrent = async () => {
+        const currentHost = deps.getHost(hostId)
+        if (!currentHost || identity(currentHost) !== source.hostIdentity || await deps.getBridge(hostId) !== bridge || bridge.runtime?.engineId !== source.engineId)
+          throw Object.assign(new Error('Codex 连接已改变，请同步后重新读取上下文用量。'), { status: 409 })
+      }
+      await assertCurrent()
       const key = JSON.stringify([hostId, threadId])
       // Native releases can omit the compaction completion item. A cheap
       // metadata read recovers an authoritative idle state in Bridge without
       // resuming a writer or loading a large conversation. Share concurrent
       // phone/desktop checks, and retain progress if the native read fails.
       let snapshot: Snapshot | undefined
-      if (bridge.threadContext(threadId).compacting || req.query.recoverCompaction === '1') snapshot = await readThread(key, bridge, threadId).catch(() => undefined)
+      if (bridge.threadContext(threadId).compacting || req.query.recoverCompaction === '1') snapshot = await readThread(key, source, threadId).catch(() => undefined)
+      await assertCurrent()
       const context = bridge.threadContext(threadId)
       const status = snapshot?.thread?.id === threadId ? snapshot.thread.status?.type : undefined
       const runtime = (current: ReturnType<Bridge['threadContext']>) => status && ['active', 'idle', 'notLoaded', 'systemError'].includes(status) && (!current.compacting || status === 'active') ? { runtimeStatus: status } : {}
-      if (context.tokenUsage?.modelContextWindow) { res.json({ ...context, ...runtime(context) } satisfies Context); return }
+      const engine = source.engineId ? { engineId: source.engineId } : {}
+      if (context.tokenUsage?.modelContextWindow) { res.json({ ...context, ...runtime(context), ...engine } satisfies Context); return }
       let value = fallback.get(key)
-      if (!value || value.expiresAt <= Date.now()) {
+      if (!value || !sameSource(value.source, source) || value.expiresAt <= Date.now()) {
         let read = pending.get(key)
-        if (!read) {
-          read = (async () => {
-            const result = snapshot || await readThread(key, bridge, threadId)
+        if (!read || !sameSource(read.source, source)) {
+          const promise = (async () => {
+            const result = snapshot || await readThread(key, source, threadId)
+            await assertCurrent()
             if (result.thread?.id !== threadId) throw Object.assign(new Error('会话不存在'), { status: 404 })
             if (!result.thread.path) return null
-            return deps.readRollout ? deps.readRollout(host, result.thread.path)
+            const usage = await (deps.readRollout ? deps.readRollout(host, result.thread.path)
               : parseRolloutTokenUsage(JSON.parse(await runHostPython(host, rolloutContextHelper(result.thread.path), deps.bridgeOptions)))
-          })().finally(() => { pending.delete(key) })
+            )
+            await assertCurrent()
+            return usage
+          })().finally(() => { if (pending.get(key) === read) pending.delete(key) })
+          read = { source, promise }
           pending.set(key, read)
         }
-        const tokenUsage = await read
-        value = { expiresAt: Date.now() + 5000, value: tokenUsage }
+        const tokenUsage = await read.promise
+        await assertCurrent()
+        value = { source, expiresAt: Date.now() + 5000, value: tokenUsage }
         fallback.set(key, value)
         if (fallback.size > 500) fallback.delete(fallback.keys().next().value!)
       }
       const latest = bridge.threadContext(threadId)
       const tokenUsage = latest.tokenUsage ? { ...latest.tokenUsage, modelContextWindow: latest.tokenUsage.modelContextWindow ?? value.value?.modelContextWindow ?? null } : value.value
-      res.json({ tokenUsage, compacting: latest.compacting, ...runtime(latest) } satisfies Context)
+      res.json({ tokenUsage, compacting: latest.compacting, ...runtime(latest), ...engine } satisfies Context)
     })().catch(next)
   })
 }

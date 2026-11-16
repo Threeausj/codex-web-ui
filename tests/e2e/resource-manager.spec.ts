@@ -54,6 +54,53 @@ test('resource menu opens host charts and GPU usage, retaining chat while pollin
   expect(inspections).toBeGreaterThanOrEqual(2);
 });
 
+test('independent daemon resource controls preserve background work, close Web terminals and prevent per-chat writer release', async ({ page, mock }) => {
+  const hostId = 'ssh-daemon-resources';
+  mock.hosts.push({ id: hostId, name: 'NAS daemon', kind: 'ssh', connectionMode: 'daemon' });
+  let paused = false;
+  const mutations: { path: string; body: any; csrf?: string }[] = [];
+  const daemonRuntime = () => ({
+    ...sample(hostId, Date.now(), paused).runtime, mode: 'ssh', connectionMode: 'daemon', independentDaemon: true,
+    activeThreadCount: paused ? 0 : 1,
+    threads: paused ? [] : [{ id: 'daemon-thread', name: '后台进行中的聊天', loaded: true, active: true, released: false, pid: 456 }],
+  });
+  await page.route(/\/api\/hosts\/local\/resources(?:\?|$)/, route => route.fulfill({ json: sample() }));
+  await page.route(/\/api\/hosts\/ssh-daemon-resources\/resources(?:\?|$)/, route => route.fulfill({ json: { ...sample(hostId), runtime: daemonRuntime() } }));
+  await page.route(/\/api\/hosts\/ssh-daemon-resources\/runtime\/(close|resume)$/, route => {
+    const request = route.request();
+    mutations.push({ path: new URL(request.url()).pathname, body: request.postDataJSON(), csrf: request.headers()['x-csrf-token'] });
+    paused = request.url().endsWith('/close');
+    return route.fulfill({ json: { ok: true, runtime: daemonRuntime() } });
+  });
+  await login(page);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('保留本机聊天草稿');
+  await page.locator('.resources-button').click();
+  const panel = page.getByRole('dialog', { name: '资源管理', exact: true });
+  await panel.getByRole('button', { name: 'NAS daemon', exact: true }).click();
+  await expect(panel.getByRole('button', { name: '关闭会话 后台进行中的聊天', exact: true })).toBeDisabled();
+  await expect(panel).toContainText('关闭 Web 连接保留后台对话任务，普通 Web 终端会关闭');
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toContain('后台 daemon 和对话任务继续运行');
+    expect(dialog.message()).toContain('普通 Web 交互终端会关闭');
+    expect(dialog.message()).not.toContain('运行任务和交互终端将中断');
+    await dialog.dismiss();
+  });
+  await panel.getByRole('button', { name: '关闭 Web Codex', exact: true }).click();
+  expect(mutations).toHaveLength(0);
+  page.once('dialog', dialog => dialog.accept());
+  await panel.getByRole('button', { name: '关闭 Web Codex', exact: true }).click();
+  await expect(panel).toContainText('后台对话任务继续运行');
+  await expect(panel).not.toContainText('已释放会话供桌面端或 CLI 使用');
+  expect(mutations).toEqual([{ path: `/api/hosts/${hostId}/runtime/close`, body: { confirmed: true }, csrf: 'mock-csrf' }]);
+  await panel.getByRole('button', { name: '重新连接 Web Codex', exact: true }).click();
+  await expect(panel).toContainText('Web Codex 已重新连接');
+  expect(mutations.at(-1)).toEqual({ path: `/api/hosts/${hostId}/runtime/resume`, body: {}, csrf: 'mock-csrf' });
+  await expect(panel.getByRole('button', { name: '关闭会话 后台进行中的聊天', exact: true })).toBeDisabled();
+  await panel.getByRole('button', { name: '关闭资源管理', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('保留本机聊天草稿');
+  expect(mock.requests.some(request => ['thread/archive', 'turn/interrupt'].includes(request.method || ''))).toBe(false);
+});
+
 test('changing resource host ignores an old response, refresh errors retain the latest sample, and phone panel fits', async ({ page, mock }) => {
   mock.hosts.push({ id: 'ssh-resource', name: 'GPU 服务器', kind: 'ssh', cwd: '/workspace/demo' });
   await page.setViewportSize({ width: 390, height: 844 });

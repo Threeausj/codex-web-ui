@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { remoteCodexCommand, sshAppServerArgs, shellQuote } from './ssh.js'
+import { remoteCodexCommand, remoteCodexDaemonCommand, codexAppServerArgs, codexDaemonArgs, sshAppServerArgs, sshCodexDaemonArgs, shellQuote } from './ssh.js'
 import type { Host } from './types.js'
 
 const execute = promisify(execFile)
@@ -82,4 +82,40 @@ test('connection-test launcher reports the actual remote Codex version on stderr
     assert.match(result.stderr, /__CODEX_WEB_VERSION__=codex-cli 0\.200\.0/)
     assert.ok(!result.stdout.includes('codex-cli'))
   } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
+})
+
+test('daemon proxy attaches without pretending per-process configuration changes the running daemon', async () => {
+  const fixture = await loginFixture()
+  try {
+    const result = await execute('/bin/sh', ['-c', remoteCodexCommand({ ...remote, cwd: fixture.cwd }, 'proxy', false, true)], { env: fixture.env })
+    assert.deepEqual(JSON.parse(result.stdout), { args: ['app-server', 'proxy'], cwd: await fs.realpath(fixture.cwd) })
+    assert.deepEqual(codexAppServerArgs('proxy', '/private/socket', true), ['app-server', 'proxy', '--sock', '/private/socket'])
+    assert.ok(!result.stdout.includes('startup banner'))
+  } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
+})
+
+test('daemon lifecycle uses the same remote login shell and quotes an explicit remote home literally', async () => {
+  const fixture = await loginFixture()
+  const home = path.join(fixture.directory, "codex home ' ; $(touch injected)")
+  await fs.writeFile(fixture.binary, `#!${process.execPath}\nconsole.log(JSON.stringify({ args: process.argv.slice(2), cwd:process.cwd(), home:process.env.CODEX_HOME }))\n`, { mode: 0o700 })
+  try {
+    const result = await execute('/bin/sh', ['-c', remoteCodexDaemonCommand({ ...remote, cwd: fixture.cwd }, 'start', home)], { env: fixture.env })
+    assert.deepEqual(JSON.parse(result.stdout), { args: ['app-server', 'daemon', 'start'], cwd: await fs.realpath(fixture.cwd), home })
+    assert.equal(await fs.access(path.join(fixture.cwd, 'injected')).then(() => true, () => false), false)
+    assert.match(result.stderr, /login shell startup banner/)
+  } finally { await fs.rm(fixture.directory, { recursive: true, force: true }) }
+})
+
+test('daemon lifecycle SSH arguments retain strict trust and the leased private socket', () => {
+  const pin = { file: '/private/known_hosts', hostKeyAlias: 'trusted-remote' }
+  const args = sshCodexDaemonArgs({ ...remote, port: 2222, identityFile: '/private/id key' }, 'version', pin, { socketPath: '/private/control' })
+  assert.ok(args.includes('StrictHostKeyChecking=yes'))
+  assert.ok(args.includes('HostKeyAlias=trusted-remote'))
+  assert.ok(args.includes('ControlPath=/private/control'))
+  assert.equal(args.at(-2), 'developer@host.example')
+  for (const action of ['start', 'version', 'restart', 'update'] as const) {
+    assert.ok(!codexDaemonArgs(action).includes('-c'), 'lifecycle must not mutate shared feature settings')
+  }
+  assert.deepEqual(codexDaemonArgs('update'), ['app-server', 'daemon', 'update', '--from-cli', '--yes'])
+  assert.throws(() => codexDaemonArgs('stop' as any), /Unsupported/)
 })

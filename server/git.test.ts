@@ -132,8 +132,11 @@ async function fixture(useAppServer = false, options: { directRead?: boolean; un
   };
   const close = async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    // Native startup can still be finishing its private plugin cache. Wait for
+    // this fixture's transport to exit before removing the same temp home.
+    await bridge?.pause();
     bridge?.close();
-    await fs.rm(directory, { recursive: true, force: true });
+    await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   };
   return { directory, root, run, get, post, close, calls };
 }

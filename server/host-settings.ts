@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { RpcFailure, type Bridge, type BridgeOptions } from './bridge.js'
 import { runHostPython } from './host-helper.js'
 import { nativeRuntimeVersion } from './native-capabilities.js'
+import { restartCodexDaemon } from './daemon.js'
 import type { Host } from './types.js'
 
 const providerId = 'web_gateway'
@@ -83,6 +84,7 @@ type Dependencies = {
   withRuntimeMaintenance<T>(hostId: string, work: () => Promise<T>): Promise<T>
   writeKey?: (host: Host, file: string, key: string) => Promise<void>
   removeKey?: (host: Host, file: string) => Promise<void>
+  daemonRestart?: typeof restartCodexDaemon
 }
 const route = (fn: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(fn(req, res, next)).catch(next) }
 const busy = (message: string) => Object.assign(new Error(message), { status: 409 })
@@ -118,8 +120,8 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
       supportsGcp: supportsGcp(bridge.userAgent, currentProvider),
       hasApiKey: !!gateway?.auth || !!gateway?.experimental_bearer_token || !!gateway?.env_key,
       model: config.model || '', account: redactSettings(account?.account || null), userAgent: bridge.userAgent,
-      connected: true, canChange: !proxy && bridge.reconnectStatus.canReconnect,
-      disabledReason: proxy ? '共享代理进程的配置需要在服务端修改；直接连接后可切换提供方' : bridge.reconnectStatus.reconnectDisabledReason,
+      connected: true, canChange: !proxy && bridge.maintenanceStatus.canReconnect,
+      disabledReason: proxy ? '共享代理进程的配置需要在服务端修改；直接连接后可切换提供方' : bridge.maintenanceStatus.reconnectDisabledReason,
     }
   }
   app.get('/api/hosts/:id/codex-settings', route(async (req, res) => { res.json(await read(String(req.params.id))) }))
@@ -188,6 +190,16 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
           }
         }
         throw error
+      }
+      // This explicit provider action writes startup configuration with reload
+      // disabled. Rebuilding a proxy alone would leave the daemon using its old
+      // provider. Login and reloadable config writes stay on the live runtime.
+      if (bridge.options.daemonManaged) {
+        try {
+          await (dependencies.daemonRestart || restartCodexDaemon)(host, { ...bridge.options, daemonHome: home })
+        } catch (error) {
+          throw new Error('提供方配置已保存，但独立 Codex 后台服务重启未完成。请核对主机状态后重试。', { cause: error })
+        }
       }
     }))
     const settings = await read(host.id)

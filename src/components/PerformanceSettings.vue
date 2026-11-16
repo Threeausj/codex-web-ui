@@ -13,11 +13,14 @@ const hosts = computed(() => props.state.hosts || []);
 const host = computed(() => hosts.value.find((entry: any) => entry.id === hostId.value));
 const information = computed(() => props.state.runtimeInformation?.[hostId.value] || null);
 const runtime = computed(() => information.value?.runtime || null);
+const independentDaemon = computed(() => runtime.value?.connectionMode === 'daemon');
+const externalDaemon = computed(() => independentDaemon.value && runtime.value?.daemonLifecycleManaged === false);
 const configuration = computed(() => information.value?.config?.config || information.value?.config || {});
 const modelCount = computed(() => Array.isArray(information.value?.models) ? information.value.models.filter((entry: any) => !entry.hidden).length : null);
 const connection = computed(() => runtime.value?.paused ? "已释放" : runtime.value?.connected ? "已连接" : "未连接");
 const mode = computed(() => {
-  const value = runtime.value?.mode || runtime.value?.connectionMode;
+  if (independentDaemon.value) return "独立 daemon";
+  const value = runtime.value?.connectionMode || runtime.value?.mode;
   if (value === "proxy") return "原生代理";
   if (value === "ssh" || host.value?.kind === "ssh") return "SSH";
   if (value === "spawn") return "本机进程";
@@ -30,7 +33,7 @@ const disabledReason = computed(() => {
   if (pending.value) return "正在更新连接信息…";
   if (!information.value) return "请先读取主机信息";
   if (runtime.value?.paused) return "此主机的 Web Codex 已释放，请在资源管理中恢复连接后重试。";
-  if ((hostId.value === props.state.hostId && props.state.busy) || runtime.value?.activeThreadCount > 0)
+  if (!independentDaemon.value && ((hostId.value === props.state.hostId && props.state.busy) || runtime.value?.activeThreadCount > 0))
     return "主机上有正在运行的任务，完成或停止后可重新连接。";
   if (runtime.value?.activeProcesses?.length)
     return "主机上有正在运行的终端，请关闭终端后重新连接。";
@@ -38,6 +41,7 @@ const disabledReason = computed(() => {
     return information.value.reconnectDisabledReason || "此主机当前无法重新连接，请稍后重试。";
   return "";
 });
+const restartDisabledReason = computed(() => disabledReason.value || (information.value?.canRestartDaemon === true ? "" : information.value?.daemonRestartDisabledReason || "请先确认主机已空闲。"));
 function tokens(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "未报告";
   const unit = value >= 1_000_000 ? 1_000_000 : value >= 1000 ? 1000 : 1;
@@ -61,17 +65,18 @@ async function refresh() {
     if (token === generation) loading.value = false;
   }
 }
-async function reconnect() {
-  if (disabledReason.value || !host.value) return;
+async function reconnect(restart = false) {
+  if ((restart ? restartDisabledReason.value : disabledReason.value) || !host.value) return;
+  if (restart && !window.confirm(`重启“${host.value.name}”的独立 Codex daemon？该主机的其他客户端也会重新连接。`)) return;
   const token = ++generation;
   const selectedHost = hostId.value;
   reconnecting.value = true;
   error.value = "";
   success.value = "";
   try {
-    await props.api.reconnectRuntime(selectedHost);
+    await (restart ? props.api.restartDaemonRuntime(selectedHost) : props.api.reconnectRuntime(selectedHost));
     if (token === generation && selectedHost === hostId.value)
-      success.value = "Codex 已重新连接，版本、模型和配置已更新。";
+      success.value = independentDaemon.value && !restart ? "Web 连接已恢复，后台 daemon 继续运行。" : "Codex 已重新连接，版本、模型和配置已更新。";
   } catch (cause: any) {
     if (token === generation && selectedHost === hostId.value) error.value = cause.message || "重新连接失败，请重试。";
   } finally {
@@ -92,7 +97,7 @@ onBeforeUnmount(() => { ++generation; });
 <template>
   <section class="performance-settings" aria-label="性能设置">
     <h3>性能</h3>
-    <p class="settings-description">更新主机上的 Codex 后，重新连接即可读取新模型和上下文配置。</p>
+    <p class="settings-description">{{ externalDaemon ? "正在复用已有服务，生命周期由外部管理。网页可重新连接；更新、重启和配置写入需在原客户端管理或迁移为托管服务。" : independentDaemon ? "Web 连接与后台 Codex 独立运行。修改静态模型目录后，请在主机空闲时重启 daemon。" : "更新主机上的 Codex 后，重新连接即可读取新模型和上下文配置。" }}</p>
     <dl class="performance-information" :aria-busy="loading">
       <div><dt>连接状态</dt><dd><span class="performance-connection" :class="{ connected: runtime?.connected && !runtime?.paused }">{{ connection }}</span><span class="performance-mode">{{ mode }}</span></dd></div>
       <div><dt>Codex 版本</dt><dd>{{ runtime?.userAgent || "未报告" }}</dd></div>
@@ -104,12 +109,15 @@ onBeforeUnmount(() => { ++generation; });
     <p class="performance-checked">最近读取：{{ time(information?.checkedAt) }}</p>
     <div class="performance-reconnect">
       <strong>重新连接 Codex</strong>
-      <p v-if="runtime?.mode === 'proxy' || runtime?.managed === false">重新建立 Web 与原生代理的连接，刷新模型和配置。Codex 版本由外部进程管理，更新后请先在宿主机重启该进程。</p>
+      <p v-if="externalDaemon">重新连接只恢复网页代理、会话状态和待处理问题，保留已有服务中的后台任务。普通 Web 终端需要先关闭，长任务建议使用 tmux。</p>
+      <p v-else-if="independentDaemon">重新连接只恢复网页代理、会话状态和待处理问题；后台任务继续运行。普通 Web 终端需要先关闭，长任务建议使用 tmux。</p>
+      <p v-else-if="runtime?.mode === 'proxy' || runtime?.managed === false">重新建立 Web 与原生代理的连接，刷新模型和配置。Codex 版本由外部进程管理，更新后请先在宿主机重启该进程。</p>
       <p v-else>重启此主机由 Web 管理的 Codex 连接，刷新版本、模型、配置和技能。该主机的其他 Web 页面也会重新连接。</p>
       <p v-if="disabledReason && !pending" class="performance-reason">{{ disabledReason }}</p>
       <div class="performance-actions">
         <button class="button button-secondary" :disabled="pending || !host || !state.authenticated" @click="refresh"><Icon :name="loading ? 'LoaderCircle' : 'RefreshCw'" :class="{ spin: loading }" :size="15" />{{ loading ? "读取中…" : "刷新信息" }}</button>
-        <button class="button button-primary" :disabled="!!disabledReason" :title="disabledReason || undefined" @click="reconnect"><Icon :name="reconnecting ? 'LoaderCircle' : 'Zap'" :class="{ spin: reconnecting }" :size="15" />{{ reconnecting ? "重新连接中…" : "重新连接 Codex" }}</button>
+        <button class="button button-primary" :disabled="!!disabledReason" :title="disabledReason || undefined" @click="reconnect()"><Icon :name="reconnecting ? 'LoaderCircle' : 'Zap'" :class="{ spin: reconnecting }" :size="15" />{{ reconnecting ? "重新连接中…" : "重新连接 Codex" }}</button>
+        <button v-if="independentDaemon" class="button button-secondary" :disabled="!!restartDisabledReason" :title="restartDisabledReason || undefined" @click="reconnect(true)"><Icon name="RotateCw" :size="15" />重启 daemon</button>
       </div>
     </div>
     <p v-if="error" class="panel-error" role="alert"><Icon name="AlertCircle" :size="16" />{{ error }}</p>

@@ -74,7 +74,9 @@ async function runtimeAction(resume: boolean) {
   const selected = hostId.value;
   if (!snapshot.value || pending.value || !props.state.online) return;
   if (!resume && !window.confirm(
-    `关闭“${host.value?.name}”的 Web Codex 连接并释放 ${snapshot.value.runtime.loadedThreadCount} 个会话？\n\n此主机上所有 Web 页面的运行任务和交互终端将中断。网页会保持暂停，方便切换到桌面端或 CLI；可随时重新连接。`,
+    snapshot.value.runtime.independentDaemon
+      ? `关闭“${host.value?.name}”的 Web 连接？\n\n后台 daemon 和对话任务继续运行，普通 Web 交互终端会关闭。网页保持暂停，可随时重新连接。`
+      : `关闭“${host.value?.name}”的 Web Codex 连接并释放 ${snapshot.value.runtime.loadedThreadCount} 个会话？\n\n此主机上所有 Web 页面的运行任务和交互终端将中断。网页会保持暂停，方便切换到桌面端或 CLI；可随时重新连接。`,
   )) return;
   stopPolling();
   ++generation;
@@ -88,7 +90,9 @@ async function runtimeAction(resume: boolean) {
     }, false);
     if (disposed || operation !== generation || !props.state.authenticated) return;
     snapshot.value = { ...snapshot.value, runtime: result.runtime };
-    notice.value = resume ? 'Web Codex 已重新连接。' : 'Web Codex 已暂停，已释放会话供桌面端或 CLI 使用。';
+    notice.value = resume ? 'Web Codex 已重新连接。' : snapshot.value?.runtime.independentDaemon
+      ? 'Web 连接已暂停，后台对话任务继续运行；普通 Web 终端已关闭。'
+      : 'Web Codex 已暂停，已释放会话供桌面端或 CLI 使用。';
     if (resume && props.state.hostId === selected) await props.api.resumeConnection({ explicit: true });
   } catch (cause: any) {
     if (!disposed && operation === generation) error.value = cause?.message || '操作失败，请重试。';
@@ -181,11 +185,12 @@ onBeforeUnmount(() => { disposed = true; ++generation; stopPolling(); document.r
               <div v-for="thread in snapshot.runtime.threads || []" :key="thread.id" class="runtime-thread">
                 <div><strong :title="thread.name">{{ thread.name }}</strong><small>{{ thread.restoring ? '历史恢复待完成' : thread.released ? '已关闭' : thread.active ? '运行中' : '空闲' }}<code v-if="thread.pid"> · PID {{ thread.pid }}</code></small></div>
                 <button v-if="thread.released && !thread.loaded" :disabled="pending || !state.online || snapshot.runtime.paused" :aria-label="`重新连接会话 ${thread.name}`" @click="threadAction(thread, true)">重新连接</button>
-                <button v-else class="runtime-close" :disabled="pending || !state.online || snapshot.runtime.managed === false" :aria-label="`关闭会话 ${thread.name}`" @click="threadAction(thread, false)">关闭会话</button>
+                <button v-else class="runtime-close" :disabled="pending || !state.online || snapshot.runtime.managed === false || snapshot.runtime.independentDaemon" :aria-label="`关闭会话 ${thread.name}`" @click="threadAction(thread, false)">关闭会话</button>
               </div>
             </div>
-            <p v-if="snapshot.runtime.threads?.length" class="resource-message muted">同一主机的会话共享 Codex PID；关闭会话只停止该会话及其子智能体，保留历史。</p>
-            <p class="resource-message muted">关闭连接会中断此主机上所有 Web 页面的任务，并保持暂停；重新连接后可继续原会话。</p>
+            <p v-if="snapshot.runtime.threads?.length && !snapshot.runtime.independentDaemon" class="resource-message muted">同一主机的会话共享 Codex PID；关闭会话只停止该会话及其子智能体，保留历史。</p>
+            <p v-if="snapshot.runtime.independentDaemon" class="resource-message muted">{{ snapshot.runtime.daemonLifecycleManaged === false ? '复用已有服务，生命周期由外部管理。' : '独立 daemon：' }}关闭 Web 连接保留后台对话任务，普通 Web 终端会关闭。需要停止对话时，请在对话中使用停止按钮。</p>
+            <p v-else class="resource-message muted">关闭连接会中断此主机上所有 Web 页面的任务，并保持暂停；重新连接后可继续原会话。</p>
             <p v-if="snapshot.runtime.managed === false" class="resource-message muted">共享桌面进程模式：仅释放网页订阅和连接。</p>
           </section>
         </main>

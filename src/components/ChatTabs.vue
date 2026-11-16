@@ -15,6 +15,10 @@ const draftKey = 'new-chat';
 const viewport = ref<HTMLElement>();
 const focusedKey = ref<string | null>(null);
 const visibleKeys = computed(() => [...props.tabs.map(key), ...(props.draft ? [draftKey] : [])]);
+const stripWidths = computed(() => ({
+  '--tabs-width': `${Math.max(0, visibleKeys.value.length * 228 - 4)}px`,
+  '--tabs-width-mobile': `${Math.max(0, visibleKeys.value.length * 199 - 3)}px`,
+}));
 const selectedKey = computed(() => props.draft ? draftKey : props.activeKey);
 const tabStop = computed(() => visibleKeys.value.includes(focusedKey.value || '')
   ? focusedKey.value : selectedKey.value || visibleKeys.value[0]);
@@ -86,7 +90,7 @@ defineExpose({ focusSelected: () => { if (selectedKey.value) focusTab(selectedKe
 
 <template>
   <div class="chat-tabs">
-    <div ref="viewport" class="chat-tabs-scroll" role="tablist" aria-label="聊天标签页">
+    <div ref="viewport" class="chat-tabs-scroll" role="tablist" aria-label="聊天标签页" :style="stripWidths">
       <div v-for="tab in tabs" :key="key(tab)" class="chat-tab"
         :class="{ active: !draft && key(tab) === activeKey, pinned: tab.pinned }"
         :data-host-id="tab.hostId" :data-thread-id="tab.threadId"

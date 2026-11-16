@@ -50,7 +50,7 @@ async function wireSettings(page: Page, mock: MockCodex) {
     socket.onMessage(raw => (target as any).receive(socket, JSON.parse(raw.toString())));
     socket.send(JSON.stringify({ method: "bridge/status", params: bridgeStatus(hostId) }));
   });
-  await page.route(/\/api\/hosts\/[^/]+\/(?:runtime\/(?:information|reconnect)|codex-settings(?:\/[^?]+)?|settings\/rpc)(?:\?|$)/, async route => {
+  await page.route(/\/api\/hosts\/[^/]+\/(?:runtime\/(?:information|reconnect|daemon\/restart)|codex-settings(?:\/[^?]+)?|settings\/rpc)(?:\?|$)/, async route => {
     const request = route.request();
     const parts = new URL(request.url()).pathname.split("/");
     const hostId = decodeURIComponent(parts[3]!);
@@ -58,11 +58,12 @@ async function wireSettings(page: Page, mock: MockCodex) {
     const body = request.method() === "POST" ? request.postDataJSON() : undefined;
     wire.calls.push({ hostId, path, method: request.method(), ...(body ? { body } : {}) });
     if (path === "runtime/information") return route.fulfill({ json: wire.information.get(hostId) });
-    if (path === "runtime/reconnect") {
+    if (path === "runtime/reconnect" || path === "runtime/daemon/restart") {
       if (wire.delay) await wire.delay;
       if (wire.failReconnect) return route.fulfill({ status: 409, json: { error: wire.failReconnect } });
       const old = wire.information.get(hostId);
       wire.information.set(hostId, runtimeInformation({
+        ...old,
         runtime: { ...old.runtime, userAgent: "codex_cli_rs/0.161.0", engineId: "new-fixture-engine" },
         config: { ...old.config, model_context_window: 500000 }, models: cliModels(true),
       }));
@@ -236,6 +237,92 @@ test("duplicate reconnect clicks issue one request, show an error and can retry"
   await settings.getByRole("button", { name: "重新连接 Codex", exact: true }).click();
   await expect(settings.getByText("500k tokens", { exact: true })).toBeVisible();
   expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toHaveLength(2);
+});
+
+test("an active independent daemon permits transport reconnect while keeping its task and disabling daemon restart", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  wire.information.set("local", runtimeInformation({
+    runtime: { ...runtimeInformation().runtime, mode: "proxy", connectionMode: "daemon", independentDaemon: true, activeThreadCount: 1 },
+    canRestartDaemon: false, daemonRestartDisabledReason: "此主机仍有对话或子智能体正在运行",
+  }));
+  mock.holdFinalMessage = true;
+  await login(page);
+  await page.getByRole("textbox", { name: "消息输入框", exact: true }).fill("继续运行中的 daemon 任务");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
+  const settings = await openSettings(page, "性能");
+  await expect(settings.getByText("独立 daemon", { exact: true })).toBeVisible();
+  await expect(settings.getByText("重新连接只恢复网页代理", { exact: false })).toBeVisible();
+  await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
+  const restart = settings.getByRole("button", { name: "重启 daemon", exact: true });
+  await expect(restart).toBeDisabled();
+  await expect(restart).toHaveAttribute("title", "此主机仍有对话或子智能体正在运行");
+  await settings.getByRole("button", { name: "重新连接 Codex", exact: true }).click();
+  await expect(settings.getByRole("status")).toContainText("Web 连接已恢复，后台 daemon 继续运行");
+  expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toEqual([{ hostId: "local", path: "runtime/reconnect", method: "POST", body: {} }]);
+  expect(wire.calls.filter(call => call.path === "runtime/daemon/restart")).toHaveLength(0);
+  await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
+  await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
+  expect(mock.requests.some(request => request.method === "turn/interrupt")).toBe(false);
+});
+
+test("daemon restart requires the server's idle permission and explicit confirmation, targets one host, and carries CSRF", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  const daemon = runtimeInformation({
+    runtime: { ...runtimeInformation().runtime, mode: "proxy", connectionMode: "daemon", independentDaemon: true },
+    canRestartDaemon: true, daemonRestartDisabledReason: null,
+  });
+  wire.information.set(remoteHostId, daemon);
+  const posted: { path: string; csrf?: string; body: any }[] = [];
+  page.on("request", request => {
+    if (!request.url().includes("/runtime/daemon/restart")) return;
+    posted.push({ path: new URL(request.url()).pathname, csrf: request.headers()["x-csrf-token"], body: request.postDataJSON() });
+  });
+  await login(page);
+  await page.getByRole("textbox", { name: "消息输入框", exact: true }).fill("当前主机草稿不因另一个主机重启而变化");
+  const settings = await openSettings(page, "性能", remoteHostId);
+  const restart = settings.getByRole("button", { name: "重启 daemon", exact: true });
+  await expect(restart).toBeEnabled();
+  page.once("dialog", async dialog => {
+    expect(dialog.message()).toContain("NAS"); expect(dialog.message()).toContain("其他客户端"); await dialog.dismiss();
+  });
+  await restart.click();
+  expect(posted).toHaveLength(0);
+  wire.information.set(remoteHostId, { ...daemon, canRestartDaemon: false, daemonRestartDisabledReason: "还有排队消息，请先处理" });
+  await settings.getByRole("button", { name: "刷新信息", exact: true }).click();
+  await expect(restart).toBeDisabled();
+  await expect(restart).toHaveAttribute("title", "还有排队消息，请先处理");
+  await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
+  wire.information.set(remoteHostId, daemon);
+  await settings.getByRole("button", { name: "刷新信息", exact: true }).click();
+  await expect(restart).toBeEnabled();
+  page.once("dialog", dialog => dialog.accept());
+  await restart.click();
+  await expect(settings.getByRole("status")).toContainText("Codex 已重新连接");
+  expect(posted).toEqual([{ path: `/api/hosts/${remoteHostId}/runtime/daemon/restart`, csrf: "mock-csrf", body: { confirmed: true } }]);
+  expect(wire.calls.filter(call => call.path === "runtime/daemon/restart")).toEqual([{ hostId: remoteHostId, path: "runtime/daemon/restart", method: "POST", body: { confirmed: true } }]);
+  expect(wire.calls.filter(call => call.path === "runtime/reconnect")).toHaveLength(0);
+  await settings.getByRole("combobox", { name: "设置主机", exact: true }).selectOption("local");
+  await expect(settings.getByRole("button", { name: "重启 daemon", exact: true })).toHaveCount(0);
+  await settings.getByRole("button", { name: "关闭设置", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "消息输入框", exact: true })).toHaveValue("当前主机草稿不因另一个主机重启而变化");
+});
+
+test("a reused external native service remains reconnectable and explicitly disables daemon lifecycle controls", async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  const disabledReason = "此连接由其他客户端启动，请在原客户端管理或迁移为托管服务";
+  wire.information.set(remoteHostId, runtimeInformation({
+    runtime: { ...runtimeInformation().runtime, mode: "proxy", connectionMode: "daemon", independentDaemon: true, managed: false, daemonLifecycleManaged: false },
+    canRestartDaemon: false, daemonRestartDisabledReason: disabledReason,
+  }));
+  await login(page);
+  const settings = await openSettings(page, "性能", remoteHostId);
+  await expect(settings.getByRole("button", { name: "重新连接 Codex", exact: true })).toBeEnabled();
+  await expect(settings.getByRole("button", { name: "重启 daemon", exact: true })).toBeDisabled();
+  await expect(settings.getByRole("button", { name: "重启 daemon", exact: true })).toHaveAttribute("title", disabledReason);
+  await expect(settings).toContainText("已有服务");
+  await expect(settings).toContainText("外部管理");
+  expect(wire.calls.filter(call => call.path === "runtime/daemon/restart")).toHaveLength(0);
 });
 
 test("the settings host controls configuration and policy without selecting another conversation", async ({ page, mock }) => {

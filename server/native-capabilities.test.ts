@@ -111,3 +111,31 @@ test('an upgraded installed CLI cannot claim support for an older still-connecte
   const value = await service.read(host, { userAgent: 'codex_web/0.159.2 (Fixture)' })
   assert.equal(value.status, 'unknown'); assert.equal(value.reason, 'runtime_version_mismatch'); assert.equal(value.checkedCliVersion, '0.160.1'); assert.deepEqual(value.methods, {})
 })
+
+test('managed daemon capabilities use the real runtime version and can override an inherited external proxy', async () => {
+  let calls = 0
+  const service = new NativeCapabilitiesService({ bridgeOptions: { mode: 'proxy' }, collect: async () => { calls++; return known() } })
+  const daemon: Host = { ...host, kind: 'ssh', connectionMode: 'daemon' }
+  const value = await service.read(daemon, { ...identity, connectionMode: 'daemon' })
+  assert.equal(value.status, 'known')
+  assert.equal(value.checkedCliVersion, '0.160.1')
+  assert.equal(calls, 1)
+  const stale = await service.read(daemon, { userAgent: 'codex_web/0.159.2 (older daemon)', connectionMode: 'daemon' })
+  assert.equal(stale.status, 'unknown')
+  assert.equal(stale.reason, 'runtime_version_mismatch')
+  assert.equal(calls, 2)
+})
+
+test('per-host spawn and daemon choices take precedence over the global proxy default while external proxies stay unknown', async () => {
+  let calls = 0
+  const service = new NativeCapabilitiesService({ bridgeOptions: { mode: 'proxy' }, collect: async () => { calls++; return known() } })
+  for (const connectionMode of ['spawn', 'daemon'] as const) {
+    const value = await service.read({ ...host, id: connectionMode, kind: 'ssh', connectionMode }, { ...identity, connectionMode: 'ssh' })
+    assert.equal(value.status, 'known')
+  }
+  const external = await service.read({ ...host, id: 'external', connectionMode: 'proxy' }, identity)
+  assert.equal(external.reason, 'proxy_runtime')
+  const actualExternal = await service.read({ ...host, id: 'stale-mode', connectionMode: 'daemon' }, { ...identity, connectionMode: 'proxy' })
+  assert.equal(actualExternal.reason, 'proxy_runtime')
+  assert.equal(calls, 2)
+})
