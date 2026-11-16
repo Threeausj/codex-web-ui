@@ -159,6 +159,7 @@ const centerFileTabs = computed(() => fileWorkspace.value?.scope === workspaceSc
 watch(workspaceOpen, open => { if (open) workspaceMounted.value = true; }, { flush: 'sync' });
 watch(() => [state.hostId, state.projectPath, state.authenticationGeneration], () => {
   selectedFilePath.value = null; fileWorkspace.value = null;
+  clearWorkspaceReveal();
 });
 watch(() => state.authenticated, authenticated => { if (!authenticated) { workspaceOpen.value = false; workspaceMounted.value = false; selectedFilePath.value = null; fileWorkspace.value = null; } });
 const composer = ref<InstanceType<typeof Composer>>();
@@ -188,6 +189,11 @@ const workspacePathScope = ref("");
 const workspaceScope = () => `${state.hostId}\0${state.projectPath}`;
 const scopedWorkspacePath = computed(() => workspacePathScope.value === workspaceScope() ? workspacePath.value : "");
 const workspace = ref<InstanceType<typeof WorkspacePanel>>();
+function clearWorkspaceReveal() {
+  workspacePath.value = "";
+  workspaceLine.value = undefined;
+  workspacePathScope.value = "";
+}
 const scroll = ref<HTMLElement>();
 const showScrollBottom = ref(false);
 const followLatest = ref(true);
@@ -590,7 +596,11 @@ async function selectThread(
   return generation === navigationSelection && hostId === state.hostId &&
     id === state.activeThread?.id && state.threadReady && !state.threadConflict;
 }
-async function showCenterChat() {
+async function showCenterChat(cancelPending = true) {
+  if (cancelPending) {
+    clearWorkspaceReveal();
+    workspace.value?.cancelFileOpen();
+  }
   const wasFile = selectedFilePath.value !== null;
   selectedFilePath.value = null;
   await nextTick();
@@ -601,12 +611,15 @@ function updateFileWorkspace(value: FileWorkspaceState) {
   fileWorkspace.value = value;
   if (selectedFilePath.value && !value.files.some(file => file.path === selectedFilePath.value)) {
     if (value.activePath && value.files.some(file => file.path === value.activePath)) selectedFilePath.value = value.activePath;
-    else void showCenterChat();
+    else void showCenterChat(false);
   }
-  else if (selectedFilePath.value && !value.activePath) void showCenterChat();
+  else if (selectedFilePath.value && !value.activePath) void showCenterChat(false);
 }
 function previewCenterFile(value: { path: string; hostId: string; projectPath: string }) {
   if (!state.authenticated || value.hostId !== state.hostId || value.projectPath !== state.projectPath) return;
+  // A clicked file link is a one-time navigation request. Restoring this host's
+  // file tabs later must not replay it and replace the selected conversation.
+  clearWorkspaceReveal();
   if (!centerFileVisible.value) saveScroll();
   selectedFilePath.value = value.path;
   threadMenu.value = false;

@@ -205,6 +205,7 @@ async function readDirectory(path: string, interruptReveal = true) {
 }
 async function openFile(path: string, destination = "files", line?: number, parentDirectory?: Promise<void>, activate = true) {
   if (!path) return;
+  ++revealGeneration;
   if (file.value?.path === path && (!file.value.binary && !/^image\//.test(file.value.mime) || file.value.dataUrl || file.value.dataBase64)) {
     ++fileGeneration;
     loading.value = false; openingFile.value = false;
@@ -215,7 +216,6 @@ async function openFile(path: string, destination = "files", line?: number, pare
     if (line) await focusLine(line);
     return;
   }
-  ++revealGeneration;
   const existing = editorTabs.value.find(entry => entry.file.path === path);
   if (existing) {
     ++fileGeneration;
@@ -258,7 +258,7 @@ async function openFile(path: string, destination = "files", line?: number, pare
       else if (directory.value !== parent) await readDirectory(parent, false);
       if (generation === fileGeneration && scope === fileScope()) {
         error.value = message;
-        if (externalFilePreview.value) emit('fileOpenFailed', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
+        if (activate && externalFilePreview.value) emit('fileOpenFailed', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
       }
     }
   } finally {
@@ -560,8 +560,9 @@ watch(() => props.state.connected, connected => {
 });
 watch(() => [props.openPath, props.openLine, fileScope()] as const, ([value, line]) => {
   const version = workspaceGeneration;
+  const intent = ++revealGeneration;
   if (value) void workspaceReady.then(() => {
-    if (version === workspaceGeneration && props.openPath === value && props.openLine === line) void revealPath(value, line);
+    if (version === workspaceGeneration && intent === revealGeneration && props.openPath === value && props.openLine === line) void revealPath(value, line);
   });
 }, { immediate: true });
 function onWorkspaceHidden() {
@@ -596,6 +597,12 @@ watch(tab, async (value) => {
 defineExpose({
   working: computed(() => editorTabs.value.some(entry => entry.saving)),
   openFile,
+  cancelFileOpen: () => {
+    ++revealGeneration;
+    ++fileGeneration;
+    if (openingFile.value) loading.value = false;
+    openingFile.value = false;
+  },
   activateFile: (path: string, line?: number) => openFile(path, "files", line),
   closeEditor,
   closeFile,
