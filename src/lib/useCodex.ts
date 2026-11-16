@@ -4761,6 +4761,12 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
     (hostId === state.hostId ? state.noProject : saved<Record<string, boolean>>('codex.projectlessHosts', {})[hostId] === true);
   if (hostId === state.hostId && noProject === state.noProject &&
       (projectPath == null || projectPath === state.projectPath)) return true;
+  const hostPath = hostId === state.hostId ? state.projectPath :
+    saved<Record<string, string>>('codex.projectPaths', {})[hostId] ??
+    state.hosts.find(host => host.id === hostId)?.cwd ?? (hostId === 'local' ? localCwd : '/tmp');
+  const preferredPath = noProject ? hostPath : projectPath ?? state.projects.find(project =>
+    (project.hostId || 'local') === hostId && [project.path, ...(project.rootPaths || [])].includes(hostPath))?.path ??
+    state.projects.find(project => (project.hostId || 'local') === hostId)?.path ?? hostPath;
   const previousHost = state.hostId;
   const previousDraft = attachmentDraftScope;
   const attachments = state.attachments;
@@ -4779,17 +4785,14 @@ async function chooseNewContext(hostId: string, projectPath?: string | null) {
     expectedHost === hostSelectionGeneration;
   try {
     if (hostId !== state.hostId || !state.connected) {
-      const changingHost = setHost(hostId);
+      const changingHost = setHost(hostId, { projectPath: preferredPath, noProject });
       expectedSelection = selectionGeneration;
       expectedHost = hostSelectionGeneration;
       await changingHost;
       if (!current()) return false;
     }
-    // A new host without a remembered path starts at its first known project.
-    const preferredPath = noProject ? state.projectPath : projectPath ?? state.projects.find((project) =>
-      (project.hostId || "local") === hostId &&
-      [project.path, ...(project.rootPaths || [])].includes(state.projectPath))?.path ??
-      state.projects.find((project) => (project.hostId || "local") === hostId)?.path;
+    // A new host's final draft scope is already selected before its handshake.
+    // Never change that scope again after the user can start typing.
     if (preferredPath && (preferredPath !== state.projectPath || noProject !== state.noProject)) {
       const changingProject = setProject(preferredPath, noProject);
       expectedSelection = selectionGeneration;
@@ -4939,7 +4942,22 @@ async function archiveProject(project: any) {
   }
   toast(`已归档 ${archived} 个对话，可在已归档对话中恢复`);
 }
-async function setHost(id: string, options: { threadId?: string } = {}) {
+/** Paint a destination before its host handshake so input always belongs to the
+ * tab the user just selected, including a second tab on a still-loading host. */
+function previewHostThread(hostId: string, target: string) {
+  const cached = conversationCache.peek(hostId, target);
+  state.activeThread = state.threads.find(thread => thread.id === target) ?? cached?.thread ?? { id: target };
+  state.noProject = isProjectlessThread(state.activeThread);
+  if (state.activeThread.cwd) state.projectPath = state.activeThread.cwd;
+  state.threadReady = false;
+  state.selectingThread = true;
+  state.threadReleased = releasedThreads.get(hostId)?.has(target) || false;
+  rememberThread(target);
+  if (cached) applyConversationSnapshot(cached, target);
+  state.busy = selectedConversationBusy(target);
+  return cached;
+}
+async function setHost(id: string, options: { threadId?: string; projectPath?: string; noProject?: boolean } = {}) {
   if (id ? !state.hosts.some((host) => host.id === id) : state.hosts.length > 0)
     throw fail(new Error("主机不存在"));
   if (id === state.hostId && (state.connected || connecting)) {
@@ -4947,6 +4965,16 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     // first handshake/configuration is still pending. Keep that transport and
     // invalidate the older selection before awaiting it; restarting setHost
     // would repeatedly close the same connection and reject its native reads.
+    if (options.threadId && options.threadId !== state.activeThread?.id) {
+      newThread(false);
+      previewHostThread(id, options.threadId);
+    }
+    if (!options.threadId && (options.projectPath !== undefined || options.noProject !== undefined)) {
+      state.projectPath = options.projectPath ?? state.projectPath;
+      state.noProject = options.noProject ?? state.noProject;
+      rememberProject(true);
+      newThread();
+    }
     const hostGeneration = hostSelectionGeneration;
     const authentication = authenticationGeneration;
     const selection = ++selectionGeneration;
@@ -4958,6 +4986,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     if (hostGeneration !== hostSelectionGeneration || authentication !== authenticationGeneration ||
         selection !== selectionGeneration || id !== state.hostId || state.runtimePaused) return;
     if (options.threadId) await selectThread(options.threadId);
+    else if (options.projectPath !== undefined || options.noProject !== undefined) await sync(false);
     return;
   }
   const hostGeneration = ++hostSelectionGeneration;
@@ -5026,11 +5055,12 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
     terminalSessionNames.get(`${id}:${state.terminalProcessId}`) || "";
   state.terminalProcesses = [];
   browserStorage.local.setItem("codex.hostId", JSON.stringify(id));
-  state.projectPath = id ?
+  state.projectPath = options.projectPath ?? (id ?
     saved<Record<string, string>>("codex.projectPaths", {})[id] ??
     state.hosts.find((host) => host.id === id)?.cwd ??
-    (id === "local" ? localCwd : "/tmp") : "";
-  state.noProject = !!id && saved<Record<string, boolean>>('codex.projectlessHosts', {})[id] === true;
+    (id === "local" ? localCwd : "/tmp") : "");
+  state.noProject = options.noProject ?? (!!id && saved<Record<string, boolean>>('codex.projectlessHosts', {})[id] === true);
+  if (!options.threadId && (options.projectPath !== undefined || options.noProject !== undefined)) rememberProject(true);
   if (!id) {
     state.threadReady = false;
     state.switchingHost = false;
@@ -5046,20 +5076,11 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
   if (target) {
     // Select before the first await: switching transports must never briefly
     // present a new-chat welcome screen or the previous host's conversation.
-    const cached = conversationCache.peek(id, target);
-    state.activeThread = state.threads.find(thread => thread.id === target) ?? cached?.thread ?? { id: target };
-    state.noProject = isProjectlessThread(state.activeThread);
-    if (state.activeThread.cwd) state.projectPath = state.activeThread.cwd;
-    state.threadReady = false;
-    state.selectingThread = true;
-    state.threadReleased = releasedThreads.get(id)?.has(target) || false;
-    rememberThread(target);
-    if (cached) applyConversationSnapshot(cached, target);
-    else void conversationCache.read(id, target).then(snapshot => {
+    const cached = previewHostThread(id, target);
+    if (!cached) void conversationCache.read(id, target).then(snapshot => {
       if (snapshot && previewCurrent() && !state.items.length)
         applyConversationSnapshot(snapshot, target);
     });
-    state.busy = selectedConversationBusy(target);
   }
   startNavigationRefresh();
   const retainedSocket = hostConnections.get(id)?.socket;

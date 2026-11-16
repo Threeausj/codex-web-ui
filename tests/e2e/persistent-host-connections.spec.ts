@@ -38,7 +38,7 @@ test('cross-host tab returns reuse healthy WebSockets without a connecting banne
     await selected(page, 'persistent-remote').click(); await expect(editor(page)).toBeEnabled();
     await expect(page.locator('.agent-message')).toContainText('远端持久会话正文');
   }
-  expect(mock.sockets).toHaveLength(1); expect(remote.sockets).toHaveLength(1);
+  await expect.poll(() => mock.sockets.length).toBe(1); await expect.poll(() => remote.sockets.length).toBe(1);
   expect(await page.evaluate(() => (window as any).__hostBanners)).toEqual([]);
   expect(mock.request('turn/start')).toBeUndefined(); expect(remote.request('turn/start')).toBeUndefined();
 });
@@ -53,7 +53,7 @@ test('inactive host events cannot enter the selected host and fresh history reco
   mock.turns.get('thread-existing')![0].items[1].text = '本机后台完成后的新正文';
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
   await expect(page.locator('.agent-message')).toContainText('本机后台完成后的新正文');
-  expect(mock.sockets).toHaveLength(1);
+  await expect.poll(() => mock.sockets.length).toBe(1);
 });
 
 test('a closed inactive transport reconnects only when selected and keeps the other host healthy', async ({ page, mock }) => {
@@ -63,9 +63,9 @@ test('a closed inactive transport reconnects only when selected and keeps the ot
   await expect(editor(page)).toBeEnabled();
   await expect(page.locator('.agent-message')).toContainText('远端持久会话正文');
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
-  expect(mock.sockets).toHaveLength(2); expect(remote.sockets).toHaveLength(1);
+  await expect.poll(() => mock.sockets.length).toBe(2); await expect.poll(() => remote.sockets.length).toBe(1);
   await selected(page, 'persistent-remote').click(); await expect(editor(page)).toBeEnabled();
-  expect(remote.sockets).toHaveLength(1);
+  await expect.poll(() => remote.sockets.length).toBe(1);
 });
 
 test('all visited host transports close on logout and cannot inject private events into a later login', async ({ page, mock }) => {
@@ -77,7 +77,7 @@ test('all visited host transports close on logout and cannot inject private even
   await settings.getByRole('button', { name: '退出网页', exact: true }).click();
   await expect(page.locator('input[type="password"]').first()).toBeVisible();
   await login(page); await expect(editor(page)).toBeVisible();
-  expect(remote.sockets).toHaveLength(2);
+  await expect.poll(() => remote.sockets.length).toBe(2);
   expect(mock.request('turn/start')).toBeUndefined(); expect(remote.request('turn/start')).toBeUndefined();
 });
 
@@ -92,9 +92,9 @@ test('offline clears both selected and parked transports and online restores onl
   await expect.poll(() => [...closed].sort()).toEqual(['local', 'remote']);
   await page.evaluate(() => { Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => true }); window.dispatchEvent(new Event('online')); });
   await expect(editor(page)).toBeEnabled();
-  expect(remote.sockets).toHaveLength(2); expect(mock.sockets).toHaveLength(1);
+  await expect.poll(() => remote.sockets.length).toBe(2); await expect.poll(() => mock.sockets.length).toBe(1);
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
-  expect(mock.sockets).toHaveLength(2);
+  await expect.poll(() => mock.sockets.length).toBe(2);
 });
 
 test('a paused parked host stays paused when selected and cannot auto-resume a writer', async ({ page, mock }) => {
@@ -105,10 +105,11 @@ test('a paused parked host stays paused when selected and cannot auto-resume a w
   await expect(editor(page)).toBeEnabled();
   await selected(page, 'local').click();
   await expect(page.getByText('Web Codex 已释放，可切换桌面端。', { exact: false }).first()).toBeVisible();
-  await expect(editor(page)).toBeDisabled();
+  await expect(editor(page)).toBeEnabled();
+  await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled();
   expect(mock.requests.filter(request => request.method === 'thread/resume')).toHaveLength(before);
-  expect(mock.sockets).toHaveLength(1);
-  expect(remote.sockets).toHaveLength(1);
+  await expect.poll(() => mock.sockets.length).toBe(1);
+  await expect.poll(() => remote.sockets.length).toBe(1);
 });
 
 test('visited host sockets use a bounded pool and retire the least recently selected connection', async ({ page, mock }) => {
@@ -124,13 +125,13 @@ test('visited host sockets use a bounded pool and retire the least recently sele
   mock.sockets[0]!.onClose(() => { localClosed = true; });
   for (const [index, { id, remote }] of remotes.entries()) {
     await open(page, id, `连接池聊天 ${index}`);
-    expect(remote.sockets).toHaveLength(1);
+    await expect.poll(() => remote.sockets.length).toBe(1);
   }
   await expect.poll(() => localClosed).toBe(true);
   // The last selected host remains connected; only the evicted oldest needs a
   // fresh transport, and reopening it never starts or interrupts model work.
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
-  expect(mock.sockets).toHaveLength(2);
+  await expect.poll(() => mock.sockets.length).toBe(2);
   expect(remotes[7]!.remote.sockets).toHaveLength(1);
   expect(mock.request('turn/start')).toBeUndefined();
   expect(mock.request('turn/interrupt')).toBeUndefined();
@@ -151,7 +152,7 @@ test('returning to a parked host restores new approvals and removes ones resolve
   mock.emit('serverRequest/resolved', { requestId: approval.id });
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
   await expect(page.locator('.approval-card')).toHaveCount(0);
-  expect(mock.sockets).toHaveLength(1); expect(remote.sockets).toHaveLength(1);
+  await expect.poll(() => mock.sockets.length).toBe(1); await expect.poll(() => remote.sockets.length).toBe(1);
 });
 
 test('an older bridge without an authoritative return snapshot is reattached before enabling its writer', async ({ page, mock }) => {
@@ -166,6 +167,6 @@ test('an older bridge without an authoritative return snapshot is reattached bef
   };
   await login(page); await visitBoth(page);
   await selected(page, 'local').click(); await expect(editor(page)).toBeEnabled();
-  expect(mock.sockets).toHaveLength(2);
+  await expect.poll(() => mock.sockets.length).toBe(2);
   expect(mock.request('turn/start')).toBeUndefined();
 });

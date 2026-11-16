@@ -178,7 +178,7 @@ test("a slow remote connection can be cancelled without resuming its ID on the l
   await recent(page).locator('[data-host-id="ssh-test"] .thread-row').click();
   await expect(page.locator(".main-header")).toHaveAttribute("data-host-id", "ssh-test");
   const input = page.getByRole("textbox", { name: "消息输入框", exact: true });
-  await expect(input).toBeDisabled();
+  await expect(input).toBeEnabled();
   await expect(
     page.getByRole("button", { name: "发送消息", exact: true }),
   ).toBeDisabled();
