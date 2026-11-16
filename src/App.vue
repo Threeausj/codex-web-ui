@@ -456,7 +456,7 @@ watch(() => [state.hostId, state.hosts.length, state.connected, state.online, st
 const editDisabled = computed(() =>
   actionBusy.value || state.busy || state.compacting || state.loading || !state.online ||
   state.selectingThread || state.switchingHost || state.changingContext ||
-  state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady),
+  state.runtimePaused || state.threadReleased || (state.activeThread && !state.threadReady && !api.canRetryMessageEdit()),
 );
 const forkActionsDisabled = computed(() =>
   !state.activeThread || actionBusy.value || !state.connected || !state.online ||

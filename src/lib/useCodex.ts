@@ -339,7 +339,7 @@ const completedTurns = new Set<string>();
 const seenThreadChanges = new Set<string>();
 const revertedTurnCandidates = new Map<string, { ids: Set<string>; awaitingAcknowledgement: boolean }>();
 let takeoverOperation = 0;
-let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
+let pendingMessageEdit: { hostId: string; threadId: string; item: DisplayItem; reverted: boolean; blocked: boolean; runtimeRetirements: number; needsHistory?: boolean; prefixLastTurnId?: string | null } | null = null;
 const terminalListeners = new Set<(chunk: string) => void>();
 const protocolListeners = new Set<(hostId: string, message: any) => boolean | void>();
 let hostOrderRevision = 0;
@@ -1740,6 +1740,8 @@ function selectedConversationBusy(threadId: string) {
 }
 function retireThreadRuntime(threadId: string) {
   if (!threadId) return;
+  if (pendingMessageEdit?.hostId === state.hostId && pendingMessageEdit.threadId === threadId)
+    ++pendingMessageEdit.runtimeRetirements;
   const thread = state.threads.find(thread => thread.id === threadId) ||
     (state.activeThread?.id === threadId ? state.activeThread : undefined);
   if (thread) updateThread({ ...thread, status: { type: 'notLoaded' } });
@@ -3972,10 +3974,17 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     sendInFlight = false;
   }
 }
+function canRetryMessageEdit() {
+  const edit = pendingMessageEdit;
+  return !!edit && edit.reverted && !edit.blocked && edit.hostId === state.hostId && edit.threadId === state.activeThread?.id &&
+    state.authenticated && state.connected && state.online && !state.runtimePaused && !state.threadReleased && !state.threadConflict &&
+    !state.busy && !state.compacting && !state.editingMessage && !state.selectingThread && !state.switchingHost && !state.changingContext;
+}
 function canEditMessage(itemId: string) {
   const item = state.items.find(entry => entry.id === itemId);
   if (item?.content?.some((input: any) => input.type === 'text' && asyncQuestionAnswerDisplayText(input.text) !== null)) return false;
-  const blocked = !state.threadReady || state.runtimePaused || state.threadReleased || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
+  const retrying = pendingMessageEdit?.item.id === itemId && canRetryMessageEdit();
+  const blocked = !state.threadReady && !retrying || state.runtimePaused || state.threadReleased || !!state.threadConflict || !state.connected || !state.online || state.busy || state.editingMessage || sendInFlight || state.selectingThread || state.switchingHost || state.changingContext;
   if (blocked) return false;
   if (pendingMessageEdit?.item.id === itemId && pendingMessageEdit.hostId === state.hostId && pendingMessageEdit.threadId === state.activeThread?.id) {
     if (pendingMessageEdit.blocked) return false;
@@ -4039,6 +4048,7 @@ async function resendEditedMessage(itemId: string, text: string, attachments?: M
   const hostId = state.hostId;
   const threadId = state.activeThread.id;
   const generation = selectionGeneration;
+  const authentication = authenticationGeneration, requestSocket = socket, requestEngine = engineId;
   const original = pendingMessageEdit?.reverted && pendingMessageEdit.item.id === itemId
     ? pendingMessageEdit.item : state.items.find(item => item.id === itemId)!;
   const input = editedMessageInput(original, text, attachments);
@@ -4049,11 +4059,40 @@ async function resendEditedMessage(itemId: string, text: string, attachments?: M
   if (selectedModel?.inputModalities?.length && !selectedModel.inputModalities.includes('image') && input.some(entry => ['image', 'localImage'].includes(entry.type)))
     throw fail(new Error('当前模型不支持图片，请选择支持图片的模型后重新发送'));
   if (!pendingMessageEdit?.reverted || pendingMessageEdit.item.id !== itemId)
-    pendingMessageEdit = { hostId, threadId, item: JSON.parse(JSON.stringify(original)), reverted: false, blocked: false, prefixLastTurnId: state.turns.at(-2)?.id ?? null };
+    pendingMessageEdit = { hostId, threadId, item: JSON.parse(JSON.stringify(original)), reverted: false, blocked: false, runtimeRetirements: 0, prefixLastTurnId: state.turns.at(-2)?.id ?? null };
   const edit = pendingMessageEdit;
   state.editingMessage = true;
   const key = recencyKey(hostId, threadId);
-  const stillSelected = () => hostId === state.hostId && threadId === state.activeThread?.id && generation === selectionGeneration;
+  const stillSelected = () => pendingMessageEdit === edit && state.authenticated && authentication === authenticationGeneration &&
+    hostId === state.hostId && threadId === state.activeThread?.id && generation === selectionGeneration &&
+    requestSocket === socket && requestEngine === engineId;
+  const available = () => stillSelected() && state.connected && state.online && !state.runtimePaused && !state.threadReleased && !state.threadConflict;
+  const changedHead = () => {
+    edit.blocked = true;
+    if (stillSelected()) void selectThread(threadId);
+    return new Error('会话已被其他客户端更新，请取消编辑并确认最新历史');
+  };
+  const restorePrefix = async () => {
+    const revision = turnRevisions.get(threadId) ?? 0;
+    const retirements = edit.runtimeRetirements;
+    // A retry always reads the latest head, never the original revert cursor.
+    const page = await history(threadId, null, hostId);
+    if (!stillSelected()) throw new Error('会话已切换，请返回原会话重新发送');
+    const ownTeardown = edit.runtimeRetirements > retirements && !state.threadReady;
+    const liveHead = state.turns.at(-1)?.id;
+    if (edit.blocked || (page.data[0]?.id ?? null) !== edit.prefixLastTurnId || page.data[0]?.status === 'inProgress' || state.busy ||
+        (turnRevisions.get(threadId) ?? 0) !== revision && !ownTeardown ||
+        ownTeardown && liveHead !== undefined && liveHead !== edit.prefixLastTurnId)
+      throw changedHead();
+    state.turns = [...page.data].reverse();
+    state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
+    if (!page.data.length && !page.nextCursor)
+      updateThread({ ...state.activeThread, preview: '' }, { authoritativePreview: true });
+    itemCache.set(threadId, state.items);
+    turnCursor = page.nextCursor;
+    state.moreTurns = !!turnCursor;
+    edit.needsHistory = false;
+  };
   try {
     if (!edit.reverted) {
       const revision = turnRevisions.get(threadId) ?? 0;
@@ -4079,24 +4118,43 @@ async function resendEditedMessage(itemId: string, text: string, attachments?: M
       updateThread(result.thread, { authoritativePreview: true });
     }
     if (edit.reverted) {
-      const revision = turnRevisions.get(threadId) ?? 0;
-      // Read the current head on retries, so a newer turn from another client
-      // cannot be hidden by the cursor returned from the original revert.
-      const page = await history(threadId, null, hostId);
-      if (!stillSelected()) throw new Error('会话已切换，请返回原会话重新发送');
-      if ((page.data[0]?.id ?? null) !== edit.prefixLastTurnId || (turnRevisions.get(threadId) ?? 0) !== revision) {
-        edit.blocked = true;
-        void selectThread(threadId);
-        throw new Error('会话已被其他客户端更新，请取消编辑并确认最新历史');
+      await restorePrefix();
+      if (!state.threadReady || state.activeThread?.status?.type === 'notLoaded') {
+        state.threadReady = false;
+        writerAttachment = null;
+        if (!available()) throw new Error('会话连接已变化，请恢复连接后重新发送');
+        const retirement = edit.runtimeRetirements;
+        const result = await rpc('thread/resume', {
+          threadId, excludeTurns: true, config: { 'features.default_mode_request_user_input': true },
+        }, 45000, { silentError: true });
+        if (!available()) throw new Error('会话连接已变化，请恢复连接后重新发送');
+        if (state.busy || result.thread?.status?.type === 'active' || (state.turns.at(-1)?.id ?? null) !== edit.prefixLastTurnId) throw changedHead();
+        if (edit.runtimeRetirements !== retirement || result.thread?.id !== threadId || result.thread.status?.type === 'notLoaded')
+          throw new Error('会话运行状态已变化，请重试恢复后重新发送');
+        // Revert can unload its native writer. Only a successful native resume
+        // plus a fresh, unchanged prefix authorizes the replacement turn. This
+        // rejoin does not replay global defaults or overwrite composer choices.
+        updateThread(result.thread);
+        await restorePrefix();
+        if (!available() || edit.runtimeRetirements !== retirement)
+          throw new Error('会话运行状态已变化，请重试恢复后重新发送');
+        if (state.runtimePolicy?.source === 'native') {
+          const previous = state.runtimePolicy;
+          const restored = restoreRuntimePermissionPolicy(result, previous);
+          const fingerprint = (policy: RuntimePermissionPolicy) => JSON.stringify([
+            policy.sandboxPolicy, policy.approvalPolicy, policy.activePermissionProfile ?? null, policy.approvalsReviewer ?? null,
+          ], (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+            ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))) : value);
+          // Missing legacy provenance does not erase saved grants; explicit
+          // profile/reviewer changes must be confirmed just like policy changes.
+          if (!restored || fingerprint({ ...previous, ...restored }) !== fingerprint(previous)) {
+            edit.blocked = true;
+            throw new Error('恢复后的会话权限已变化，请取消编辑并重新确认');
+          }
+        }
+        state.threadReady = true;
+        writerAttachment = { hostId, threadId, engineId: requestEngine };
       }
-      state.turns = [...page.data].reverse();
-      state.items = state.turns.flatMap(turn => turn.items.map((item: any) => ({ ...item, turnId: turn.id })));
-      if (!page.data.length && !page.nextCursor)
-        updateThread({ ...state.activeThread, preview: '' }, { authoritativePreview: true });
-      itemCache.set(threadId, state.items);
-      turnCursor = page.nextCursor;
-      state.moreTurns = !!turnCursor;
-      edit.needsHistory = false;
     }
     if (!stillSelected() || edit.blocked || state.busy) throw new Error('会话状态已变化，请重新打开后确认');
     await send(text, input);
@@ -4107,6 +4165,10 @@ async function resendEditedMessage(itemId: string, text: string, attachments?: M
     if ((error as { uncertain?: boolean }).uncertain) {
       edit.blocked = true;
       if (stillSelected() && state.connected) void selectThread(threadId);
+    }
+    if (stillSelected() && writerConflict(error)) {
+      edit.blocked = true;
+      state.threadConflict = { hostId, threadId, generation, message: '此对话正被其他 Codex 客户端占用，请取消编辑并核对会话后重试。' };
     }
     throw fail(error);
   } finally { state.editingMessage = false; }
@@ -6474,6 +6536,7 @@ export function useCodex() {
     dismissAsyncQuestionNotices,
     asyncQuestionNoticesState: asyncQuestionNotices.state,
     canEditMessage,
+    canRetryMessageEdit,
     resendEditedMessage,
     cancelMessageEdit,
     interrupt,

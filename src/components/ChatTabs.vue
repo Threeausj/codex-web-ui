@@ -159,5 +159,11 @@ defineExpose({ focusSelected: () => { if (selectedKey.value) focusTab(selectedKe
 </template>
 
 <style scoped>
-.chat-tab.preview .chat-tab-title { font-style: italic; }
+.chat-tab.preview .chat-tab-title {
+  /* CJK fallback fonts commonly lack italics and the app disables synthetic
+     faces. Tilt the whole label so every script uses the same preview cue. */
+  font-style: normal;
+  transform: skewX(-10deg);
+  transform-origin: center;
+}
 </style>
