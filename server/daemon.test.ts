@@ -40,6 +40,21 @@ test('read-only daemon version returns only validated version metadata', async t
   assert.deepEqual((await f.commands())[0].args, ['app-server', 'daemon', 'version'])
 })
 
+test('Windows attaches an existing daemon through a read-only version check without launching another server', async t => {
+  const f = await fixture(); t.after(() => fs.rm(f.directory, { recursive: true, force: true }))
+  assert.deepEqual(await ensureCodexDaemon({ ...host, platform: 'windows' }, f.options), { status: 'alreadyRunning', ...version })
+  assert.deepEqual((await f.commands()).map(command => command.args), [['app-server', 'daemon', 'version']])
+})
+
+test('Windows startup explains incomplete desktop packages and elevated SSH without leaking diagnostics', async t => {
+  for (const [diagnostic, code] of [['this CLI has no complete local package', 'daemon_incomplete_package'], ['start the Windows daemon from a non-elevated terminal', 'daemon_windows_elevated']]) {
+    const f = await fixture(`console.error(${JSON.stringify(diagnostic + ' /private/user key=secret')});process.exitCode=1;`)
+    t.after(() => fs.rm(f.directory, { recursive: true, force: true }))
+    await assert.rejects(ensureCodexDaemon(host, f.options), (error: any) => error.code === code && !/private|secret/.test(error.message))
+    assert.equal((await f.commands()).length, 1)
+  }
+})
+
 test('an existing independently launched socket is reused without claiming daemon lifecycle ownership', async t => {
   const f = await fixture(`console.log(JSON.stringify({status:args.includes('version')?'running':'alreadyRunning',...${JSON.stringify(version)},managedCodexVersion:null,...(args.includes('version')?{backend:null}:{})}));`)
   t.after(() => fs.rm(f.directory, { recursive: true, force: true }))

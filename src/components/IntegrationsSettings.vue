@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import Icon from './Icon.vue';
+import { isAbsoluteHostPath } from '../../shared/host-path';
 import { methodAccepts, mcpAuthLabel, mcpRuntimeLabel, safeAuthorizationUrl, type IntegrationCapabilities } from '../lib/integration-capabilities';
 const props = defineProps<{ api: any; state: any }>();
 const capabilities = ref<IntegrationCapabilities | null>(null);
@@ -22,7 +23,7 @@ const scope = () => JSON.stringify([props.state.hostId, props.api.runtimeIdentit
 const canReload = computed(() => methodAccepts(capabilities.value, 'config/mcpServer/reload', []));
 const capabilityNotice = computed(() => ({ proxy_runtime: '当前连接使用原生代理，无法用本机 CLI 协议确认代理进程的版本。原生操作暂不显示，请使用直接连接并刷新。', runtime_version_unknown: '当前连接未报告可验证的 Codex 版本。重新连接 Web Codex 后可刷新操作能力。', runtime_version_mismatch: '安装的 Codex 已更新，但当前连接仍使用旧版本。重新连接 Web Codex 后可刷新操作能力。' } as Record<string, string>)[capabilities.value?.reason || ''] || '暂时无法确认主机原生协议。清单仍可查看，更新 Codex 后可刷新操作能力。');
 function skillParams(skill: any, enabled: boolean) {
-  if (typeof skill.path === 'string' && skill.path.startsWith('/') && methodAccepts(capabilities.value, 'skills/config/write', ['path', 'enabled'])) return { path: skill.path, enabled };
+  if (isAbsoluteHostPath(skill.path) && methodAccepts(capabilities.value, 'skills/config/write', ['path', 'enabled'])) return { path: skill.path, enabled };
   if (typeof skill.name === 'string' && skill.name && methodAccepts(capabilities.value, 'skills/config/write', ['name', 'enabled'])) return { name: skill.name, enabled };
   return null;
 }

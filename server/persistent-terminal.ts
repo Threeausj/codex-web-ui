@@ -4,9 +4,10 @@ import { z } from 'zod'
 import type { Bridge } from './bridge.js'
 import type { Host } from './types.js'
 import { tmuxSandbox } from './tmux.js'
+import { isAbsoluteHostPath } from '../shared/host-path.js'
 
 type Dependencies = { getBridge: (hostId: string) => Promise<Bridge>; getHost: (id: string) => Host | undefined; requireAuth: RequestHandler; requireCsrf: RequestHandler }
-const input = z.object({ hostId: z.string().default('local'), cwd: z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f]/.test(value), 'An absolute working directory is required'), permission: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('read-only') }).strict()
+const input = z.object({ hostId: z.string().default('local'), cwd: z.string().min(1).max(4096).refine(isAbsoluteHostPath, 'An absolute working directory is required'), permission: z.enum(['read-only', 'workspace-write', 'danger-full-access']).default('read-only') }).strict()
 const blocked = (message: string) => /permission denied|operation not permitted|access denied|sandbox|namespace|bwrap|denied by/i.test(message)
 const blockedReason = '当前权限或容器隔离策略阻止检测 tmux；请检查权限与 namespace 支持，或明确选择完全访问后重试。'
 export function persistentSessionName(hostId: string, cwd: string) { return `codex-web-${createHash('sha256').update(`${hostId}\0${cwd}`).digest('hex').slice(0, 24)}` }
@@ -15,7 +16,9 @@ export function persistentSessionName(hostId: string, cwd: string) { return `cod
 export function registerPersistentTerminal(app: Express, deps: Dependencies) {
   app.post('/api/terminal-sessions/prepare', deps.requireAuth, deps.requireCsrf, async (req, res) => {
     const { hostId, cwd, permission } = input.parse(req.body)
-    if (!deps.getHost(hostId)) { res.status(404).json({ error: 'Host not found' }); return }
+    const host = deps.getHost(hostId)
+    if (!host) { res.status(404).json({ error: 'Host not found' }); return }
+    if (host.platform === 'windows') { res.json({ available: false, reason: 'Windows 原生终端使用 PowerShell；tmux 持久会话需添加 WSL 主机。' }); return }
     const bridge = await deps.getBridge(hostId)
     const metadata = await bridge.request('fs/getMetadata', { path: cwd }) as { isDirectory: boolean }
     if (!metadata.isDirectory) { res.status(400).json({ error: 'Working directory must be a directory' }); return }

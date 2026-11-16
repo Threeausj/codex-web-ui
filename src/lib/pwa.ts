@@ -71,6 +71,7 @@ let lastActiveWorker: ServiceWorker | null = null;
 let updateTimer: ReturnType<typeof setTimeout> | undefined;
 let updatePoll: ReturnType<typeof setTimeout> | undefined;
 let updateWorker: ServiceWorker | null = null;
+let activationRequestedAt = 0;
 const observedRegistrations = new WeakSet<ServiceWorkerRegistration>();
 const observedWorkers = new WeakSet<ServiceWorker>();
 let listenersInstalled = false;
@@ -104,6 +105,7 @@ function clearUpdateActivation() {
   updateTimer = undefined;
   updatePoll = undefined;
   updateWorker = null;
+  activationRequestedAt = 0;
 }
 function reloadUpdatedApp() {
   clearUpdateActivation();
@@ -140,6 +142,14 @@ function recognizeWorkerActivation(worker: ServiceWorker | null = updateWorker):
 
 function pollWorkerActivation() {
   if (!wantsReload || recognizeWorkerActivation()) return;
+  // A sleeping worker may not act on the first message. Reposting the same
+  // idempotent request is bounded by updateTimer and never reloads past the
+  // active-work guard. Do not keep targeting a worker that is being replaced.
+  if (updateWorker?.state === 'installed' && registration?.waiting === updateWorker &&
+      Date.now() - activationRequestedAt >= 1500) {
+    activationRequestedAt = Date.now();
+    try { updateWorker.postMessage({ type: 'SKIP_WAITING' }); } catch { /* Lifecycle polling and the existing deadline remain authoritative. */ }
+  }
   updatePoll = setTimeout(pollWorkerActivation, 500);
 }
 
@@ -386,6 +396,7 @@ export async function updatePwa() {
       refreshUpdateAvailability();
       pwaState.updateError = '应用更新超时，新版尚未完成激活，请重试或手动刷新页面。';
     }, 15000);
+    activationRequestedAt = Date.now();
     worker.postMessage({ type: 'SKIP_WAITING' });
     pollWorkerActivation();
   } catch (cause: any) {

@@ -7,6 +7,8 @@ import { z } from 'zod'
 import type { Bridge, BridgeOptions } from './bridge.js'
 import { runHostPython } from './host-helper.js'
 import type { Host } from './types.js'
+import { isAbsoluteHostPath, joinHostPath } from '../shared/host-path.js'
+import { windowsUploadSource } from './windows-upload.js'
 
 export type RemoteUploadInput = {
   action: 'prepare' | 'write' | 'cleanup'
@@ -135,14 +137,14 @@ type Dependencies = {
   bridgeOptions?: BridgeOptions
   runRemote?: (host: Host, source: string) => Promise<string>
 }
-const absolutePath = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value), '需要绝对项目路径')
+const absolutePath = z.string().min(1).max(4096).refine(isAbsoluteHostPath, '需要绝对项目路径')
 const route = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
 
 export function registerUploads(app: Express, dependencies: Dependencies) {
   const upload = multer({ storage: multer.memoryStorage(), limits: { files: 8, fileSize: 20 * 1024 * 1024, fields: 4, fieldSize: 8192 } })
   const execute = dependencies.runRemote ?? ((host: Host, source: string) => runHostPython(host, source, dependencies.bridgeOptions, { timeoutMs: 60000 }))
   const remote = async (host: Host, input: RemoteUploadInput) => {
-    const output = await execute(host, remoteUploadSource(input))
+    const output = await execute(host, host.platform === 'windows' ? windowsUploadSource(input) : remoteUploadSource(input))
     let result: { ok?: boolean; code?: string }
     try { result = JSON.parse(output) }
     catch { throw new Error('远程上传返回格式不正确，请检查 SSH 连接后重试。') }
@@ -158,8 +160,8 @@ export function registerUploads(app: Express, dependencies: Dependencies) {
     if (!host) { res.status(404).json({ error: 'Host not found' }); return }
     const uploadId = randomUUID()
     const uploadCwd = host.kind === 'local' ? dependencies.cwd : absolutePath.parse(req.body?.cwd || host.cwd)
-    const baseDirectory = host.kind === 'local' ? path.join(dependencies.dataDir, 'uploads') : path.posix.join(uploadCwd, '.codex-web-uploads')
-    const directory = path.posix.join(baseDirectory, uploadId)
+    const baseDirectory = host.kind === 'local' ? path.join(dependencies.dataDir, 'uploads') : joinHostPath(uploadCwd, '.codex-web-uploads')
+    const directory = joinHostPath(baseDirectory, uploadId)
     const entries = files.map((file, index) => {
       const name = path.posix.basename(file.originalname.replace(/\\/g, '/')).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 180) || 'upload'
       return { file, name, filename: `${index}-${name}` }
@@ -178,7 +180,7 @@ export function registerUploads(app: Express, dependencies: Dependencies) {
       const bridge = host.kind === 'local' ? await dependencies.getBridge(hostId) : undefined
       const saved: { name: string; path: string; mime: string; size: number }[] = []
       for (const { file, name, filename } of entries) {
-        const destination = path.posix.join(directory, filename)
+        const destination = joinHostPath(directory, filename)
         if (bridge) {
           await bridge.request('fs/writeFile', { path: destination, dataBase64: file.buffer.toString('base64') })
           await fs.chmod(destination, 0o600)

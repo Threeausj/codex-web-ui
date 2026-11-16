@@ -1,3 +1,4 @@
+import { isAbsoluteHostPath } from '../shared/host-path.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -13,7 +14,7 @@ const cadence = z.discriminatedUnion('kind', [
 ]);
 export const automationInput = z.object({
   name: z.string().trim().min(1).max(100), hostId: z.string().min(1).max(256),
-  cwd: z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value)),
+  cwd: z.string().min(1).max(4096).refine(isAbsoluteHostPath),
   prompt: z.string().trim().min(1).max(16000), model: z.string().max(256), effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']),
   permission: z.enum(['read-only', 'workspace-write', 'danger-full-access']),
   timezone: z.string().max(100).refine(value => { try { new Intl.DateTimeFormat('en', { timeZone: value }); return true; } catch { return false; } }),

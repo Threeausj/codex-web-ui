@@ -4,6 +4,8 @@ import { z } from "zod";
 import type { Bridge, BridgeOptions } from "./bridge.js";
 import type { Host } from "./types.js";
 import { readHostGit } from "./git-read.js";
+import { runHostPython } from "./host-helper.js";
+import { isAbsoluteHostPath, normalizeHostPath, joinHostPath, hostDirname, withinHostPath } from '../shared/host-path.js';
 import type { CommandExecResponse } from "../shared/protocol/v2/CommandExecResponse.js";
 
 type GitBridge = Pick<Bridge, "request">;
@@ -14,7 +16,7 @@ export type GitDependencies = {
   busyWorktreeThreads?: (hostId: string, directory: string) => Promise<string[]>;
 };
 type Permission = "read-only" | "workspace-write" | "danger-full-access";
-type Context = { bridge: GitBridge; cwd: string; permission: Permission; read?: (cwd: string, args: string[]) => Promise<CommandExecResponse> };
+type Context = { bridge: GitBridge; cwd: string; permission: Permission; read?: (cwd: string, args: string[]) => Promise<CommandExecResponse>; resolveExecutable?: () => Promise<string>; executable?: string };
 export type GitFile = {
   path: string;
   originalPath?: string;
@@ -29,7 +31,7 @@ const absolute = z
   .min(1)
   .max(4096)
   .refine(
-    (value) => value.startsWith("/") && !/[\x00-\x1f\x7f]/.test(value),
+    isAbsoluteHostPath,
     "需要有效的绝对目录",
   );
 const scope = z.object({
@@ -62,7 +64,7 @@ const file = z
     (value) =>
       !value.startsWith("/") &&
       !value.startsWith("-") &&
-      !/[\x00-\x1f\x7f\\]/.test(value) &&
+      !/[\x00-\x1f\x7f\\:]/.test(value) &&
       !value
         .split("/")
         .some(
@@ -109,12 +111,14 @@ async function git(
         : { type: "readOnly", networkAccess: false };
   let result: CommandExecResponse;
   try {
+    if (writableRoots && context.resolveExecutable && !context.executable)
+      context.executable = await context.resolveExecutable();
     result =
       !writableRoots && context.read
         ? await context.read(context.cwd, args)
         : (await context.bridge.request("command/exec", {
             command: [
-              "git",
+              context.executable || "git",
               "--no-pager",
               "-c",
               "core.quotePath=false",
@@ -227,9 +231,9 @@ async function repository(context: Context) {
       throw error(`目录 ${context.cwd} 不是 Git 仓库，请选择仓库目录或其中的子目录。`, 409);
     throw cause;
   }
-  if (!root.startsWith("/")) throw error("无法识别 Git 仓库目录");
-  context.cwd = root;
-  return root;
+  if (!isAbsoluteHostPath(root)) throw error("无法识别 Git 仓库目录");
+  context.cwd = normalizeHostPath(root);
+  return context.cwd;
 }
 async function mutationRoots(context: Context, extra: string[] = []) {
   if (context.permission === "read-only")
@@ -243,8 +247,8 @@ async function mutationRoots(context: Context, extra: string[] = []) {
   return [
     ...new Set([
       context.cwd,
-      path.posix.resolve(context.cwd, common.stdout.trim()),
-      path.posix.resolve(context.cwd, privateGit.stdout.trim()),
+      isAbsoluteHostPath(common.stdout.trim()) ? normalizeHostPath(common.stdout.trim()) : joinHostPath(context.cwd, common.stdout.trim()),
+      isAbsoluteHostPath(privateGit.stdout.trim()) ? normalizeHostPath(privateGit.stdout.trim()) : joinHostPath(context.cwd, privateGit.stdout.trim()),
       ...extra,
     ]),
   ];
@@ -256,13 +260,20 @@ async function contextFor(
   const parsed = scope.parse(input);
   const context: Context = {
     bridge: await deps.getBridge(parsed.hostId),
-    cwd: path.posix.normalize(parsed.cwd),
+    cwd: normalizeHostPath(parsed.cwd),
     permission: parsed.permission,
   };
   if (deps.getHost) {
     const host = deps.getHost(parsed.hostId);
     if (!host) throw error("主机不存在", 404);
     context.read = (cwd, args) => readHostGit(host, cwd, args, deps.bridgeOptions);
+    if (host.platform === 'windows') context.resolveExecutable = async () => {
+      // The daemon may predate the SSH login environment. Use the same native
+      // Git found by read-only helpers without restarting that shared daemon.
+      const executable = JSON.parse(await runHostPython(host, "import json,shutil\nprint(json.dumps(shutil.which('git.exe')))\n", deps.bridgeOptions));
+      if (!isAbsoluteHostPath(executable)) throw error('Windows 主机未找到 Git，请安装 Git 或 Codex 桌面运行时后重试', 409);
+      return executable;
+    };
   }
   await repository(context);
   return context;
@@ -473,21 +484,19 @@ export function registerGit(app: Express, deps: GitDependencies) {
           startPoint: branch.optional(),
         })
         .parse(req.body);
-      const destination = path.posix.normalize(input.path);
+      const destination = normalizeHostPath(input.path);
       if (
-        destination === "/" ||
-        destination === context.cwd ||
-        destination.startsWith(`${context.cwd}/`) ||
-        context.cwd.startsWith(`${destination}/`)
+        hostDirname(destination) === destination ||
+        withinHostPath(context.cwd, destination) || withinHostPath(destination, context.cwd)
       )
         throw error("工作树应创建在当前项目之外的独立目录");
       const roots = await mutationRoots(context, [
-        path.posix.dirname(destination),
+        hostDirname(destination),
       ]);
       await assertBranch(context, input.branch);
       if (input.startPoint) await assertBranch(context, input.startPoint);
       const parent = (await context.bridge.request("fs/getMetadata", {
-        path: path.posix.dirname(destination),
+        path: hostDirname(destination),
       })) as { isDirectory?: boolean };
       if (!parent.isDirectory) throw error("工作树的父目录不存在");
       await git(
@@ -518,7 +527,7 @@ export function registerGit(app: Express, deps: GitDependencies) {
   app.post('/api/git/worktree/remove', route(async (req, res) => {
     const context = await contextFor(deps, req.body);
     const input = z.object({ path: absolute }).parse(req.body);
-    const destination = path.posix.normalize(input.path);
+    const destination = normalizeHostPath(input.path);
     const trees = parseWorktrees((await git(context, ['worktree', 'list', '--porcelain', '-z'])).stdout);
     const tree = trees.find(entry => entry.path === destination);
     if (!tree) throw error('工作树不存在或已被其他程序移除', 404);
@@ -528,7 +537,7 @@ export function registerGit(app: Express, deps: GitDependencies) {
     if (active.length) throw error('此工作树仍有正在运行的 Web 会话，请等待完成或先释放会话', 409);
     const changed = await git({ ...context, cwd: destination }, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']);
     if (changed.stdout) throw error('工作树有未提交或未跟踪文件，清理前请提交或另行保留这些改动', 409);
-    const roots = await mutationRoots(context, [path.posix.dirname(destination)]);
+    const roots = await mutationRoots(context, [hostDirname(destination)]);
     // No --force: Git rechecks dirty/locked state at removal time.
     await git(context, ['worktree', 'remove', '--', destination], roots);
     res.json({ ...(await status(context)), removedPath: destination });

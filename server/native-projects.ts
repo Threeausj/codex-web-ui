@@ -4,16 +4,17 @@ import { z } from 'zod'
 import type { Bridge } from './bridge.js'
 import type { Storage } from './storage.js'
 import type { Project } from './types.js'
+import { isAbsoluteHostPath, isWindowsHostPath, normalizeHostPath } from '../shared/host-path.js'
 
 export type NativeProjectResolution = { projectId: string | null; supported: boolean }
 type Dependencies = {
   storage: Pick<Storage, 'host' | 'projects'>
   getBridge(hostId: string): Promise<Pick<Bridge, 'request'>>
 }
-const absoluteRoot = z.string().min(1).max(4096).refine(value => value.startsWith('/') && !/[\x00-\x1f\x7f]/.test(value))
+const absoluteRoot = z.string().min(1).max(4096).refine(isAbsoluteHostPath)
 const nativeProject = z.object({ id: z.string().min(1).max(512), name: z.string(), roots: z.array(z.object({ path: absoluteRoot })) })
 const projectPage = z.object({ data: z.array(nativeProject), nextCursor: z.string().min(1).max(4096).nullable() })
-const normalizeRoot = (root: string) => path.posix.normalize(root).replace(/\/$/, '') || '/'
+const normalizeRoot = (root: string) => { const value = normalizeHostPath(root).replace(/\/$/, '') || '/'; return isWindowsHostPath(root) ? value.toLowerCase() : value }
 const normalizeRoots = (roots: string[]) => [...new Set(roots.map(normalizeRoot))].sort()
 const rootsKey = (roots: string[]) => JSON.stringify(normalizeRoots(roots))
 

@@ -1,4 +1,5 @@
 import type { CollaborationMode } from '../../shared/protocol/CollaborationMode';
+import { isAbsoluteHostPath } from '../../shared/host-path';
 
 export function nativeCollaborationMode(mode: 'default' | 'plan', model: string, effort: string): CollaborationMode {
   if (!model.trim()) throw new Error('模型配置尚未加载，请稍候');
@@ -16,7 +17,7 @@ export function skillInventory(result: any, cwd: string): any[] {
   return (result?.data || []).filter((entry: any) => entry.cwd === cwd)
     .flatMap((entry: any) => entry.skills || [])
     .filter((skill: any) => {
-      if (typeof skill.name !== 'string' || !skill.name || typeof skill.path !== 'string' || !skill.path.startsWith('/') || paths.has(skill.path)) return false;
+      if (typeof skill.name !== 'string' || !skill.name || !isAbsoluteHostPath(skill.path) || paths.has(skill.path)) return false;
       paths.add(skill.path);
       return true;
     });

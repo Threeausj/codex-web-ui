@@ -2,9 +2,13 @@ import { methodAccepts } from "./integration-capabilities";
 import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
 import type { FileEntryChange, FileEntryRequest } from '../../shared/file-entries';
+import type { InstalledPlugin, PluginInventory } from '../../shared/plugin-mentions';
+import { integrationInputs } from './plugin-mentions';
+import { validAppId } from '../../shared/plugin-mentions';
+import { isAbsoluteHostPath, joinHostPath } from '../../shared/host-path';
 import { useHostSettings } from './host-settings';
 import { usePromptPresets } from './prompt-presets';
-import { interactiveShellCommand } from '../../shared/terminal-shell';
+import { interactiveShellCommand, windowsInteractiveShellCommand } from '../../shared/terminal-shell';
 import { orderHosts } from '../../shared/host-order';
 import { orderProjects, projectOrderKey, type ProjectOrderEntry } from '../../shared/project-order';
 import { isProjectlessThread, PROJECTLESS_THREAD_SOURCE } from '../../shared/project-context';
@@ -168,6 +172,9 @@ const state = reactive({
   modeError: "",
   goalReadError: "",
   apps: [] as any[],
+  plugins: [] as InstalledPlugin[],
+  mentionsLoading: false,
+  mentionsError: '',
   mcpServers: [] as any[],
   account: null as any,
   rateLimits: null as any,
@@ -349,7 +356,7 @@ let latestProjectOrder: ProjectOrderEntry[] = [];
 function validProjectOrder(value: unknown): value is ProjectOrderEntry[] {
   return Array.isArray(value) && value.length <= 2000 && value.every(entry => entry &&
     typeof entry.hostId === 'string' && entry.hostId.length > 0 && entry.hostId.length <= 256 &&
-    typeof entry.path === 'string' && entry.path.startsWith('/') && entry.path.length <= 4096 &&
+    isAbsoluteHostPath(entry.path) && entry.path.length <= 4096 &&
     !/[\x00-\x1f\x7f]/.test(entry.hostId + entry.path)) &&
     new Set(value.map(projectOrderKey)).size === value.length;
 }
@@ -2118,6 +2125,7 @@ function receive(message: any) {
     return;
   }
   if (method === "skills/changed") { void loadSkills({ forceReload: true }).catch(() => {}); return; }
+  if (method === 'app/list/updated') { mentionsLoaded = ''; return; }
   if (method === "thread/goal/updated" || method === "thread/goal/cleared") {
     applyGoal(state.hostId, p.threadId, method === "thread/goal/cleared" ? null : p.goal);
     return;
@@ -3364,7 +3372,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   } catch (error) {
     if (current()) {
       if (writerConflict(error)) {
-        const message = '此对话正被其他 Codex 客户端占用。可以重试，或确认后强制进入。';
+        const message = '此对话被另一个 App Server 进程占用。两端连接同一后台服务才能共同操作；可重试，或确认后强制进入。';
         state.threadConflict = { hostId, threadId: id, generation, message };
         state.error = message;
         state.busy = false;
@@ -3747,8 +3755,10 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
     if (skill.enabled !== false && skillMention(inputs[0].text || "", skill.name) && !inputs.some(input => input.type === 'skill' && input.path === skill.path))
       inputs.push({ type: "skill", name: skill.name, path: skill.path });
   for (const app of state.apps)
-    if (app.slug && inputs[0].text.includes(`$${app.slug}`) && !inputs.some(input => input.type === 'mention' && input.path === `app://${app.id}`))
+    if (app.slug && validAppId(app.id) && app.isAccessible !== false && app.isEnabled !== false && skillMention(inputs[0].text || '', app.slug) && !inputs.some(input => input.type === 'mention' && input.path === `app://${app.id}`))
       inputs.push({ type: "mention", name: app.name, path: `app://${app.id}` });
+  for (const mention of integrationInputs(inputs[0]?.text || ''))
+    if (!inputs.some(input => input.type === 'mention' && input.path === mention.path)) inputs.push(mention);
   // Quoted text is context, not a source of skill/app commands or a Goal objective.
   if (!editedInput) for (const selection of selections)
     inputs.push({ type: 'text', text: formatConversationQuote(selection!), text_elements: [] });
@@ -5064,6 +5074,9 @@ async function setHost(id: string, options: { threadId?: string; projectPath?: s
   state.nativePermissionProfiles = [];
   resetModeContext();
   state.apps = [];
+  state.plugins = [];
+  state.mentionsLoading = false;
+  state.mentionsError = '';
   state.mcpServers = [];
   state.integrationErrors = [];
   state.rateLimits = null;
@@ -5378,7 +5391,7 @@ async function searchFiles(query: string) {
   const files = result.files.map((file: any) => ({
     ...file,
     name: file.file_name,
-    absolutePath: `${file.root.replace(/\/$/, "")}/${file.path}`,
+    absolutePath: isAbsoluteHostPath(file.path) ? file.path : joinHostPath(file.root, file.path),
   }));
   if (generation === searchGeneration && requestScope === scope())
     state.searchResults = files;
@@ -5450,7 +5463,7 @@ async function readFile(path: string, options: { silentError?: boolean; hostId?:
 async function downloadFile(path: string) {
   if (!state.authenticated || !state.hosts.some(host => host.id === state.hostId))
     throw new Error('请先登录并选择文件所在主机');
-  if (!path.startsWith('/') || /[\x00-\x1f\x7f\\]/.test(path)) throw new Error('需要绝对文件路径');
+  if (!isAbsoluteHostPath(path)) throw new Error('需要绝对文件路径');
   // Hand the transfer to the browser's download manager. Large files never
   // enter the WebSocket, a Base64 string, or a browser-sized in-memory Blob.
   const link = document.createElement("a");
@@ -5641,7 +5654,7 @@ async function startTerminal(
     const result = await rpc(
       "command/exec",
       {
-        command: options.command || [...interactiveShellCommand],
+        command: options.command || [...(state.hosts.find(host => host.id === state.hostId)?.platform === 'windows' ? windowsInteractiveShellCommand : interactiveShellCommand)],
         processId,
         tty: true,
         cwd: state.projectPath,
@@ -6149,6 +6162,47 @@ async function clearGoal() {
     await goalRpc(hostId, 'thread/goal/clear', { threadId });
     if (auth === authenticationGeneration && revision === (goalRevisions.get(key) || 0)) applyGoal(hostId, threadId, null);
   });
+}
+
+let mentionsLoaded = '', mentionsLoadedAt = 0, mentionsRequest: { key: string; promise: Promise<void> } | null = null;
+let mentionsGeneration = 0, mentionsVisibleKey = '';
+async function loadMentions(options: { forceReload?: boolean } = {}) {
+  const hostId = state.hostId, cwd = state.projectPath, threadId = state.threadReady ? state.activeThread?.id : undefined;
+  const key = JSON.stringify([authenticationGeneration, engineId, hostId, cwd, threadId]);
+  if (!options.forceReload && mentionsLoaded === key && Date.now() - mentionsLoadedAt < 30000) return;
+  if (mentionsRequest?.key === key) return mentionsRequest.promise;
+  const generation = ++mentionsGeneration;
+  if (mentionsVisibleKey !== key) { mentionsVisibleKey = key; state.plugins = []; state.apps = []; }
+  const current = () => generation === mentionsGeneration && state.authenticated && hostId === state.hostId && cwd === state.projectPath &&
+    key === JSON.stringify([authenticationGeneration, engineId, state.hostId, state.projectPath, state.threadReady ? state.activeThread?.id : undefined]);
+  state.mentionsLoading = true; state.mentionsError = '';
+  const errors: string[] = [];
+  const params = new URLSearchParams(); if (cwd) params.set('cwd', cwd); if (options.forceReload) params.set('force', '1');
+  const promise = (async () => {
+    const results = await Promise.allSettled([
+      loadSkills({ forceReload: !!options.forceReload }),
+      http(`/hosts/${encodeURIComponent(hostId)}/plugins?${params}`, {}, false).then((result: PluginInventory) => {
+        if (current()) { state.plugins = result.plugins || []; if (!result.supported && result.reason) errors.push(result.reason); }
+      }),
+      (async () => {
+        const apps: any[] = [], cursors = new Set<string>(); let cursor: string | undefined;
+        do {
+          const result = await rpc('app/list', { limit: 100, ...(threadId ? { threadId } : {}), ...(cursor ? { cursor } : {}), ...(options.forceReload ? { forceRefetch: true } : {}) }, 45000, { silentError: true });
+          if (!current()) return;
+          apps.push(...(result.data || []));
+          cursor = result.nextCursor || undefined;
+          if (cursor && (cursors.has(cursor) || apps.length >= 1000)) throw new Error('应用列表分页未完成，请刷新后重试');
+          if (cursor) cursors.add(cursor);
+        } while (cursor);
+        if (current()) state.apps = [...new Map(apps.map(app => [app.id, app])).values()];
+      })(),
+    ]);
+    if (!current()) return;
+    for (const [index, result] of results.entries()) if (result.status === 'rejected') errors.push(`${['技能', '插件', '应用'][index]}：${result.reason?.message || '加载失败'}`);
+    state.mentionsError = errors.join('；');
+    if (!errors.length) { mentionsLoaded = key; mentionsLoadedAt = Date.now(); }
+  })().finally(() => { if (generation === mentionsGeneration) state.mentionsLoading = false; if (mentionsRequest?.promise === promise) mentionsRequest = null; });
+  mentionsRequest = { key, promise }; return promise;
 }
 
 async function loadIntegrations() {
@@ -6666,6 +6720,7 @@ export function useCodex() {
     saveConfig,
     loadIntegrations,
     loadSkills,
+    loadMentions,
     loadModeCapabilities,
     attachSkill,
     removeSkill,

@@ -249,7 +249,7 @@ test('a queued worker update preserves an open preset editor until the user expl
 test('a queued app update waits for host Codex maintenance even when its settings tab is hidden', async ({ page, mock }) => {
   const information: any = { command: 'codex update', canUpdate: true, runtimeVersion: '0.164.0', operation: null };
   const requests: string[] = [];
-  await page.route('**/api/hosts/local/codex-update', route => {
+  await page.route('**/api/hosts/local/codex-update*', route => {
     if (route.request().method() === 'POST') {
       const { requestId } = route.request().postDataJSON();
       requests.push(requestId);
@@ -281,16 +281,43 @@ test('a queued app update waits for host Codex maintenance even when its setting
     expect(requests).toHaveLength(1);
     await settings.locator('.settings-nav').getByRole('button', { name: 'Codex', exact: true }).click();
     await expect(updater.getByRole('status')).toContainText('正在执行 codex update');
+    // Polling can observe completion before a manual refresh click. Install
+    // the navigation listener first and let the normal poll release the guard.
+    const reloaded = page.waitForEvent('domcontentloaded');
     information.runtimeVersion = '0.165.0';
     information.operation = { ...information.operation, state: 'completed', installedVersion: '0.165.0',
       runtimeVersion: '0.165.0', finishedAt: Date.now(), updatedAt: Date.now() };
-    await Promise.all([page.waitForEvent('domcontentloaded'), updater.getByRole('button', { name: '刷新更新状态', exact: true }).click()]);
+    await reloaded;
     await expect(input).toHaveValue('Codex 更新期间保留的草稿');
     await expect(page.getByRole('textbox', { name: '访问密码', exact: true })).toHaveCount(0);
     expect(navigations).toBe(1);
     expect(requests).toHaveLength(1);
     expect(mock.request('turn/start')).toBeUndefined();
     expect(mock.request('turn/interrupt')).toBeUndefined();
+  } finally { workerRevision = ''; }
+});
+
+test('a lost first worker activation request is retried without discarding the draft', async ({ page, mock }) => {
+  await page.addInitScript(() => {
+    const original = ServiceWorker.prototype.postMessage;
+    let requests = 0;
+    ServiceWorker.prototype.postMessage = function(message: any, ...rest: any[]) {
+      if (message?.type === 'SKIP_WAITING') {
+        (window as any).activationRequests = ++requests;
+        if (requests === 1) return;
+      }
+      return original.call(this, message, ...rest as []);
+    };
+  });
+  await loginBuilt(page);
+  await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill('激活重试时保留的草稿');
+  workerRevision = '\n// retry-first-worker-activation-fixture\n';
+  try {
+    await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())!.update());
+    await expect.poll(() => page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.waiting?.state)).toBe('installed');
+    await Promise.all([page.waitForEvent('domcontentloaded'), page.getByRole('button', { name: '更新应用', exact: true }).click()]);
+    await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toHaveValue('激活重试时保留的草稿');
+    expect(mock.request('turn/start')).toBeUndefined();
   } finally { workerRevision = ''; }
 });
 

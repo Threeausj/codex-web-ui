@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { Express, RequestHandler } from 'express';
 import type { Bridge } from './bridge.js';
 import type { Host, AuthenticatedRequest } from './types.js';
+import { isAbsoluteHostPath, isWindowsHostPath, normalizeHostPath, joinHostPath, hostDirname, withinHostPath } from '../shared/host-path.js';
 
 type PreviewDependencies = {
   getBridge: (hostId?: string) => Promise<Bridge>;
@@ -23,8 +24,7 @@ const MIME: Record<string, string> = {
   '.mp4': 'video/mp4', '.mp3': 'audio/mpeg',
 };
 export function withinRoot(root: string, target: string) {
-  const relative = path.posix.relative(root, target);
-  return relative !== '..' && !relative.startsWith('../') && !path.posix.isAbsolute(relative);
+  return withinHostPath(root, target);
 }
 export function rewritePreviewAssets(source: string, base: string, extension: string) {
   if (/^\.html?$/.test(extension)) {
@@ -42,15 +42,15 @@ export function registerPreview(app: Express, deps: PreviewDependencies) {
   app.get('/api/preview', deps.requireAuth, (req: AuthenticatedRequest, res) => {
     const hostId = typeof req.query.host === 'string' ? req.query.host : 'local';
     const file = typeof req.query.path === 'string' ? req.query.path : '';
-    if (!deps.getHost(hostId) || !file.startsWith('/') || file.includes('\0')) { res.status(400).send('请选择主机和绝对文件路径'); return; }
-    const target = path.posix.normalize(file);
+    if (!deps.getHost(hostId) || !isAbsoluteHostPath(file)) { res.status(400).send('请选择主机和绝对文件路径'); return; }
+    const target = normalizeHostPath(file);
     const requestedRoot = typeof req.query.root === 'string' ? req.query.root : '';
-    const root = requestedRoot.startsWith('/') && withinRoot(path.posix.normalize(requestedRoot), target) ? path.posix.normalize(requestedRoot) : path.posix.dirname(target);
+    const root = isAbsoluteHostPath(requestedRoot) && withinRoot(requestedRoot, target) ? normalizeHostPath(requestedRoot) : hostDirname(target);
     for (const [id, ticket] of tickets) if (ticket.expiresAt < Date.now()) tickets.delete(id);
     if (tickets.size >= 256) tickets.delete(tickets.keys().next().value!);
     const id = randomBytes(24).toString('base64url');
     tickets.set(id, { sessionId: req.session!.id, hostId, root, expiresAt: Date.now() + 60 * 60 * 1000 });
-    const relative = path.posix.relative(root, target).split('/').map(encodeURIComponent).join('/');
+    const relative = (isWindowsHostPath(root) ? path.win32 : path.posix).relative(root, target).split(/[\\/]/).map(encodeURIComponent).join('/');
     res.set('Cache-Control', 'no-store').redirect(`/api/preview-files/${id}/${relative}`);
   });
   // Opaque sandbox origins omit SameSite cookies on subresources. The random
@@ -60,13 +60,13 @@ export function registerPreview(app: Express, deps: PreviewDependencies) {
     if (!ticket || !deps.isSessionActive(ticket.sessionId) || ticket.expiresAt < Date.now()) { res.status(403).send('预览已过期，请重新打开'); return; }
     const raw = req.params.asset;
     const relative = Array.isArray(raw) ? raw.join('/') : String(raw);
-    const target = path.posix.resolve(ticket.root, relative);
-    if (!withinRoot(ticket.root, target) || relative.includes('\0')) { res.status(403).send('文件超出预览目录'); return; }
+    const target = joinHostPath(ticket.root, relative);
+    if (!withinRoot(ticket.root, target) || /[\x00-\x1f\\]/.test(relative) || /^[A-Za-z]:/.test(relative)) { res.status(403).send('文件超出预览目录'); return; }
     const bridge = await deps.getBridge(ticket.hostId);
     // Do not let a preview script follow symlinks out of its selected root.
     let segmentPath = ticket.root;
-    for (const segment of path.posix.relative(ticket.root, target).split('/')) {
-      segmentPath = path.posix.join(segmentPath, segment);
+    for (const segment of (isWindowsHostPath(ticket.root) ? path.win32 : path.posix).relative(ticket.root, target).split(/[\\/]/)) {
+      segmentPath = joinHostPath(segmentPath, segment);
       const meta = await bridge.request('fs/getMetadata', { path: segmentPath }) as { isSymlink: boolean; isFile: boolean; isDirectory: boolean };
       if (meta.isSymlink) { res.status(403).send('预览不跟随符号链接'); return; }
     }

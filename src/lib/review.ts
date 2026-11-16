@@ -1,3 +1,4 @@
+import { isAbsoluteHostPath } from '../../shared/host-path';
 import type { ReviewTarget } from '../../shared/protocol/v2/ReviewTarget';
 export type ReviewScope = 'uncommittedChanges' | 'baseBranch' | 'commit' | 'custom';
 export function reviewTarget(scope: ReviewScope, value = '', title?: string): ReviewTarget {
@@ -23,7 +24,7 @@ export function reviewFindings(review: unknown): ReviewFinding[] {
     if (!Array.isArray(output?.findings)) return [];
     return output.findings.slice(0, 100).flatMap((entry: any) => {
       const location = entry?.code_location;
-      if (!entry || typeof entry.title !== 'string' || typeof entry.body !== 'string' || typeof location?.absolute_file_path !== 'string' || !location.absolute_file_path.startsWith('/') || /[\x00-\x1f\x7f]/.test(location.absolute_file_path)) return [];
+      if (!entry || typeof entry.title !== 'string' || typeof entry.body !== 'string' || !isAbsoluteHostPath(location?.absolute_file_path) || /[\x00-\x1f\x7f]/.test(location.absolute_file_path)) return [];
       const range = location.line_range;
       const start = Number.isSafeInteger(range?.start) && range.start > 0 ? range.start : undefined;
       const end = Number.isSafeInteger(range?.end) && range.end >= (start || 1) ? range.end : undefined;

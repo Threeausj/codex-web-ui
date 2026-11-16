@@ -23,6 +23,10 @@ SSH 主机可以让 Codex 作为独立 daemon 运行，网页服务通过 `codex
 
 若目标 socket 上已有桌面端或 TUI 启动的兼容 App Server，原生 daemon 命令可能直接复用它。这类已有服务的生命周期仍由外部管理，网页可以连接与同步，但会禁用 daemon 重启、CLI 更新以及配置与账户修改。它不会因为选择“独立后台服务”就自动变成 Web 可管理的 daemon；需要在原客户端处理，或先核对空闲状态后另行迁移。
 
+## macOS / Windows 与桌面共同使用
+
+同一 `CODEX_HOME` 共享历史；同一 App Server 才能共同操作活动会话。Mac/Windows 桌面端“此电脑”与桌面端连接 Linux 的远程入口可能使用不同启动方式，不会因为开启独立 daemon 就自动共用进程。Windows 还需配置原生 SSH 入口、完整 CLI，并从普通终端首次启动后台；已运行时网页只查询与连接。实机结果及设置见[插件与跨平台说明](platform-plugins.md)。
+
 ## 重连与更新分别处理
 
 普通连接使用幂等的 `codex app-server daemon start`，已有 daemon 不会因网页连接、切换聊天或重新连接而自动升级或重启。

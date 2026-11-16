@@ -1,3 +1,4 @@
+import { isAbsoluteHostPath } from '../../shared/host-path';
 import { privateState } from './private-state';
 import { getCurrentScope, onScopeDispose, reactive, watch } from 'vue';
 import { resolvePermissionProfile } from './configuration';
@@ -436,7 +437,7 @@ export function useSideChat(api: any, mainState: any) {
       const metadata = await call(source.hostId, 'thread/read', { threadId: state.saveTargetThreadId, includeTurns: false });
       path = metadata?.thread?.path;
     }
-    if (typeof path !== 'string' || !path.startsWith('/')) return false;
+    if (!isAbsoluteHostPath(path)) return false;
     const result = await call(source.hostId, 'fs/readFile', { path });
     if (typeof result?.dataBase64 !== 'string' || result.dataBase64.length > 12 * 1024 * 1024) return false;
     const bytes = Uint8Array.from(atob(result.dataBase64), character => character.charCodeAt(0));

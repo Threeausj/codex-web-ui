@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { WINDOWS_PRIVATE_ACL_HELPER } from './windows-security.js'
 import { randomUUID } from 'node:crypto'
 import type { Express, RequestHandler } from 'express'
 import { z } from 'zod'
@@ -7,6 +8,7 @@ import { runHostPython } from './host-helper.js'
 import { nativeRuntimeVersion } from './native-capabilities.js'
 import { restartCodexDaemon } from './daemon.js'
 import type { Host } from './types.js'
+import { isAbsoluteHostPath, hostDirname, joinHostPath } from '../shared/host-path.js'
 
 const providerId = 'web_gateway'
 const secretFile = '.web-gateway-key'
@@ -15,7 +17,26 @@ const secretFile = '.web-gateway-key'
 export const gatewayTokenReader = 'import pathlib,sys; sys.stdout.write(pathlib.Path(sys.argv[1]).read_text())'
 export function gatewayKeyWriter(file: string, key: string): string {
   const payload = Buffer.from(JSON.stringify({ file, key })).toString('base64')
-  return `import base64,json,os,pathlib,tempfile\np=json.loads(base64.b64decode('${payload}'))\nf=pathlib.Path(p['file'])\nif not f.parent.is_dir(): raise RuntimeError('Codex home is missing')\nfd,tmp=tempfile.mkstemp(prefix='.web-key-',dir=str(f.parent))\ntry:\n    os.fchmod(fd,0o600)\n    with os.fdopen(fd,'w') as out: out.write(p['key']); out.flush(); os.fsync(out.fileno())\n    os.replace(tmp,str(f))\nfinally:\n    if os.path.exists(tmp): os.unlink(tmp)\nprint('ok')\n`
+  const security = Buffer.from(WINDOWS_PRIVATE_ACL_HELPER).toString('base64')
+  return `import base64,json,os,pathlib,tempfile,sys
+p=json.loads(base64.b64decode('${payload}'))
+f=pathlib.Path(p['file'])
+if not f.parent.is_dir(): raise RuntimeError('Codex home is missing')
+fd,tmp=tempfile.mkstemp(prefix='.web-key-',dir=str(f.parent))
+try:
+    if os.name=='nt':
+        exec(base64.b64decode('${security}'))
+        windows_private_acl(tmp,windows_current_sid())
+    else: os.fchmod(fd,0o600)
+    with os.fdopen(fd,'w',encoding='utf-8',newline='') as out:
+        fd=None
+        out.write(p['key']);out.flush();os.fsync(out.fileno())
+    os.replace(tmp,str(f))
+finally:
+    if fd is not None: os.close(fd)
+    if os.path.exists(tmp): os.unlink(tmp)
+print(json.dumps({'python':sys.executable}) if os.name=='nt' else 'ok')
+`
 }
 function safeUrl(value: string) {
   let url: URL
@@ -45,7 +66,7 @@ export function redactSettings(value: unknown): any {
   }))
 }
 const text = z.string().max(4096)
-const configPath = text.min(1).refine(value => path.isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(value), '配置路径必须为绝对路径')
+const configPath = text.min(1).refine(isAbsoluteHostPath, '配置路径必须为绝对路径')
 const empty = z.object({}).strict().optional()
 const paging = z.object({ cursor: z.string().max(8192).nullable().optional(), limit: z.number().int().min(1).max(100).optional() }).strict()
 // The built-in GCP provider was added in 0.165. Older/custom binaries must not
@@ -120,7 +141,7 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
     const activeProvider = config.model_providers?.[currentProvider]
     const user = [...(configuration.layers || [])].reverse().find((layer: any) => layer.name?.type === 'user' && !layer.name.profile)
     const configFile = user?.name?.file
-    const configPath = typeof configFile === 'string' && configFile.length <= 4096 && path.isAbsolute(configFile) && !/[\x00-\x1f\x7f]/.test(configFile) ? configFile : ''
+    const configPath = typeof configFile === 'string' && configFile.length <= 4096 && isAbsoluteHostPath(configFile) ? configFile : ''
     const providerName = typeof activeProvider?.name === 'string' ? activeProvider.name.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160) : ''
     const proxy = !bridge.runtime.managed
     // The effective provider is authoritative. A configured but inactive Web
@@ -164,8 +185,8 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
         throw busy('Google Cloud Vertex AI 需要 Codex 0.165.0 或更新版本，请先更新并重新连接此主机')
       const user = [...(before.layers || [])].reverse().find((layer: any) => layer.name?.type === 'user' && !layer.name.profile)
       const file = user?.name?.file
-      const home = bridge.codexHome || (typeof file === 'string' ? path.dirname(file) : '')
-      if (!home || !path.isAbsolute(home)) throw busy('Codex 未报告配置目录，请更新 Codex 后重试')
+      const home = bridge.codexHome || (typeof file === 'string' ? hostDirname(file) : '')
+      if (!isAbsoluteHostPath(home)) throw busy('Codex 未报告配置目录，请更新 Codex 后重试')
       const edits: any[] = []
       let stagedKey: string | undefined
       if (input.provider === 'gateway') {
@@ -174,16 +195,24 @@ export function registerHostSettings(app: Express, dependencies: Dependencies) {
           throw Object.assign(new Error('首次使用或更换中转站地址时，请输入 API Key'), { status: 400 })
         // Rotating a credential must not overwrite the old provider's key if
         // an optimistic config write subsequently fails.
-        const keyFile = input.apiKey ? path.join(home, `${secretFile}-${randomUUID()}`) : undefined
+        const keyFile = input.apiKey ? joinHostPath(home, `${secretFile}-${randomUUID()}`) : undefined
+        let tokenCommand = host.platform === 'windows' ? 'python.exe' : 'python3'
         if (input.apiKey) {
           if (/\s/.test(input.apiKey)) throw Object.assign(new Error('API Key 不能包含空白字符'), { status: 400 })
           if (dependencies.writeKey) await dependencies.writeKey(host, keyFile!, input.apiKey)
-          else await runHostPython(host, gatewayKeyWriter(keyFile!, input.apiKey), dependencies.bridgeOptions)
+          else {
+            const result = await runHostPython(host, gatewayKeyWriter(keyFile!, input.apiKey), dependencies.bridgeOptions)
+            if (host.platform === 'windows') {
+              const python = JSON.parse(result).python
+              if (!isAbsoluteHostPath(python)) throw busy('无法确认 Windows 认证读取程序，提供方配置尚未保存')
+              tokenCommand = python
+            }
+          }
           stagedKey = keyFile
         }
         edits.push({ keyPath: `model_providers.${providerId}`, mergeStrategy: 'replace', value: {
           name: 'Web Gateway', base_url: baseUrl, wire_api: 'responses',
-          auth: keyFile ? { command: 'python3', args: ['-c', gatewayTokenReader, keyFile] } : previous.auth,
+          auth: keyFile ? { command: tokenCommand, args: ['-c', gatewayTokenReader, keyFile] } : previous.auth,
         } })
         if (input.model?.trim()) edits.push({ keyPath: 'model', value: input.model.trim(), mergeStrategy: 'replace' })
       }

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import FileExplorerActions from './FileExplorerActions.vue';
 import type { FileEntryChange } from '../../shared/file-entries';
+import { hostDirname, joinHostPath, normalizeHostPath } from '../../shared/host-path';
 
 const props = defineProps<{
   api: any;
@@ -38,8 +39,9 @@ const canSelect = computed(
 );
 const parentPath = computed(() => {
   const path = currentPath.value || address.value.trim();
-  if (!path.startsWith("/") || path === "/") return "";
-  return path.replace(/\/+$/, "").replace(/\/[^/]+$/, "") || "/";
+  if (!path) return '';
+  const parent = hostDirname(path);
+  return parent === normalizeHostPath(path) ? '' : parent;
 });
 async function navigate(path?: string) {
   const requestGeneration = ++generation;
@@ -68,7 +70,7 @@ async function navigate(path?: string) {
   }
 }
 function openFolder(fileName: string) {
-  void navigate(`${currentPath.value.replace(/\/$/, "")}/${fileName}`);
+  void navigate(joinHostPath(currentPath.value, fileName));
 }
 function select() {
   if (canSelect.value) emit("selected", currentPath.value);

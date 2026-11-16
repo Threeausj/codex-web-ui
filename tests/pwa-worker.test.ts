@@ -52,7 +52,7 @@ function worker(options: { skipWaiting?: () => Promise<void> } = {}) {
   return { fire, listeners, notifications, opened, networkRequests, cached, setClients(value: any[]) { clients = value; }, setOffline(value: boolean) { offline = value; } };
 }
 
-test('an explicit update keeps its worker message alive until activation is accepted', async () => {
+test('an explicit update requests activation without holding the message event open', async () => {
   let accepted!: () => void;
   let calls = 0;
   const target = worker({ skipWaiting: () => { calls++; return new Promise<void>(resolve => { accepted = resolve; }); } });
@@ -62,7 +62,7 @@ test('an explicit update keeps its worker message alive until activation is acce
   const activation = target.fire('message', { data: { type: 'SKIP_WAITING' } }).then(() => { settled = true; });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(calls, 1);
-  assert.equal(settled, false, 'The worker must not end the event before skipWaiting resolves');
+  assert.equal(settled, true, 'Waiting for activation must not keep the waiting worker message open');
   accepted();
   await activation;
   assert.equal(settled, true);

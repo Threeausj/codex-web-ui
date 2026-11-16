@@ -43,7 +43,7 @@ def run(arguments,seconds):
     env=os.environ.copy()
     if config['home']: env['CODEX_HOME']=config['home']
     executable=[config['command']]+arguments
-    if config['remote']:
+    if config['remote'] and os.name!='nt':
         # Match the app-server launcher: login-shell PATH, POSIX command lookup,
         # explicit host Codex home applied after shell startup overrides.
         launch=('cd '+shlex.quote(config['cwd'])+' || exit 126\\n' if config['cwd'] else '')
@@ -53,7 +53,7 @@ def run(arguments,seconds):
     if config['cwd'] and not pathlib.Path(config['cwd']).is_dir(): raise UpdateFailure('directory')
     directory=config['cwd'] or None
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        try: process=subprocess.Popen(executable,cwd=directory,env=env,stdin=subprocess.DEVNULL,stdout=output,stderr=errors,start_new_session=True)
+        try: process=subprocess.Popen(executable,cwd=directory,env=env,stdin=subprocess.DEVNULL,stdout=output,stderr=errors,start_new_session=os.name!='nt',creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
         except (OSError,ValueError): raise UpdateFailure('not_executable')
         deadline=time.monotonic()+seconds
         failure=None
@@ -62,11 +62,15 @@ def run(arguments,seconds):
             if os.fstat(output.fileno()).st_size+os.fstat(errors.fileno()).st_size>2*1024*1024: failure='output_limit'; break
             time.sleep(0.1)
         if failure:
-            try: os.killpg(process.pid,signal.SIGTERM)
+            try:
+                if os.name=='nt': process.terminate()
+                else: os.killpg(process.pid,signal.SIGTERM)
             except ProcessLookupError: pass
             try: process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                try: os.killpg(process.pid,signal.SIGKILL)
+                try:
+                    if os.name=='nt': process.kill()
+                    else: os.killpg(process.pid,signal.SIGKILL)
                 except ProcessLookupError: pass
                 process.wait()
             raise UpdateFailure(failure)

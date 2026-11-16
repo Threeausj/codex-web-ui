@@ -216,7 +216,7 @@ test("strict directory queries reject relative, control-character, repeated and 
   const invalid = [
     "?path=relative",
     "?path=",
-    "?path=C%3A%5Cproject",
+    "?path=C%3Aproject",
     "?path=%2Fproject%00",
     "?path=%2Fproject%0A",
     "?path=%2Fproject%7F",

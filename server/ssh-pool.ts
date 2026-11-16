@@ -8,12 +8,14 @@ import type { Host } from './types.js'
 import type { SSHHostKeyPin } from './ssh-host-keys.js'
 import { sshKnownHostsArgs, type SSHConnectionControl } from './ssh.js'
 import { createSshAskpass } from './ssh-askpass.js'
+import { powershellCommand } from './windows-shell.js'
 
 const execute = promisify(execFile)
 type Master = { ready: Promise<void>; closed: Promise<void>; close(): void }
 type Entry = {
   key: string; hostId: string; control: SSHConnectionControl; master: Promise<Master>;
   references: number; retired: boolean; stopping: boolean; rawMaster?: Master; lastUsed: number; timer?: ReturnType<typeof setTimeout>
+  platformReady?: Promise<void>
 }
 export type SSHConnectionLease = { control: SSHConnectionControl; closed?: Promise<void>; release(): void }
 export type SshLease = SSHConnectionLease
@@ -68,7 +70,7 @@ export async function sshConnectionIdentity(host: Host, pin?: SSHHostKeyPin) {
       for (const value of values) if (value && value !== 'none') files.add(value)
   }
   const identities = await Promise.all([...files].sort().map(file => fileIdentity(file, file === pin?.file)))
-  return digest(JSON.stringify([host.id, host.hostname, host.username, host.port, host.identityFile, host.authentication,
+  return digest(JSON.stringify([host.id, host.hostname, host.username, host.port, host.identityFile, host.authentication, host.platform,
     pin?.hostKeyAlias, resolved.stdout, identities, process.env.SSH_AUTH_SOCK || '']))
 }
 
@@ -115,6 +117,18 @@ async function startMaster(host: Host, pin: SSHHostKeyPin | undefined, control: 
     } finally { await askpass?.dispose() }
   })()
   return { ready, closed, close }
+}
+
+/** Detect once per authenticated master. A nested PowerShell native pipeline
+ * can consume/transform protocol stdin and binary stdout. For that default
+ * shell the launcher must run its relay directly in the existing shell. */
+async function detectWindowsShell(host: Host, pin: SSHHostKeyPin | undefined, control: SSHConnectionControl) {
+  const command = powershellCommand("$ErrorActionPreference='Stop';$shell=(Get-ItemProperty 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;if(-not $shell -or $shell -match '(?i)(^|[\\\\/])cmd(?:\\.exe)?$'){[Console]::Out.Write('cmd')}elseif($shell -match '(?i)(^|[\\\\/])(?:powershell|pwsh)(?:\\.exe)?$'){[Console]::Out.Write('powershell')}else{[Console]::Out.Write('unsupported')}")
+  const { stdout } = await execute('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8',
+    ...sshKnownHostsArgs(pin, control), ...(host.port ? ['-p', String(host.port)] : []), '--', destination(host), command], { timeout: 12000, maxBuffer: 4096 })
+  const value = stdout.trim()
+  if (value !== 'cmd' && value !== 'powershell') throw new Error('Windows SSH 默认 Shell 暂不受支持；请使用 cmd 或 PowerShell，WSL 请按 Linux 主机连接。')
+  control.windowsShell = value
 }
 
 /** One strictly authenticated OpenSSH transport, with independent feature channels. */
@@ -182,7 +196,10 @@ export class SshConnectionPool {
           created.rawMaster = master
           void master.closed.then(() => { if (this.entries.get(key) === created) this.entries.delete(key); this.allEntries.delete(created); clearTimeout(created.timer); created.retired = true; void fs.rm(control.socketPath, { force: true }).catch(() => {}) })
           if (created.stopping || !current()) { master.close(); await master.ready.catch(() => {}); throw new Error('SSH 连接状态已变化，请重试') }
-          return master.ready.then(() => master, error => { master.close(); if (this.entries.get(key) === created) this.entries.delete(key); throw error })
+          return master.ready.then(async () => {
+            try { if (host.platform === 'windows' && !this.options.start) await detectWindowsShell(host, pin, control); return master }
+            catch (error) { master.close(); if (this.entries.get(key) === created) this.entries.delete(key); throw error }
+          }, error => { master.close(); if (this.entries.get(key) === created) this.entries.delete(key); throw error })
         }).catch(error => { if (this.entries.get(key) === created) this.entries.delete(key); if (!created.rawMaster) this.allEntries.delete(created); throw error })
       }
     }

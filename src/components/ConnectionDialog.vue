@@ -47,6 +47,7 @@ const draft = reactive({
   codexPath:
     props.host?.codexPath === "codex" ? "" : props.host?.codexPath || "",
   cwd: props.host?.cwd || "",
+  platform: props.host?.platform || 'posix',
   connectionMode: props.host?.id ? props.host.connectionMode || "inherit" : "daemon",
 });
 const title = computed(() =>
@@ -262,6 +263,7 @@ function payload() {
     authentication: identityMode.value === "password" ? "password" as const : "key" as const,
     ...(identityMode.value === "password" && password.value ? { password: password.value } : {}),
     codexPath: draft.codexPath.trim(),
+    platform: draft.platform,
     cwd: draft.cwd.trim(),
     connectionMode: draft.connectionMode === "inherit" ? null : draft.connectionMode,
   };
@@ -584,6 +586,7 @@ onBeforeUnmount(() => {
             <details class="ssh-advanced">
               <summary>高级选项 <Icon name="ChevronDown" :size="14" /></summary>
               <div class="ssh-advanced-fields">
+                <label class="ssh-field"><span>主机系统</span><select v-model="draft.platform" aria-label="SSH 主机系统" :disabled="!!busy"><option value="posix">Linux / macOS</option><option value="windows">Windows</option></select><small>Windows SSH 入口需使用 cmd；网页终端使用 PowerShell。独立后台服务需要完整 CLI 安装。</small></label>
                 <label class="ssh-field">
                   <span>Codex 运行方式</span>
                   <select v-model="draft.connectionMode" aria-label="Codex 运行方式" :disabled="!!busy">

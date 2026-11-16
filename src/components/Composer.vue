@@ -11,6 +11,9 @@ import { contextUsage } from "../lib/context-usage";
 import { composerMarkdownPreview } from "../lib/composer-markdown";
 import { continueMarkdown, formatMarkdown, isMarkdownCodeAt, type MarkdownEdit, type MarkdownFormat } from "../lib/markdown-editing";
 import { insertPromptPreset } from "../lib/prompt-presets";
+import { mentionedPlugins } from '../lib/plugin-mentions';
+import { integrationMention, validAppId } from '../../shared/plugin-mentions';
+import { isAbsoluteHostPath, joinHostPath } from '../../shared/host-path';
 import type { PromptPreset } from "../../shared/prompt-presets";
 import { conversationSelectionKey, normalizeConversationSelection, type ConversationSelectionSource } from "../lib/conversation-selection";
 import {
@@ -204,8 +207,16 @@ const modes = computed(() => [
 ].filter((mode) => `${mode.name} ${mode.id}`.toLowerCase().includes(query.value.toLowerCase())));
 const pickerFiles = ref<any[]>([]);
 const files = computed(() => pickerFiles.value.slice(0, 12).map((file: any) => ({ ...file, kind: "file" })));
+const matchingPlugins = computed(() => mentionedPlugins(props.state.plugins || [], props.state.skills || [])
+  .filter(plugin => `${plugin.displayName} ${plugin.name} ${plugin.description}`.toLowerCase().includes(query.value.toLowerCase()))
+  .map(plugin => ({ kind: 'plugin', id: `plugin:${plugin.id}`, name: plugin.displayName, description: plugin.enabled ? plugin.description : '此插件已在当前主机禁用',
+    icon: 'Package', image: plugin.icon, disabled: !plugin.enabled, path: `plugin://${plugin.id}` })));
+const matchingApps = computed(() => (props.state.apps || []).filter((app: any) => validAppId(app.id) &&
+  `${app.name} ${app.id} ${app.description || ''}`.toLowerCase().includes(query.value.toLowerCase()))
+  .map((app: any) => ({ kind: 'app', id: `app:${app.id}`, name: app.name, description: !app.isAccessible ? '此应用尚未连接或当前账户无权使用' : app.isEnabled === false ? '此应用已在当前主机禁用' : app.description,
+    icon: 'Globe', disabled: !app.isAccessible || app.isEnabled === false, path: `app://${app.id}` })));
 const results = computed<any[]>(() =>
-  picker.value === "commands" ? [...matchingCommands.value, ...matchingPresets.value, ...matchingSkills.value] : [...modes.value, ...files.value],
+  picker.value === "commands" ? [...matchingCommands.value, ...matchingPresets.value, ...matchingSkills.value] : [...matchingPlugins.value, ...matchingApps.value, ...modes.value, ...files.value],
 );
 const conversationMode = computed(() => props.state.goalMode ? "goal" : props.state.collaborationMode === "plan" ? "plan" : "default");
 const modeLabel = computed(() => conversationMode.value === "goal" ? "Goal 模式" : "Plan 模式");
@@ -512,6 +523,7 @@ function inspectInput() {
   const nextPicker = commandMatch ? "commands" : fileMatch ? "mentions" : "";
   const nextQuery = commandMatch?.[1] ?? fileMatch?.[1] ?? "";
   const wasCommands = picker.value === "commands";
+  const wasMentions = picker.value === 'mentions';
   if (picker.value !== nextPicker || query.value !== nextQuery) {
     selected.value = 0;
     pickerError.value = "";
@@ -534,6 +546,7 @@ function inspectInput() {
         pickerError.value = props.api.promptPresets.state.error;
     });
   if (picker.value === "mentions") {
+    if (!wasMentions && props.state.connected) void props.api.loadMentions?.();
     searchPending.value = true;
     const requestedQuery = nextQuery;
     searchTimer = setTimeout(async () => {
@@ -564,6 +577,11 @@ async function pick(result: any) {
   if (!result || result.disabled || choosing.value || pickerDisabled.value) return;
   if (result.kind === "preset") {
     usePreset(result.preset);
+  } else if (result.kind === 'plugin' || result.kind === 'app') {
+    const position = input.value?.selectionStart ?? draft.value.length;
+    const before = draft.value.slice(0, position).replace(/@[^\s]*$/, integrationMention(result.name, result.path) + ' ');
+    draft.value = before + draft.value.slice(position); picker.value = '';
+    await nextTick(); input.value?.focus(); input.value?.setSelectionRange(before.length, before.length);
   } else if (result.kind === "skill" || result.kind === "mode") {
     const key = draftKey.value;
     const chosenDraft = draft.value;
@@ -593,9 +611,9 @@ async function pick(result: any) {
     const before = draft.value.slice(0, position);
     const match = before.match(/(?:^|\s)@([^\s]*)$/);
     const root = result.root || props.state.projectPath;
-    const path = result.path?.startsWith("/")
+    const path = isAbsoluteHostPath(result.path)
       ? result.path
-      : `${root?.replace(/\/$/, "")}/${result.path || result.file_name || result.name}`;
+      : joinHostPath(root || '/', result.path || result.file_name || result.name);
     const replaced = before.replace(
       /@[^\s]*$/,
       `@${path.includes(" ") ? JSON.stringify(path) : path} `,
@@ -943,10 +961,10 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
       id="composer-picker"
       :style="{ maxHeight: `${pickerMaxHeight}px` }"
       role="listbox"
-      :aria-label="picker === 'commands' ? '对话指令' : '模式与项目文件'"
+      :aria-label="picker === 'commands' ? '对话指令' : '插件、应用、模式与文件'"
     >
       <div class="picker-label">
-        <span class="picker-heading">{{ picker === "commands" ? "指令、预设与技能" : "对话模式与文件" }}</span>
+        <span class="picker-heading">{{ picker === "commands" ? "指令、预设与技能" : "插件、应用、模式与文件" }}</span>
         <span class="picker-input-hint"><span class="picker-keyboard-hint">↑ ↓ 选择 · ↵ 确认</span><span class="picker-touch-hint">点击选择</span></span>
         <button type="button" class="icon-button picker-close" aria-label="关闭选择菜单" @pointerdown.prevent @click="closePicker"><Icon name="X" :size="14" /></button>
       </div>
@@ -963,7 +981,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         @mousedown.prevent
         @click="pick(result)"
       >
-        <Icon
+        <img v-if="result.image" :src="result.image" class="picker-integration-icon" alt="" />
+        <Icon v-else
           :name="result.kind === 'file' ? 'FileText' : result.icon"
           :size="17"
         />
@@ -978,6 +997,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
           }}</span>
         </div>
         <span v-if="result.kind === 'preset'" class="picker-kind">预设</span>
+        <span v-else-if="result.kind === 'plugin'" class="picker-kind">插件</span>
+        <span v-else-if="result.kind === 'app'" class="picker-kind">应用</span>
         <span v-else-if="result.kind === 'skill'" class="picker-kind">技能</span>
         <span v-else-if="result.kind === 'mode' && result.id === conversationMode" class="picker-kind">当前</span>
         <Icon v-if="index === selected" name="CornerDownLeft" :size="14" />
@@ -987,11 +1008,13 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
           searchPending
             ? "正在搜索…"
             : picker === "mentions"
-              ? "没有找到匹配的文件"
+              ? "没有找到匹配的插件、应用、模式或文件"
               : "没有匹配的指令、预设或技能"
         }}
       </div>
       <div v-if="picker === 'commands' && state.skillsLoading" class="picker-note" role="status">正在加载当前项目的技能…</div>
+      <div v-if="picker === 'mentions' && state.mentionsLoading" class="picker-note" role="status">正在读取当前主机的插件与应用…</div>
+      <div v-if="picker === 'mentions' && state.mentionsError" class="picker-note picker-error" role="alert">{{ state.mentionsError }}<button class="text-button" @click="api.loadMentions({ forceReload: true })">重新加载</button></div>
       <div v-if="pickerError || (picker === 'commands' && state.skillsError)" class="picker-note picker-error" role="alert">
         {{ pickerError || state.skillsError }}
         <button v-if="picker === 'commands'" class="text-button" @click="reloadSkills">重新加载</button>
@@ -1151,8 +1174,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             :disabled="!state.connected || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
             @pointerdown.prevent
             @click="insertAt"
-            title="选择模式或引用项目文件"
-            aria-label="选择模式或引用项目文件"
+            title="选择插件、应用、模式或引用项目文件"
+            aria-label="选择插件、应用、模式或引用项目文件"
             :aria-expanded="picker === 'mentions'"
             aria-haspopup="listbox"
           >
@@ -1406,6 +1429,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   .picker-close { width: 36px; height: 36px; }
 }
 .picker-kind { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
+.picker-integration-icon { flex: 0 0 auto; width: 20px; height: 20px; object-fit: contain; }
 .picker-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; font-size: 11px; color: var(--muted); }
 .picker-error, .composer-mode-error { color: var(--danger); }
 .composer-mode-error { padding-bottom: 9px; font-size: 12px; }

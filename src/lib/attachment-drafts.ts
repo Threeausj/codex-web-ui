@@ -1,4 +1,5 @@
 import { indexedPrivatePersistence, type PrivatePersistence } from './private-state';
+import { isAbsoluteHostPath } from '../../shared/host-path';
 
 export type DraftAttachment = {
   id: string; hostId: string; name: string; path: string; mime: string; size: number;
@@ -16,7 +17,7 @@ function valid(value: unknown, hostId: string): value is Document {
   const doc = value as Document;
   return doc?.version === 1 && doc.hostId === hostId && Array.isArray(doc.files) && doc.files.length <= 256 &&
     doc.files.every(file => file && typeof file.id === 'string' && file.hostId === hostId &&
-      typeof file.path === 'string' && file.path.startsWith('/') && file.path.length <= 8192 &&
+      isAbsoluteHostPath(file.path) &&
       typeof file.name === 'string' && file.name.length <= 512 && typeof file.mime === 'string' &&
       Number.isFinite(file.size) && file.size >= 0 && (!file.original || file.original instanceof Blob));
 }
