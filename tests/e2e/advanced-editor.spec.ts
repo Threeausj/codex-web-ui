@@ -20,7 +20,7 @@ test('multiple file drafts survive tab switches, bridge reconnection, panel clos
   await page.locator('.file-tree-row').filter({ hasText: 'index.html' }).click();
   await replaceSource(page, 'index.html 文件内容', '<h1>Second draft</h1>');
   mock.emit('bridge/status', { connected: false }); mock.emit('bridge/status', { connected: true });
-  await page.getByRole('navigation', { name: '已打开文件' }).getByRole('button', { name: 'README.md', exact: true }).click();
+  await page.getByRole('tab', { name: 'README.md', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'README.md 文件内容' })).toHaveText('# Private draftUnsaved second line');
   await page.getByRole('button', { name: '切换工作区', exact: true }).click();
   await page.getByRole('button', { name: '切换工作区', exact: true }).click();
@@ -66,7 +66,7 @@ test('multiple file drafts survive tab switches, bridge reconnection, panel clos
   await page.waitForTimeout(300);
   expect(await page.evaluate(() => (window as any).draftReadProbe.writes)).toBe(0);
   await page.evaluate(() => (window as any).draftReadProbe.release());
-  await page.getByRole('navigation', { name: '已打开文件' }).getByRole('button', { name: 'index.html', exact: true }).click();
+  await page.getByRole('tab', { name: 'index.html', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'index.html 文件内容' })).toHaveText('<h1>Second draft</h1>');
   expect(mock.requests.filter(request => request.method === 'fs/writeFile')).toHaveLength(0);
 });

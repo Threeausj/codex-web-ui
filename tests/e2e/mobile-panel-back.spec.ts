@@ -25,7 +25,7 @@ for (const panel of ['sidebar', 'workspace'] as const) {
     await expect.poll(() => guard(page)).toBe(true);
     await browserBack(page);
     if (panel === 'sidebar') await expect(page.locator('.sidebar')).not.toHaveClass(/mobile-open/);
-    else await expect(page.locator('#workspace-panel')).toHaveCount(0);
+    else await expect(page.locator('#workspace-panel')).toBeHidden();
     expect(page.url()).toBe(url);
     await expect(input).toHaveValue('返回手势保留草稿');
     await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
@@ -53,7 +53,7 @@ test('closing by button or backdrop consumes the guard, repeated opens do not ac
   await page.evaluate(() => history.forward());
   await expect.poll(() => guard(page)).toBe(false);
   await expect(page.locator('.sidebar')).not.toHaveClass(/mobile-open/);
-  await expect(page.locator('#workspace-panel')).toHaveCount(0);
+  await expect(page.locator('#workspace-panel')).toBeHidden();
 });
 
 test('mobile Back closes the top right panel then the left panel, while an immediate close/reopen stays open', async ({ page }) => {
@@ -64,7 +64,7 @@ test('mobile Back closes the top right panel then the left panel, while an immed
   await page.evaluate(() => (document.querySelector('[aria-label="切换工作区"]') as HTMLButtonElement).click());
   await expect(page.locator('#workspace-panel')).toBeVisible();
   await browserBack(page);
-  await expect(page.locator('#workspace-panel')).toHaveCount(0);
+  await expect(page.locator('#workspace-panel')).toBeHidden();
   await expect(page.locator('.sidebar')).toHaveClass(/mobile-open/);
   await expect.poll(() => guard(page)).toBe(true);
   await browserBack(page);
@@ -80,7 +80,7 @@ test('mobile Back closes the top right panel then the left panel, while an immed
   await expect(page.locator('#workspace-panel')).toBeVisible();
   await expect.poll(() => guard(page)).toBe(true);
   await browserBack(page);
-  await expect(page.locator('#workspace-panel')).toHaveCount(0);
+  await expect(page.locator('#workspace-panel')).toBeHidden();
   await expect.poll(() => guard(page)).toBe(false);
 });
 

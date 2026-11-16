@@ -185,6 +185,7 @@ for (const event of ['hidden', 'freeze'] as const) {
     await mock.install(reopened); await reopened.goto('/');
     await expect(reopened.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
     await reopened.getByRole('button', { name: '切换工作区', exact: true }).click();
+    await reopened.getByRole('tab', { name: 'README.md', exact: true }).click();
     await expect(reopened.getByRole('textbox', { name: 'README.md 文件内容', exact: true })).toContainText('立即保留的文件草稿');
     expect(mock.request('fs/writeFile')).toBeUndefined();
     expect(mock.request('turn/start')).toBeUndefined();

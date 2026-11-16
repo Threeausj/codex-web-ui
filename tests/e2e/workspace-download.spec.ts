@@ -29,7 +29,9 @@ test("workspace list and editor hand the saved file path to the browser download
   expect(url.pathname).toBe("/api/hosts/local/download");
   expect(url.searchParams.get("path")).toBe("/workspace/demo/README.md");
   expect(mock.request("fs/writeFile")).toBeUndefined();
+  await page.getByRole("tab", { name: "新对话", exact: true }).click();
   await page.getByLabel("选择权限", { exact: true }).selectOption("read-only");
+  await page.getByRole("tab", { name: "README.md", exact: true }).click();
   pending = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载文件", exact: true }).click();
   downloaded = await pending;

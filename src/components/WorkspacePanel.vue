@@ -34,8 +34,20 @@ const props = defineProps<{
   openPath?: string;
   openLine?: number;
   tmuxTarget?: { sessionId: string; paneId?: string };
+  filePreviewTarget?: string;
+  filePreviewVisible?: boolean;
 }>();
-const emit = defineEmits<{ close: []; error: [message: string]; add: [source: ConversationSelectionSource]; ask: [source: ConversationSelectionSource] }>();
+type FileTabsSnapshot = { scope: string; hostId: string; projectPath: string; files: { path: string; title: string; dirty: boolean; saving: boolean }[]; activePath: string };
+const emit = defineEmits<{
+  close: [];
+  error: [message: string];
+  add: [source: ConversationSelectionSource];
+  ask: [source: ConversationSelectionSource];
+  fileTabsChange: [snapshot: FileTabsSnapshot];
+  previewFile: [target: { path: string; hostId: string; projectPath: string }];
+  fileOpenFailed: [target: { path: string; hostId: string; projectPath: string }];
+}>();
+const externalFilePreview = computed(() => !!props.filePreviewTarget);
 const tab = ref(props.initialTab || "files");
 const tabs = [
   { id: "files", name: "文件", icon: "Folder" },
@@ -52,7 +64,7 @@ const directory = ref("");
 const directoryInput = ref("");
 const entries = ref<any[]>([]);
 const revealedFile = ref("");
-type EditorTab = { file: any; content: string; original: string; view: "preview" | "source"; conflict: any; saving: boolean; line?: number | null };
+type EditorTab = { file: any; content: string; original: string; view: "preview" | "source"; conflict: any; saving: boolean; line?: number | null; htmlPreview?: boolean };
 const editorTabs = ref<EditorTab[]>([]);
 const activePath = ref("");
 const activeEditor = computed(() => editorTabs.value.find(entry => entry.file.path === activePath.value));
@@ -62,6 +74,7 @@ const originalContent = computed({ get: () => activeEditor.value?.original || ""
 const fileEditor = ref<InstanceType<typeof CodeEditor>>();
 const selectedLine = computed({ get: () => activeEditor.value?.line || null, set: value => { if (activeEditor.value) activeEditor.value.line = value; } });
 const loading = ref(false);
+const openingFile = ref(false);
 const saving = computed({ get: () => !!activeEditor.value?.saving, set: value => { if (activeEditor.value) activeEditor.value.saving = value; } });
 const error = ref("");
 const downloading = ref("");
@@ -90,16 +103,30 @@ watch(tab, value => { if (value === "preview") previewMounted.value = true; });
 watch(previewSource, value => { if (value === "service") developmentMounted.value = true; });
 const fileView = computed({ get: () => activeEditor.value?.view || "preview", set: value => { if (activeEditor.value) activeEditor.value.view = value; } });
 const draftWarning = ref("");
-let activeScope = "", draftTimer: ReturnType<typeof setTimeout> | undefined, workspaceReady: Promise<void> = Promise.resolve();
+const activeScope = ref("");
+let draftTimer: ReturnType<typeof setTimeout> | undefined, workspaceReady: Promise<void> = Promise.resolve();
 function persistDrafts() {
   clearTimeout(draftTimer);
-  if (!activeScope || !props.state.authenticated) return;
-  const scope = activeScope;
+  if (!activeScope.value || !props.state.authenticated) return;
+  const scope = activeScope.value;
   const tabs = editorTabs.value.map(entry => ({ ...entry, saving: false, file: { ...entry.file, dataUrl: undefined, dataBase64: undefined } }));
-  void privateState.write("file-workspace", scope, { tabs, activePath: activePath.value }).then(() => { if (scope === activeScope) draftWarning.value = ""; }).catch(cause => { if (scope === activeScope) draftWarning.value = `草稿保留在当前页面，持久化失败：${cause.message}`; });
+  void privateState.write("file-workspace", scope, { tabs, activePath: activePath.value }).then(() => { if (scope === activeScope.value) draftWarning.value = ""; }).catch(cause => { if (scope === activeScope.value) draftWarning.value = `草稿保留在当前页面，持久化失败：${cause.message}`; });
 }
 function scheduleDrafts() { clearTimeout(draftTimer); draftTimer = setTimeout(persistDrafts, 180); }
 watch([editorTabs, activePath], scheduleDrafts, { deep: true });
+function fileTabsSnapshot(): FileTabsSnapshot { return {
+  scope: fileScope(), hostId: props.state.hostId, projectPath: props.state.projectPath || "",
+  files: activeScope.value === fileScope() ? editorTabs.value.map(entry => ({ path: entry.file.path, title: entry.file.path.split('/').pop() || entry.file.path, dirty: entry.content !== entry.original, saving: entry.saving })) : [],
+  activePath: activeScope.value === fileScope() ? activePath.value : "",
+}; }
+watch(fileTabsSnapshot, value => emit('fileTabsChange', value), { deep: true, immediate: true });
+function announceFilePreview(path: string) {
+  if (!externalFilePreview.value || !path) return;
+  // Publish tab metadata before activation so the center can show a newly
+  // opened file during this render, including from the mobile drawer.
+  emit('fileTabsChange', fileTabsSnapshot());
+  emit('previewFile', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
+}
 // Keep inactive Office tabs as metadata only. Each preview is up to 8 MiB;
 // retaining all sixteen Base64 packages would waste mobile memory. A selected
 // binary tab without bytes is already re-read by openFile below.
@@ -145,13 +172,19 @@ const isMarkdown = computed(() => !file.value?.binary && isMarkdownPath(file.val
 const isOffice = computed(() => !!officeFileKind(file.value?.path || ""));
 const isJson = computed(() => !file.value?.binary && isJsonPath(file.value?.path || ""));
 const isJsonPreview = computed(() => isJson.value && fileView.value === "preview");
+const isHtml = computed(() => !file.value?.binary && /\.html?$/i.test(file.value?.path || ""));
+const htmlPreviewUrl = computed(() => file.value && isHtml.value ? `/api/preview?host=${encodeURIComponent(props.state.hostId)}&path=${encodeURIComponent(file.value.path)}&root=${encodeURIComponent(props.state.projectPath)}` : "");
 const jsonPreviewContent = computed(() => isJsonPreview.value ? jsonUnicodePreview(content.value) : "");
 function join(base: string, name: string) {
   return `${base.replace(/\/$/, "")}/${name}`;
 }
 async function readDirectory(path: string, interruptReveal = true) {
   if (!path) return;
-  if (interruptReveal) { ++revealGeneration; ++fileGeneration; revealedFile.value = ""; activePath.value = ""; }
+  if (interruptReveal) {
+    ++revealGeneration; revealedFile.value = "";
+    // Directory browsing does not replace the middle column's selected file.
+    if (!externalFilePreview.value) { ++fileGeneration; openingFile.value = false; activePath.value = ""; }
+  }
   const generation = ++directoryGeneration;
   const scope = fileScope();
   loading.value = true;
@@ -170,12 +203,13 @@ async function readDirectory(path: string, interruptReveal = true) {
       loading.value = false;
   }
 }
-async function openFile(path: string, destination = "files", line?: number, parentDirectory?: Promise<void>) {
+async function openFile(path: string, destination = "files", line?: number, parentDirectory?: Promise<void>, activate = true) {
   if (!path) return;
   if (file.value?.path === path && (!file.value.binary && !/^image\//.test(file.value.mime) || file.value.dataUrl || file.value.dataBase64)) {
     ++fileGeneration;
-    loading.value = false;
+    loading.value = false; openingFile.value = false;
     tab.value = destination;
+    if (activate) announceFilePreview(path);
     previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
     if (line) await focusLine(line);
@@ -185,15 +219,16 @@ async function openFile(path: string, destination = "files", line?: number, pare
   const existing = editorTabs.value.find(entry => entry.file.path === path);
   if (existing) {
     ++fileGeneration;
-    loading.value = false;
+    loading.value = false; openingFile.value = false;
     error.value = "";
     activePath.value = path; tab.value = destination; previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
-    if (!existing.file.binary && !/^image\//.test(existing.file.mime)) { if (line) await focusLine(line); return; }
-    if (existing.file.dataUrl || existing.file.dataBase64) return;
+    if (!existing.file.binary && !/^image\//.test(existing.file.mime)) { if (activate) announceFilePreview(path); if (line) await focusLine(line); return; }
+    if (existing.file.dataUrl || existing.file.dataBase64) { if (activate) announceFilePreview(path); return; }
   }
   if (!existing && editorTabs.value.length >= 16) { error.value = "最多打开 16 个文件，请先关闭一个标签"; return; }
   loading.value = true;
+  openingFile.value = true;
   const generation = ++fileGeneration;
   const scope = fileScope();
   error.value = "";
@@ -206,6 +241,7 @@ async function openFile(path: string, destination = "files", line?: number, pare
     previewDocument.value = destination === "preview";
     if (destination === "preview") previewInput.value = path;
     tab.value = destination;
+    if (activate) announceFilePreview(path);
     if (line) await focusLine(line);
   } catch (cause: any) {
     if (generation === fileGeneration && scope === fileScope()) {
@@ -220,11 +256,15 @@ async function openFile(path: string, destination = "files", line?: number, pare
       const parent = path.slice(0, path.lastIndexOf("/")) || "/";
       if (parentDirectory) await parentDirectory;
       else if (directory.value !== parent) await readDirectory(parent, false);
-      if (generation === fileGeneration && scope === fileScope()) error.value = message;
+      if (generation === fileGeneration && scope === fileScope()) {
+        error.value = message;
+        if (externalFilePreview.value) emit('fileOpenFailed', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
+      }
     }
   } finally {
-    if (generation === fileGeneration && scope === fileScope())
-      loading.value = false;
+    if (generation === fileGeneration && scope === fileScope()) {
+      loading.value = false; openingFile.value = false;
+    }
   }
 }
 async function focusLine(line: number) {
@@ -243,8 +283,7 @@ async function revealPath(path: string, line?: number) {
     const metadata = await props.api.rpc("fs/getMetadata", { path });
     if (scope !== fileScope() || generation !== revealGeneration) return;
     if (metadata.isDirectory) {
-      ++fileGeneration;
-      activePath.value = "";
+      if (!externalFilePreview.value) { ++fileGeneration; openingFile.value = false; activePath.value = ""; }
       tab.value = "files";
       await readDirectory(path, false);
     } else {
@@ -339,18 +378,21 @@ function toggleChange(event: Event, key: string) {
   else expandedChanges.value.delete(key);
 }
 function closeFile() {
-  ++fileGeneration; activePath.value = ""; previewDocument.value = false; tab.value = "files";
+  ++fileGeneration; openingFile.value = false; activePath.value = ""; previewDocument.value = false; tab.value = "files";
 }
 function closeEditor(path: string) {
   const entry = editorTabs.value.find(entry => entry.file.path === path);
-  if (!entry || entry.saving) return;
-  if (entry.content !== entry.original && !window.confirm("关闭标签会丢弃此文件的未保存草稿，是否继续？")) return;
+  if (!entry || entry.saving) return false;
+  if (entry.content !== entry.original && !window.confirm("关闭标签会丢弃此文件的未保存草稿，是否继续？")) return false;
   editorTabs.value = editorTabs.value.filter(candidate => candidate !== entry);
   if (activePath.value === path) {
+    ++fileGeneration; openingFile.value = false;
     activePath.value = editorTabs.value.at(-1)?.file.path || "";
-    if (file.value && officeFileKind(file.value.path) && !file.value.dataBase64) void openFile(activePath.value, tab.value);
+    // Closing a file while the chat is selected must not open another file.
+    if (file.value && officeFileKind(file.value.path) && !file.value.dataBase64) void openFile(activePath.value, tab.value, undefined, undefined, false);
   }
   persistDrafts();
+  return true;
 }
 function codeSelection(value: { text: string; startLine: number; endLine: number }, action: 'add' | 'ask') {
   if (!file.value || !props.state.activeThread?.id) return;
@@ -385,8 +427,7 @@ async function preview(path?: string) {
   previewSource.value = "file";
   error.value = "";
   if (/^https?:\/\//i.test(input)) {
-    ++fileGeneration;
-    loading.value = false;
+    if (!externalFilePreview.value) { ++fileGeneration; openingFile.value = false; loading.value = false; }
     previewDocument.value = false;
     previewUrl.value = input;
     previewInput.value = input;
@@ -397,13 +438,18 @@ async function preview(path?: string) {
     const filePath = input.startsWith("/")
       ? input
       : join(props.state.projectPath, input);
+    if (externalFilePreview.value && /\.html?$/i.test(filePath)) {
+      const scope = fileScope();
+      await openFile(filePath, "files");
+      if (scope === fileScope() && activeEditor.value?.file.path === filePath) activeEditor.value.htmlPreview = true;
+      return;
+    }
     if (isMarkdownPath(filePath) || isJsonPath(filePath) || isImagePath(filePath) || officeFileKind(filePath) || /\.pdf$/i.test(filePath)) {
       previewInput.value = filePath;
       await openFile(filePath, "preview");
       return;
     }
-    ++fileGeneration;
-    loading.value = false;
+    if (!externalFilePreview.value) { ++fileGeneration; openingFile.value = false; loading.value = false; }
     previewDocument.value = false;
     previewUrl.value = `/api/preview?host=${encodeURIComponent(props.state.hostId)}&path=${encodeURIComponent(filePath)}&root=${encodeURIComponent(props.state.projectPath)}`;
     previewInput.value = filePath;
@@ -463,7 +509,7 @@ watch(
     persistDrafts();
     ++directoryGeneration; ++fileGeneration; ++revealGeneration;
     const version = ++workspaceGeneration;
-    const scope = fileScope(); activeScope = "";
+    const scope = fileScope(); activeScope.value = "";
     const current = () => version === workspaceGeneration && scope === fileScope() && props.state.authenticated;
     editorTabs.value = []; activePath.value = ""; revealedFile.value = ""; downloading.value = ""; previewDocument.value = false;
     // Directory navigation belongs to this host and project, just like drafts.
@@ -471,7 +517,7 @@ watch(
     directory.value = props.state.projectPath || "";
     directoryInput.value = directory.value;
     entries.value = [];
-    loading.value = false;
+    loading.value = false; openingFile.value = false;
     error.value = "";
     draftWarning.value = "";
     fileSearch.value = "";
@@ -494,13 +540,13 @@ watch(
       // Do not persist an empty initial workspace while its saved tabs are
       // still being read. Slow storage must not overwrite the recovery copy.
       if (!current()) return;
-      activeScope = scope;
+      activeScope.value = scope;
       if (props.state.connected && props.state.projectPath) await readDirectory(props.state.projectPath, false);
     })();
     // Restoration must finish independently of metadata/file reads. A held
     // first link must not make the next link wait for its response.
     void workspaceReady.then(() => {
-      if (current() && !props.openPath && (file.value?.binary || /^image\//.test(file.value?.mime || ""))) void openFile(activePath.value);
+      if (current() && !props.openPath && (file.value?.binary || /^image\//.test(file.value?.mime || ""))) void openFile(activePath.value, "files", undefined, undefined, false);
     });
   }, { immediate: true },
 );
@@ -550,6 +596,9 @@ watch(tab, async (value) => {
 defineExpose({
   working: computed(() => editorTabs.value.some(entry => entry.saving)),
   openFile,
+  activateFile: (path: string, line?: number) => openFile(path, "files", line),
+  closeEditor,
+  closeFile,
   revealPath,
   setTab: (value: string) => {
     tab.value = value;
@@ -593,7 +642,7 @@ defineExpose({
         <Icon name="X" :size="13" />
       </button>
     </div>
-    <div v-if="tab === 'files' || (tab === 'preview' && previewSource === 'file' && previewDocument)" class="workspace-body files-view">
+    <div v-if="externalFilePreview || tab === 'files' || (tab === 'preview' && previewSource === 'file' && previewDocument)" v-show="tab === 'files' || (tab === 'preview' && previewSource === 'file' && previewDocument)" class="workspace-body files-view">
       <template v-if="tab === 'preview'">
         <div class="preview-source-toolbar segmented-control">
           <button class="active" @click="previewSource = 'file'">文件 / URL</button>
@@ -635,14 +684,17 @@ defineExpose({
           />
         </button>
       </form>
-      <p v-if="draftWarning" class="panel-error" role="status">{{ draftWarning }}</p>
-      <nav v-if="editorTabs.length" class="file-tab-bar" aria-label="已打开文件">
+      <p v-if="draftWarning && !externalFilePreview" class="panel-error" role="status">{{ draftWarning }}</p>
+      <nav v-if="editorTabs.length && !externalFilePreview" class="file-tab-bar" aria-label="已打开文件">
         <div v-for="entry in editorTabs" :key="entry.file.path" :class="{ active: activePath === entry.file.path }">
           <button :title="entry.file.path" :aria-pressed="activePath === entry.file.path" @click="openFile(entry.file.path, tab)">{{ entry.file.path.split('/').pop() }}<i v-if="entry.content !== entry.original" class="dirty-dot"></i></button>
           <button class="icon-button" :disabled="entry.saving" :aria-label="'关闭文件 ' + entry.file.path.split('/').pop()" @click="closeEditor(entry.file.path)"><Icon name="X" :size="12" /></button>
         </div>
       </nav>
-      <template v-if="file">
+      <Teleport :to="filePreviewTarget || 'body'" :disabled="!externalFilePreview">
+      <section v-if="file" v-show="!externalFilePreview || filePreviewVisible" class="file-editor" :class="{ 'center-file-preview': externalFilePreview }" aria-label="文件预览">
+        <div v-if="error && externalFilePreview" class="panel-error"><Icon name="AlertCircle" :size="16" /><span>{{ error }}</span><button class="icon-button" @click="error = ''" aria-label="关闭文件错误"><Icon name="X" :size="13" /></button></div>
+        <p v-if="draftWarning && externalFilePreview" class="panel-error" role="status">{{ draftWarning }}</p>
         <div class="file-editor-heading">
           <button
             class="icon-button"
@@ -676,10 +728,10 @@ defineExpose({
             aria-label="预览 HTML"
           >
             <Icon name="Eye" :size="15" /></button
-          ><button
-            v-if="!isImage && !file.binary && !isJsonPreview"
+          ><div v-if="externalFilePreview && isHtml" class="segmented-control file-view-switch" aria-label="HTML 显示方式"><button :class="{ active: activeEditor?.htmlPreview }" :aria-pressed="!!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = true)">预览</button><button :class="{ active: !activeEditor?.htmlPreview }" :aria-pressed="!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = false)">源码</button></div><button
+            v-if="!isImage && !file.binary && !isJsonPreview && !activeEditor?.htmlPreview"
             class="button button-small button-secondary"
-            :disabled="!dirty || saving || loading || state.permission === 'read-only'"
+            :disabled="!dirty || saving || (externalFilePreview ? openingFile : loading) || state.permission === 'read-only'"
             @click="save"
           >
             <Icon :name="saving ? 'LoaderCircle' : 'Save'" :size="13" />保存
@@ -691,7 +743,9 @@ defineExpose({
           <div class="file-conflict-actions"><button class="button button-small button-secondary" @click="resolveConflict(true)">重新载入磁盘版本</button><button class="button button-small" :disabled="conflict.binary" @click="resolveConflict(false)">保留草稿并手动合并</button></div>
           <small>手动合并后再次保存；保存前仍会检查磁盘是否又有更新。</small>
         </section>
-        <div v-if="isImage" class="file-image">
+        <div v-if="openingFile && externalFilePreview" class="file-preview-loading" role="status"><Icon name="LoaderCircle" :size="13" class="spin" />正在读取文件…</div>
+        <div v-if="externalFilePreview && isHtml && activeEditor?.htmlPreview" class="file-html-preview"><iframe :src="htmlPreviewUrl" title="项目预览" sandbox="allow-scripts allow-forms allow-popups allow-downloads" referrerpolicy="no-referrer"></iframe></div>
+        <div v-else-if="isImage" class="file-image">
           <img :src="file.dataUrl" :alt="displayName" />
         </div>
         <PdfPreview v-else-if="file.mime === 'application/pdf' && file.dataBase64" :key="file.path" :data-base64="file.dataBase64" :name="displayName" />
@@ -730,8 +784,9 @@ defineExpose({
                 : "已保存"
           }}</span>
         </div>
-      </template>
-      <div v-else class="file-tree">
+      </section>
+      </Teleport>
+      <div v-if="externalFilePreview || !file" class="file-tree">
         <label class="workspace-file-search"><Icon name="Search" :size="14" /><input v-model="fileSearch" aria-label="搜索文件名" placeholder="搜索当前目录文件名" /><button v-if="fileSearch" class="icon-button" aria-label="清除文件名搜索" @click="fileSearch = ''"><Icon name="X" :size="13" /></button></label>
         <p v-if="entries.length && !sortedEntries.length" class="file-search-empty">没有匹配的文件</p>
         <div
@@ -792,13 +847,13 @@ defineExpose({
         </div>
       </div>
     </div>
-    <div v-else-if="tab === 'agents'" class="workspace-body agents-view">
+    <div v-if="tab === 'agents'" class="workspace-body agents-view">
       <SubagentsPanel :api="api" :state="state" />
     </div>
-    <div v-else-if="tab === 'tmux'" class="workspace-body tmux-view">
+    <div v-if="tab === 'tmux'" class="workspace-body tmux-view">
       <TmuxPanel :target="tmuxTarget" :api="api" :state="state" @attach="attachTmux" />
     </div>
-    <div v-else-if="tab === 'git'" class="workspace-body git-view">
+    <div v-if="tab === 'git'" class="workspace-body git-view">
       <GitPanel
         :api="api"
         :state="state"
@@ -807,7 +862,7 @@ defineExpose({
         @error="emit('error', $event)"
       />
     </div>
-    <div v-else-if="tab === 'terminal'" class="workspace-body terminal-view">
+    <div v-if="tab === 'terminal'" class="workspace-body terminal-view">
       <div class="terminal-mode-toolbar">
         <div class="segmented-control">
           <button
@@ -902,7 +957,7 @@ defineExpose({
         </div>
       </template>
     </div>
-    <div v-else-if="tab === 'changes'" class="workspace-body changes-view">
+    <div v-if="tab === 'changes'" class="workspace-body changes-view">
       <div class="changes-heading">
         <span>{{ changeScope === 'latest' ? '上一轮操作' : '已加载操作记录' }} · {{ changes.length }} 个文件</span><span class="diff-stats"><span class="diff-count-add">+{{ changeTotals.added }}</span><span class="diff-count-remove">−{{ changeTotals.removed }}</span></span>
       </div>
@@ -1026,6 +1081,12 @@ defineExpose({
 </template>
 
 <style scoped>
+/* The same editor instance can live outside the right workspace via Teleport. */
+.center-file-preview { flex: 1; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+.center-file-preview .file-editor-heading, .center-file-preview .file-editor-footer { flex-shrink: 0; }
+.file-preview-loading { display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 6px 12px; color: var(--muted); font-size: 12px; }
+.file-html-preview { display: flex; flex: 1; min-height: 0; overflow: auto; }
+.file-html-preview iframe { flex: 1; min-width: 0; width: 100%; height: 100%; min-height: 0; border: 0; background: white; }
 .file-save-conflict { flex: 0 0 auto; padding: 12px; border-bottom: 1px solid var(--border); background: var(--surface); font-size: 12px; max-height: 50%; overflow: auto; }
 .file-conflict-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
 .file-conflict-comparison > div { min-width: 0; }

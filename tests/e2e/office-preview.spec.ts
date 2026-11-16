@@ -21,7 +21,9 @@ function files(mock: MockCodex, values: Record<string, Buffer>) {
   };
 }
 async function open(page: any, name: string) {
-  await page.getByRole('link', { name, exact: true }).click();
+  const source = page.getByRole('link', { name, exact: true });
+  if (!await source.isVisible()) await page.getByRole('tab', { name: '已有测试历史', exact: true }).click();
+  await source.click();
   await expect(page.getByRole('region', { name: 'Office 文件预览', exact: true })).toBeVisible();
 }
 test('DOCX renders Chinese pages locally in a script-disabled frame without opening external relationships', async ({ page, mock }) => {
@@ -34,7 +36,7 @@ test('DOCX renders Chinese pages locally in a script-disabled frame without open
   await expect(frame.getByText('中文工作文档 · 第一页', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Office 页码', { exact: true })).toHaveText('1 / 2');
   await expect(frame.getByText('第二页的独立内容', { exact: true })).not.toBeVisible();
-  await page.locator('.workspace-panel').screenshot({ path: '.data/office-docx-desktop.png' });
+  await page.locator('.center-file-preview').screenshot({ path: '.data/office-docx-desktop.png' });
   await page.getByRole('button', { name: '下一页', exact: true }).click();
   await expect(frame.getByText('第二页的独立内容', { exact: true })).toBeVisible();
   await expect(frame.getByText('中文工作文档 · 第一页', { exact: true })).not.toBeVisible();
@@ -65,7 +67,7 @@ test('PPTX renders one real slide at a time and cleans up when another file is o
   await open(page, '报告.pptx');
   const frame = page.frameLocator('iframe[title="报告.pptx 只读预览"]');
   await expect(frame.getByText('中文幻灯片 1', { exact: true })).toBeVisible();
-  await page.locator('.workspace-panel').screenshot({ path: '.data/office-pptx-desktop.png' });
+  await page.locator('.center-file-preview').screenshot({ path: '.data/office-pptx-desktop.png' });
   await expect(page.getByLabel('Office 页码', { exact: true })).toHaveText('1 / 2');
   // This text carries an internal jump-to-slide-2 relationship. Read-only
   // previews keep page navigation in the toolbar, including for shape links.
@@ -105,12 +107,12 @@ test('phone Office pages and sheet tabs remain usable without widening the appli
   await open(page, '说明.docx');
   const frame = page.frameLocator('iframe[title="说明.docx 只读预览"]');
   await expect(frame.getByText('中文工作文档 · 第一页', { exact: true })).toBeVisible();
-  await page.locator('.workspace-panel').screenshot({ path: '.data/office-docx-phone.png' });
+  await page.locator('.center-file-preview').screenshot({ path: '.data/office-docx-phone.png' });
   await page.getByRole('combobox', { name: 'Office 缩放', exact: true }).selectOption('50');
   await expect(page.getByRole('combobox', { name: 'Office 缩放', exact: true })).toHaveValue('50');
   await page.getByRole('button', { name: '下一页', exact: true }).click();
   await expect(frame.getByText('第二页的独立内容', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '关闭工作区', exact: true }).click();
+  await page.getByRole('tab', { name: '已有测试历史', exact: true }).click();
   await open(page, '结果.xlsx');
   await expect(page.getByRole('cell', { name: '病例编号', exact: true })).toBeVisible();
   const scroll = page.locator('.office-sheet-scroll');
@@ -119,7 +121,7 @@ test('phone Office pages and sheet tabs remain usable without widening the appli
   expect(await scroll.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
   await page.getByRole('combobox', { name: '选择工作表', exact: true }).selectOption('1');
   await expect(page.getByRole('cell', { name: '第二个工作表', exact: true })).toBeVisible();
-  await page.locator('.workspace-panel').screenshot({ path: '.data/office-xlsx-phone.png' });
+  await page.locator('.center-file-preview').screenshot({ path: '.data/office-xlsx-phone.png' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });
 
@@ -156,6 +158,7 @@ test('switching hosts disposes Office rendering and restores the correct host do
   await expect(page.getByRole('cell', { name: '病例编号', exact: true })).toBeVisible();
   await page.locator('[data-section="recent"] [data-host-id="local"] .thread-row').filter({ hasText: 'Alpha 会话' }).click();
   await expect(page.getByRole('table', { name: '工作表内容', exact: true })).toHaveCount(0);
+  await page.getByRole('tab', { name: '说明.docx', exact: true }).click();
   await expect(page.frameLocator('iframe[title="说明.docx 只读预览"]').getByText('中文工作文档 · 第一页', { exact: true })).toBeVisible();
 });
 
@@ -170,8 +173,8 @@ test('inactive Office packages are re-read on tab return and text drafts survive
   await expect(page.getByRole('cell', { name: '病例编号', exact: true })).toBeVisible();
   const docxReads = () => mock.requests.filter(request => request.method === 'fs/readFile' && request.params?.path === '/workspace/demo/说明.docx').length;
   expect(docxReads()).toBe(1);
-  const tabs = page.getByRole('navigation', { name: '已打开文件', exact: true });
-  await tabs.getByRole('button', { name: '说明.docx', exact: true }).click();
+  const tabs = page.getByRole('tablist', { name: '聊天标签页', exact: true });
+  await tabs.getByRole('tab', { name: '说明.docx', exact: true }).click();
   await expect(page.frameLocator('iframe[title="说明.docx 只读预览"]').getByText('中文工作文档 · 第一页', { exact: true })).toBeVisible();
   expect(docxReads()).toBe(2);
   // Closing the current tab selects the inactive workbook, which must also
@@ -179,7 +182,7 @@ test('inactive Office packages are re-read on tab return and text drafts survive
   await tabs.getByRole('button', { name: '关闭文件 说明.docx', exact: true }).click();
   await expect(page.getByRole('cell', { name: '病例编号', exact: true })).toBeVisible();
   expect(mock.requests.filter(request => request.method === 'fs/readFile' && request.params?.path === '/workspace/demo/结果.xlsx')).toHaveLength(2);
-  await tabs.getByRole('button', { name: '草稿.ts', exact: true }).click();
+  await tabs.getByRole('tab', { name: '草稿.ts', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '草稿.ts 文件内容', exact: true })).toHaveText('const draft = "仍未保存";');
   await expect(page.locator('.file-editor-footer')).toContainText('未保存');
   expect(mock.requests.filter(request => request.method === 'fs/writeFile')).toEqual([]);

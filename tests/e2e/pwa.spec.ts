@@ -309,7 +309,7 @@ test('a pending workspace file save postpones a worker update until its write is
   const file = page.getByRole('textbox', { name: 'README.md 文件内容', exact: true });
   await file.click(); await file.press('ControlOrMeta+A');
   await page.keyboard.insertText('# Updating while saving');
-  await page.locator('.workspace-panel').getByRole('button', { name: '保存', exact: true }).click();
+  await page.locator('.center-file-preview').getByRole('button', { name: '保存', exact: true }).click();
   await expect.poll(() => !!pending).toBe(true);
   let navigations = 0;
   page.on('domcontentloaded', () => { navigations++; });
