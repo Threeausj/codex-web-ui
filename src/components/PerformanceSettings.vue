@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 
-const props = defineProps<{ api: any; state: any; hostId: string; maintenanceBusy?: boolean }>();
+const props = defineProps<{ api: any; state: any; hostId: string; maintenanceBusy?: boolean; settingsBusy?: boolean; embedded?: boolean }>();
 const hostId = computed(() => props.hostId);
 const loading = ref(false);
 const reconnecting = ref(false);
@@ -26,10 +26,11 @@ const mode = computed(() => {
   if (value === "spawn") return "本机进程";
   return value || "未报告";
 });
-const pending = computed(() => loading.value || reconnecting.value || props.maintenanceBusy || props.state.runtimeReconnectingHostId === hostId.value);
+const pending = computed(() => loading.value || reconnecting.value || props.maintenanceBusy || props.settingsBusy || props.state.runtimeReconnectingHostId === hostId.value);
 const disabledReason = computed(() => {
   if (!props.state.authenticated) return "请先登录";
   if (props.maintenanceBusy) return "此主机正在更新 Codex，请等待更新并重启完成。";
+  if (props.settingsBusy) return "正在保存 Codex 设置，请稍候。";
   if (pending.value) return "正在更新连接信息…";
   if (!information.value) return "请先读取主机信息";
   if (runtime.value?.paused) return "此主机的 Web Codex 已释放，请在资源管理中恢复连接后重试。";
@@ -91,12 +92,14 @@ watch(hostId, () => {
   success.value = "";
   void refresh();
 }, { immediate: true });
+watch(() => props.settingsBusy, (busy, wasBusy) => { if (!busy && wasBusy) void refresh(); });
 onBeforeUnmount(() => { ++generation; });
 </script>
 
 <template>
   <section class="performance-settings" aria-label="性能设置">
-    <h3>性能</h3>
+    <h4 v-if="embedded">运行与连接</h4>
+    <h3 v-else>性能</h3>
     <p class="settings-description">{{ externalDaemon ? "正在复用已有服务，生命周期由外部管理。网页可重新连接；更新、重启和配置写入需在原客户端管理或迁移为托管服务。" : independentDaemon ? "Web 连接与后台 Codex 独立运行。修改静态模型目录后，请在主机空闲时重启 daemon。" : "更新主机上的 Codex 后，重新连接即可读取新模型和上下文配置。" }}</p>
     <dl class="performance-information" :aria-busy="loading">
       <div><dt>连接状态</dt><dd><span class="performance-connection" :class="{ connected: runtime?.connected && !runtime?.paused }">{{ connection }}</span><span class="performance-mode">{{ mode }}</span></dd></div>

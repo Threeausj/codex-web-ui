@@ -151,7 +151,7 @@ test('a discarded app window restores its reading position from private storage,
   await expect.poll(() => reopened.locator('.conversation-scroll').evaluate(element => element.scrollTop)).toBe(top);
   expect(mock.request('turn/start')).toBeUndefined();
   await reopened.getByRole('button', { name: /^设置\s/ }).click();
-  await reopened.getByRole('button', { name: '账户', exact: true }).click();
+  await reopened.getByRole('button', { name: '通用', exact: true }).click();
   await reopened.getByRole('button', { name: '退出网页', exact: true }).click();
   await expect(reopened.getByRole('textbox', { name: '访问密码', exact: true })).toBeVisible();
   await expect.poll(async () => (await records(reopened)).filter(row => JSON.parse(row.key)[1] === 'reading-positions').length).toBe(0);

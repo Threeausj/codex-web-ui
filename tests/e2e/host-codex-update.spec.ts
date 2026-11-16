@@ -55,7 +55,7 @@ async function setup(page: Page, mock: MockCodex) {
   });
   return wire;
 }
-async function settings(page: Page, section: '性能' | 'Codex' | '连接' = '性能', hostId = remoteId) {
+async function settings(page: Page, section: 'Codex' | '连接' = 'Codex', hostId = remoteId) {
   const sidebar = page.getByRole('button', { name: '打开侧边栏', exact: true });
   if (await sidebar.isVisible()) await sidebar.click();
   await page.locator('.settings-button').click();
@@ -165,7 +165,7 @@ test('duplicate clicks start once and closing settings keeps the server operatio
   await expect.poll(() => wire.posts.length).toBe(1);
   await dialog.getByRole('button', { name: '关闭设置', exact: true }).click();
   release(); wire.holdPost = undefined;
-  dialog = await settings(page, '性能', 'local');
+  dialog = await settings(page, 'Codex', 'local');
   await expect(dialog.getByRole('combobox', { name: '设置主机', exact: true })).toBeEnabled();
   await dialog.getByRole('combobox', { name: '设置主机', exact: true }).selectOption(remoteId);
   await expect(panel(page).getByRole('status')).toContainText('正在检查主机');

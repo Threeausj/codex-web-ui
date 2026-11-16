@@ -33,7 +33,10 @@ const props = defineProps<{
   currentDraft?: string;
 }>();
 const emit = defineEmits<{ close: []; theme: [value: string] }>();
-const section = ref(props.initialTab || (props.state.hosts?.length ? "general" : "hosts"));
+function settingsSection(value?: string) {
+  return value === "performance" ? "codex" : value === "account" ? "general" : value;
+}
+const section = ref(settingsSection(props.initialTab) || (props.state.hosts?.length ? "general" : "hosts"));
 const settingsHostId = ref(props.state.hostId || props.state.hosts?.[0]?.id || "");
 const codexSettingsBusy = ref(false);
 const codexUpdateBusy = ref(false);
@@ -56,15 +59,13 @@ watch(section, value => { if (value === "presets") void props.api.promptPresets.
 defineExpose({ close: closeSettings, working: computed(() => presetsEditor.value?.working || presetsState.value.busy || codexSettingsBusy.value || codexUpdateBusy.value) });
 const sections = [
   { id: "general", label: "通用", icon: "Settings2" },
-  { id: "performance", label: "性能", icon: "Zap" },
+  { id: "codex", label: "Codex", icon: "Bot" },
   { id: "pwa", label: "应用与通知", icon: "Smartphone" },
   { id: "projects", label: "项目", icon: "Folder" },
   { id: "archived", label: "已归档的聊天", icon: "Archive" },
   { id: "hosts", label: "连接", icon: "Globe" },
   { id: "presets", label: "提示词预设", icon: "ListChecks" },
   { id: "permissions", label: "权限预设", icon: "Shield" },
-  { id: "codex", label: "Codex", icon: "Bot" },
-  { id: "account", label: "账户", icon: "Lock" },
   { id: "integrations", label: "技能与集成", icon: "Package" },
   { id: "config", label: "配置", icon: "Code2" },
   { id: "shortcuts", label: "快捷键", icon: "Keyboard" },
@@ -146,7 +147,7 @@ const config = computed(
 );
 const currentHosts = computed(() => props.state.hosts || []);
 const settingsHost = computed(() => currentHosts.value.find((host: any) => host.id === settingsHostId.value));
-const globalSection = computed(() => ["general", "pwa", "account", "shortcuts", "hosts", "presets"].includes(section.value));
+const globalSection = computed(() => ["general", "pwa", "shortcuts", "hosts", "presets"].includes(section.value));
 const projectHost = computed(() =>
   currentHosts.value.find((host: any) => host.id === projectHostId.value),
 );
@@ -515,9 +516,31 @@ watch(() => [settingsHostId.value, section.value], () => {
                 才能加入活动对话。网页审批由首个提交结果的客户端处理。
               </p>
             </div>
+            <section class="web-access-settings" aria-label="网页访问">
+              <h4>网页访问</h4>
+              <p class="settings-description">管理此 Web 应用的访问密码与登录。主机的模型账户可在 Codex 中切换。</p>
+              <div class="setting-row">
+                <div>
+                  <strong>网页访问</strong
+                  ><span>{{
+                    state.authRequired
+                      ? "使用访问密码验证，网页保持登录 30 天"
+                      : "当前服务未要求访问密码"
+                  }}</span>
+                </div>
+                <button
+                  v-if="state.authRequired"
+                  class="button button-small button-secondary"
+                  :disabled="saving"
+                  @click="action(() => api.logout())"
+                >
+                  退出网页
+                </button>
+              </div>
+              <PasswordSettings v-if="state.authRequired" :api="api" :state="state" />
+            </section>
           </template>
           <PwaSettings v-else-if="section === 'pwa'" :api="api" :state="state" />
-          <PerformanceSettings v-else-if="section === 'performance'" :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" />
           <template v-else-if="section === 'projects'">
             <h3>项目</h3>
             <p class="settings-description">
@@ -649,7 +672,7 @@ watch(() => [settingsHostId.value, section.value], () => {
                   >
                   <div class="connection-actions">
                     <button class="icon-button" :disabled="saving || codexSettingsBusy || codexUpdateBusy"
-                      @click="settingsHostId = host.id; section = 'performance'"
+                      @click="settingsHostId = host.id; section = 'codex'"
                       :title="`更新并重启 ${host.name} 的 Codex`" :aria-label="`更新并重启 ${host.name} 的 Codex`">
                       <Icon name="Download" :size="16" />
                     </button>
@@ -910,30 +933,10 @@ watch(() => [settingsHostId.value, section.value], () => {
             </div>
           </template>
           <ArchivedChatsPanel v-else-if="section === 'archived'" :api="api" :state="state" :host-id="settingsHostId" />
-          <CodexSettings v-else-if="section === 'codex'" :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" @busy="codexSettingsBusy = $event" />
-          <template v-else-if="section === 'account'">
-            <h3>网页账户</h3>
-            <p class="settings-description">管理此 Web 应用的访问密码与登录。主机的模型账户可在 Codex 中切换。</p>
-            <div class="setting-row">
-              <div>
-                <strong>网页访问</strong
-                ><span>{{
-                  state.authRequired
-                    ? "使用访问密码验证，网页保持登录 30 天"
-                    : "当前服务未要求访问密码"
-                }}</span>
-              </div>
-              <button
-                v-if="state.authRequired"
-                class="button button-small button-secondary"
-                :disabled="saving"
-                @click="action(() => api.logout())"
-              >
-                退出网页
-              </button>
-            </div>
-            <PasswordSettings v-if="state.authRequired" :api="api" :state="state" />
-          </template>
+          <div v-else-if="section === 'codex'" class="codex-settings-page">
+            <CodexSettings :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" @busy="codexSettingsBusy = $event" />
+            <PerformanceSettings embedded :api="api" :state="state" :host-id="settingsHostId" :maintenance-busy="codexUpdateBusy" :settings-busy="codexSettingsBusy" />
+          </div>
           <template v-else-if="section === 'integrations'">
             <IntegrationsSettings :key="settingsHostId" :api="settingsApi" :state="settingsState" />
           </template>
@@ -1097,7 +1100,7 @@ watch(() => [settingsHostId.value, section.value], () => {
               </div>
             </div></template
           >
-          <HostCodexUpdate v-if="settingsHost" v-show="['performance', 'codex', 'hosts'].includes(section)"
+          <HostCodexUpdate v-if="settingsHost" v-show="['codex', 'hosts'].includes(section)"
             :api="api" :state="state" :host-id="settingsHostId"
             :disabled="saving || codexSettingsBusy || !!state.runtimeReconnectingHostId"
             @busy="codexUpdateBusy = $event" />
@@ -1124,6 +1127,9 @@ watch(() => [settingsHostId.value, section.value], () => {
 </template>
 
 <style scoped>
+.codex-settings-page > .performance-settings, .web-access-settings { margin-top: 32px; padding-top: 28px; border-top: 1px solid var(--border); }
+.codex-settings-page :deep(.performance-settings > h4), .web-access-settings > h4 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+
 .settings-host-bar { display:flex; align-items:center; gap:12px; padding:12px 22px; border-bottom:1px solid var(--border); flex-shrink:0; }
 .settings-host-bar label { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:11px; flex-shrink:0; }
 .settings-host-bar .text-input { width:210px; min-width:0; min-height:32px; font-size:12px; padding:7px 10px; }

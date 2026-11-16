@@ -21,14 +21,16 @@ let pollTimer: ReturnType<typeof setTimeout> | undefined;
 let loginChecks = 0;
 let disposed = false;
 const account = computed(() => information.value?.account?.account || information.value?.account || null);
+const runtimeReconnecting = computed(() => props.state.runtimeReconnectingHostId === props.hostId);
 const blocked = computed(() => {
   if (props.maintenanceBusy) return "此主机正在更新 Codex，请等待更新并重启完成。";
+  if (runtimeReconnecting.value) return "正在重新连接 Codex，请稍候。";
   if (!information.value) return "请先读取主机的 Codex 设置";
   if (information.value.canChange === false) return information.value.disabledReason || "当前主机无法更改 Codex 设置";
   if (props.hostId === props.state.hostId && props.state.busy) return "任务运行中，完成或停止后可切换模型账户。";
   return "";
 });
-const pending = computed(() => loading.value || !!operation.value || props.maintenanceBusy);
+const pending = computed(() => loading.value || !!operation.value || props.maintenanceBusy || runtimeReconnecting.value);
 const loginUrl = computed(() => {
   const value = deviceLogin.value?.verificationUrl;
   if (typeof value !== "string") return "";
@@ -195,7 +197,7 @@ watch(() => [props.hostId, props.state.authenticated, props.state.authentication
   emit("busy", false);
   void refresh();
 }, { immediate: true });
-watch(() => props.maintenanceBusy, (busy, wasBusy) => {
+watch(() => !!props.maintenanceBusy || runtimeReconnecting.value, (busy, wasBusy) => {
   if (busy) {
     stopPolling();
     // A read started before maintenance may report the old CLI's capabilities.

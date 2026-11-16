@@ -353,7 +353,7 @@ test('logout clears prefetched private contents before the next authenticated se
   const panel = await openAgents(page)
   await expect(panel.locator('[data-agent-id="agent-active"]')).toContainText('退出前的私密子智能体内容')
   await page.getByRole('button', { name: /^设置\s/ }).click()
-  await page.getByRole('button', { name: '账户', exact: true }).click()
+  await page.getByRole('button', { name: '通用', exact: true }).click()
   await page.getByRole('button', { name: '退出网页', exact: true }).click()
   await expect(page.getByRole('textbox', { name: '访问密码' })).toBeVisible()
   wire.rows[0].agentNickname = 'New Login Agent'

@@ -264,7 +264,7 @@ test('a queued app update waits for host Codex maintenance even when its setting
   await input.fill('Codex 更新期间保留的草稿');
   await page.locator('.settings-button').click();
   const settings = page.getByRole('dialog', { name: '设置', exact: true });
-  await settings.locator('.settings-nav').getByRole('button', { name: '性能', exact: true }).click();
+  await settings.locator('.settings-nav').getByRole('button', { name: 'Codex', exact: true }).click();
   const updater = settings.getByRole('region', { name: '主机 Codex 更新', exact: true });
   await updater.getByRole('button', { name: '更新并重启 Codex', exact: true }).click();
   await expect(updater.getByRole('status')).toContainText('正在执行 codex update');
@@ -279,7 +279,7 @@ test('a queued app update waits for host Codex maintenance even when its setting
     await expect(updates.getByRole('status')).toHaveText('已安排在当前任务结束后更新');
     expect(navigations).toBe(0);
     expect(requests).toHaveLength(1);
-    await settings.locator('.settings-nav').getByRole('button', { name: '性能', exact: true }).click();
+    await settings.locator('.settings-nav').getByRole('button', { name: 'Codex', exact: true }).click();
     await expect(updater.getByRole('status')).toContainText('正在执行 codex update');
     information.runtimeVersion = '0.165.0';
     information.operation = { ...information.operation, state: 'completed', installedVersion: '0.165.0',
@@ -398,7 +398,7 @@ test("notification consent is requested only on click; device preferences, test,
   await enable.click();
   await expect(page.getByText("本机已启用", { exact: true })).toBeVisible();
   expect(calls.filter((call) => call.method === "POST" && call.pathname.endsWith("/subscription")).at(-1)?.body.preferences.completed).toBe(false);
-  await page.getByRole("button", { name: "账户", exact: true }).click();
+  await page.getByRole("button", { name: "通用", exact: true }).click();
   await page.getByRole("button", { name: "退出网页", exact: true }).click();
   await expect(page.getByRole("button", { name: "进入工作区", exact: true })).toBeVisible();
   expect(mock.authenticated).toBe(false);
@@ -418,7 +418,7 @@ for (const failure of ['false', 'reject']) {
     await expect.poll(() => calls.filter(call => call.method === 'POST' && call.pathname.endsWith('/subscription')).length).toBe(1);
     await openPushSettings(page);
     await page.evaluate(value => { (window as any).pushFixture.unsubscribeFailure = value; }, failure);
-    await page.getByRole('button', { name: '账户', exact: true }).click();
+    await page.getByRole('button', { name: '通用', exact: true }).click();
     await page.getByRole('button', { name: '退出网页', exact: true }).click();
     await expect(page.getByRole('button', { name: '进入工作区', exact: true })).toBeVisible();
     expect(mock.authenticated).toBe(false);
@@ -857,7 +857,7 @@ test('a late push test from a signed-out login cannot change a fresh login or it
   await openPushSettings(page);
   await page.getByRole('button', { name: '发送测试通知', exact: true }).click();
   await expect.poll(() => pending.length).toBe(1);
-  await page.getByRole('button', { name: '账户', exact: true }).click();
+  await page.getByRole('button', { name: '通用', exact: true }).click();
   await page.getByRole('button', { name: '退出网页', exact: true }).click();
   await expect(page.getByRole('button', { name: '进入工作区', exact: true })).toBeVisible();
   expect(mock.authenticated).toBe(false);
