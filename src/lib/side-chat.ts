@@ -229,19 +229,16 @@ export function useSideChat(api: any, mainState: any) {
     state.open = true;
     state.connected = canConnect();
     state.error = '';
-    state.notice = state.threadId ? '后续提问沿用首次创建的侧边上下文；如需按新选段重新继承历史，请另开侧边分支。' : '';
+    state.notice = state.threadId ? '后续提问沿用首次创建的侧边上下文；如需继承当前主对话的完整上下文，请另开侧边分支。' : '';
   }
   async function newBranch() {
-    let source = state.source && { ...state.source };
-    if (!source || state.busy || state.loading || state.saving) throw new Error('请等待侧边任务完成');
+    if (!state.source || state.busy || state.loading || state.saving) throw new Error('请等待侧边任务完成');
     if (!canConnect()) throw new Error('请先返回侧边聊天所在的主机，再结束或另开分支');
-    if (!sourceSelected()) {
-      const current = mainState.activeThread;
-      if (!current?.id || mainState.switchingHost) throw new Error('请先打开当前主机的对话');
-      const title = current.name || current.preview || '';
-      source = { kind: 'conversation', hostId: mainState.hostId, threadId: current.id,
-        ...(typeof title === 'string' && title.trim() ? { threadName: title.replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 160) } : {}) };
-    }
+    const current = mainState.activeThread;
+    if (!current?.id || mainState.switchingHost) throw new Error('请先打开当前主机的对话');
+    const title = current.name || current.preview || '';
+    const source: SideChatSource = { kind: 'conversation', hostId: mainState.hostId, threadId: current.id,
+      ...(typeof title === 'string' && title.trim() ? { threadName: title.replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 160) } : {}) };
     const closing = close();
     const closedGeneration = generation;
     await closing;

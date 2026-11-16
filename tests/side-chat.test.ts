@@ -52,7 +52,9 @@ test('sidebar retains its first history anchor, can explicitly restart, and save
     assert.equal(await value.controller.saveBranch(), 'saved-sidebar', 'Repeated save reuses the accepted result');
     await value.controller.newBranch();
     assert.equal(value.controller.state.threadId, '');
-    assert.equal(value.controller.state.source?.turnId, 'new-selected-turn');
+    assert.equal(value.controller.state.source?.kind, 'conversation');
+    assert.equal(value.controller.state.source?.text, undefined);
+    assert.equal(value.controller.state.source?.turnId, undefined);
     assert.equal(value.controller.state.items.length, 0);
   } finally { value.controller.dispose(); }
 });

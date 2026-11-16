@@ -10,6 +10,8 @@ import {
 import Icon from "./Icon.vue";
 import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
+import FileExplorerActions from './FileExplorerActions.vue';
+import { changedFilePath, type FileEntryChange, type FileEntryOperation } from '../../shared/file-entries';
 import { privateState } from "../lib/private-state";
 import type { ConversationSelectionSource } from "../lib/conversation-selection";
 import { isImagePath, isMarkdownPath, officeFileKind } from "../lib/file-preview";
@@ -79,6 +81,16 @@ const openingFile = ref(false);
 const saving = computed({ get: () => !!activeEditor.value?.saving, set: value => { if (activeEditor.value) activeEditor.value.saving = value; } });
 const error = ref("");
 const downloading = ref("");
+const fileMutations = ref(0);
+const fileMutationDisabled = computed(() => !!fileMutations.value || loading.value || !props.state.connected || !props.state.authenticated ||
+  props.state.selectingThread || props.state.switchingHost || props.state.changingContext || props.state.permission === 'read-only');
+const fileActionRefs = new Map<string, InstanceType<typeof FileExplorerActions>>();
+function fileEntryMenu(event: Event, name: string) { event.preventDefault(); fileActionRefs.get(name)?.openMenu(); }
+function fileEntryKey(event: KeyboardEvent, name: string) {
+  if (event.target instanceof HTMLElement && !event.target.classList.contains('file-tree-row')) return;
+  if (event.key === 'F2' || event.key === 'Delete') { event.preventDefault(); void fileActionRefs.get(name)?.start(event.key === 'F2' ? 'rename' : 'delete'); }
+}
+function mutationWorking(value: boolean) { fileMutations.value = Math.max(0, fileMutations.value + (value ? 1 : -1)); }
 const conflict = computed({ get: () => activeEditor.value?.conflict || null, set: value => { if (activeEditor.value) activeEditor.value.conflict = value; } });
 const expandedChanges = ref(new Set<string>());
 let directoryGeneration = 0;
@@ -179,6 +191,67 @@ const htmlPreviewUrl = computed(() => file.value && isHtml.value ? `/api/preview
 const jsonPreviewContent = computed(() => isJsonPreview.value ? jsonUnicodePreview(content.value) : "");
 function join(base: string, name: string) {
   return `${base.replace(/\/$/, "")}/${name}`;
+}
+async function beforeFileChange(operation: FileEntryOperation, path: string) {
+  const affected = editorTabs.value.filter(entry => entry.file.path === path || entry.file.path.startsWith(path + '/'));
+  if (affected.some(entry => entry.saving)) throw new Error('文件正在保存，请完成后再操作。');
+  if (operation === 'delete' && affected.some(entry => entry.content !== entry.original))
+    return window.confirm('删除目标包含未保存的文件草稿。删除磁盘文件后，草稿仍保留在编辑器中。确认继续？');
+  return true;
+}
+function applyFileChange(tabs: EditorTab[], selected: string, change: FileEntryChange) {
+  const retained: EditorTab[] = [];
+  for (const entry of tabs) {
+    const path = changedFilePath(entry.file.path, change);
+    if (path === null) {
+      if (entry.content !== entry.original) retained.push({ ...entry, file: { ...entry.file, missing: true } });
+    } else {
+      if (path !== entry.file.path) entry.file = { ...entry.file, path };
+      retained.push(entry);
+    }
+  }
+  const active = changedFilePath(selected, change);
+  return { tabs: retained, activePath: active ?? (retained.some(entry => entry.file.path === selected) ? selected : '') };
+}
+const stopFileEntryListener = props.api.subscribeFileEntries?.(async (change: FileEntryChange) => {
+  if (!props.state.authenticated) return;
+  const authentication = props.api.runtimeIdentity?.().authenticationGeneration;
+  const currentScope = fileScope();
+  const current = () => props.state.authenticated && authentication === props.api.runtimeIdentity?.().authenticationGeneration;
+  if (change.previousPath) {
+    // Rename open paths in every project on this host, including saved tabs.
+    // Deleted files with unsaved edits stay recoverable in their original tab.
+    const catalog = await privateState.read<any[]>('file-workspace-tabs', 'catalog').catch(() => []);
+    if (!current()) return;
+    const scopes = new Set<string>([...(change.hostId === props.state.hostId ? [currentScope] : []), ...(catalog || []).filter(entry => entry.hostId === change.hostId).map(entry => entry.scope)]);
+    for (const scope of scopes) {
+      if (!current()) return;
+      if (scope === fileScope() && activeScope.value === scope) {
+        const result = applyFileChange(editorTabs.value, activePath.value, change);
+        editorTabs.value = result.tabs; activePath.value = result.activePath;
+        persistDrafts(); emit('fileTabsChange', fileTabsSnapshot());
+      } else {
+        const saved = await privateState.read<{ tabs: EditorTab[]; activePath: string }>('file-workspace', scope).catch(() => null);
+        if (!current() || !saved || !Array.isArray(saved.tabs)) continue;
+        const result = applyFileChange(saved.tabs, saved.activePath, change);
+        await privateState.write('file-workspace', scope, result);
+        const [hostId, projectPath] = scope.split('\0');
+        emit('fileTabsChange', { scope, hostId: hostId!, projectPath: projectPath || '', ready: true,
+          files: result.tabs.map(entry => ({ path: entry.file.path, title: entry.file.path.split('/').pop() || '', dirty: entry.content !== entry.original, saving: entry.saving })), activePath: result.activePath });
+      }
+    }
+  }
+  if (current() && change.hostId === props.state.hostId && currentScope === fileScope()) {
+    const path = changedFilePath(directory.value, change);
+    if (path !== directory.value) await readDirectory(path ?? change.directory, false);
+    else if (directory.value === change.directory) await readDirectory(directory.value, false);
+  }
+});
+async function fileEntryChanged(change: FileEntryChange) {
+  if (change.hostId !== props.state.hostId || change.directory !== directory.value) return;
+  fileSearch.value = '';
+  if (change.operation === 'createFile') await openFile(change.path);
+  else if (change.operation === 'createDirectory' || change.operation === 'rename') revealedFile.value = change.path;
 }
 async function readDirectory(path: string, interruptReveal = true) {
   if (!path) return;
@@ -343,7 +416,7 @@ function up() {
   void readDirectory(path);
 }
 async function save() {
-  if (!file.value || saving.value || props.state.permission === "read-only") return;
+  if (!file.value || file.value.missing || saving.value || fileMutations.value || props.state.permission === "read-only") return;
   const path = file.value.path;
   const savedEditor = activeEditor.value!;
   const savedFile = savedEditor.file;
@@ -596,6 +669,7 @@ window.addEventListener("pagehide", persistDrafts);
 document.addEventListener("visibilitychange", onWorkspaceHidden);
 document.addEventListener("freeze", persistDrafts);
 onBeforeUnmount(() => {
+  stopFileEntryListener?.();
   persistDrafts(); window.removeEventListener("pagehide", persistDrafts); clearTimeout(draftTimer);
   document.removeEventListener("visibilitychange", onWorkspaceHidden);
   document.removeEventListener("freeze", persistDrafts);
@@ -625,7 +699,7 @@ defineExpose({
     await pending;
     return scope === fileScope() && activeScope.value === scope;
   },
-  working: computed(() => editorTabs.value.some(entry => entry.saving)),
+  working: computed(() => !!fileMutations.value || editorTabs.value.some(entry => entry.saving)),
   openFile,
   cancelFileOpen: () => {
     ++revealGeneration;
@@ -709,7 +783,7 @@ defineExpose({
           v-model="directoryInput"
           placeholder="项目目录"
           aria-label="目录路径"
-        /><button
+        /><FileExplorerActions :api="api" :host-id="state.hostId" :directory="directory" :disabled="fileMutationDisabled || !directory" :before-change="beforeFileChange" @changed="fileEntryChanged" @working="mutationWorking" /><button
           class="icon-button"
           type="submit"
           title="刷新目录"
@@ -769,7 +843,7 @@ defineExpose({
           ><div v-if="externalFilePreview && isHtml" class="segmented-control file-view-switch" aria-label="HTML 显示方式"><button :class="{ active: activeEditor?.htmlPreview }" :aria-pressed="!!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = true)">预览</button><button :class="{ active: !activeEditor?.htmlPreview }" :aria-pressed="!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = false)">源码</button></div><button
             v-if="!isImage && !file.binary && !isJsonPreview && !activeEditor?.htmlPreview"
             class="button button-small button-secondary"
-            :disabled="!dirty || saving || (externalFilePreview ? openingFile : loading) || state.permission === 'read-only'"
+            :disabled="!dirty || saving || fileMutations > 0 || file?.missing || (externalFilePreview ? openingFile : loading) || state.permission === 'read-only'"
             @click="save"
           >
             <Icon :name="saving ? 'LoaderCircle' : 'Save'" :size="13" />保存
@@ -781,6 +855,7 @@ defineExpose({
           <div class="file-conflict-actions"><button class="button button-small button-secondary" @click="resolveConflict(true)">重新载入磁盘版本</button><button class="button button-small" :disabled="conflict.binary" @click="resolveConflict(false)">保留草稿并手动合并</button></div>
           <small>手动合并后再次保存；保存前仍会检查磁盘是否又有更新。</small>
         </section>
+        <p v-if="file.missing" class="panel-error" role="status">磁盘文件已删除；未保存的文字草稿仍保留在此标签，可复制后另存。</p>
         <div v-if="openingFile && externalFilePreview" class="file-preview-loading" role="status"><Icon name="LoaderCircle" :size="13" class="spin" />正在读取文件…</div>
         <div v-if="externalFilePreview && isHtml && activeEditor?.htmlPreview" class="file-html-preview"><iframe :src="htmlPreviewUrl" title="项目预览" sandbox="allow-scripts allow-forms allow-popups allow-downloads" referrerpolicy="no-referrer"></iframe></div>
         <div v-else-if="isImage" class="file-image">
@@ -832,6 +907,8 @@ defineExpose({
           :key="entry.fileName || entry.name"
           class="file-tree-entry"
           :class="{ 'revealed-file': (entry.path || join(directory, entry.fileName || entry.name)) === revealedFile }"
+          @contextmenu="fileEntryMenu($event, entry.fileName || entry.name)"
+          @keydown="fileEntryKey($event, entry.fileName || entry.name)"
         >
           <button class="file-tree-row" @click="openEntry(entry)">
             <Icon
@@ -874,6 +951,7 @@ defineExpose({
               }"
             />
           </button>
+          <FileExplorerActions :ref="(value: any) => value ? fileActionRefs.set(entry.fileName || entry.name, value) : fileActionRefs.delete(entry.fileName || entry.name)" :api="api" :host-id="state.hostId" :directory="directory" :entry="{ name: entry.fileName || entry.name, isDirectory: !!(entry.isDirectory || entry.type === 'directory') }" :disabled="fileMutationDisabled" :before-change="beforeFileChange" @changed="fileEntryChanged" @working="mutationWorking" />
         </div>
         <div v-if="!entries.length && !loading" class="panel-empty">
           <Icon name="FolderOpen" :size="32" />

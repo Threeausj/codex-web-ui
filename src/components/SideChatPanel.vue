@@ -130,9 +130,7 @@ function openParent() {
   if (source) emit('openParent', source.hostId, source.threadId);
 }
 async function newBranch() {
-  if (!window.confirm(conversationContext.value || parentChanged.value
-    ? `另开侧边分支会结束当前临时问答，并继承${parentChanged.value ? '当前主窗口对话' : '原对话'}的上下文。未保存的侧边问答和草稿将清除，是否继续？`
-    : '另开侧边分支会关闭当前临时问答，并按当前选段重新继承历史，是否继续？')) return;
+  if (!window.confirm('新建侧边聊天将继承当前主对话的上下文，清除旧引用、未保存的侧边问答和草稿。是否继续？')) return;
   try { await props.controller.newBranch(); localError.value = ''; followTail.value = true; focusQuestion(); }
   catch (cause: any) { localError.value = cause.message; }
 }
@@ -273,7 +271,7 @@ function quoteAnswer() {
 .side-chat-close-dialog footer { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
 .side-chat-primary:not(:disabled) { background: var(--side-chat-accent); color: var(--inverse); }
 @media (max-width: 760px) {
-  .side-chat-heading { height: calc(48px + env(safe-area-inset-top)); min-height: calc(48px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 11px 0; }
+  .side-chat-heading { height: calc(44px + env(safe-area-inset-top)); min-height: calc(44px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 11px 0; }
   .side-chat-heading .icon-button { width: 36px; height: 38px; }
   .side-chat-heading strong { font-size: 13px; }
   .side-chat-context-controls { min-height: 40px; }

@@ -81,6 +81,31 @@ test('the mobile keyboard cannot push a quoted side question outside the visible
   await expect(page.getByRole('button', { name: '发送侧边问题', exact: true })).toBeInViewport();
 });
 
+test('a new side branch clears the selected quote and draft and inherits current full context on its first question', async ({ page, mock }) => {
+  sidebarWire(mock);
+  await login(page);
+  await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).first().click();
+  await page.locator('[data-selection-item-id="history-agent"]').evaluate(element => {
+    const range = document.createRange(); range.selectNodeContents(element);
+    const selection = window.getSelection()!; selection.removeAllRanges(); selection.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+  });
+  await page.getByRole('button', { name: '在侧边聊天中提问', exact: true }).click();
+  await expect(page.locator('.side-chat-quote')).toContainText('历史保持可读');
+  await page.getByRole('textbox', { name: '围绕引用内容提问', exact: true }).fill('不应保留的旧草稿');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '另开侧边分支', exact: true }).click();
+  await expect(page.locator('.side-chat-quote')).toHaveCount(0);
+  const input = page.getByRole('textbox', { name: '基于当前对话提问', exact: true });
+  await expect(input).toHaveValue('');await expect(input).toBeFocused();
+  expect(mock.request('thread/fork')).toBeUndefined();
+  await input.fill('根据完整上下文回答');await page.getByRole('button', { name: '发送侧边问题', exact: true }).click();
+  await expect.poll(() => mock.requests.filter(request => request.method === 'turn/start').length).toBe(1);
+  const fork = mock.request('thread/fork')!.params;
+  expect(fork.threadId).toBe('thread-existing');expect(fork.lastTurnId).toBeUndefined();expect(fork.beforeTurnId).toBeUndefined();
+  expect(mock.request('turn/start')!.params.input).toEqual([{ type: 'text', text: '根据完整上下文回答', text_elements: [] }]);
+});
+
 test('hiding a running side chat keeps its streamed answer and editable follow-up draft', async ({ page, mock }) => {
   const wire = sidebarWire(mock);
   mock.holdFinalMessage = true;
