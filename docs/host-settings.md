@@ -62,6 +62,10 @@ SSH 主机编辑弹窗的 **高级选项 → Codex 运行方式** 提供“继�
 
 ## 中转站和官方账号
 
+页面通过所选主机的原生 `config/read` 读取当前生效的 `model_provider` 和 `model_providers`，包含该账户 `CODEX_HOME/config.toml` 的配置及原生配置层；用户配置路径由原生接口报告。`threecode` 等已有自定义 HTTP 提供方显示为“中转站”，并展示名称、原生 ID 和 API 地址；不因名称不同而默认选中官方账户。详情见[官方配置说明](https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers)。
+
+查看设置不会修改配置或回传密钥。已有自定义提供方可继续按原配置运行；如显式保存到网页管理的中转配置，需要输入新的 Key，原自定义配置保留。外部管理的共享服务仍只读显示。
+
 **设置 → Codex → 中转站** 输入兼容 Responses API 的 API 根地址（例如 `https://api.example.com/v1`）、API Key 和可选默认模型，再保存。第一次配置或更换地址时需要 Key；同地址留空保留已保存的 Key。切换提供方不自动升级主机的 Codex。
 
 使用官方的[命令式认证配置](https://learn.chatgpt.com/docs/config-file/config-reference)把 Key 保存在目标主机 Codex 数据目录下的独立 `0600` 文件，不通过读取设置回传 Key，也不替换官方 `auth.json`。此功能要求主机 Python 3 和支持 `model_providers.<id>.auth` 的 Codex。切换提供方会影响该用户的 Codex 配置；共享代理模式须在服务端修改。
