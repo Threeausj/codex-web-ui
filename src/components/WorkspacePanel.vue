@@ -37,7 +37,7 @@ const props = defineProps<{
   filePreviewTarget?: string;
   filePreviewVisible?: boolean;
 }>();
-type FileTabsSnapshot = { scope: string; hostId: string; projectPath: string; files: { path: string; title: string; dirty: boolean; saving: boolean }[]; activePath: string };
+type FileTabsSnapshot = { scope: string; hostId: string; projectPath: string; ready: boolean; files: { path: string; title: string; dirty: boolean; saving: boolean }[]; activePath: string };
 const emit = defineEmits<{
   close: [];
   error: [message: string];
@@ -46,6 +46,7 @@ const emit = defineEmits<{
   fileTabsChange: [snapshot: FileTabsSnapshot];
   previewFile: [target: { path: string; hostId: string; projectPath: string }];
   fileOpenFailed: [target: { path: string; hostId: string; projectPath: string }];
+  revealDirectory: [target: { hostId: string; projectPath: string }];
 }>();
 const externalFilePreview = computed(() => !!props.filePreviewTarget);
 const tab = ref(props.initialTab || "files");
@@ -116,6 +117,7 @@ function scheduleDrafts() { clearTimeout(draftTimer); draftTimer = setTimeout(pe
 watch([editorTabs, activePath], scheduleDrafts, { deep: true });
 function fileTabsSnapshot(): FileTabsSnapshot { return {
   scope: fileScope(), hostId: props.state.hostId, projectPath: props.state.projectPath || "",
+  ready: activeScope.value === fileScope(),
   files: activeScope.value === fileScope() ? editorTabs.value.map(entry => ({ path: entry.file.path, title: entry.file.path.split('/').pop() || entry.file.path, dirty: entry.content !== entry.original, saving: entry.saving })) : [],
   activePath: activeScope.value === fileScope() ? activePath.value : "",
 }; }
@@ -286,6 +288,8 @@ async function revealPath(path: string, line?: number) {
       if (!externalFilePreview.value) { ++fileGeneration; openingFile.value = false; activePath.value = ""; }
       tab.value = "files";
       await readDirectory(path, false);
+      if (scope === fileScope() && generation === revealGeneration && externalFilePreview.value)
+        emit('revealDirectory', { hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
     } else {
       // Directory browsing is independent from previewing file bytes. Load it
       // even if the preview is rejected, and expose the matching download row.
@@ -299,8 +303,10 @@ async function revealPath(path: string, line?: number) {
       await Promise.all([directoryLoad, openFile(path, "files", line, directoryLoad)]);
     }
   } catch (cause: any) {
-    if (scope === fileScope() && generation === revealGeneration)
+    if (scope === fileScope() && generation === revealGeneration) {
       error.value = cause.message || "无法打开路径";
+      if (externalFilePreview.value) emit('fileOpenFailed', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
+    }
   }
 }
 async function download(path: string) {
@@ -392,6 +398,24 @@ function closeEditor(path: string) {
     if (file.value && officeFileKind(file.value.path) && !file.value.dataBase64) void openFile(activePath.value, tab.value, undefined, undefined, false);
   }
   persistDrafts();
+  return true;
+}
+async function closeEditorFromScope(scope: string, path: string) {
+  if (scope === fileScope()) return closeEditor(path);
+  const authentication = props.api.runtimeIdentity?.().authenticationGeneration;
+  const current = () => props.state.authenticated && authentication === props.api.runtimeIdentity?.().authenticationGeneration;
+  await props.api.privateSessionReady?.();
+  if (!current()) return false;
+  const saved = await privateState.read<{ tabs: EditorTab[]; activePath: string }>("file-workspace", scope);
+  if (!current()) return false;
+  if (!saved || !Array.isArray(saved.tabs)) return true;
+  const entry = saved.tabs.find(candidate => candidate.file?.path === path);
+  if (!entry) return true;
+  if (entry.saving || entry.content !== entry.original && !window.confirm("关闭标签会丢弃此文件的未保存草稿，是否继续？")) return false;
+  if (!current()) return false;
+  const tabs = saved.tabs.filter(candidate => candidate.file?.path !== path);
+  const activePath = saved.activePath === path ? tabs.at(-1)?.file.path || "" : saved.activePath;
+  await privateState.write("file-workspace", scope, { ...saved, tabs, activePath });
   return true;
 }
 function codeSelection(value: { text: string; startLine: number; endLine: number }, action: 'add' | 'ask') {
@@ -595,6 +619,12 @@ watch(tab, async (value) => {
   }
 });
 defineExpose({
+  waitForScope: async (scope: string) => {
+    if (scope !== fileScope()) return false;
+    const pending = workspaceReady;
+    await pending;
+    return scope === fileScope() && activeScope.value === scope;
+  },
   working: computed(() => editorTabs.value.some(entry => entry.saving)),
   openFile,
   cancelFileOpen: () => {
@@ -605,6 +635,7 @@ defineExpose({
   },
   activateFile: (path: string, line?: number) => openFile(path, "files", line),
   closeEditor,
+  closeEditorFromScope,
   closeFile,
   revealPath,
   setTab: (value: string) => {

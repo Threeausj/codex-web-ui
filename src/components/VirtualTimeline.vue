@@ -10,6 +10,7 @@ const viewport = ref<HTMLElement | null>(null);
 const margin = ref(0);
 const selectionIds = ref<string[]>([]);
 let geometry: ResizeObserver | undefined;
+let disposed = false;
 const options = computed(() => {
   // Core compares the previous key lookup with this one to detect prepends.
   // Capturing each immutable array is necessary; reading live props defeats it.
@@ -55,19 +56,30 @@ function selectionChanged() {
     .map(element => element.dataset.timelineRow!);
 }
 onMounted(async () => {
+  if (disposed) return;
   viewport.value = container.value?.closest<HTMLElement>('.conversation-scroll, .side-chat-transcript') || null;
   updateMargin();
+  if (container.value && viewport.value && props.initialReading && !props.initialReading.bottom) {
+    container.value.style.visibility = 'hidden';
+    viewport.value.scrollTop = props.initialReading.top;
+  }
   if (typeof ResizeObserver !== 'undefined') {
     geometry = new ResizeObserver(updateMargin);
     if (viewport.value) geometry.observe(viewport.value);
     if (container.value?.parentElement) geometry.observe(container.value.parentElement);
   }
   document.addEventListener('selectionchange', selectionChanged);
-  await nextTick();
-  if (props.initialReading && !props.initialReading.bottom) await restoreReading(props.initialReading);
-  else virtualizer.value.scrollToEnd();
+  try {
+    await nextTick();
+    if (disposed) return;
+    if (props.initialReading && !props.initialReading.bottom) await restoreReading(props.initialReading);
+    else virtualizer.value.scrollToEnd();
+    if (disposed) return;
+  } finally {
+    if (!disposed && container.value) container.value.style.visibility = '';
+  }
 });
-onBeforeUnmount(() => { geometry?.disconnect(); document.removeEventListener('selectionchange', selectionChanged); });
+onBeforeUnmount(() => { disposed = true; geometry?.disconnect(); document.removeEventListener('selectionchange', selectionChanged); });
 async function revealItem(itemId: string) {
   const index = props.rows.findIndex(row => row.item?.id === itemId || row.id === itemId);
   if (index < 0) return false;
@@ -76,12 +88,24 @@ async function revealItem(itemId: string) {
   return true;
 }
 async function restoreReading(position: ReadingPosition) {
+  if (disposed) return;
   const id = position.anchor?.historyId;
   const index = id ? props.rows.findIndex(row => row.id === id || row.item?.id === id || row.turnId === id) : -1;
   if (index >= 0) {
+    const mounted = container.value?.querySelector<HTMLElement>(`[data-index="${index}"]`);
+    if (mounted && viewport.value) {
+      // Revalidation often restores an anchor that is already in view. Moving
+      // it to the row's start first would expose that intermediate position for
+      // one frame before the saved within-row offset is reapplied.
+      virtualizer.value.cancelScroll();
+      viewport.value.scrollTop += mounted.getBoundingClientRect().top - viewport.value.getBoundingClientRect().top - (position.anchor?.offset || 0);
+      return;
+    }
     virtualizer.value.scrollToIndex(index, { align: 'start' });
     await nextTick();
+    if (disposed) return;
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    if (disposed) return;
     const row = container.value?.querySelector<HTMLElement>(`[data-index="${index}"]`);
     if (row && viewport.value) {
       virtualizer.value.cancelScroll();

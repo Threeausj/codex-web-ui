@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from './Icon.vue';
 
 type ChatTab = { hostId: string; threadId: string; title: string; pinned: boolean };
-type FileTab = { path: string; title: string; dirty: boolean; saving: boolean };
+type FileTab = { scope: string; hostId: string; projectPath: string; threadId?: string; path: string; title: string; dirty: boolean; saving: boolean };
 const props = defineProps<{
   tabs: ChatTab[];
   activeKey: string | null;
@@ -11,19 +11,31 @@ const props = defineProps<{
   disabled: boolean;
   fileTabs?: FileTab[];
   activeFilePath?: string | null;
+  activeFileScope?: string | null;
+  currentWorkspaceScope?: string | null;
 }>();
-const emit = defineEmits<{ select: [tab: ChatTab]; close: [tab: ChatTab]; new: []; selectDraft: []; selectFile: [path: string]; closeFile: [path: string] }>();
+const emit = defineEmits<{ select: [tab: ChatTab]; close: [tab: ChatTab]; new: []; selectDraft: []; selectFile: [tab: FileTab]; closeFile: [tab: FileTab] }>();
 const key = (tab: ChatTab) => JSON.stringify([tab.hostId, tab.threadId]);
 const draftKey = 'new-chat';
-const fileKey = (path: string) => JSON.stringify(['file', path]);
+const fileKey = (tab: Pick<FileTab, 'hostId' | 'projectPath' | 'path'>) => JSON.stringify(['file', tab.hostId, tab.projectPath, tab.path]);
+const isActiveFile = (tab: FileTab) => props.activeFilePath === tab.path && props.activeFileScope === tab.scope;
+const fileTabLabel = (tab: FileTab) => {
+  const duplicates = props.fileTabs?.filter(item => item.title === tab.title) || [];
+  if (duplicates.length < 2 || tab.scope === props.currentWorkspaceScope) return tab.title;
+  const project = tab.projectPath.split('/').filter(Boolean).at(-1) || tab.hostId;
+  return `${tab.title} · ${tab.hostId}/${project}`;
+};
 const viewport = ref<HTMLElement>();
 const focusedKey = ref<string | null>(null);
-const visibleKeys = computed(() => [...props.tabs.map(key), ...(props.draft ? [draftKey] : []), ...(props.fileTabs || []).map(tab => fileKey(tab.path))]);
+const visibleKeys = computed(() => [...props.tabs.map(key), ...(props.draft ? [draftKey] : []), ...(props.fileTabs || []).map(fileKey)]);
 const stripWidths = computed(() => ({
   '--tabs-width': `${Math.max(0, visibleKeys.value.length * 228 - 4)}px`,
   '--tabs-width-mobile': `${Math.max(0, visibleKeys.value.length * 199 - 3)}px`,
 }));
-const selectedKey = computed(() => props.activeFilePath ? fileKey(props.activeFilePath) : props.draft ? draftKey : props.activeKey);
+const selectedKey = computed(() => {
+  const activeFile = props.fileTabs?.find(isActiveFile);
+  return activeFile ? fileKey(activeFile) : props.draft ? draftKey : props.activeKey;
+});
 const tabStop = computed(() => visibleKeys.value.includes(focusedKey.value || '')
   ? focusedKey.value : selectedKey.value || visibleKeys.value[0]);
 let observer: ResizeObserver | undefined;
@@ -67,8 +79,8 @@ function keydown(event: KeyboardEvent, value: string) {
   } else if (event.key === 'Delete') {
     const tab = props.tabs.find(tab => key(tab) === value);
     if (tab && !tab.pinned) { event.preventDefault(); event.stopPropagation(); closeTab(tab); }
-    const file = props.fileTabs?.find(tab => fileKey(tab.path) === value);
-    if (file && !file.saving) { event.preventDefault(); event.stopPropagation(); emit('closeFile', file.path); }
+    const file = props.fileTabs?.find(tab => fileKey(tab) === value);
+    if (file && !file.saving) { event.preventDefault(); event.stopPropagation(); emit('closeFile', file); }
   }
 }
 function closeMiddle(event: MouseEvent, tab: ChatTab) {
@@ -77,7 +89,7 @@ function closeMiddle(event: MouseEvent, tab: ChatTab) {
   closeTab(tab);
 }
 watch(selectedKey, selected => { focusedKey.value = selected; });
-watch(() => [selectedKey.value, ...props.tabs.map(tab => `${key(tab)}:${tab.title}:${tab.pinned}`), ...(props.fileTabs || []).map(tab => `${fileKey(tab.path)}:${tab.title}:${tab.dirty}`), props.draft], async () => {
+watch(() => [selectedKey.value, ...props.tabs.map(tab => `${key(tab)}:${tab.title}:${tab.pinned}`), ...(props.fileTabs || []).map(tab => `${fileKey(tab)}:${tab.title}:${tab.dirty}`), props.draft], async () => {
   if (!visibleKeys.value.includes(focusedKey.value || '')) focusedKey.value = selectedKey.value;
   void showSelected();
   if (closingFocus && !visibleKeys.value.includes(closingFocus)) {
@@ -122,18 +134,18 @@ defineExpose({ focusSelected: () => { if (selectedKey.value) focusTab(selectedKe
         </button>
         <div v-if="!activeFilePath" class="chat-tab-menu"><slot name="menu" /></div>
       </div>
-      <div v-for="tab in fileTabs || []" :key="fileKey(tab.path)" class="chat-tab file-tab"
-        :class="{ active: activeFilePath === tab.path }" :data-file-path="tab.path"
-        @auxclick="event => { if (event.button === 1) { event.preventDefault(); if (!disabled && !tab.saving) emit('closeFile', tab.path); } }">
-        <button type="button" class="chat-tab-select" role="tab" :data-tab-key="fileKey(tab.path)"
-          :aria-label="tab.title" :aria-description="tab.dirty ? '有未保存的修改' : undefined"
-          :aria-selected="activeFilePath === tab.path" :tabindex="tabStop === fileKey(tab.path) ? 0 : -1"
-          :disabled="disabled" :title="tab.path" @click="emit('selectFile', tab.path)"
-          @focus="focusedKey = fileKey(tab.path)" @keydown="keydown($event, fileKey(tab.path))">
-          <Icon name="FileText" :size="14" /><span class="chat-tab-title">{{ tab.title }}</span><i v-if="tab.dirty" class="dirty-dot" aria-label="未保存"></i>
+      <div v-for="tab in fileTabs || []" :key="fileKey(tab)" class="chat-tab file-tab"
+        :class="{ active: isActiveFile(tab) }" :data-file-path="tab.path" :data-file-host="tab.hostId" :data-file-project="tab.projectPath"
+        @auxclick="event => { if (event.button === 1) { event.preventDefault(); if (!disabled && !tab.saving) emit('closeFile', tab); } }">
+        <button type="button" class="chat-tab-select" role="tab" :data-tab-key="fileKey(tab)"
+          :aria-label="fileTabLabel(tab)" :aria-description="tab.dirty ? '有未保存的修改' : undefined"
+          :aria-selected="isActiveFile(tab)" :tabindex="tabStop === fileKey(tab) ? 0 : -1"
+          :disabled="disabled" :title="`${tab.hostId} · ${tab.projectPath || '无项目'} · ${tab.path}`" @click="emit('selectFile', tab)"
+          @focus="focusedKey = fileKey(tab)" @keydown="keydown($event, fileKey(tab))">
+          <Icon name="FileText" :size="14" /><span class="chat-tab-title">{{ fileTabLabel(tab) }}</span><i v-if="tab.dirty" class="dirty-dot" aria-label="未保存"></i>
         </button>
         <button type="button" class="chat-tab-close" :disabled="disabled || tab.saving" :aria-label="`关闭文件 ${tab.title}`"
-          :title="`关闭文件 ${tab.title}`" @click.stop="emit('closeFile', tab.path)"><Icon name="X" :size="13" /></button>
+          :title="`关闭文件 ${tab.title}`" @click.stop="emit('closeFile', tab)"><Icon name="X" :size="13" /></button>
       </div>
     </div>
     <button type="button" class="icon-button chat-tab-new" :disabled="disabled"

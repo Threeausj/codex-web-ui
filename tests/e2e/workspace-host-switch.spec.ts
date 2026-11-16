@@ -81,7 +81,8 @@ test('switching hosts discards the previous host directory and pending file-link
   await switchConversation(page, 'host-b', 'Beta 会话');
   await expect(page.getByRole('textbox', { name: '目录路径', exact: true })).toHaveValue('/srv/beta');
   await expect(page.locator('.file-tree-row')).toHaveText(['beta.ts']);
-  await expect(page.locator('.chat-tabs .file-tab')).toHaveCount(0);
+  await expect(page.locator('.chat-tabs .file-tab[data-file-host="local"]')).toHaveCount(1);
+  await expect(page.locator('.center-file-preview')).toBeHidden();
   await expect(page.locator('.workspace-panel .panel-error')).toHaveCount(0);
   await expect(page.locator('.global-error')).toHaveCount(0);
   expect(remote.requests.filter(request => request.method?.startsWith('fs/') && request.params?.path?.startsWith('/srv/alpha'))).toEqual([]);
@@ -110,6 +111,65 @@ test('the same path on two hosts keeps separate unsaved tabs and restores each d
   await page.getByRole('tab', { name: 'shared.ts', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'shared.ts 文件内容', exact: true })).toHaveText('const draft = "beta unsaved";');
   await expect(page.locator('.file-editor-footer')).toContainText('未保存');
+  expect([...mock.requests, ...remote.requests].filter(request => request.method === 'fs/writeFile')).toEqual([]);
+});
+
+test('open file tabs remain visible across workspaces and switch to their owning host when selected', async ({ page, mock }) => {
+  const remote = twoHosts(mock);
+  filesystem(mock, { '/srv/alpha': ['alpha.ts'] }, { '/srv/alpha/alpha.ts': 'const owner = "alpha";' });
+  filesystem(remote, { '/srv/beta': ['beta.ts'] }, { '/srv/beta/beta.ts': 'const owner = "beta";' });
+  await login(page);
+  await switchConversation(page, 'local', 'Alpha 会话');
+  await openFiles(page);
+  await page.locator('.file-tree-row').filter({ hasText: 'alpha.ts' }).click();
+  await expect(page.getByRole('textbox', { name: 'alpha.ts 文件内容', exact: true })).toHaveText('const owner = "alpha";');
+  await switchConversation(page, 'host-b', 'Beta 会话');
+  await openFiles(page);
+  await page.locator('.file-tree-row').filter({ hasText: 'beta.ts' }).click();
+  await expect(page.getByRole('textbox', { name: 'beta.ts 文件内容', exact: true })).toHaveText('const owner = "beta";');
+
+  const alphaTab = page.locator('.chat-tabs .file-tab[data-file-host="local"] [role="tab"]');
+  const betaTab = page.locator('.chat-tabs .file-tab[data-file-host="host-b"] [role="tab"]');
+  await expect(alphaTab).toBeVisible();
+  await expect(betaTab).toBeVisible();
+  await alphaTab.click();
+  await expect(page.getByRole('textbox', { name: 'alpha.ts 文件内容', exact: true })).toHaveText('const owner = "alpha";');
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'local');
+  await expect(page.getByRole('heading', { name: 'Alpha 会话', exact: true })).toBeVisible();
+  await expect(betaTab).toBeVisible();
+  expect(remote.requests.filter(request => request.method?.startsWith('fs/') && request.params?.path?.startsWith('/srv/alpha'))).toEqual([]);
+  await page.locator('.chat-tabs .file-tab[data-file-host="host-b"] .chat-tab-close').click();
+  await expect(betaTab).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator('.chat-tabs .file-tab[data-file-host="local"] [role="tab"]')).toBeVisible();
+  await expect(page.locator('.chat-tabs .file-tab[data-file-host="host-b"]')).toHaveCount(0);
+  await page.locator('.chat-tabs .file-tab[data-file-host="local"] .chat-tab-close').click();
+  await expect(page.locator('.chat-tabs .file-tab')).toHaveCount(0);
+  await expect(page.locator('.workspace-panel')).toBeHidden();
+  await page.reload();
+  await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeEnabled();
+  await expect(page.locator('.chat-tabs .file-tab')).toHaveCount(0);
+});
+
+test('closing an inactive workspace tab confirms unsaved drafts without changing the active workspace', async ({ page, mock }) => {
+  const remote = twoHosts(mock);
+  filesystem(mock, { '/srv/alpha': ['alpha.ts'] }, { '/srv/alpha/alpha.ts': 'const owner = "alpha";' });
+  filesystem(remote, { '/srv/beta': ['beta.ts'] }, { '/srv/beta/beta.ts': 'const owner = "beta";' });
+  await login(page);
+  await switchConversation(page, 'local', 'Alpha 会话');
+  await openFiles(page);
+  await page.locator('.file-tree-row').filter({ hasText: 'alpha.ts' }).click();
+  await editSource(page, 'alpha.ts 文件内容', 'const draft = "unsaved alpha";');
+  await switchConversation(page, 'host-b', 'Beta 会话');
+  const alphaTab = page.locator('.chat-tabs .file-tab[data-file-host="local"]');
+  page.once('dialog', dialog => dialog.dismiss());
+  await alphaTab.locator('.chat-tab-close').click();
+  await expect(alphaTab).toBeVisible();
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'host-b');
+  page.once('dialog', dialog => dialog.accept());
+  await alphaTab.locator('.chat-tab-close').click();
+  await expect(alphaTab).toHaveCount(0);
+  await expect(page.locator('.main-header')).toHaveAttribute('data-host-id', 'host-b');
   expect([...mock.requests, ...remote.requests].filter(request => request.method === 'fs/writeFile')).toEqual([]);
 });
 
@@ -156,6 +216,7 @@ test('a file read failure received after leaving its host does not report an err
   const response = await failedRead;
   expect(response.status()).toBe(502);
   await response.finished();
+  await openFiles(page);
   await page.locator('.file-tree-row').filter({ hasText: 'beta.ts' }).click();
   await expect(page.getByRole('textbox', { name: 'beta.ts 文件内容', exact: true })).toHaveText('const beta = true;');
   await expect(page.locator('.global-error')).toHaveCount(0);

@@ -850,6 +850,7 @@ function applyConversationSnapshot(snapshot: ConversationSnapshot, id: string) {
   state.noProject = isProjectlessThread(state.activeThread);
   state.items = itemCache.get(id) ?? snapshot.items;
   state.turns = snapshot.turns;
+  state.busy = selectedConversationBusy(id);
   settleLoadedToolItems(state.items, state.turns);
   rememberAsyncQuestions(id, state.items);
   historyWindowTruncated = snapshot.historyTruncated === true;
@@ -1728,6 +1729,14 @@ function currentItems(threadId: string): DisplayItem[] {
     itemCache.set(threadId, items);
   }
   return items;
+}
+function selectedConversationBusy(threadId: string) {
+  // Native observations, including an explicit idle update, outrank a cached
+  // running turn. The remaining hints preserve its presentation while a new
+  // selection is hydrating; they do not acquire a writer or enable sending.
+  return threadBusy.get(threadId) ?? (activeTurns.has(threadId) ||
+    state.turns.some(turn => turn.status === 'inProgress' && !completedTurns.has(turn.id)) ||
+    state.activeThread?.id === threadId && state.activeThread.status?.type === 'active');
 }
 function retireThreadRuntime(threadId: string) {
   if (!threadId) return;
@@ -3117,7 +3126,7 @@ async function selectThreadOnce(id: string, options: { preserveWriter?: boolean 
   if (cached && !tokenUsages.has(modeKey)) tokenUsages.set(modeKey, cached.tokenUsage);
   state.diff = "";
   state.plan = [];
-  state.busy = activeTurns.has(id);
+  state.busy = selectedConversationBusy(id);
   state.compacting = compactions.has(modeKey);
   turnCursor = loadedHistory ? loadedHistory.cursor : cached?.cursor ?? null;
   state.moreTurns = !!turnCursor;
@@ -4988,6 +4997,7 @@ async function setHost(id: string, options: { threadId?: string } = {}) {
       if (snapshot && previewCurrent() && !state.items.length)
         applyConversationSnapshot(snapshot, target);
     });
+    state.busy = selectedConversationBusy(target);
   }
   startNavigationRefresh();
   const retainedSocket = hostConnections.get(id)?.socket;
