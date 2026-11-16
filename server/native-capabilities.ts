@@ -26,7 +26,12 @@ export function externalProxyRuntime(host: Host, native: NativeIdentity, options
 function object(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 const versionPattern = /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/
 export function nativeRuntimeVersion(userAgent?: string | null) {
-  return typeof userAgent === 'string' ? /^[A-Za-z0-9_.-]+\/(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\s|$)/.exec(userAgent)?.[1] : undefined
+  if (typeof userAgent !== 'string') return undefined
+  // Desktop daemons identify themselves as "Codex Desktop/<version>". Read
+  // only the leading product/version, never a CLI token inside its descriptor.
+  const slash = userAgent.indexOf('/')
+  if (slash < 1 || slash > 80 || !/^[A-Za-z0-9_.-]+(?: [A-Za-z0-9_.-]+)*$/.test(userAgent.slice(0, slash))) return undefined
+  return /^(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\s|$)/.exec(userAgent.slice(slash + 1))?.[1]
 }
 /** All discovery output is protocol metadata, never raw config/schema/credentials. */
 export function parseNativeCapabilities(raw: unknown, checkedAt: number): NativeCapabilities {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { NativeCapabilitiesService, nativeMethods, parseNativeCapabilities } from './native-capabilities.js'
+import { NativeCapabilitiesService, nativeMethods, nativeRuntimeVersion, parseNativeCapabilities } from './native-capabilities.js'
 import type { Host } from './types.js'
 
 const host: Host = { id: 'fixture', name: 'Fixture', kind: 'local' }
@@ -11,6 +11,35 @@ const identity = { userAgent: 'codex_web/0.160.1 (Fixture)' }
 function known() {
   return { status: 'known', checkedCliVersion: '0.160.1', methods: Object.fromEntries(nativeMethods.map(method => [method, { available: true, params: method === 'config/mcpServer/reload' ? [] : ['threadId'], required: method === 'config/mcpServer/reload' ? [] : ['threadId'] }])) }
 }
+
+test('runtime versions recognize bounded Desktop product names and retain the leading daemon version', () => {
+  assert.equal(nativeRuntimeVersion('Codex Desktop/0.165.0 (Debian 12.0.0; x86_64) unknown (codex_cli_rs; 0.1.0)'), '0.165.0')
+  assert.equal(nativeRuntimeVersion('Codex Desktop/0.163.0 (Linux; x86_64) codex_cli_rs/0.1.0'), '0.163.0')
+  assert.equal(nativeRuntimeVersion('codex_cli_rs/0.166.0'), '0.166.0')
+  assert.equal(nativeRuntimeVersion('codex_web/0.166.0-beta.1 (Linux)'), '0.166.0-beta.1')
+  assert.equal(nativeRuntimeVersion('codex_web/0.166.0+fixture (Linux)'), '0.166.0+fixture')
+  for (const value of [undefined, null, '', 'Codex Desktop', ' Codex Desktop/0.165.0', 'Codex  Desktop/0.165.0',
+    'Codex Desktop /0.165.0', 'runtime: Codex Desktop/0.165.0', '(Codex Desktop/0.165.0)',
+    'fixture (codex_cli_rs/0.165.0)', 'https://Codex Desktop/0.165.0', 'Codex\nDesktop/0.165.0',
+    'Codex Desktop/0.165', 'Codex Desktop/v0.165.0', 'Codex Desktop/0.165.0suffix',
+    'Codex Desktop/0.165.0/other', `${'x'.repeat(81)}/0.165.0`])
+    assert.equal(nativeRuntimeVersion(value), undefined, `Do not infer a runtime version from ${JSON.stringify(value)}`)
+})
+
+test('Desktop daemon capability discovery verifies its actual version against the selected CLI', async () => {
+  let calls = 0
+  const service = new NativeCapabilitiesService({ collect: async () => { calls++; return { ...known(), checkedCliVersion: '0.165.0' } } })
+  const daemon: Host = { ...host, connectionMode: 'daemon' }
+  const value = await service.read(daemon, { engineId: 'desktop', connectionMode: 'daemon', userAgent: 'Codex Desktop/0.165.0 (Debian 12.0.0; x86_64) unknown (codex_cli_rs; 0.1.0)' })
+  assert.equal(value.status, 'known')
+  assert.equal(value.checkedCliVersion, '0.165.0')
+  assert.equal(calls, 1)
+  const older = await service.read(daemon, { engineId: 'older-desktop', connectionMode: 'daemon', userAgent: 'Codex Desktop/0.163.0 (Linux; x86_64) codex_cli_rs/0.165.0' })
+  assert.equal(older.status, 'unknown')
+  assert.equal(older.reason, 'runtime_version_mismatch')
+  assert.deepEqual(older.methods, {})
+  assert.equal(calls, 2)
+})
 
 test('capabilities keep only validated known method fields and reject unknown schemas', () => {
   const raw = { ...known(), credentials: 'private-token', schema: { secret: true } }

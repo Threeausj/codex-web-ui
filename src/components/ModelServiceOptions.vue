@@ -8,9 +8,14 @@ const busy = ref(false);
 const error = ref('');
 const capabilities = ref<any>(null);
 const catalogTiers = computed(() => modelServiceTiers(props.state));
-const tierSupported = computed(() => props.state.activeThread ? methodAccepts(capabilities.value, 'thread/settings/update', ['threadId', 'serviceTier']) :
+const tierSupported = computed(() => props.state.activeThread ?
+  methodAccepts(capabilities.value, 'thread/settings/update', ['threadId', 'serviceTier']) || methodAccepts(capabilities.value, 'turn/start', ['threadId', 'input', 'serviceTier']) :
   methodAccepts(capabilities.value, 'thread/start', ['serviceTier']) && methodAccepts(capabilities.value, 'turn/start', ['threadId', 'input', 'serviceTier']));
-const tiers = computed(() => tierSupported.value ? catalogTiers.value : []);
+const tiers = catalogTiers;
+const capabilityLoading = ref(false);
+const tierHint = computed(() => capabilityLoading.value ? '正在读取主机的速度设置…' : !tierSupported.value ?
+  capabilities.value?.status === 'known' ? '当前主机暂不支持调整速度' : '暂时无法确认主机的速度设置，重新连接后重试' :
+  selectedTier.value?.description || '服务层级由当前主机的模型目录提供');
 const windows = computed(() => rateLimitWindows(props.state.rateLimits));
 const selected = computed({
   get: () => props.state.serviceTierScope === serviceTierScope(props.state) ? props.state.serviceTier || '' : props.state.nativeServiceTier || '',
@@ -27,9 +32,20 @@ let quotaRevision = 0, quotaDirty = false;
 let pending: Promise<void> | null = null;
 let capabilityPending: Promise<void> | null = null;
 let capabilityGeneration = 0;
+let capabilityRetry: ReturnType<typeof setTimeout> | undefined;
+let capabilityAttempts = 0;
 let seenEngine: string | null = null;
+function clearCapabilityRetry() { clearTimeout(capabilityRetry); capabilityRetry = undefined; }
+function retryCapabilities() {
+  clearCapabilityRetry();
+  const reason = capabilities.value?.reason;
+  if (disposed || !props.state.connected || !props.state.authenticated || !catalogTiers.value.length ||
+      capabilities.value?.status === 'known' || reason && reason !== 'schema_unavailable' || capabilityAttempts >= 3) return;
+  capabilityRetry = setTimeout(() => { capabilityRetry = undefined; void readCapabilities(); }, capabilityAttempts * 5000);
+}
 async function readCapabilities() {
   if (disposed || !props.state.connected || !props.state.authenticated || !catalogTiers.value.length || capabilityPending) return;
+  clearCapabilityRetry(); capabilityLoading.value = true; capabilityAttempts++;
   const version = generation;
   const revision = capabilityGeneration;
   const host = props.state.hostId;
@@ -41,7 +57,9 @@ async function readCapabilities() {
   })();
   capabilityPending = operation;
   await operation;
-  if (capabilityPending === operation) capabilityPending = null;
+  if (capabilityPending === operation) {
+    capabilityPending = null; capabilityLoading.value = false; retryCapabilities();
+  }
 }
 async function readLimits() {
   if (disposed || !props.state.connected || !props.state.authenticated || pending) return;
@@ -58,14 +76,14 @@ async function readLimits() {
   await operation;
   if (pending === operation) { pending = null; if (quotaDirty) { quotaDirty = false; void readLimits(); } }
 }
-watch(() => [props.state.hostId, props.state.connected, props.state.authenticated], () => { generation++; capabilityGeneration++; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
-watch(catalogTiers, () => { void readCapabilities(); });
+watch(() => [props.state.hostId, props.state.connected, props.state.authenticated], () => { generation++; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilityLoading.value = false; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
+watch(catalogTiers, () => { capabilityAttempts = 0; void readCapabilities(); });
 const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
   if (hostId !== props.state.hostId) return;
   if (message.method === 'account/rateLimits/updated') { quotaRevision++; if (pending) quotaDirty = true; else void readLimits(); }
-  if (message.method === 'bridge/status' && message.params?.engineId !== seenEngine) { seenEngine = message.params?.engineId || null; capabilityGeneration++; capabilities.value = null; capabilityPending = null; void readCapabilities(); }
+  if (message.method === 'bridge/status' && message.params?.engineId !== seenEngine) { seenEngine = message.params?.engineId || null; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilities.value = null; capabilityPending = null; void readCapabilities(); }
 }) || (() => {});
-onBeforeUnmount(() => { disposed = true; generation++; quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
+onBeforeUnmount(() => { disposed = true; generation++; clearCapabilityRetry(); quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
 async function choose(value: string) {
   busy.value = true; error.value = '';
   const choice = choiceGeneration;
@@ -77,9 +95,9 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 </script>
 <template>
   <div v-if="tiers.length || windows.length || state.rateLimits?.ordinaryUsageAllowed === false" class="model-service-options">
-    <label v-if="tiers.length" class="composer-select service-tier-select" :title="selectedTier?.description || '服务层级由当前主机的模型目录提供'">
+    <label v-if="tiers.length" class="composer-select service-tier-select" :title="tierHint">
       <Icon name="Zap" :size="13" /><span class="service-tier-value" aria-hidden="true">{{ selectedLabel }}</span><Icon name="ChevronDown" :size="12" />
-      <select v-model="selected" aria-label="模型服务层级" :disabled="disabled || busy"><option value="">原生默认</option><option v-if="unlistedSelection" :value="selected" disabled>{{ selectedLabel }}</option><option v-for="tier in tiers" :key="tier.id" :value="tier.id" :title="tier.description">{{ tier.name }}</option></select>
+      <select v-model="selected" aria-label="模型服务层级" :disabled="disabled || busy || !tierSupported"><option value="">原生默认</option><option v-if="unlistedSelection" :value="selected" disabled>{{ selectedLabel }}</option><option v-for="tier in tiers" :key="tier.id" :value="tier.id" :title="tier.description">{{ tier.name }}</option></select>
     </label>
     <details v-if="windows.length" class="account-usage"><summary aria-label="查看账户使用额度"><Icon name="Gauge" :size="13" />额度</summary><div class="account-usage-popover"><strong>主机账户额度</strong><div v-for="window in windows" :key="window.key"><span>{{ window.name }} · {{ window.label }}</span><span>已用 {{ Math.round(window.used) }}%</span><progress :value="window.used" max="100"></progress><small>{{ resetTime(window.resetsAt) }}</small></div><p v-if="state.rateLimits?.ordinaryUsageAllowed === false">服务端已限制常规额度；以账户实际状态为准。</p></div></details>
     <span v-if="state.rateLimits?.ordinaryUsageAllowed === false" class="service-tier-error" role="status">常规额度已受限</span>
