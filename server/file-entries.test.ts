@@ -37,6 +37,66 @@ async function fixture() {
   return { root, request, inspect, calls, headers, close: async () => { await new Promise<void>(resolve => server.close(() => resolve()));await fs.rm(root, { recursive: true, force: true }); } };
 }
 
+test('copy and move preserve binary bytes, nested files and links without following them', async () => {
+  const f = await fixture();
+  try {
+    await fs.mkdir(path.join(f.root, 'source'));await fs.mkdir(path.join(f.root, 'target'));await fs.mkdir(path.join(f.root, 'source/nested'));
+    const bytes = Buffer.from([0,1,2,255,128,13,10]);
+    await fs.writeFile(path.join(f.root, 'source/nested/中文 `literal` $x.bin'), bytes);
+    await fs.symlink('../../target', path.join(f.root, 'source/nested/link'));
+    const before = await f.inspect('source');
+    const copied = await f.request({ operation: 'copy', sourceDirectory: f.root, name: 'source', newName: 'copied', directory: path.join(f.root, 'target'), expectedVersion: before.version });
+    assert.equal(copied.status, 200);assert.equal((await copied.json() as any).previousPath, undefined);
+    assert.deepEqual(await fs.readFile(path.join(f.root, 'target/copied/nested/中文 `literal` $x.bin')), bytes);
+    assert.equal(await fs.readlink(path.join(f.root, 'target/copied/nested/link')), '../../target');
+    const moved = await f.request({ operation: 'move', sourceDirectory: f.root, name: 'source', newName: 'moved', directory: path.join(f.root, 'target'), expectedVersion: before.version });
+    assert.equal(moved.status, 200);assert.equal((await moved.json() as any).previousPath, path.join(f.root, 'source'));
+    assert.equal(await fs.access(path.join(f.root, 'source')).then(() => true, () => false), false);
+    assert.deepEqual(await fs.readFile(path.join(f.root, 'target/moved/nested/中文 `literal` $x.bin')), bytes);
+    assert.equal((await fs.readdir(path.join(f.root, 'target'))).some(name => name.startsWith('.codex-web-')), false);
+  } finally { await f.close(); }
+});
+
+test('transfers refuse overwrite, changed sources, recursive targets, FIFO entries and missing hosts', async () => {
+  const f = await fixture();
+  try {
+    await fs.writeFile(path.join(f.root, 'source'), 'source');await fs.writeFile(path.join(f.root, 'destination'), 'existing');
+    const original = await f.inspect('source');
+    const transfer = { operation: 'copy', sourceDirectory: f.root, name: 'source', newName: 'destination', expectedVersion: original.version };
+    for (const operation of ['copy', 'move']) assert.equal((await f.request({ ...transfer, operation })).status, 409);
+    assert.equal(await fs.readFile(path.join(f.root, 'source'), 'utf8'), 'source');assert.equal(await fs.readFile(path.join(f.root, 'destination'), 'utf8'), 'existing');
+    await fs.writeFile(path.join(f.root, 'source'), 'changed externally');
+    assert.equal((await f.request({ ...transfer, newName: 'new' })).status, 409);
+    await fs.mkdir(path.join(f.root, 'tree'));await fs.mkdir(path.join(f.root, 'tree/child'));
+    const tree = await f.inspect('tree');
+    for (const operation of ['copy', 'move']) {
+      const response = await f.request({ operation, directory: path.join(f.root, 'tree/child'), sourceDirectory: f.root, name: 'tree', newName: 'recursive', expectedVersion: tree.version });
+      assert.equal(response.status, 400);assert.equal((await response.json() as any).code, 'RECURSIVE');
+    }
+    await new Promise<void>((resolve, reject) => execFile('mkfifo', [path.join(f.root, 'pipe')], error => error ? reject(error) : resolve()));
+    const pipe = await f.inspect('pipe');
+    const response = await f.request({ ...transfer, name: 'pipe', newName: 'copied-pipe', expectedVersion: pipe.version });
+    assert.equal(response.status, 400);assert.equal((await response.json() as any).code, 'UNSUPPORTED_ENTRY');
+    assert.equal((await fs.readdir(f.root)).some(name => name.startsWith('.codex-web-')), false);
+    const calls = f.calls.length;
+    assert.equal((await f.request(transfer, 'missing')).status, 404);
+    assert.equal((await f.request({ ...transfer, sourceDirectory: '../relative' })).status, 400);assert.equal(f.calls.length, calls);
+  } finally { await f.close(); }
+});
+
+test('a cross-filesystem move keeps the original and requests an explicit copy instead', async t => {
+  const f = await fixture();let destination: string | undefined;
+  try {
+    const other = await fs.stat('/dev/shm').catch(() => null);
+    if (!other || other.dev === (await fs.stat(f.root)).dev) { t.skip('No separate temporary filesystem');return; }
+    destination = await fs.mkdtemp('/dev/shm/codex-web-move-test-');
+    await fs.writeFile(path.join(f.root, 'source.txt'), 'must survive');const metadata = await f.inspect('source.txt');
+    const response = await f.request({ operation: 'move', directory: destination, sourceDirectory: f.root, name: 'source.txt', newName: 'target.txt', expectedVersion: metadata.version });
+    assert.equal(response.status, 409);assert.equal((await response.json() as any).code, 'CROSS_DEVICE');
+    assert.equal(await fs.readFile(path.join(f.root, 'source.txt'), 'utf8'), 'must survive');assert.deepEqual(await fs.readdir(destination), []);
+  } finally { if (destination) await fs.rm(destination, { recursive: true, force: true });await f.close(); }
+});
+
 test('file entry API requires login and CSRF, rejects escaped names and never connects unknown hosts', async () => {
   const f = await fixture();
   try {

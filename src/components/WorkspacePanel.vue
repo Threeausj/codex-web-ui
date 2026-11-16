@@ -11,15 +11,18 @@ import Icon from "./Icon.vue";
 import { diffStats } from "../lib/diff-stats";
 import FileMarkdownPreview from "./FileMarkdownPreview.vue";
 import FileExplorerActions from './FileExplorerActions.vue';
+import FileUploadZone from './FileUploadZone.vue';
 import { changedFilePath, type FileEntryChange, type FileEntryOperation } from '../../shared/file-entries';
 import { isAbsoluteHostPath, normalizeHostPath, joinHostPath, hostDirname } from '../../shared/host-path';
 import { privateState } from "../lib/private-state";
 import type { ConversationSelectionSource } from "../lib/conversation-selection";
 import { isImagePath, isMarkdownPath, officeFileKind } from "../lib/file-preview";
 import { isJsonPath, jsonUnicodePreview } from "../lib/json-preview";
+import { isCsvPath } from '../lib/csv-preview';
 const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
 const PdfPreview = defineAsyncComponent(() => import("./PdfPreview.vue"));
 const OfficePreview = defineAsyncComponent(() => import("./OfficePreview.vue"));
+const CsvPreview = defineAsyncComponent(() => import('./CsvPreview.vue'));
 const InteractiveTerminal = defineAsyncComponent(
   () => import("./InteractiveTerminal.vue"),
 );
@@ -86,9 +89,18 @@ const fileMutations = ref(0);
 const fileMutationDisabled = computed(() => !!fileMutations.value || loading.value || !props.state.connected || !props.state.authenticated ||
   props.state.selectingThread || props.state.switchingHost || props.state.changingContext || props.state.permission === 'read-only');
 const fileActionRefs = new Map<string, InstanceType<typeof FileExplorerActions>>();
+const directoryActions = ref<InstanceType<typeof FileExplorerActions>>();
+const uploadZone = ref<InstanceType<typeof FileUploadZone>>();
 function fileEntryMenu(event: Event, name: string) { event.preventDefault(); fileActionRefs.get(name)?.openMenu(); }
 function fileEntryKey(event: KeyboardEvent, name: string) {
   if (event.target instanceof HTMLElement && !event.target.classList.contains('file-tree-row')) return;
+  if ((event.ctrlKey || event.metaKey) && ['c', 'x', 'v'].includes(event.key.toLowerCase())) {
+    event.preventDefault(); event.stopPropagation();
+    const action = fileActionRefs.get(name);
+    if (event.key.toLowerCase() === 'v') void directoryActions.value?.start('paste');
+    else void action?.copyEntry(event.key.toLowerCase() === 'c' ? 'copy' : 'move');
+    return;
+  }
   if (event.key === 'F2' || event.key === 'Delete') { event.preventDefault(); void fileActionRefs.get(name)?.start(event.key === 'F2' ? 'rename' : 'delete'); }
 }
 function mutationWorking(value: boolean) { fileMutations.value = Math.max(0, fileMutations.value + (value ? 1 : -1)); }
@@ -186,6 +198,7 @@ const isImage = computed(
 const isMarkdown = computed(() => !file.value?.binary && isMarkdownPath(file.value?.path || ""));
 const isOffice = computed(() => !!officeFileKind(file.value?.path || ""));
 const isJson = computed(() => !file.value?.binary && isJsonPath(file.value?.path || ""));
+const isCsv = computed(() => !file.value?.binary && isCsvPath(file.value?.path || ''));
 const isJsonPreview = computed(() => isJson.value && fileView.value === "preview");
 const isHtml = computed(() => !file.value?.binary && /\.html?$/i.test(file.value?.path || ""));
 const htmlPreviewUrl = computed(() => file.value && isHtml.value ? `/api/preview?host=${encodeURIComponent(props.state.hostId)}&path=${encodeURIComponent(file.value.path)}&root=${encodeURIComponent(props.state.projectPath)}` : "");
@@ -196,6 +209,8 @@ function join(base: string, name: string) {
 async function beforeFileChange(operation: FileEntryOperation, path: string) {
   const affected = editorTabs.value.filter(entry => entry.file.path === path || entry.file.path.startsWith(path + '/'));
   if (affected.some(entry => entry.saving)) throw new Error('文件正在保存，请完成后再操作。');
+  if (operation === 'copy' && affected.some(entry => entry.content !== entry.original))
+    return window.confirm('复制使用磁盘上的已保存内容。当前文件仍有未保存草稿，是否继续复制磁盘版本？');
   if (operation === 'delete' && affected.some(entry => entry.content !== entry.original))
     return window.confirm('删除目标包含未保存的文件草稿。删除磁盘文件后，草稿仍保留在编辑器中。确认继续？');
   return true;
@@ -245,14 +260,14 @@ const stopFileEntryListener = props.api.subscribeFileEntries?.(async (change: Fi
   if (current() && change.hostId === props.state.hostId && currentScope === fileScope()) {
     const path = changedFilePath(directory.value, change);
     if (path !== directory.value) await readDirectory(path ?? change.directory, false);
-    else if (directory.value === change.directory) await readDirectory(directory.value, false);
+    else if (directory.value === change.directory || change.previousPath && directory.value === hostDirname(change.previousPath)) await readDirectory(directory.value, false);
   }
 });
 async function fileEntryChanged(change: FileEntryChange) {
   if (change.hostId !== props.state.hostId || change.directory !== directory.value) return;
   fileSearch.value = '';
   if (change.operation === 'createFile') await openFile(change.path);
-  else if (change.operation === 'createDirectory' || change.operation === 'rename') revealedFile.value = change.path;
+  else if (['createDirectory', 'rename', 'copy', 'move', 'upload'].includes(change.operation)) revealedFile.value = change.path;
 }
 async function readDirectory(path: string, interruptReveal = true) {
   if (!path) return;
@@ -348,7 +363,7 @@ async function openFile(path: string, destination = "files", line?: number, pare
 async function focusLine(line: number) {
   if (!file.value || file.value.binary || isImage.value) return;
   selectedLine.value = Math.max(1, Math.min(Math.floor(line), content.value.split("\n").length));
-  if (isMarkdown.value) fileView.value = "source";
+  if (isMarkdown.value || isCsv.value) fileView.value = "source";
   await nextTick();
   const editor = fileEditor.value;
   if (!editor) return;
@@ -418,7 +433,7 @@ function up() {
   void readDirectory(path);
 }
 async function save() {
-  if (!file.value || file.value.missing || saving.value || fileMutations.value || props.state.permission === "read-only") return;
+  if (!file.value || file.value.missing || saving.value || fileMutations.value || props.state.permission === "read-only" || file.value.encoding && file.value.encoding !== 'UTF-8') return;
   const path = file.value.path;
   const savedEditor = activeEditor.value!;
   const savedFile = savedEditor.file;
@@ -785,7 +800,7 @@ defineExpose({
           v-model="directoryInput"
           placeholder="项目目录"
           aria-label="目录路径"
-        /><FileExplorerActions :api="api" :host-id="state.hostId" :directory="directory" :disabled="fileMutationDisabled || !directory" :before-change="beforeFileChange" @changed="fileEntryChanged" @working="mutationWorking" /><button
+        /><FileExplorerActions ref="directoryActions" :api="api" :host-id="state.hostId" :directory="directory" :disabled="fileMutationDisabled || !directory" :before-change="beforeFileChange" @changed="fileEntryChanged" @working="mutationWorking" /><button type="button" class="icon-button" aria-label="上传文件到当前目录" title="上传文件到当前目录（也可拖入文件列表）" :disabled="fileMutationDisabled || !directory" @click="uploadZone?.choose()"><Icon name="Upload" :size="16" /></button><button
           class="icon-button"
           type="submit"
           title="刷新目录"
@@ -819,7 +834,7 @@ defineExpose({
             <Icon name="ArrowLeft" :size="15" /></button
           ><span :title="file.path"
             >{{ displayName }}<i v-if="dirty" class="dirty-dot"></i></span
-          ><div v-if="isMarkdown || isJson" class="segmented-control file-view-switch" :aria-label="isJson ? 'JSON 显示方式' : 'Markdown 显示方式'">
+          ><div v-if="isMarkdown || isJson || isCsv" class="segmented-control file-view-switch" :aria-label="isCsv ? 'CSV 显示方式' : isJson ? 'JSON 显示方式' : 'Markdown 显示方式'">
             <button :class="{ active: fileView === 'preview' }" :aria-pressed="fileView === 'preview'" @click="fileView = 'preview'">预览</button>
             <button :class="{ active: fileView === 'source' }" :aria-pressed="fileView === 'source'" @click="fileView = 'source'">源码</button>
           </div><button
@@ -845,7 +860,7 @@ defineExpose({
           ><div v-if="externalFilePreview && isHtml" class="segmented-control file-view-switch" aria-label="HTML 显示方式"><button :class="{ active: activeEditor?.htmlPreview }" :aria-pressed="!!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = true)">预览</button><button :class="{ active: !activeEditor?.htmlPreview }" :aria-pressed="!activeEditor?.htmlPreview" @click="activeEditor && (activeEditor.htmlPreview = false)">源码</button></div><button
             v-if="!isImage && !file.binary && !isJsonPreview && !activeEditor?.htmlPreview"
             class="button button-small button-secondary"
-            :disabled="!dirty || saving || fileMutations > 0 || file?.missing || (externalFilePreview ? openingFile : loading) || state.permission === 'read-only'"
+            :disabled="!dirty || saving || fileMutations > 0 || file?.missing || (!!file.encoding && file.encoding !== 'UTF-8') || (externalFilePreview ? openingFile : loading) || state.permission === 'read-only'"
             @click="save"
           >
             <Icon :name="saving ? 'LoaderCircle' : 'Save'" :size="13" />保存
@@ -870,6 +885,7 @@ defineExpose({
           <p>此文件可下载后查看</p>
           <span>{{ displayName }}</span>
         </div>
+        <CsvPreview v-else-if="isCsv && fileView === 'preview'" :key="state.hostId + ':' + file.path" :content="content" :name="displayName" :encoding="file.encoding" />
         <FileMarkdownPreview
           v-else-if="isMarkdown && fileView === 'preview'"
           :content="content"
@@ -886,11 +902,11 @@ defineExpose({
         />
         <CodeEditor
           v-else :key="file.path" ref="fileEditor" v-model="content" :path="file.path"
-          :line="selectedLine || undefined" :readonly="state.permission === 'read-only'" :allow-question="!!state.activeThread?.id"
+          :line="selectedLine || undefined" :readonly="state.permission === 'read-only' || !!file.encoding && file.encoding !== 'UTF-8'" :allow-question="!!state.activeThread?.id"
           @save="save" @selection="codeSelection"
         />
         <div class="file-editor-footer">
-          <span>{{ isImage ? '图片预览' : isOffice ? 'Office 只读预览' : (isJsonPreview ? 'JSON 只读预览 · ' : '') + content.split("\n").length + ' 行' }}{{ selectedLine && !isImage && !isOffice ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
+          <span>{{ file.encoding && file.encoding !== 'UTF-8' ? file.encoding + ' · 只读 · ' : '' }}{{ isCsv && fileView === 'preview' ? 'CSV 表格预览' : isImage ? '图片预览' : isOffice ? 'Office 只读预览' : (isJsonPreview ? 'JSON 只读预览 · ' : '') + content.split("\n").length + ' 行' }}{{ selectedLine && !isImage && !isOffice ? ' · 定位第 ' + selectedLine + ' 行' : '' }}</span
           ><span>{{
             state.permission === "read-only"
               ? "只读"
@@ -901,7 +917,8 @@ defineExpose({
         </div>
       </section>
       </Teleport>
-      <div v-if="externalFilePreview || !file" class="file-tree">
+      <FileUploadZone v-if="externalFilePreview || !file" ref="uploadZone" :api="api" :host-id="state.hostId" :host-name="state.hosts.find((host: any) => host.id === state.hostId)?.name" :directory="directory" :disabled="fileMutationDisabled || !directory" @working="mutationWorking" @changed="fileEntryChanged">
+      <div class="file-tree" tabindex="0" @keydown="(event: KeyboardEvent) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v' && event.target === event.currentTarget) { event.preventDefault(); void directoryActions?.start('paste'); } }">
         <label class="workspace-file-search"><Icon name="Search" :size="14" /><input v-model="fileSearch" aria-label="搜索文件名" placeholder="搜索当前目录文件名" /><button v-if="fileSearch" class="icon-button" aria-label="清除文件名搜索" @click="fileSearch = ''"><Icon name="X" :size="13" /></button></label>
         <p v-if="entries.length && !sortedEntries.length" class="file-search-empty">没有匹配的文件</p>
         <div
@@ -964,6 +981,7 @@ defineExpose({
           </p>
         </div>
       </div>
+      </FileUploadZone>
     </div>
     <div v-if="tab === 'agents'" class="workspace-body agents-view">
       <SubagentsPanel :api="api" :state="state" />
