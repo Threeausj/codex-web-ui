@@ -18,6 +18,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   project: [project: any];
   select: [selection: { id: string; hostId: string }];
+  keep: [selection: { id: string; hostId: string; title: string }];
   error: [message: string];
   projectAction: [
     action: {
@@ -353,6 +354,7 @@ async function pin() {
         :api="api"
         nested
         @select="emit('select', $event)"
+        @keep="emit('keep', $event)"
         @error="emit('error', $event)"
       />
       <button

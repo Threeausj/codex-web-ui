@@ -23,6 +23,120 @@ function fixture(initial?: Stored) {
   return { store, persistence, writes, authentication: () => { authentication++; }, saved: () => saved };
 }
 
+test('single selections reuse one temporary preview and do not serialize it', async () => {
+  const f = fixture();
+  await f.store.load();
+  f.store.preview({ ...tab('a'), text: 'Never retain private message text' } as ChatTab);
+  f.store.preview(tab('b', 'remote'));
+  assert.deepEqual(f.store.state.entries, []);
+  assert.equal(f.store.state.preview!.threadId, 'b');
+  assert.equal(f.store.state.preview!.hostId, 'remote');
+  assert.equal('text' in f.store.state.preview!, false);
+  await f.store.flush();
+  assert.deepEqual(f.writes, []);
+});
+
+test('keeping a preview promotes it once while selecting kept tabs retains the other preview slot', async () => {
+  const f = fixture();
+  await f.store.load();
+  f.store.preview(tab('a', 'remote', { title: 'Preview a' }));
+  f.store.open({ hostId: 'remote', threadId: 'a' });
+  assert.equal(f.store.state.preview, null);
+  assert.equal(f.store.state.entries[0]!.title, 'Preview a');
+  f.store.preview(tab('b'));
+  f.store.preview(tab('a', 'remote', { title: 'Kept a' }));
+  assert.equal(f.store.state.preview!.threadId, 'b');
+  assert.deepEqual(f.store.state.entries.map(entry => entry.threadId), ['a']);
+  assert.equal(f.store.state.entries[0]!.title, 'Kept a');
+  f.store.open(tab('a', 'remote'));
+  await f.store.flush();
+  assert.deepEqual(f.saved()!.entries.map((entry: any) => entry.threadId), ['a']);
+  assert.equal('preview' in f.saved()!, false);
+  const restored = createChatTabs({ ready: async () => {}, authentication: () => 1, persistence: f.persistence });
+  await restored.load();
+  assert.equal(restored.state.preview, null);
+  assert.equal(restored.state.entries.length, 1);
+});
+
+test('a slow stored catalog reconciles a preview with a kept tab without duplicates or title loss', async () => {
+  const read = deferred<any>();
+  const f = fixture();
+  f.persistence.read = async <T>() => read.promise as Promise<T | null>;
+  const loading = f.store.load();
+  f.store.preview({ hostId: 'remote', threadId: 'a' });
+  read.resolve({ version: 1, entries: [tab('a', 'remote', { title: 'Saved title', pinned: true })] });
+  await loading;
+  assert.equal(f.store.state.preview, null);
+  assert.equal(f.store.state.entries.length, 1);
+  assert.equal(f.store.state.entries[0]!.title, 'Saved title');
+  assert.equal(f.store.state.entries[0]!.pinned, true);
+  await f.store.flush();
+});
+
+test('a preview remains temporary when other tabs hydrate and a double selection during loading promotes only its target', async () => {
+  const read = deferred<any>();
+  const f = fixture();
+  f.persistence.read = async <T>() => read.promise as Promise<T | null>;
+  const loading = f.store.load();
+  f.store.preview(tab('a')); f.store.open({ hostId: 'local', threadId: 'a' });
+  f.store.preview(tab('b'));
+  read.resolve({ version: 1, entries: [tab('kept', 'remote', { pinned: true })] });
+  await loading;
+  assert.deepEqual(f.store.state.entries.map(entry => entry.threadId), ['kept', 'a']);
+  assert.equal(f.store.state.preview!.threadId, 'b');
+  await f.store.flush();
+  assert.deepEqual(f.saved()!.entries.map((entry: any) => entry.threadId), ['kept', 'a']);
+});
+
+test('preview rename, removal and close stay isolated by host and closing chooses a kept tab', async () => {
+  const f = fixture();
+  await f.store.load();
+  f.store.open(tab('kept'));
+  f.store.preview(tab('shared', 'remote'));
+  f.store.rename(tab('shared', 'local'), 'Other host');
+  assert.equal(f.store.state.preview!.title, 'Title shared');
+  f.store.rename(tab('shared', 'remote'), 'Renamed preview');
+  assert.equal(f.store.state.preview!.title, 'Renamed preview');
+  f.store.remove(tab('shared', 'local'));
+  assert.equal(f.store.state.preview!.hostId, 'remote');
+  assert.equal(f.store.close(tab('shared', 'remote'), tab('shared', 'remote'))!.threadId, 'kept');
+  assert.equal(f.store.state.preview, null);
+  f.store.preview(tab('another', 'remote'));
+  f.store.removeHost('local');
+  assert.equal(f.store.state.preview!.threadId, 'another');
+  f.store.removeHost('remote');
+  assert.equal(f.store.state.preview, null);
+  await f.store.flush();
+});
+
+test('pinning a preview keeps it and the pin limit never promotes an extra preview', async () => {
+  const f = fixture();
+  await f.store.load();
+  f.store.preview(tab('first'));
+  assert.equal(f.store.togglePinned(tab('first')), true);
+  assert.equal(f.store.state.preview, null);
+  assert.equal(f.store.state.entries[0]!.pinned, true);
+  for (let i = 1; i < maxPinnedChatTabs; i++) {
+    f.store.open(tab(`kept-${i}`)); f.store.togglePinned(tab(`kept-${i}`));
+  }
+  f.store.preview(tab('temporary'));
+  assert.equal(f.store.togglePinned(tab('temporary')), false);
+  assert.equal(f.store.state.preview!.threadId, 'temporary');
+  assert.equal(f.store.state.entries.length, maxPinnedChatTabs);
+  await f.store.flush();
+});
+
+test('authentication replacement clears a preview before any new-account navigation', async () => {
+  const f = fixture();
+  await f.store.load();
+  f.store.preview(tab('private', 'private-host'));
+  f.authentication();
+  await f.store.flush();
+  assert.equal(f.store.state.preview, null);
+  assert.deepEqual(f.store.state.entries, []);
+  assert.deepEqual(f.writes, []);
+});
+
 test('reopening a chat updates its title and recency while keeping tab order stable', async () => {
   const f = fixture();
   await f.store.load();

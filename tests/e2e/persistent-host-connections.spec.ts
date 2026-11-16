@@ -15,6 +15,7 @@ async function open(page: Page, host: string, name: string) {
   await page.locator(`[data-section="recent"] .nav-thread[data-host-id="${host}"] .thread-row`).filter({ hasText: name }).click();
   await expect(selected(page, host)).toHaveAttribute('aria-selected', 'true');
   await expect(editor(page)).toBeEnabled();
+  await selected(page, host).dblclick();
 }
 async function visitBoth(page: Page) {
   await open(page, 'local', '已有测试历史');
