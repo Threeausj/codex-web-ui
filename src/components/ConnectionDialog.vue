@@ -33,7 +33,12 @@ const uploadedKey = ref<{ identityFile: string; name: string }>();
 const draftKeys = new Map<string, string>();
 const error = ref("");
 const testResult = ref<any>(null);
-const identityMode = ref(props.host?.identityFile ? "file" : "default");
+const identityMode = ref(
+  props.host?.authentication === "password" ? "password" : props.host?.identityFile ? "file" : "default",
+);
+// A login password belongs only to this dialog, never the persisted chat draft.
+const password = ref("");
+const showPassword = ref(false);
 const draft = reactive({
   name: props.host?.name || "",
   hostname: `${props.host?.username ? props.host.username + "@" : ""}${props.host?.hostname || ""}`,
@@ -49,6 +54,11 @@ const title = computed(() =>
 );
 const testedVersion = computed(() => testResult.value?.version || "");
 const hostKeyTarget = computed(() => `${draft.hostname.trim()}\n${String(draft.port).trim()}`);
+const canReusePassword = computed(() =>
+  props.host?.authentication === "password" && props.host.hasPassword === true &&
+  draft.hostname.trim() === `${props.host.username ? props.host.username + "@" : ""}${props.host.hostname || ""}` &&
+  (String(draft.port).trim() ? Number(draft.port) : null) === (props.host.port ?? null),
+);
 const hostKeyTrustLabel = computed(() =>
   hostKey.value?.status === "changed" ? "替换指纹并测试连接" : "信任并测试连接",
 );
@@ -127,7 +137,10 @@ async function inspectHostKey() {
 async function checkConnection(fields: ReturnType<typeof payload>) {
   const generation = hostKeyGeneration;
   const scope = hostKeyTarget.value;
-  const result = await props.api.testHost(fields);
+  const result = await props.api.testHost({
+    ...fields,
+    ...(fields.authentication === "password" && props.host?.id ? { hostId: props.host.id } : {}),
+  });
   if (disposed || generation !== hostKeyGeneration || scope !== hostKeyTarget.value) return;
   if (result?.ok === false || result?.success === false) {
     const failure = new Error(result.error || result.message || "连接测试失败");
@@ -220,6 +233,14 @@ watch(
   },
   { deep: true },
 );
+watch(password, () => {
+  error.value = "";
+  testResult.value = null;
+});
+watch(identityMode, mode => {
+  showPassword.value = false;
+  if (mode !== "password") password.value = "";
+});
 
 function payload() {
   const { hostname, port } = keyTarget();
@@ -227,6 +248,10 @@ function payload() {
     identityMode.value === "file" ? draft.identityFile.trim() : "";
   if (identityMode.value === "file" && !identityFile)
     throw new Error("请上传私钥或填写身份文件路径");
+  if (identityMode.value === "password" && !password.value && !canReusePassword.value)
+    throw new Error("请输入 SSH 登录密码");
+  if (identityMode.value === "password" && /[\x00\r\n]/.test(password.value))
+    throw new Error("SSH 登录密码不能包含换行或空字符");
   return {
     name: draft.name.trim() || hostname,
     hostname,
@@ -234,6 +259,8 @@ function payload() {
     username: "",
     port,
     identityFile,
+    authentication: identityMode.value === "password" ? "password" as const : "key" as const,
+    ...(identityMode.value === "password" && password.value ? { password: password.value } : {}),
     codexPath: draft.codexPath.trim(),
     cwd: draft.cwd.trim(),
     connectionMode: draft.connectionMode === "inherit" ? null : draft.connectionMode,
@@ -251,6 +278,8 @@ async function submit(kind: "test" | "save") {
     } else {
       if (props.host?.id) await props.api.updateHost(props.host.id, fields);
       else await props.api.addHost(fields);
+      password.value = "";
+      showPassword.value = false;
       savedIdentityFile = fields.identityFile;
       await cleanDraftKeys(savedIdentityFile);
       if (!disposed) emit("saved");
@@ -270,7 +299,11 @@ async function submit(kind: "test" | "save") {
   }
 }
 function close() {
-  if (busy.value !== "save" && busy.value !== "upload" && busy.value !== "trust") emit("close");
+  if (busy.value !== "save" && busy.value !== "upload" && busy.value !== "trust") {
+    password.value = "";
+    showPassword.value = false;
+    emit("close");
+  }
 }
 function focusableElements() {
   return [
@@ -319,6 +352,8 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   disposed = true;
+  password.value = "";
+  showPassword.value = false;
   clearHostKey();
   if (!busy.value) void cleanDraftKeys(savedIdentityFile);
   document.removeEventListener("keydown", onKeyDown, true);
@@ -454,7 +489,7 @@ onBeforeUnmount(() => {
                 :disabled="!!busy"
                 @click="identityMode = 'default'"
               >
-                无身份验证
+                SSH 配置
               </button>
               <button
                 type="button"
@@ -464,6 +499,15 @@ onBeforeUnmount(() => {
                 @click="identityMode = 'file'"
               >
                 身份文件
+              </button>
+              <button
+                type="button"
+                :class="{ active: identityMode === 'password' }"
+                :aria-pressed="identityMode === 'password'"
+                :disabled="!!busy"
+                @click="identityMode = 'password'"
+              >
+                密码登录
               </button>
             </div>
             <div v-if="identityMode === 'file'" class="ssh-field">
@@ -506,6 +550,35 @@ onBeforeUnmount(() => {
                 role="status"
               >已上传 {{ uploadedKey?.name }}</small>
               <small>支持无口令的 OpenSSH / PEM 私钥，最大 64 KB。也可填写服务端已有文件路径。</small>
+            </div>
+            <div v-else-if="identityMode === 'password'" class="ssh-field">
+              <label for="ssh-login-password">SSH 登录密码</label>
+              <div class="ssh-password-input">
+                <input
+                  id="ssh-login-password"
+                  v-model="password"
+                  aria-label="SSH 登录密码"
+                  :type="showPassword ? 'text' : 'password'"
+                  :placeholder="canReusePassword ? '已保存，留空保留原密码' : '输入 SSH 登录密码'"
+                  :required="!canReusePassword"
+                  :disabled="!!busy"
+                  maxlength="1024"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                  autocapitalize="off"
+                />
+                <button
+                  class="ssh-password-toggle"
+                  type="button"
+                  :aria-label="showPassword ? '隐藏 SSH 密码' : '显示 SSH 密码'"
+                  :aria-pressed="showPassword"
+                  :disabled="!!busy"
+                  @click="showPassword = !showPassword"
+                ><Icon name="Eye" :size="16" /></button>
+              </div>
+              <small v-if="canReusePassword">已保存密码；留空保留，输入新密码替换。</small>
+              <small v-else-if="props.host?.hasPassword">主机地址、用户名或端口已变更，请重新输入密码。</small>
+              <small>密码加密保存在服务端，用于自动重连，不会返回浏览器。</small>
             </div>
             <p v-else class="ssh-form-note">使用已有的 SSH 配置和代理身份。</p>
             <details class="ssh-advanced">
@@ -680,6 +753,36 @@ onBeforeUnmount(() => {
   font-size: 13px;
   font-weight: 500;
   line-height: 1.5;
+}
+.ssh-field > label {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.ssh-password-input {
+  position: relative;
+  min-width: 0;
+}
+.ssh-field .ssh-password-input input {
+  padding-right: 42px;
+}
+.ssh-password-toggle {
+  position: absolute;
+  right: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  color: var(--muted);
+  border-radius: 7px;
+}
+.ssh-password-toggle:hover:not(:disabled),
+.ssh-password-toggle[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--hover);
 }
 .ssh-key-heading {
   display: flex;

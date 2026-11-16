@@ -66,6 +66,12 @@ test('SSH host PATCH requires auth/CSRF, persists edits, clears optional fields 
     assert.equal(application.bridges.get(host.id), originalBridge)
     assert.equal(originalBridge.connected, true)
 
+    const unchangedAuthentication = await request(endpoint, 'PATCH', { authentication: 'key' })
+    assert.equal(unchangedAuthentication.status, 200)
+    assert.equal((await unchangedAuthentication.json() as { connectionReset: boolean }).connectionReset, false)
+    assert.equal(application.bridges.get(host.id), originalBridge)
+    assert.equal(originalBridge.connected, true)
+
     const closed = new Promise<{ code: number; reason: string }>(resolve => socket!.once('close', (code, reason) => resolve({ code, reason: reason.toString() })))
     const edited = await request(endpoint, 'PATCH', { port: 2222, username: '', identityFile: '', codexPath: '', cwd: '' })
     const saved = await edited.json() as { host: Host; hosts: Host[]; connectionReset: boolean }

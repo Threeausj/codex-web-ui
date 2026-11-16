@@ -108,6 +108,9 @@ test('SSH preview forwarding is loopback-only and rejects argument injection', (
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: '-oProxyCommand=touch /tmp/bad' }, 43210, 5173))
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: 'example.invalid', username: 'user;touch' }, 43210, 5173))
   assert.throws(() => sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Bad', hostname: 'example.invalid' }, 43210, 80))
+  const passwordArgs = sshForwardArgs({ id: 'ssh-test', kind: 'ssh', name: 'Password', hostname: 'example.invalid', authentication: 'password', hasPassword: true }, 43210, 5173, undefined, { socketPath: '/private/pooled-ssh' })
+  assert.ok(passwordArgs.includes('ControlPath=/private/pooled-ssh'))
+  assert.ok(passwordArgs.includes('BatchMode=yes'))
 })
 
 test('SSH preview forwarding pins managed keys with the same strict trust options and preserves SSH defaults for unmanaged hosts', () => {

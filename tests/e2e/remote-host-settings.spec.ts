@@ -105,6 +105,7 @@ test("SSH connections can be edited and empty advanced fields restore automatic 
       username: "",
       port: 2222,
       identityFile: "/keys/prod",
+      authentication: "key",
       codexPath: "/opt/codex/bin/codex",
       cwd: "/srv/project",
       connectionMode: "daemon",
@@ -121,7 +122,7 @@ test("SSH connections can be edited and empty advanced fields restore automatic 
   );
   await edit.getByLabel("远端 Codex 路径", { exact: true }).fill("");
   await edit.getByLabel("SSH 端口", { exact: true }).fill("");
-  await edit.getByRole("button", { name: "无身份验证", exact: true }).click();
+  await edit.getByRole("button", { name: "SSH 配置", exact: true }).click();
   await edit.getByRole("button", { name: "保存", exact: true }).click();
   await expect(
     page
