@@ -3,6 +3,7 @@ import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
 import type { FileEntryChange, FileEntryRequest, FileClipboard } from '../../shared/file-entries';
 import { decodeCsvBytes, isCsvPath } from './csv-preview';
+import { extendModelCatalog } from './model-catalog';
 import type { InstalledPlugin, PluginInventory } from '../../shared/plugin-mentions';
 import { integrationInputs } from './plugin-mentions';
 import { validAppId } from '../../shared/plugin-mentions';
@@ -5937,7 +5938,7 @@ async function loadConfig(preserveChoices = false) {
   verifiedConfiguration = { scope: requestScope, socket: requestSocket };
   void modelsRequest.then(({ value }) => {
     if (!current() || !value) return;
-    state.models = value.data;
+    state.models = extendModelCatalog(value.data);
     if (!state.model)
       state.model =
         (state.models.find((model) => model.isDefault) ?? state.models[0])
