@@ -3,6 +3,7 @@ import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
 import type { FileEntryChange, FileEntryRequest, FileClipboard } from '../../shared/file-entries';
 import { decodeCsvBytes, isCsvPath } from './csv-preview';
+import { extendModelCatalog } from './model-catalog';
 import type { InstalledPlugin, PluginInventory } from '../../shared/plugin-mentions';
 import { integrationInputs } from './plugin-mentions';
 import { validAppId } from '../../shared/plugin-mentions';
@@ -433,7 +434,7 @@ async function refreshCurrentRuntimeMetadata() {
     if (!current() || information.runtime?.engineId !== selectedEngine) return;
     await readConfig(true, true);
     if (!current()) return;
-    if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+    if (Array.isArray(information.models)) state.models = extendModelCatalog(information.models).filter((entry: any) => !entry.hidden);
   } catch { /* A later reconnect/read retries metadata; never replay mutations. */ }
   finally {
     if (choices?.observedEngine === selectedEngine && metadataReconnectChoices === choices)
@@ -478,7 +479,7 @@ async function reconnectRuntime(hostId = state.hostId, restartDaemon = false) {
         if (!currentHost()) return information;
         if (!state.connected || state.runtimePaused || engineId !== reconnectedEngine)
           throw new Error('Codex 连接已变化，请重新读取运行信息');
-        if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+        if (Array.isArray(information.models)) state.models = extendModelCatalog(information.models).filter((entry: any) => !entry.hidden);
         await Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
         assertAuthenticated();
         if (!currentHost()) return information;
@@ -5563,23 +5564,30 @@ async function changeModelSettings(change: ModelSettingsChange) {
   state.modelSettingsBusy = true;
   state.modelSettingsNotice = "";
   try {
+    // A native default is already in effect when there is no saved thread
+    // tier. Do not make an unrelated model/effort choice depend on proving
+    // support for a redundant serviceTier:null reset.
+    const nativeChange = { ...change };
+    if (nativeChange.serviceTier === null && (!threadId || !state.nativeServiceTier)) delete nativeChange.serviceTier;
+    const fields = Object.keys(nativeChange);
     // Unknown/old runtimes can still select model and effort for the next
     // explicit turn/start, whose request already carries these fields.
     let capabilities: any = null;
-    try { capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false); } catch {}
+    if (fields.length) try { capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false); } catch {}
     assertCurrent();
-    const fields = Object.keys(change);
     const queued = !!messageQueue?.state.items.length;
     let saved = false;
-    if (threadId && !queued && methodAccepts(capabilities, 'thread/settings/update', ['threadId', ...fields])) {
+    if (threadId && fields.length && !queued && methodAccepts(capabilities, 'thread/settings/update', ['threadId', ...fields])) {
       try {
-        await rpc('thread/settings/update', { threadId, ...change } as any, 15000, { silentError: true });
+        await rpc('thread/settings/update', { threadId, ...nativeChange } as any, 15000, { silentError: true });
         saved = true;
       } catch (cause: any) { if (cause.code !== -32601) throw cause; }
       assertCurrent();
     }
-    if ('serviceTier' in change && !saved && !methodAccepts(capabilities, 'turn/start', ['threadId', 'input', 'serviceTier']))
-      throw new Error("当前 Codex 的原生服务层级协议尚未确认，请更新 Codex 或稍后重试");
+    if ('serviceTier' in nativeChange && !saved && !methodAccepts(capabilities, 'turn/start', ['threadId', 'input', 'serviceTier']))
+      throw new Error(capabilities?.reason === 'runtime_version_mismatch'
+        ? `安装的 Codex CLI${capabilities.checkedCliVersion ? `（${capabilities.checkedCliVersion}）` : ''}与运行中的 App Server 版本不一致，请核对 CLI 路径并重新加载后台服务`
+        : "运行中的 Codex 尚未确认支持调整速度，请重启或重新连接 Codex 后重试");
     if (change.model) state.model = change.model;
     if (change.effort) state.effort = change.effort;
     if ('serviceTier' in change) {
@@ -5592,12 +5600,12 @@ async function changeModelSettings(change: ModelSettingsChange) {
       ? `已选择，下一次手动发送新一轮时生效${queueNotice}`
       : "已保存，后续新一轮生效";
     const activeTurnId = threadId && state.busy ? activeTurns.get(threadId) : undefined;
-    if (!activeTurnId || !methodAccepts(capabilities, 'turn/settings/update', ['threadId', 'turnId', ...fields])) {
+    if (!activeTurnId || !fields.length || !methodAccepts(capabilities, 'turn/settings/update', ['threadId', 'turnId', ...fields])) {
       state.modelSettingsNotice = state.busy || queued ? futureNotice : "";
       return;
     }
     try {
-      const result = await rpc('turn/settings/update', { threadId: threadId!, turnId: activeTurnId, ...change } as any, 15000, { silentError: true });
+      const result = await rpc('turn/settings/update', { threadId: threadId!, turnId: activeTurnId, ...nativeChange } as any, 15000, { silentError: true });
       if (!current()) return;
       state.modelSettingsNotice = result?.status === 'applied' && activeTurns.get(threadId!) === activeTurnId
         ? `已更新，当前任务后续模型请求生效；已发出的请求不变${queueNotice}`
@@ -5937,7 +5945,7 @@ async function loadConfig(preserveChoices = false) {
   verifiedConfiguration = { scope: requestScope, socket: requestSocket };
   void modelsRequest.then(({ value }) => {
     if (!current() || !value) return;
-    state.models = value.data;
+    state.models = extendModelCatalog(value.data);
     if (!state.model)
       state.model =
         (state.models.find((model) => model.isDefault) ?? state.models[0])

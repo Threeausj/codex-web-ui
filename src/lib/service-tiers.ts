@@ -9,7 +9,9 @@ export function modelServiceTiers(state: any): { id: string; name: string; descr
 /** An omitted override preserves the native thread's current tier. */
 export function serviceTierParams(state: any): { serviceTier?: string | null } {
   if (state.serviceTierScope !== serviceTierScope(state)) return {};
-  if (state.serviceTier === null) return { serviceTier: null };
+  // Only clear a saved non-default tier. A redundant reset must not couple
+  // ordinary model selection to service-tier capability discovery.
+  if (state.serviceTier === null) return state.activeThread && state.nativeServiceTier ? { serviceTier: null } : {};
   return modelServiceTiers(state).some(tier => tier.id === state.serviceTier) ? { serviceTier: state.serviceTier } : {};
 }
 export function rateLimitWindows(response: any) {

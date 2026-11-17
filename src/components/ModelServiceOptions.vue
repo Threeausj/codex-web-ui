@@ -14,7 +14,8 @@ const tierSupported = computed(() => props.state.activeThread ?
 const tiers = catalogTiers;
 const capabilityLoading = ref(false);
 const tierHint = computed(() => capabilityLoading.value ? '正在读取主机的速度设置…' : !tierSupported.value ?
-  capabilities.value?.status === 'known' ? '当前主机暂不支持调整速度' : '暂时无法确认主机的速度设置，重新连接后重试' :
+  capabilities.value?.reason === 'runtime_version_mismatch' ? '安装的 Codex CLI 与运行中的 App Server 版本不一致；请核对 CLI 路径并重新加载后台服务' :
+  capabilities.value?.status === 'known' ? '当前主机暂不支持调整速度' : '暂时无法确认主机的速度设置；请重启或重新连接 Codex 后重试' :
   selectedTier.value?.description || '服务层级由当前主机的模型目录提供');
 const windows = computed(() => rateLimitWindows(props.state.rateLimits));
 const selected = computed({
