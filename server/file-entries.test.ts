@@ -108,6 +108,9 @@ test('file entry API requires login and CSRF, rejects escaped names and never co
     assert.equal((await f.request({ ...input, directory: 'relative' })).status, 400);
     assert.equal((await f.request(input, 'missing')).status, 404);
     assert.equal(f.calls.length, 0);
+    assert.equal((await f.request({ ...input, directory: path.join(f.root, 'missing') })).status, 404);
+    await fs.writeFile(path.join(f.root, 'not-directory'), 'file');
+    assert.equal((await f.request({ ...input, directory: path.join(f.root, 'not-directory') })).status, 400);
   } finally { await f.close(); }
 });
 

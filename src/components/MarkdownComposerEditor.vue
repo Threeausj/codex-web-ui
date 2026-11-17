@@ -139,8 +139,8 @@ defineExpose({ focus, setSelectionRange, replaceSelection, resize,
 <template><div ref="parent" class="markdown-composer-editor" :class="{ 'is-disabled': disabled, 'markdown-source-mode': sourceMode }"></div></template>
 
 <style scoped>
-.markdown-composer-editor { --composer-editor-font-size:14px;width:100%;min-width:0;padding:0 2px 8px; }
-.markdown-composer-editor :deep(.cm-editor) { background:transparent;color:var(--text);font-family:inherit;font-size:14px; }
+.markdown-composer-editor { --composer-editor-font-size:var(--composer-font-size);width:100%;min-width:0;padding:0 2px 8px; }
+.markdown-composer-editor :deep(.cm-editor) { background:transparent;color:var(--text);font-family:inherit;font-size:var(--composer-editor-font-size); }
 .markdown-composer-editor :deep(.cm-editor.cm-focused) { outline:none; }
 .markdown-composer-editor :deep(.cm-scroller) { min-height:51px;max-height:210px;overflow:auto;font:inherit;line-height:1.8;overscroll-behavior:contain; }
 .markdown-composer-editor :deep(.cm-content) { min-height:51px;padding:0;caret-color:var(--text);font-family:inherit;overflow-wrap:anywhere; }
@@ -170,5 +170,5 @@ defineExpose({ focus, setSelectionRange, replaceSelection, resize,
 .markdown-composer-editor :deep(.cm-md-rule) { position:relative; }
 .markdown-composer-editor :deep(.cm-md-rule-source) { color:transparent; }
 .markdown-composer-editor :deep(.cm-md-rule::after) { position:absolute;content:'';height:1px;background:var(--border);left:0;right:0;top:50%;pointer-events:none; }
-@media(max-width:760px) { .markdown-composer-editor { --composer-editor-font-size:16px; }.markdown-composer-editor :deep(.cm-editor) { font-size:16px; }.markdown-composer-editor :deep(.cm-scroller) { max-height:min(210px,35dvh); } }
+@media(max-width:760px) { .markdown-composer-editor :deep(.cm-scroller) { max-height:min(210px,35dvh); } }
 </style>
