@@ -8,6 +8,8 @@ const loading = ref(false);
 const reconnecting = ref(false);
 const error = ref("");
 const success = ref("");
+const nativeCapabilities = ref<any>(null);
+const versionLoading = ref(false);
 let generation = 0;
 const hosts = computed(() => props.state.hosts || []);
 const host = computed(() => hosts.value.find((entry: any) => entry.id === hostId.value));
@@ -51,6 +53,15 @@ function tokens(value: unknown) {
 function time(value: number | undefined) {
   return value && Number.isFinite(value) ? new Date(value).toLocaleString() : "尚未读取";
 }
+async function refreshVersion(selectedHost: string, token: number) {
+  nativeCapabilities.value = null;
+  versionLoading.value = true;
+  try {
+    const result = await props.api.requestHttp(`/hosts/${encodeURIComponent(selectedHost)}/native-capabilities`, {}, false);
+    if (token === generation && selectedHost === hostId.value && props.state.authenticated) nativeCapabilities.value = result;
+  } catch { /* Runtime information and reconnect remain usable if discovery fails. */ }
+  finally { if (token === generation) versionLoading.value = false; }
+}
 async function refresh() {
   if (pending.value || !host.value || !props.state.authenticated) return;
   const token = ++generation;
@@ -60,6 +71,7 @@ async function refresh() {
   success.value = "";
   try {
     await props.api.refreshRuntimeInformation(selectedHost);
+    if (token === generation && selectedHost === hostId.value) void refreshVersion(selectedHost, token);
   } catch (cause: any) {
     if (token === generation && selectedHost === hostId.value) error.value = cause.message || "无法读取 Codex 信息，请重试。";
   } finally {
@@ -76,8 +88,10 @@ async function reconnect(restart = false) {
   success.value = "";
   try {
     await (restart ? props.api.restartDaemonRuntime(selectedHost) : props.api.reconnectRuntime(selectedHost));
-    if (token === generation && selectedHost === hostId.value)
+    if (token === generation && selectedHost === hostId.value) {
+      void refreshVersion(selectedHost, token);
       success.value = independentDaemon.value && !restart ? "Web 连接已恢复，后台 daemon 继续运行。" : "Codex 已重新连接，版本、模型和配置已更新。";
+    }
   } catch (cause: any) {
     if (token === generation && selectedHost === hostId.value) error.value = cause.message || "重新连接失败，请重试。";
   } finally {
@@ -90,6 +104,8 @@ watch(hostId, () => {
   reconnecting.value = false;
   error.value = "";
   success.value = "";
+  nativeCapabilities.value = null;
+  versionLoading.value = false;
   void refresh();
 }, { immediate: true });
 watch(() => props.settingsBusy, (busy, wasBusy) => { if (!busy && wasBusy) void refresh(); });
@@ -103,12 +119,14 @@ onBeforeUnmount(() => { ++generation; });
     <p class="settings-description">{{ externalDaemon ? "正在复用已有服务，生命周期由外部管理。网页可重新连接；更新、重启和配置写入需在原客户端管理或迁移为托管服务。" : independentDaemon ? "Web 连接与后台 Codex 独立运行。修改静态模型目录后，请在主机空闲时重启 daemon。" : "更新主机上的 Codex 后，重新连接即可读取新模型和上下文配置。" }}</p>
     <dl class="performance-information" :aria-busy="loading">
       <div><dt>连接状态</dt><dd><span class="performance-connection" :class="{ connected: runtime?.connected && !runtime?.paused }">{{ connection }}</span><span class="performance-mode">{{ mode }}</span></dd></div>
-      <div><dt>Codex 版本</dt><dd>{{ runtime?.userAgent || "未报告" }}</dd></div>
+      <div><dt>已安装 CLI</dt><dd>{{ versionLoading ? "读取中…" : nativeCapabilities?.checkedCliVersion || "未确认" }}</dd></div>
+      <div><dt>运行中 Codex</dt><dd>{{ runtime?.userAgent || "未报告" }}</dd></div>
       <div><dt>可用模型</dt><dd>{{ modelCount === null ? "未读取" : `${modelCount} 个` }}</dd></div>
       <div><dt>默认模型</dt><dd>{{ configuration.model || "未配置" }}</dd></div>
       <div><dt>配置上下文窗口</dt><dd>{{ tokens(configuration.model_context_window) }}</dd></div>
       <div><dt>Codex 自动压缩阈值</dt><dd>{{ tokens(configuration.model_auto_compact_token_limit) }}</dd></div>
     </dl>
+    <p v-if="nativeCapabilities?.reason === 'runtime_version_mismatch'" class="performance-version-mismatch">已安装 CLI 与运行中的 Codex 版本不一致。{{ externalDaemon ? "请核对所配置的 CLI 路径，并在原客户端重新加载后台服务；重新连接只恢复 Web 连接。" : independentDaemon ? "请核对 CLI 路径；若刚更新 CLI，请在主机空闲时重启 daemon。重新连接只恢复 Web 连接。" : "请核对 CLI 路径，并重启所连接的 Codex 进程后刷新信息。" }}</p>
     <p class="performance-checked">最近读取：{{ time(information?.checkedAt) }}</p>
     <div class="performance-reconnect">
       <strong>重新连接 Codex</strong>
@@ -136,6 +154,7 @@ onBeforeUnmount(() => { ++generation; });
 .performance-connection.connected { color: var(--green); }
 .performance-mode { margin-left: 9px; color: var(--muted); font-size: 11px; }
 .performance-checked { font-size: 10px; color: var(--muted); }
+.performance-version-mismatch { color: var(--text); font-size: 13px; line-height: 1.7; }
 .performance-reconnect { border-top: 1px solid var(--border); margin-top: 22px; padding-top: 22px; }
 .performance-reconnect strong { font-size: 12px; font-weight: 500; }
 .performance-reconnect p { color: var(--muted); font-size: 11px; line-height: 1.8; margin-top: 9px; }

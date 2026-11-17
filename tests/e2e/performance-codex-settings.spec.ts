@@ -22,6 +22,7 @@ type SettingsWire = {
   codex: Map<string, any>;
   calls: { hostId: string; path: string; method: string; body?: any }[];
   failReconnect?: string;
+  reconnectModels?: any[];
   delay?: Promise<void>;
 };
 async function wireSettings(page: Page, mock: MockCodex) {
@@ -65,7 +66,7 @@ async function wireSettings(page: Page, mock: MockCodex) {
       wire.information.set(hostId, runtimeInformation({
         ...old,
         runtime: { ...old.runtime, userAgent: "codex_cli_rs/0.161.0", engineId: "new-fixture-engine" },
-        config: { ...old.config, model_context_window: 500000 }, models: cliModels(true),
+        config: { ...old.config, model_context_window: 500000 }, models: wire.reconnectModels || cliModels(true),
       }));
       (hostId === "local" ? mock : mock.hostMocks.get(hostId)!).emit("bridge/status", bridgeStatus(hostId));
       return route.fulfill({ json: { ok: true, runtime: wire.information.get(hostId).runtime } });
@@ -117,6 +118,75 @@ function pagedModels(mock: MockCodex) {
   };
   return catalogue;
 }
+
+test('settings distinguish installed CLI from the active daemon and discard stale host version reads', async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  wire.information.get(remoteHostId).runtime = { ...wire.information.get(remoteHostId).runtime, connectionMode: 'daemon', userAgent: 'Codex Desktop/0.165.0' };
+  let held = false;
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/hosts/*/native-capabilities*', async route => {
+    const id = decodeURIComponent(new URL(route.request().url()).pathname.split('/')[3]!);
+    if (id === 'local') { held = true; await delayed; }
+    return route.fulfill({ json: id === 'local'
+      ? { status: 'known', checkedCliVersion: '0.160.1', methods: {} }
+      : { status: 'unknown', checkedCliVersion: '0.169.0', reason: 'runtime_version_mismatch', methods: {} } });
+  });
+  await login(page);
+  const settings = await openSettings(page, 'Codex', remoteHostId);
+  const runtime = settings.locator('.performance-settings');
+  await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '已安装 CLI' }) })).toContainText('0.169.0');
+  await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '运行中 Codex' }) })).toContainText('Codex Desktop/0.165.0');
+  await expect(runtime.locator('.performance-version-mismatch')).toContainText('主机空闲时重启 daemon');
+  await expect(settings.getByRole('button', { name: '重新连接 Codex', exact: true })).toBeEnabled();
+  await settings.getByRole('combobox', { name: '设置主机', exact: true }).selectOption('local');
+  await expect.poll(() => held).toBe(true);
+  await settings.getByRole('combobox', { name: '设置主机', exact: true }).selectOption(remoteHostId);
+  await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '已安装 CLI' }) })).toContainText('0.169.0');
+  release();
+  await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '已安装 CLI' }) })).toContainText('0.169.0');
+  expect(wire.calls.some(call => ['runtime/reconnect', 'runtime/daemon/restart'].includes(call.path))).toBe(false);
+});
+
+for (const recovery of ['reconnect', 'observed-engine']) test(`${recovery}: metadata refresh keeps the selected 6.2 model in the picker and next request`, async ({ page, mock }) => {
+  const wire = await wireSettings(page, mock);
+  const models = ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol'].map(model => ({
+    id: model, model, displayName: model, isDefault: model === 'gpt-6.1-sol',
+    defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }],
+  }));
+  mock.config.model = 'gpt-6.1-sol';
+  mock.modelCatalog = models;
+  wire.information.get('local').models = models;
+  wire.information.get('local').config.model = 'gpt-6.1-sol';
+  const refreshedModels = [...models, { ...models[0]!, id: 'metadata-refreshed', model: 'metadata-refreshed', isDefault: false }];
+  wire.reconnectModels = refreshedModels;
+  await login(page);
+  await page.locator('[data-section="recent"] .nav-thread[data-host-id="local"]').filter({ hasText: '已有测试历史' }).locator('.thread-row').click();
+  await expect(page.locator('.agent-message')).toContainText('历史保持可读');
+  const model = page.getByRole('combobox', { name: '选择模型', exact: true });
+  await model.selectOption('gpt-6.2-astra');
+  await expect(model).toBeEnabled();
+  await expect(model).toHaveValue('gpt-6.2-astra');
+  const input = page.getByRole('textbox', { name: '消息输入框', exact: true });
+  await input.fill('重新连接后仍使用选择的模型');
+  if (recovery === 'reconnect') {
+    const settings = await openSettings(page, 'Codex');
+    await settings.getByRole('button', { name: '重新连接 Codex', exact: true }).click();
+    await expect(settings.getByRole('status')).toContainText('Codex 已重新连接');
+    await settings.getByRole('button', { name: '关闭设置', exact: true }).click();
+  } else {
+    const updated = wire.information.get('local');
+    updated.models = refreshedModels;
+    updated.runtime.engineId = 'updated-fixture-engine';
+    mock.emit('bridge/status', { ...updated.runtime, hostId: 'local', pendingRequests: [] });
+  }
+  await expect(model.locator('option[value="metadata-refreshed"]')).toHaveCount(1);
+  await expect(model.locator('option[value="gpt-6.2-astra"]')).toHaveCount(1);
+  await expect(model).toHaveValue('gpt-6.2-astra');
+  await expect(input).toHaveValue('重新连接后仍使用选择的模型');
+  await page.getByRole('button', { name: '发送消息', exact: true }).click();
+  await expect.poll(() => mock.request('turn/start')?.params?.model).toBe('gpt-6.2-astra');
+});
 
 for (const width of [1280, 390]) test(`${width}px: Codex combines provider, connection and update controls for the selected host without separate performance or account tabs`, async ({ page, mock }) => {
   await page.setViewportSize({ width, height: 900 });
