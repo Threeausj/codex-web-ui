@@ -8,11 +8,13 @@ import { runHostPython } from './host-helper.js'
 import { writePrivateJson } from './storage.js'
 import { nativeRuntimeVersion } from './native-capabilities.js'
 import { updateCodexDaemon, type CodexDaemonOptions } from './daemon.js'
-import { activeCodexUpdate, type HostCodexUpdateOperation, type HostCodexUpdateStatus } from '../shared/host-update.js'
+import { activeCodexUpdate, type HostCodexUpdateAction, type HostCodexUpdateOperation, type HostCodexUpdateStatus } from '../shared/host-update.js'
 
 const semver = z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/).max(100)
+const actionSchema = z.enum(['update', 'reload'])
 const operationSchema = z.object({
   id: z.string().uuid(), hostId: z.string().min(1).max(256),
+  action: actionSchema.optional(),
   state: z.enum(['checking', 'updating', 'restarting', 'completed', 'failed']),
   startedAt: z.number().nonnegative(), updatedAt: z.number().nonnegative(), finishedAt: z.number().nonnegative().optional(),
   beforeVersion: semver.optional(), installedVersion: semver.optional(), runtimeVersion: semver.optional(),
@@ -82,7 +84,7 @@ def run(arguments,seconds):
             raise UpdateFailure('command_failed')
         return text
 def version():
-    value=run(['--version'],15)
+    value=run(['--version'],6)
     match=re.search(r'^codex-cli\\s+(\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?)\\s*$',value,re.M)
     if not match: raise UpdateFailure('version_unknown')
     return match.group(1)
@@ -109,6 +111,7 @@ export class HostCodexUpdates {
   private operations: HostCodexUpdateOperation[] = []
   private active = new Map<string, Promise<void>>()
   private receipts = new Map<string, Promise<void>>()
+  private versionReads = new WeakMap<Bridge, Promise<string | undefined>>()
   private writes: Promise<void> = Promise.resolve()
   private closed = false
   constructor(dataDir: string, private readonly dependencies: Dependencies) {
@@ -148,21 +151,43 @@ export class HostCodexUpdates {
       : !bridge.runtime.managed ? '此 Codex 由外部代理管理，请在主机更新并重启对应进程。'
       : !bridge.maintenanceStatus.canReconnect ? bridge.maintenanceStatus.reconnectDisabledReason || '主机暂时不可重启。' : undefined
     return { command: 'codex update', canUpdate: !disabledReason, ...(disabledReason ? { disabledReason } : {}),
-      ...(codexVersion(bridge?.userAgent) ? { runtimeVersion: codexVersion(bridge?.userAgent) } : {}), operation: structuredClone(operation) }
+      runtimeVersion: bridge?.connected && !bridge.paused ? codexVersion(bridge.userAgent) : undefined,
+      operation: structuredClone(operation) }
+  }
+  async inspect(hostId: string): Promise<HostCodexUpdateStatus> {
+    const { host, bridge } = this.target(hostId)
+    if (!bridge?.connected || bridge.paused || this.isUpdating(hostId) || this.dependencies.isHostChanging?.(hostId))
+      return this.status(hostId)
+    const engineId = bridge.runtime.engineId
+    let probe = this.versionReads.get(bridge)
+    if (!probe) {
+      probe = this.execute(host, 'version', bridge.codexHome)
+        .then(result => semver.safeParse(result.version).data, () => undefined)
+        .finally(() => this.versionReads.delete(bridge))
+      this.versionReads.set(bridge, probe)
+    }
+    const cliVersion = await probe
+    const status = this.status(hostId)
+    if (this.dependencies.getHost(hostId) !== host || this.dependencies.getExistingBridge(hostId) !== bridge ||
+        bridge.runtime.engineId !== engineId || !bridge.connected || bridge.paused ||
+        this.isUpdating(hostId) || this.dependencies.isHostChanging?.(hostId)) return status
+    return { ...status, cliVersion }
   }
   private async execute(host: Host, phase: 'version' | 'update', home?: string) {
     if (this.dependencies.execute) return this.dependencies.execute(host, phase, home)
     const raw = JSON.parse(await runHostPython(host, codexUpdateScript(host, this.dependencies.bridgeOptions || {}, phase, home), this.dependencies.bridgeOptions,
-      { timeoutMs: phase === 'update' ? 630000 : 25000, maxOutputBytes: 4096 }))
+      { timeoutMs: phase === 'update' ? 630000 : 8500, maxOutputBytes: 4096 }))
     if (raw?.ok !== true) throw new Error(failureMessages[raw?.reason] || '无法确认 Codex 更新结果；原有连接未主动重启，请在主机上核对。')
     return { version: semver.parse(raw.version) }
   }
-  async start(hostId: string, requestId: string): Promise<HostCodexUpdateStatus> {
+  async start(hostId: string, requestId: string, action: HostCodexUpdateAction = 'update'): Promise<HostCodexUpdateStatus> {
     z.string().uuid().parse(requestId)
+    actionSchema.parse(action)
     const { host, bridge } = this.target(hostId)
     const key = JSON.stringify([hostId, requestId])
     const repeated = this.operations.find(entry => entry.hostId === hostId && entry.id === requestId)
     if (repeated) {
+      if ((repeated.action ?? 'update') !== action) throw busy('此请求编号对应另一项 Codex 操作。')
       // A concurrent duplicate must not acknowledge an in-memory receipt whose
       // first durable write could still fail.
       await this.receipts.get(key)
@@ -175,7 +200,7 @@ export class HostCodexUpdates {
     // ID after being offline. A full journal must fail visibly rather than
     // replaying an operation whose acknowledgement was lost.
     if (this.operations.length >= 512) throw busy('Codex 更新记录已达上限，请稍后重试。')
-    const operation: HostCodexUpdateOperation = { id: requestId, hostId, state: 'checking', startedAt: this.now(), updatedAt: this.now(), message: '正在核对活动任务和当前版本…' }
+    const operation: HostCodexUpdateOperation = { id: requestId, hostId, action, state: 'checking', startedAt: this.now(), updatedAt: this.now(), message: '正在核对活动任务和当前版本…' }
     this.operations.push(operation)
     let release!: () => void
     let authorized = false
@@ -186,13 +211,18 @@ export class HostCodexUpdates {
         await this.dependencies.withRuntimeMaintenance(hostId, () => bridge.reconnect(async () => {
           if (this.dependencies.getHost(hostId) !== host) throw busy('主机配置已改变，请重新确认后更新。')
           const before = await this.execute(host, 'version', bridge.codexHome)
-          operation.beforeVersion = semver.parse(before.version)
-          await this.update(operation, 'updating', '正在执行 codex update…')
-          const installed = await this.execute(host, 'update', bridge.codexHome)
-          operation.installedVersion = semver.parse(installed.version)
+          const running = codexVersion(bridge.userAgent)
+          operation.beforeVersion = running || semver.parse(before.version)
+          if (action === 'reload') {
+            operation.installedVersion = semver.parse(before.version)
+          } else {
+            await this.update(operation, 'updating', '正在执行 codex update…')
+            const installed = await this.execute(host, 'update', bridge.codexHome)
+            operation.installedVersion = semver.parse(installed.version)
+          }
           if (this.dependencies.getHost(hostId) !== host) throw busy('主机配置已改变，更新结果待核对；未继续重启。')
           if (bridge.options.daemonManaged) {
-            await this.update(operation, 'restarting', '安装版本已确认，正在更新独立 Codex 后台服务…')
+            await this.update(operation, 'restarting', '正在为独立后台服务加载已安装的 CLI…')
             const options: CodexDaemonOptions = { ...bridge.options, daemonHome: bridge.codexHome }
             const daemon = await (this.dependencies.executeDaemonUpdate
               ? this.dependencies.executeDaemonUpdate(host, options)
@@ -207,7 +237,7 @@ export class HostCodexUpdates {
         operation.runtimeVersion = runtimeVersion
         if (!runtimeVersion || runtimeVersion !== operation.installedVersion) throw new Error('安装已更新，但运行版本未能与安装版本一致；请核对 Codex 路径并重新连接。')
         operation.finishedAt = this.now()
-        await this.update(operation, 'completed', `Codex ${runtimeVersion} 已运行，模型与配置将重新读取。`)
+        await this.update(operation, 'completed', action === 'reload' ? '已重新加载安装版本。' : 'Codex 更新并重启完成。')
       } catch (error) {
         operation.finishedAt = this.now(); operation.state = 'failed'; operation.updatedAt = this.now()
         operation.error = error instanceof Error && error.message.length <= 512 ? error.message : '更新或重启失败，请刷新主机版本后核对。'
@@ -230,10 +260,10 @@ export class HostCodexUpdates {
 export async function registerHostCodexUpdates(app: Express, dataDir: string, dependencies: Dependencies) {
   const updates = new HostCodexUpdates(dataDir, dependencies); await updates.init()
   const route = (handler: RequestHandler): RequestHandler => (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next) }
-  app.get('/api/hosts/:id/codex-update', route((req, res) => { res.json(updates.status(String(req.params.id))) }))
+  app.get('/api/hosts/:id/codex-update', route(async (req, res) => { res.json(await updates.inspect(String(req.params.id))) }))
   app.post('/api/hosts/:id/codex-update', route(async (req, res) => {
-    const { requestId } = z.object({ requestId: z.string().uuid() }).strict().parse(req.body)
-    res.status(202).json(await updates.start(String(req.params.id), requestId))
+    const { requestId, action } = z.object({ requestId: z.string().uuid(), action: actionSchema.optional() }).strict().parse(req.body)
+    res.status(202).json(await updates.start(String(req.params.id), requestId, action))
   }))
   return updates
 }

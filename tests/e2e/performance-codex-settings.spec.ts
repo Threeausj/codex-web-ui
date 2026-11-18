@@ -137,7 +137,7 @@ test('settings distinguish installed CLI from the active daemon and discard stal
   const runtime = settings.locator('.performance-settings');
   await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '已安装 CLI' }) })).toContainText('0.169.0');
   await expect(runtime.locator('dl div').filter({ has: page.locator('dt', { hasText: '运行中 Codex' }) })).toContainText('Codex Desktop/0.165.0');
-  await expect(runtime.locator('.performance-version-mismatch')).toContainText('主机空闲时重启 daemon');
+  await expect(runtime.locator('.performance-version-mismatch')).toContainText('重新加载已安装版本');
   await expect(settings.getByRole('button', { name: '重新连接 Codex', exact: true })).toBeEnabled();
   await settings.getByRole('combobox', { name: '设置主机', exact: true }).selectOption('local');
   await expect.poll(() => held).toBe(true);

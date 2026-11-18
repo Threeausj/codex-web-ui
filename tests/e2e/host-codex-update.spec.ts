@@ -4,9 +4,9 @@ import { test, expect, login, MockCodex } from './fixtures';
 const remoteId = 'ssh-update-host';
 const panel = (page: Page) => page.getByRole('region', { name: '主机 Codex 更新', exact: true });
 const button = (page: Page) => panel(page).getByRole('button', { name: '更新并重启 Codex', exact: true });
-type Operation = { id: string; state: string; beforeVersion: string; installedVersion?: string; runtimeVersion?: string;
+type Operation = { id: string; action?: 'reload'; state: string; beforeVersion: string; installedVersion?: string; runtimeVersion?: string;
   startedAt: number; updatedAt: number; message?: string; error?: string };
-type Information = { operation: Operation | null; canUpdate: boolean; disabledReason?: string; runtimeVersion: string; command: string };
+type Information = { operation: Operation | null; canUpdate: boolean; disabledReason?: string; runtimeVersion: string; cliVersion?: string; command: string };
 const info = (version = '0.164.0'): Information => ({ operation: null, canUpdate: true, runtimeVersion: version, command: 'codex update' });
 function operation(state = 'updating', overrides: Partial<Operation> = {}): Operation {
   return { id: '00000000-0000-4000-8000-000000000165', state, beforeVersion: '0.164.0', startedAt: Date.now(), updatedAt: Date.now(), ...overrides };
@@ -17,7 +17,7 @@ async function setup(page: Page, mock: MockCodex) {
   mock.hostMocks.set(remoteId, remote);
   const wire = {
     states: new Map<string, Information>([['local', info()], [remoteId, info()]]),
-    posts: [] as { hostId: string; body: { requestId: string } }[],
+    posts: [] as { hostId: string; body: { requestId: string; action?: 'reload' } }[],
     gets: [] as string[],
     informationReads: [] as string[],
     reject: undefined as { status: number; message: string } | undefined,
@@ -31,7 +31,7 @@ async function setup(page: Page, mock: MockCodex) {
     if (route.request().method() === 'POST') {
       wire.posts.push({ hostId, body: route.request().postDataJSON() });
       if (wire.reject) return route.fulfill({ status: wire.reject.status, json: { error: wire.reject.message } });
-      if (!wire.deferAdmission) wire.states.get(hostId)!.operation = operation('checking', { id: wire.posts.at(-1)!.body.requestId });
+      if (!wire.deferAdmission) wire.states.get(hostId)!.operation = operation('checking', { id: wire.posts.at(-1)!.body.requestId, action: wire.posts.at(-1)!.body.action });
       if (wire.holdPost) await wire.holdPost;
       if (wire.loseAcknowledgement) return route.abort('failed');
       return route.fulfill({ status: 202, json: wire.states.get(hostId) });
@@ -90,7 +90,8 @@ test('updating another host reports each stage and refreshed runtime version whi
   wire.states.set(remoteId, { ...info('0.165.0'), operation: operation('completed', { installedVersion: '0.165.0', runtimeVersion: '0.165.0' }) });
   await panel(page).getByRole('button', { name: '刷新更新状态', exact: true }).click();
   await expect(panel(page).getByRole('status')).toContainText('更新并重启完成');
-  await expect(panel(page).getByText('0.165.0', { exact: true })).toHaveCount(2);
+  await expect(panel(page).getByText('0.165.0', { exact: true })).toBeVisible();
+  await expect(panel(page).getByText('0.164.0 → 0.165.0', { exact: true })).toBeVisible();
   await expect(dialog.locator('.performance-information')).toContainText('codex_cli_rs/0.165.0');
   await expect(dialog.getByRole('combobox', { name: '设置主机', exact: true })).toBeEnabled();
   await dialog.getByRole('button', { name: '关闭设置', exact: true }).click();
@@ -99,6 +100,29 @@ test('updating another host reports each stage and refreshed runtime version whi
   await expect(page.locator('.agent-message')).toContainText('历史保持可读');
   expect(mock.hostMocks.get(remoteId)!.request('thread/resume')).toBeUndefined();
   noTaskMutation(mock); noTaskMutation(mock.hostMocks.get(remoteId)!);
+});
+
+test('an outdated update record stays historical and the reload button applies the already installed CLI', async ({ page, mock }) => {
+  const wire = await setup(page, mock);
+  wire.states.set(remoteId, { ...info('0.166.0'), cliVersion: '0.170.0', operation: operation('completed', {
+    installedVersion: '0.165.0', runtimeVersion: '0.165.0', message: 'Codex 0.165.0 已运行，模型与配置将重新读取。',
+  }) });
+  await login(page); await settings(page);
+  await expect(panel(page).getByText('0.166.0', { exact: true })).toBeVisible();
+  await expect(panel(page).getByText('0.170.0', { exact: true })).toBeVisible();
+  await expect(panel(page).getByText('0.164.0 → 0.165.0', { exact: true })).toBeVisible();
+  await expect(panel(page).getByRole('status')).toHaveCount(0);
+  const reload = panel(page).getByRole('button', { name: '重新加载已安装版本', exact: true });
+  await reload.click();
+  await expect.poll(() => wire.posts.map(post => post.body.action)).toEqual(['reload']);
+  await expect(panel(page).getByRole('status')).toContainText('正在检查主机');
+  wire.states.set(remoteId, { ...info('0.170.0'), cliVersion: '0.170.0', operation: operation('completed', {
+    id: wire.posts[0]!.body.requestId, action: 'reload', beforeVersion: '0.166.0', installedVersion: '0.170.0', runtimeVersion: '0.170.0',
+  }) });
+  await panel(page).getByRole('button', { name: '刷新更新状态', exact: true }).click();
+  await expect(panel(page).getByRole('status')).toContainText('已重新加载安装版本');
+  expect(wire.posts).toHaveLength(1);
+  noTaskMutation(mock);
 });
 
 test('server busy tasks, terminals and unmanaged proxy runtimes disable update without sending a command', async ({ page, mock }) => {
@@ -202,7 +226,7 @@ test('a definite update refusal remains visible and an explicit retry gets a new
   wire.reject = undefined;
   await panel(page).getByRole('button', { name: '刷新更新状态', exact: true }).click();
   await expect(button(page)).toBeEnabled(); await button(page).click();
-  expect(wire.posts).toHaveLength(2);
+  await expect.poll(() => wire.posts.length).toBe(2);
   expect(wire.posts[0]!.body.requestId).not.toBe(wire.posts[1]!.body.requestId);
   await expect(panel(page).getByRole('status')).toContainText('正在检查主机');
   noTaskMutation(mock);
