@@ -571,15 +571,17 @@ export class Bridge {
     }
   }
   private rememberEvent(event: RpcMessage) {
-    const bytes = Buffer.byteLength(JSON.stringify(event))
+    const data = JSON.stringify(event)
+    const bytes = Buffer.byteLength(data)
     this.replayEvents.push({ event, bytes, at: Date.now() })
     this.replayBytes += bytes
     this.pruneReplay()
+    return { data, bytes }
   }
   private broadcast(message: RpcMessage) {
     const event = { ...message, bridgeEventSequence: ++this.eventSequence }
-    this.rememberEvent(event)
-    for (const key of this.clients.keys()) this.clientSend(key, event)
+    const frame = this.rememberEvent(event)
+    for (const channel of this.clientChannels.values()) channel.sendFrame(frame.data, frame.bytes)
     return event
   }
 
@@ -695,11 +697,12 @@ export class Bridge {
     // Background observers need the accepted input as well as browser clients.
     this.observeProtocol(message)
     const sequence = ++this.eventSequence
-    this.rememberEvent({ ...message, bridgeEventSequence: sequence })
-    for (const [key, socket] of this.clients)
-      this.clientSend(key, key !== pending.clientKey || socket !== pending.clientSocket
-        ? { ...message, bridgeEventSequence: sequence }
-        : { method: 'bridge/event/ack', bridgeEventSequence: sequence })
+    const frame = this.rememberEvent({ ...message, bridgeEventSequence: sequence })
+    for (const [key, socket] of this.clients) {
+      if (key === pending.clientKey && socket === pending.clientSocket)
+        this.clientSend(key, { method: 'bridge/event/ack', bridgeEventSequence: sequence })
+      else this.clientChannels.get(key)?.sendFrame(frame.data, frame.bytes)
+    }
   }
 
   private async fromClient(key: string, message: RpcMessage) {

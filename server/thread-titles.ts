@@ -10,6 +10,7 @@ export type ThreadTitleBridge = {
 }
 export type ThreadTitleDependencies = { getBridge(hostId: string): ThreadTitleBridge | Promise<ThreadTitleBridge> }
 export type ThreadTitleOptions = {
+  enabled?: () => boolean
   timeoutMs?: number
   cleanupTimeoutMs?: number
   maxPending?: number
@@ -101,8 +102,10 @@ export class ThreadTitleService {
   private readonly maxConcurrentHosts: number
   private readonly maxCandidates: number
   private closed = false
+  private readonly enabled: () => boolean
 
   constructor(private readonly dependencies: ThreadTitleDependencies, options: ThreadTitleOptions = {}) {
+    this.enabled = options.enabled ?? (() => true)
     this.timeoutMs = limit(options.timeoutMs, 30000, 120000)
     this.cleanupTimeoutMs = limit(options.cleanupTimeoutMs, 2000, 10000)
     this.maxPending = limit(options.maxPending, 64, 512)
@@ -140,6 +143,7 @@ export class ThreadTitleService {
     const id = key(host.id, threadId)
     const response = record(params?.result), request = record(params?.request)
     if (method === 'thread/start') {
+      if (!this.enabled()) return
       const created = record(response?.thread)
       if (!created || created.ephemeral !== false || string(created.name) || string(created.preview) || this.jobs.has(id) || this.candidates.has(id) || this.seen.has(id)) return
       // Automatic jobs are only for new, empty user threads created by this Web
@@ -158,6 +162,7 @@ export class ThreadTitleService {
     const candidate = this.candidates.get(id)
     if (!candidate) return
     this.candidates.delete(id)
+    if (!this.enabled()) return
     const prompt = titlePrompt(request?.input)
     if (!prompt || Date.now() - candidate.at > CANDIDATE_TTL) return
     if (this.jobs.size >= this.maxPending || [...this.jobs.values()].filter(job => job.host.id === host.id).length >= this.maxPendingPerHost) return

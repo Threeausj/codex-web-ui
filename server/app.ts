@@ -175,7 +175,6 @@ export async function createApp(options: AppOptions = {}) {
   })
   await notificationObservers.init()
   const stopPushSubscriptionListener = push.onSubscriptionChange(() => notificationObservers.wake())
-  const titleService = threadTitles = new ThreadTitleService({ getBridge })
   const nativeProjects = new NativeProjects({ storage, getBridge })
   app.disable('x-powered-by')
   if (options.trustProxy ?? process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
@@ -206,6 +205,7 @@ export async function createApp(options: AppOptions = {}) {
   const tmuxMonitors = await registerTmuxMonitors(app, dataDir, { getHost: id => storage.host(id), bridgeOptions, autoStart: false,
     notify: (host, notice) => push.notifyExternal(host, notice) })
   const preferences = await registerPreferences(app, dataDir)
+  const titleService = threadTitles = new ThreadTitleService({ getBridge }, { enabled: () => preferences.threadTitleMode === 'ai' })
   await registerBookmarks(app, dataDir, id => !!storage.host(id))
   const promptPresets = await registerPromptPresets(app, dataDir)
   registerGit(app, { getBridge, getHost: id => storage.host(id), bridgeOptions,

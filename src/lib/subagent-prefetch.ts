@@ -29,6 +29,7 @@ function createPrefetch(api: any, state: any) {
   let listGeneration = 0
   let listRetryAt = 0
   let listed = false
+  let emptyPollAt = 0
   const seenActivity = new Map<string, any>()
 
   async function load(more = false, preserve = false, retry = false) {
@@ -46,6 +47,7 @@ function createPrefetch(api: any, state: any) {
       threads.value = [...combined.values()]
       if (!preserve || !listed) nextCursor.value = result?.nextCursor || null
       listed = true
+      emptyPollAt = page.length || result?.nextCursor ? 0 : Date.now() + 120_000
       listRetryAt = 0
     } catch (cause: any) {
       if (generation === listGeneration && requestScope === scope()) {
@@ -80,6 +82,7 @@ function createPrefetch(api: any, state: any) {
     error.value = ''
     listRetryAt = 0
     listed = false
+    emptyPollAt = 0
     seenActivity.clear()
     cache.reset()
     void load()
@@ -111,7 +114,8 @@ function createPrefetch(api: any, state: any) {
   })
 
   const poller = window.setInterval(() => {
-    if (connected.value && rootId.value && document.visibilityState === 'visible') void refresh()
+    if (connected.value && rootId.value && document.visibilityState === 'visible' &&
+      (state.busy || agents.value.length || Date.now() >= emptyPollAt)) void refresh()
   }, 15_000)
   const wake = () => {
     if (document.visibilityState === 'visible' && connected.value) void refresh()

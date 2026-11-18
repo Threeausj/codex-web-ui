@@ -139,7 +139,10 @@ test("phone dark settings and native folder dialog retain contrast and fit the v
   await login(page);
   const settings = await openSettings(page);
   await readableDark(settings);
-  await readableDark(settings.locator(".settings-description"));
+  const descriptions = settings.locator('.settings-description');
+  await expect(descriptions.first()).toBeVisible();
+  for (const description of await descriptions.all()) await readableDark(description);
+  await readableDark(settings.getByRole('combobox', { name: '新对话标题' }));
   await readableDark(settings.getByRole("combobox", { name: "全局默认权限" }));
   await settings.locator(".settings-nav").getByRole("button", { name: "项目", exact: true }).click();
   await settings.getByRole("button", { name: "浏览项目文件夹", exact: true }).click();

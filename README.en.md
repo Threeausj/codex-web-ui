@@ -186,6 +186,8 @@ There is no automatic cross-machine cloud synchronization. A service on another 
 
 ## Everyday workflow
 
+Under Settings → General, change the new conversation title mode to use the first message preview without a model call. This preference applies to all devices on this Web service. AI titles remain the default; existing names and manual renaming are unaffected.
+
 - `Cmd/Ctrl + K`: command palette; `Cmd/Ctrl + Shift + O`: new chat; `Cmd/Ctrl + J`: terminal. `Enter` sends, `Shift + Enter` adds a line, and `Esc` closes panels.
 - Type `/` to search commands and the selected host's Skills. Selecting a skill adds a reference token; sending includes `$skill-name` and its native skill path. Type or tap `@` for project files or Default, Plan, and Goal modes. On phones, tap a mode directly or dismiss the menu with its close button; selecting a mode preserves the unsent draft. Use the attachment button for files and images.
 - Plan uses Codex's built-in planning mode. Goal saves the supplied objective on the current thread, with an optional positive integer token budget; leaving it empty adds no limit. Its card shows status and cumulative usage, with pause, resume, and clear controls. Wait for the current turn to finish or use Stop before changing modes. Switching to Plan pauses an active goal. Modes keep the chosen permissions.

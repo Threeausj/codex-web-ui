@@ -116,6 +116,7 @@ const state = reactive({
   hostId: "local",
   projects: [] as any[],
   preferences: {
+    threadTitleMode: 'ai' as 'ai' | 'preview',
     pins: [] as Pin[],
     collapsed: {} as Record<string, boolean>,
     permissionProfiles: [] as any[],
@@ -771,6 +772,8 @@ function clearConversationCaches() {
   retainedHistoryTurns.clear(); retentionProbes.clear();
   threadRevisions.clear();
   threadNameRevisions.clear();
+  legacyRecency.clear();
+  recencySortSupport.clear();
   removedThreads.clear();
   deletedThreads.clear();
   threadListScope = '';
@@ -1400,8 +1403,12 @@ async function normalizeThreadRecency(hostId: string, thread: any) {
     legacyRecency.delete(legacyRecency.keys().next().value!);
   return { ...thread, recencyAt: await entry.pending };
 }
-async function normalizeThreadPage(hostId: string, result: any) {
+async function normalizeThreadPage(hostId: string, result: any, preview?: (threads: any[]) => void) {
+  const authentication = authenticationGeneration;
   const data = (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id)));
+  if (data.every((thread: any) => Number.isFinite(thread.recencyAt))) return { ...result, data };
+  preview?.(data.map((thread: any) => Number.isFinite(thread.recencyAt) ? thread : { ...thread,
+    recencyAt: legacyRecency.get(recencyKey(hostId, thread.id))?.value ?? threadActivityAt(thread) }));
   let next = 0;
   // Missing recency is a compatibility path, bounded to four lightweight
   // metadata reads rather than fetching every chat's messages at once.
@@ -1409,7 +1416,7 @@ async function normalizeThreadPage(hostId: string, result: any) {
     Array.from({ length: Math.min(4, data.length) }, async () => {
       for (;;) {
         const index = next++;
-        if (index >= data.length) return;
+        if (index >= data.length || !state.authenticated || authentication !== authenticationGeneration) return;
         data[index] = await normalizeThreadRecency(hostId, data[index]);
       }
     }),
@@ -1421,7 +1428,9 @@ async function threadPage(
   method: "thread/list" | "thread/search",
   params: any,
   metadataOnly = false,
+  preview?: (threads: any[]) => void,
 ) {
+  const authentication = authenticationGeneration;
   const projectRevision = projectChangeSequence;
   const supportKey = `${hostId}:${method}`;
   const supported = recencySortSupport.get(supportKey) !== false;
@@ -1445,6 +1454,7 @@ async function threadPage(
       sortKey: "updated_at",
     });
   }
+  if (!state.authenticated || authentication !== authenticationGeneration) return { ...result, data: [], nextCursor: null };
   result.data = (result.data || []).map((thread: any) => {
     const change = threadProjectChanges.get(recencyKey(hostId, thread.id));
     return change && change.revision > projectRevision ? { ...thread, projectId: change.projectId } : thread;
@@ -1454,7 +1464,7 @@ async function threadPage(
     ...result,
     data: (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id))),
   };
-  return normalizeThreadPage(hostId, result);
+  return normalizeThreadPage(hostId, result, preview);
 }
 function mergeNavigation(hostId: string, threads: any[], replace = false) {
   const nav = hostNavigation(hostId);
@@ -1475,14 +1485,18 @@ function refreshHostNavigation(hostId: string): Promise<void> {
   const nav = hostNavigation(hostId);
   nav.loading = true;
   const revision = navigationRevisions.get(hostId) ?? 0;
+  const authentication = authenticationGeneration;
   const task = (async () => {
     try {
       const result = await threadPage(hostId, "thread/list", {
         limit: 60,
         modelProviders: [],
+      }, false, threads => {
+        if (!nav.threads.length && state.authenticated && authentication === authenticationGeneration &&
+          revision === (navigationRevisions.get(hostId) ?? 0) && state.hosts.some(host => host.id === hostId)) mergeNavigation(hostId, threads);
       });
       if (
-        !state.authenticated ||
+        !state.authenticated || authentication !== authenticationGeneration ||
         !state.hosts.some((host) => host.id === hostId) ||
         revision !== (navigationRevisions.get(hostId) ?? 0)
       )
@@ -2808,12 +2822,16 @@ async function refreshThreads() {
   const generation = ++listGeneration;
   const requestScope = state.hostId;
   const revision = threadEventSequence;
+  const authentication = authenticationGeneration;
   const nameRevisions = new Map(threadNameRevisions);
   const result = await threadPage(requestScope, "thread/list", {
     limit: 60,
     modelProviders: [],
+  }, false, threads => {
+    if (!state.threads.length && state.authenticated && authentication === authenticationGeneration && generation === listGeneration &&
+      revision === threadEventSequence && requestScope === state.hostId) state.threads = threads;
   });
-  if (generation !== listGeneration || requestScope !== state.hostId) return;
+  if (!state.authenticated || authentication !== authenticationGeneration || generation !== listGeneration || requestScope !== state.hostId) return;
   const preservePagination =
     (!threadListScope || threadListScope === requestScope) && loadedMorePages;
   const fresh = result.data
@@ -5874,10 +5892,9 @@ async function loadConfig(preserveChoices = false) {
     rpc(method, params, 45000, { silentError: true }).then(value => {
       if (current()) apply(value);
     }).catch(() => {});
-  // Account and quota endpoints can wait on a provider's network. They are
+  // Account endpoints can wait on a provider's network. They are
   // useful metadata, but never prerequisites for reading or resuming a thread.
   void optional("account/read", { refreshToken: false }, value => { state.account = value.account; });
-  void optional("account/rateLimits/read", {}, value => { state.rateLimits = value; });
   void optional("permissionProfile/list", { cwd: state.projectPath || undefined }, value => {
     state.nativePermissionProfiles = value.data || [];
   });

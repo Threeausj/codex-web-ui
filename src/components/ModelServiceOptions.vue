@@ -77,12 +77,15 @@ async function readLimits() {
   await operation;
   if (pending === operation) { pending = null; if (quotaDirty) { quotaDirty = false; void readLimits(); } }
 }
-watch(() => [props.state.hostId, props.state.connected, props.state.authenticated], () => { generation++; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilityLoading.value = false; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
+watch(() => [props.state.hostId, props.state.connected, props.state.authenticated, props.state.authenticationGeneration], () => { generation++; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilityLoading.value = false; quotaDirty = false; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
 watch(catalogTiers, () => { capabilityAttempts = 0; void readCapabilities(); });
 const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
   if (hostId !== props.state.hostId) return;
   if (message.method === 'account/rateLimits/updated') { quotaRevision++; if (pending) quotaDirty = true; else void readLimits(); }
-  if (message.method === 'bridge/status' && message.params?.engineId !== seenEngine) { seenEngine = message.params?.engineId || null; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilities.value = null; capabilityPending = null; void readCapabilities(); }
+  if (message.method === 'bridge/status' && message.params?.engineId && message.params.engineId !== seenEngine) {
+    if (seenEngine) { quotaRevision++; if (pending) quotaDirty = true; else void readLimits(); }
+    seenEngine = message.params.engineId; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilities.value = null; capabilityPending = null; void readCapabilities();
+  }
 }) || (() => {});
 onBeforeUnmount(() => { disposed = true; generation++; clearCapabilityRetry(); quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
 async function choose(value: string) {

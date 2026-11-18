@@ -209,6 +209,11 @@ async function action(fn: () => Promise<any>, message?: string) {
     saving.value = false;
   }
 }
+async function chooseTitleMode(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  await action(() => props.api.updatePreferences({ threadTitleMode: select.value }));
+  select.value = props.state.preferences?.threadTitleMode || 'ai';
+}
 async function addProject() {
   if (saving.value || !projectPath.value.trim() || !projectHost.value) return;
   await action(async () => {
@@ -441,6 +446,12 @@ watch(() => [settingsHostId.value, section.value], () => {
                 <option value="system">跟随系统</option>
                 <option value="light">浅色</option>
                 <option value="dark">深色</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <label for="thread-title-mode"><strong>新对话标题</strong></label>
+              <select id="thread-title-mode" class="text-input compact-select" :disabled="saving" :value="state.preferences?.threadTitleMode || 'ai'" @change="chooseTitleMode">
+                <option value="ai">AI 生成</option><option value="preview">首条消息（不调用模型）</option>
               </select>
             </div>
             <div class="setting-row">
