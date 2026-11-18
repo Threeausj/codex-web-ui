@@ -1271,15 +1271,6 @@ hr {
   width: 27px;
   height: 27px;
 }
-.mention-button {
-  font-size: 17px;
-}
-.toolbar-separator {
-  height: 13px;
-  width: 1px;
-  background: var(--border);
-  margin: 0 6px;
-}
 .composer-select {
   display: flex;
   align-items: center;
@@ -1402,6 +1393,7 @@ hr {
 .drop-overlay {
   position: absolute;
   inset: 0;
+  pointer-events: none;
   border: 2px dashed var(--muted);
   background: var(--surface);
   border-radius: 15px;
@@ -2758,9 +2750,6 @@ hr {
     width: 25px;
     height: 26px;
   }
-  .toolbar-separator {
-    margin-inline: 4px;
-  }
   .model-select {
     margin-left: 1px;
     gap: 3px;
@@ -3028,9 +3017,6 @@ hr {
   }
   .composer-submit {
     gap: 10px;
-  }
-  .toolbar-separator {
-    margin-inline: 3px;
   }
   .welcome h2 {
     font-size: 23px;

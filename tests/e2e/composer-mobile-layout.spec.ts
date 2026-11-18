@@ -5,7 +5,13 @@ for (const width of [320, 390, 430]) {
     await page.setViewportSize({ width, height: 844 });
     mock.projects[0].name = "手机长项目名".repeat(12);
     mock.hosts[0].name = "主机名称".repeat(16);
+    mock.config.model = 'gpt-6.2-astra';
+    mock.modelCatalog = [{ ...mock.modelCatalog[0], id: 'gpt-6.2-astra', model: 'gpt-6.2-astra',
+      displayName: 'GPT-6.2-Astra', serviceTiers: [{ id: 'priority', name: 'Fast' }] }];
     await login(page);
+    const model = page.getByRole('combobox', { name: '选择模型', exact: true });
+    await expect(model).toHaveValue('gpt-6.2-astra');
+    await expect(page.getByRole('combobox', { name: '模型服务层级', exact: true })).toBeAttached();
     const verify = async () => {
       const area = await page.locator(".composer-area").boundingBox();
       const context = await page.locator(".new-context").boundingBox();
@@ -22,6 +28,14 @@ for (const width of [320, 390, 430]) {
       expect(Math.abs(tools!.x - submit!.x)).toBeLessThanOrEqual(1);
       expect(Math.abs(tools!.width - submit!.width)).toBeLessThanOrEqual(1);
       expect(send!.x + send!.width).toBeLessThanOrEqual(area!.x + area!.width - 8);
+      const modelFits = await model.evaluate(element => {
+        const select = element as HTMLSelectElement;
+        const style = getComputedStyle(select);
+        const canvas = document.createElement('canvas').getContext('2d')!;
+        canvas.font = style.font;
+        return select.clientWidth >= canvas.measureText(select.selectedOptions[0]!.text).width;
+      });
+      expect(modelFits).toBe(true);
       expect(await page.locator(".composer-area").evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
       expect(await page.locator("body").evaluate((element) => element.scrollWidth <= window.innerWidth)).toBe(true);
     };
@@ -38,7 +52,7 @@ test("mobile touch can choose a file without losing input focus or text", async 
   await login(page);
   const input = page.getByRole("textbox", { name: "消息输入框" });
   await input.fill("请查看 ");
-  await page.getByRole("button", { name: "选择插件、应用、模式或引用项目文件", exact: true }).click();
+  await input.pressSequentially("@");
   const option = page.getByRole("listbox").getByRole("option").filter({ hasText: "README.md" });
   await expect(option).toBeVisible();
   await option.dispatchEvent("click");

@@ -8,7 +8,6 @@ import MarkdownComposerEditor from "./MarkdownComposerEditor.vue";
 import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
-import { composerMarkdownPreview } from "../lib/composer-markdown";
 import { continueMarkdown, formatMarkdown, isMarkdownCodeAt, type MarkdownEdit, type MarkdownFormat } from "../lib/markdown-editing";
 import { insertPromptPreset } from "../lib/prompt-presets";
 import { mentionedPlugins } from '../lib/plugin-mentions';
@@ -30,12 +29,6 @@ const emit = defineEmits<{
   search: [];
 }>();
 const draft = ref("");
-const markdownPreview = ref(false);
-const previewElement = ref<HTMLElement>();
-let editingSelection = { start: 0, end: 0 };
-const renderedDraft = computed(() => markdownPreview.value
-  ? composerMarkdownPreview(draft.value, props.state.hostId, props.state.activeThread?.cwd || props.state.projectPath || '/')
-  : null);
 const draftStorageWarning = ref(false);
 const quotedContexts = ref<ConversationSelectionSource[]>([]);
 const input = ref<InstanceType<typeof MarkdownComposerEditor>>();
@@ -176,7 +169,6 @@ function usePreset(preset: PromptPreset, position = input.value?.selectionStart 
   const inserted = insertPromptPreset(remaining, preset.content, before.length);
   draft.value = inserted.text;
   picker.value = "";
-  markdownPreview.value = false;
   void nextTick(() => {
     input.value?.focus(); input.value?.setSelectionRange(inserted.position, inserted.position); resize();
   });
@@ -470,34 +462,12 @@ function onBeforeInput(event: InputEvent) {
   event.preventDefault();
   if (!markdownEnter()) void send();
 }
-function editDraft() {
-  markdownPreview.value = false;
-  void nextTick(() => {
-    resize();
-    input.value?.focus({ preventScroll: true });
-    input.value?.setSelectionRange(Math.min(editingSelection.start, draft.value.length), Math.min(editingSelection.end, draft.value.length));
-  });
-}
 function focusInput() {
-  markdownPreview.value = false;
   void nextTick(() => { resize(); input.value?.focus({ preventScroll: true }); });
-}
-function toggleMarkdownPreview() {
-  if (markdownPreview.value) { editDraft(); return; }
-  if (!draft.value.trim()) return;
-  editingSelection = { start: input.value?.selectionStart ?? draft.value.length, end: input.value?.selectionEnd ?? draft.value.length };
-  picker.value = "";
-  pickerError.value = "";
-  searchPending.value = false;
-  ++pickerGeneration;
-  if (searchTimer) clearTimeout(searchTimer);
-  closeContextMenu();
-  markdownPreview.value = true;
-  void nextTick(() => previewElement.value?.focus({ preventScroll: true }));
 }
 watch([() => props.state.hostId, () => props.state.projectPath, () => props.state.activeThread?.id,
   () => props.state.authenticationGeneration, () => props.state.authenticated], () => {
-  markdownPreview.value = false;
+  dropping.value = false;
   picker.value = "";
   pickerFiles.value = [];
   pickerError.value = "";
@@ -772,18 +742,29 @@ function paste(event: ClipboardEvent) {
   if (!event.clipboardData?.getData("text/plain")) event.preventDefault();
   void upload(files, true);
 }
+function dragFiles(event: DragEvent) {
+  const transfer = event.dataTransfer;
+  if (!transfer?.types.includes("Files")) return;
+  event.preventDefault();
+  transfer.dropEffect = "copy";
+  dropping.value = true;
+}
+function leaveDrag(event: DragEvent) {
+  if (!dropping.value) return;
+  const composer = event.currentTarget as HTMLElement;
+  if (event.relatedTarget instanceof Node && composer.contains(event.relatedTarget)) return;
+  if (!event.relatedTarget) {
+    const { left, right, top, bottom } = composer.getBoundingClientRect();
+    if (event.clientX >= left && event.clientX < right && event.clientY >= top && event.clientY < bottom) return;
+  }
+  dropping.value = false;
+}
 function drop(event: DragEvent) {
   dropping.value = false;
-  if (event.dataTransfer?.files.length) void upload(event.dataTransfer.files);
-}
-function insertAt() {
-  markdownPreview.value = false;
-  draft.value += draft.value && !draft.value.endsWith(" ") ? " @" : "@";
-  void nextTick(() => {
-    input.value?.focus();
-    input.value?.setSelectionRange(draft.value.length, draft.value.length);
-    inspectInput();
-  });
+  const files = event.dataTransfer?.files;
+  if (!files?.length) return;
+  event.preventDefault();
+  void upload(files);
 }
 function closePicker() {
   picker.value = "";
@@ -851,7 +832,6 @@ function clearSubmittedDraft(key: string, submitted: string) {
 watch(
   draftKey,
   (key, previous) => {
-    markdownPreview.value = false;
     if (pendingDraftSubmission && !pendingDraftSubmission.threadId &&
       previous === pendingDraftSubmission.key && props.state.activeThread?.id &&
       !props.state.selectingThread && !props.state.switchingHost &&
@@ -890,13 +870,9 @@ watch(selected, () => {
       container.scrollTop = option.offsetTop + option.offsetHeight - container.clientHeight;
   });
 });
-watch(draft, (value) => {
-  if (!value.trim()) markdownPreview.value = false;
-  saveDraft(draftKey.value, value);
-}, { flush: "sync" });
+watch(draft, value => saveDraft(draftKey.value, value), { flush: "sync" });
 watch(quotedContexts, value => saveContexts(draftKey.value, value), { deep: true, flush: 'sync' });
 function setDraft(text: string) {
-  markdownPreview.value = false;
   draft.value = text;
   void nextTick(() => {
     input.value?.focus();
@@ -1023,11 +999,13 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
     <div
       class="composer"
       :class="{ dropping, 'composer-disabled': !state.connected }"
-      @dragover.prevent="dropping = true"
-      @dragleave.prevent="dropping = false"
-      @drop.prevent="drop"
+      @dragenter="dragFiles"
+      @dragover="dragFiles"
+      @dragleave="leaveDrag"
+      @dragend="dropping = false"
+      @drop="drop"
     >
-      <div v-if="dropping" class="drop-overlay">
+      <div v-if="dropping" class="drop-overlay" aria-hidden="true">
         <Icon name="Paperclip" :size="24" /><strong
           >松开以上传文件或图片</strong
         >
@@ -1117,7 +1095,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         </div>
       </div>
       <MarkdownComposerEditor
-        v-show="!markdownPreview"
         ref="input"
         v-model="draft"
         :placeholder="
@@ -1129,7 +1106,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               ? delivery === 'queue' ? '输入下一轮要执行的任务…' : '追加指令，调整当前任务…'
               : welcome
                 ? conversationMode === 'goal' && !state.goal ? '输入希望 Codex 持续完成的目标…' : '描述一个任务，让 Codex 帮你完成'
-                : '继续对话，/ 选择技能、@ 选择模式或引用文件'
+                : '继续对话，/ 技能 · @ 引用或模式'
         "
         :history-scope="draftKey"
         :aria-controls="picker ? 'composer-picker' : undefined"
@@ -1144,11 +1121,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         @paste="paste"
         :disabled="!state.authenticated || !state.hostId"
       />
-      <section v-if="markdownPreview" ref="previewElement" class="composer-markdown-preview" tabindex="0"
-        role="region" aria-label="Markdown 草稿预览" @keydown.esc.prevent="editDraft" @paste="paste">
-        <div class="markdown" v-html="renderedDraft?.html"></div>
-        <p v-if="renderedDraft?.truncated" class="composer-preview-note" role="status">仅预览前 100,000 个字符，完整原文仍会发送；切回编辑可查看全部内容。</p>
-      </section>
       <div class="composer-toolbar">
         <div class="composer-tools">
           <input
@@ -1168,28 +1140,11 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               :name="uploading ? 'LoaderCircle' : 'Plus'"
               :size="19"
               :class="{ spin: uploading }"
-            /></button
-          ><button
-            class="icon-button mention-button"
-            :disabled="!state.connected || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
-            @pointerdown.prevent
-            @click="insertAt"
-            title="选择插件、应用、模式或引用项目文件"
-            aria-label="选择插件、应用、模式或引用项目文件"
-            :aria-expanded="picker === 'mentions'"
-            aria-haspopup="listbox"
-          >
-            @</button
-          ><button type="button" class="icon-button markdown-preview-toggle"
-            :disabled="!draft.trim() || contextBusy"
-            :aria-label="markdownPreview ? '编辑 Markdown' : '预览 Markdown'"
-            :title="markdownPreview ? '返回实时 Markdown 编辑' : '完整 Markdown 预览；输入框已实时渲染。Ctrl/⌘+B 粗体、I 斜体、E 代码、Shift+K 链接'"
-            :aria-pressed="markdownPreview" @pointerdown.prevent @click="toggleMarkdownPreview">
-            <Icon :name="markdownPreview ? 'Pencil' : 'Eye'" :size="16" />
-          </button><span class="toolbar-separator"></span
-          ><label
+            />
+          </button>
+          <label
             class="composer-select model-select"
-            :title="selectedModel?.description || '选择模型'"
+            :title="selectedModel?.displayName || state.model || '选择模型'"
             ><select
               :value="state.model"
               @change="chooseModelSetting($event, 'model')"
@@ -1391,14 +1346,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   box-shadow: none;
 }
 .composer:focus-within { box-shadow: none; }
-.markdown-preview-toggle[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
-.composer-markdown-preview { min-height: 51px; max-height: 210px; overflow: auto; overscroll-behavior: contain; padding: 0 2px 8px; outline: none; }
-.composer-markdown-preview .markdown { font-size: var(--composer-font-size); line-height: 1.8; overflow-wrap: anywhere; }
-.composer-markdown-preview :deep(h1), .composer-markdown-preview :deep(h2), .composer-markdown-preview :deep(h3) { margin-top: 8px; font-size: 1.1em; }
-.composer-markdown-preview :deep(h1:first-child), .composer-markdown-preview :deep(h2:first-child), .composer-markdown-preview :deep(h3:first-child) { margin-top: 0; }
-.composer-markdown-preview :deep(pre), .composer-markdown-preview :deep(table) { max-width: 100%; }
-.composer-markdown-preview :deep(img) { max-height: 140px; object-fit: contain; }
-.composer-preview-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .composer-area :deep(.new-context) {
   margin: 0;
   padding: 6px 15px;
@@ -1489,9 +1436,19 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 @media (max-width: 760px) {
   .context-menu-actions .icon-button { width: 40px; height: 40px; }
   .context-compact-action { min-height: 44px; font-size: 13px; }
+  .composer .composer-tools { flex-wrap: wrap; column-gap: 6px; row-gap: 0; }
+  .composer .composer-tools > .icon-button { flex: 0 0 34px; width: 34px; height: 36px; }
+  .composer .model-select { flex: 1 1 120px; min-width: min(100%, 116px); margin-left: 0; gap: 3px; }
+  .composer .model-select select { flex: 1; max-width: none; min-height: 36px; font-size: 12px; }
+  .composer .effort-select { flex: 0 0 auto; margin: 0; gap: 3px; }
+  .composer .effort-select select { min-height: 36px; padding-inline: 0; font-size: 12px; }
+  .composer .composer-submit { width: 100%; gap: 7px; }
+  .context-usage { margin-right: auto; min-height: 36px; gap: 4px; padding-inline: 0; }
+  .composer .permission-select { max-width: calc(100% - 43px); }
+  .composer .permission-select select { max-width: min(170px, 100%); text-overflow: ellipsis; min-height: 36px; font-size: 12px; }
+  .composer .send-button { width: 36px; height: 36px; }
 }
 @media (max-width: 600px) {
-  .composer-markdown-preview { max-height: min(210px, 35dvh); }
   .composer-area { border-radius: 12px; }
   .composer { padding: 12px 12px 10px; }
   .composer-area :deep(.new-context) {
@@ -1505,19 +1462,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   .composer-area :deep(.context-choice select) { max-width: 100%; }
   .composer-area :deep(.context-add) { grid-column: 1 / -1; margin-left: 0; padding: 0; }
   .composer > textarea { padding: 0 0 8px; min-height: 52px; font-size: var(--composer-font-size); }
-  .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 3px; width: 100%; }
-  .composer .composer-tools { display: flex; flex-wrap: nowrap; width: 100%; gap: 3px; }
-  .composer .composer-tools > .icon-button { flex: 0 0 34px; width: 34px; height: 36px; }
-  .toolbar-separator { flex: 0 0 1px; margin-inline: 3px; }
-  .composer .model-select { flex: 1 1 0; margin-left: 0; gap: 3px; }
-  .composer .model-select select { flex: 1 1 0; max-width: none; min-height: 36px; font-size: 12px; }
-  .composer .effort-select { flex: 0 0 auto; margin: 0 0 0 4px; gap: 3px; }
-  .composer .effort-select select { min-height: 36px; padding-inline: 0; font-size: 12px; }
-  .composer .composer-submit { min-width: 0; width: 100%; justify-content: flex-end; gap: 7px; }
-  .context-usage { margin-right: auto; min-height: 36px; font-size: 11px; gap: 4px; padding-inline: 0; }
-  .composer .permission-select { min-width: 0; max-width: calc(100% - 50px); }
-  .composer .permission-select select { width: auto; max-width: min(170px, 100%); text-overflow: ellipsis; min-height: 36px; font-size: 12px; }
-  .composer .send-button { width: 36px; height: 36px; }
   .composer-picker { bottom: calc(100% + 7px); }
   .composer-tokens { gap: 6px; }
   .composer-token { font-size: 12px; }

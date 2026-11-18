@@ -122,21 +122,48 @@ test('changing conversation resets undo so another draft cannot be restored into
   await expect(input(page)).not.toHaveValue(/欢迎页/);
 });
 
-test('dropping an attachment uploads it once without inserting its file contents into Markdown', async ({ page, mock }) => {
+test('dragging across composer children keeps a stable overlay and uploads the file once', async ({ page, mock }) => {
   await login(page);
   await fillAtEnd(page, '保留 **现有草稿**');
-  await input(page).evaluate(element => {
+  const composer = page.locator('.composer');
+  const overlay = composer.locator('.drop-overlay');
+  const dataTransfer = await page.evaluateHandle(() => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(['ATTACHMENT_CONTENT_MUST_NOT_ENTER_THE_DRAFT'], 'notes.txt', { type: 'text/plain' }));
-    const bounds = element.getBoundingClientRect();
-    element.dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true,
-      clientX: bounds.left + 8, clientY: bounds.top + 8 }));
+    return transfer;
   });
+  await composer.dispatchEvent('dragenter', { dataTransfer });
+  await expect(overlay).toBeVisible();
+  await expect(overlay).toHaveCSS('pointer-events', 'none');
+  const upload = await page.getByRole('button', { name: '上传文件或图片', exact: true }).elementHandle();
+  await input(page).dispatchEvent('dragleave', { dataTransfer, relatedTarget: upload, bubbles: true });
+  await expect(overlay).toBeVisible();
+  const bounds = (await composer.boundingBox())!;
+  await input(page).dispatchEvent('dragleave', { dataTransfer, clientX: bounds.x + 10, clientY: bounds.y + 10, bubbles: true });
+  await expect(overlay).toBeVisible();
+  await composer.dispatchEvent('dragleave', { dataTransfer, clientX: bounds.x - 1, clientY: bounds.y - 1 });
+  await expect(overlay).toHaveCount(0);
+  await composer.dispatchEvent('dragover', { dataTransfer });
+  await expect(overlay).toBeVisible();
+  await input(page).dispatchEvent('drop', { dataTransfer, bubbles: true, cancelable: true });
+  await expect(overlay).toHaveCount(0);
   await expect(page.locator('.attachment').filter({ hasText: 'notes.txt' })).toBeVisible();
   expect(mock.uploads).toHaveLength(1);
   expect(mock.uploads[0]!.body.toString()).toContain('ATTACHMENT_CONTENT_MUST_NOT_ENTER_THE_DRAFT');
   await expect(input(page)).toHaveValue('保留 **现有草稿**');
   expect(mock.request('turn/start')).toBeUndefined();
+});
+
+test('dragging text does not activate the file overlay', async ({ page, mock }) => {
+  await login(page);
+  const dataTransfer = await page.evaluateHandle(() => {
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', '普通文本');
+    return transfer;
+  });
+  await page.locator('.composer').dispatchEvent('dragover', { dataTransfer });
+  await expect(page.locator('.drop-overlay')).toHaveCount(0);
+  expect(mock.uploads).toEqual([]);
 });
 
 for (const modifier of ['Control', 'Meta']) test(`${modifier}+K preserves global search and Escape returns to the unchanged draft`, async ({ page, mock }) => {

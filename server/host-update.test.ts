@@ -113,10 +113,45 @@ test('updating an idle host executes the fixed update once and restarts only tha
   const result = await (await f.request()).json()
   assert.equal(result.operation.state, 'completed'); assert.equal(result.operation.beforeVersion, '0.163.0'); assert.equal(result.operation.installedVersion, '0.165.0'); assert.equal(result.operation.runtimeVersion, '0.165.0')
   assert.equal(result.runtimeVersion, '0.165.0'); assert.equal(result.command, 'codex update')
+  assert.equal(result.cliVersion, '0.165.0')
   assert.notEqual(f.bridges.get('remote')!.runtime.engineId, before); assert.equal(f.peers.get('remote')!.length, 2); assert.equal(f.peers.get('local')!.length, 1)
-  assert.deepEqual(f.calls, [{ hostId: 'remote', phase: 'version' }, { hostId: 'remote', phase: 'update' }])
+  assert.deepEqual(f.calls, [{ hostId: 'remote', phase: 'version' }, { hostId: 'remote', phase: 'update' }, { hostId: 'remote', phase: 'version' }])
   assert.equal((await fs.stat(path.join(f.directory, 'codex-updates.json'))).mode & 0o777, 0o600)
-  await f.request('remote', { requestId: firstId }); assert.equal(f.calls.length, 2)
+  await f.request('remote', { requestId: firstId }); assert.equal(f.calls.length, 3)
+})
+
+test('a status read separates live CLI and server versions from the last completed operation', async t => {
+  const f = await fixture(); t.after(() => f.close())
+  await f.request('remote', { requestId: firstId }); await until(() => !f.updates.isUpdating('remote'))
+  f.installed.set('remote', '0.170.0')
+  const result = await (await f.request()).json()
+  assert.equal(result.runtimeVersion, '0.165.0')
+  assert.equal(result.cliVersion, '0.170.0')
+  assert.equal(result.operation.installedVersion, '0.165.0')
+  assert.equal(f.calls.filter(call => call.phase === 'update').length, 1)
+})
+
+for (const daemon of [false, true]) test(`${daemon ? 'managed daemon' : 'spawned server'} reload applies the installed package without rerunning the installer`, async t => {
+  const f = await fixture({ daemon }); t.after(() => f.close())
+  f.installed.set('remote', '0.170.0')
+  const request = { requestId: firstId, action: 'reload' }
+  assert.equal((await f.request('remote', request)).status, 202)
+  await until(() => !f.updates.isUpdating('remote'))
+  const operation = f.updates.status('remote').operation!
+  assert.equal(operation.action, 'reload'); assert.equal(operation.state, 'completed')
+  assert.equal(operation.beforeVersion, '0.163.0'); assert.equal(operation.runtimeVersion, '0.170.0')
+  assert.deepEqual(f.calls, [{ hostId: 'remote', phase: 'version' }])
+  assert.equal(f.daemonCalls.length, daemon ? 1 : 0)
+  assert.equal((await f.request('remote', request)).status, 202)
+  assert.equal((await f.request('remote', { requestId: firstId })).status, 409)
+  assert.equal(f.calls.length, 1)
+})
+
+test('reloading cannot take over an externally managed runtime', async t => {
+  const f = await fixture({ proxy: true }); t.after(() => f.close())
+  assert.equal((await f.request('remote', { requestId: firstId, action: 'reload' })).status, 409)
+  assert.deepEqual(f.calls, [])
+  assert.deepEqual(f.daemonCalls, [])
 })
 
 test('an explicit managed daemon update installs the CLI then updates the selected daemon and reconnects exactly once', async t => {

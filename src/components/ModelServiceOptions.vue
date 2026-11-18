@@ -125,5 +125,10 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 .account-usage-popover > div { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 12px; }
 .account-usage progress, .account-usage small { grid-column: 1 / -1; width: 100%; }
 .service-tier-error { color: var(--red); font-size: 11px; }
-@media(max-width:760px) { .service-tier-select { min-height: 36px; } .service-tier-value { max-width: 80px; } .account-usage summary { min-height: 36px; } }
+@media(max-width:760px) {
+  .model-service-options { flex-wrap: wrap; max-width: 100%; }
+  .service-tier-select { min-height: 36px; }
+  .service-tier-value { max-width: 80px; }
+  .account-usage summary { min-height: 36px; }
+}
 </style>

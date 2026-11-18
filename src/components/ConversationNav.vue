@@ -12,6 +12,7 @@ import { bookmarkProjectDetails } from "../lib/bookmark-project";
 import type { ConversationBookmark } from "../../shared/bookmarks";
 import { createThreadIndicators, threadIndicatorsKey, threadIndicatorStorageKey } from '../lib/thread-indicators';
 import { createThreadReadSync } from '../lib/thread-read-sync';
+import { useNativeThreadRead } from '../lib/native-thread-read';
 const props = defineProps<{ api: any; state: any; bookmarks: ReturnType<typeof useConversationBookmarks> }>();
 const emit = defineEmits<{
   select: [selection: { id: string; hostId: string }];
@@ -53,6 +54,7 @@ const allThreads = computed(() => props.api.navigationThreads());
 let readSync: ReturnType<typeof createThreadReadSync> | undefined;
 const indicators = createThreadIndicators(browserStorage.local, Date.now, receipt => readSync?.markRead(receipt));
 readSync = createThreadReadSync(props.state, props.api, indicators);
+useNativeThreadRead(props.state, props.api);
 provide(threadIndicatorsKey, indicators);
 function markVisibleConversation() {
   const visible = props.state.authenticated && props.state.threadReady && !props.state.selectingThread && !props.state.changingContext &&
