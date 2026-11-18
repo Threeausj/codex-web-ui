@@ -2738,55 +2738,6 @@ hr {
     line-height: 1.6;
     padding: 0 3px 10px;
   }
-  .composer-toolbar {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 3px;
-  }
-  .composer-tools {
-    gap: 3px;
-  }
-  .composer-tools > .icon-button {
-    width: 25px;
-    height: 26px;
-  }
-  .model-select {
-    margin-left: 1px;
-    gap: 3px;
-  }
-  .composer-select select {
-    font-size: 12px;
-    max-width: 144px;
-    min-height: 36px;
-  }
-  .composer-select > svg:last-child {
-    width: 11px;
-  }
-  .effort-select {
-    display: flex;
-    margin-left: auto;
-  }
-  .effort-select select {
-    max-width: 42px;
-  }
-  .composer-submit {
-    gap: 10px;
-    justify-content: flex-end;
-  }
-  .permission-select {
-    gap: 3px;
-  }
-  .permission-select select {
-    max-width: 150px;
-    font-size: 12px;
-  }
-  .permission-select > svg:first-child {
-    width: 13px;
-  }
-  .send-button {
-    height: 29px;
-    width: 29px;
-  }
   .composer-picker {
     width: 100%;
     max-height: 45dvh;
@@ -3005,19 +2956,6 @@ hr {
   .header-project h1 {
     display: none;
   }
-  .composer-select select {
-    max-width: 120px;
-    font-size: 12px;
-  }
-  .permission-select > svg:first-child {
-    display: block;
-  }
-  .permission-select select {
-    max-width: 140px;
-  }
-  .composer-submit {
-    gap: 10px;
-  }
   .welcome h2 {
     font-size: 23px;
   }
@@ -3205,20 +3143,6 @@ textarea.file-editor {
   .header-project > button,
   .header-project h1 {
     font-size: 13px;
-  }
-  .composer-tools > .icon-button {
-    width: 34px;
-    height: 36px;
-  }
-  .send-button {
-    width: 34px;
-    height: 34px;
-  }
-  .composer-submit:has(.stop-button + .send-button) .permission-select {
-    display: none;
-  }
-  .composer-toolbar {
-    min-height: 36px;
   }
   .workspace-tabs button {
     min-height: 36px;

@@ -78,6 +78,7 @@ const contextDisabled = computed(
     props.state.selectingThread || props.state.modeBusy || uploading.value || submitting.value,
 );
 const modelSettingsError = ref("");
+const serviceTierError = ref("");
 let modelChoiceGeneration = 0;
 const modelControlsDisabled = computed(() => !!(props.contextBusy || !props.state.connected || props.state.switchingHost ||
   props.state.selectingThread || props.state.threadReleased || props.state.threadConflict || props.state.runtimePaused ||
@@ -266,6 +267,7 @@ const selectedModel = computed(() =>
       model.model === props.state.model || model.id === props.state.model,
   ),
 );
+const selectedModelLabel = computed(() => selectedModel.value?.displayName || props.state.model || "加载模型…");
 const effortLabels: Record<string, string> = {
   none: "None",
   minimal: "Minimal",
@@ -1144,8 +1146,10 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
           </button>
           <label
             class="composer-select model-select"
-            :title="selectedModel?.displayName || state.model || '选择模型'"
-            ><select
+            :title="selectedModelLabel"
+          >
+            <span class="composer-select-value" aria-hidden="true">{{ selectedModelLabel }}</span>
+            <select
               :value="state.model"
               @change="chooseModelSetting($event, 'model')"
               aria-label="选择模型"
@@ -1170,7 +1174,9 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             v-if="efforts.length"
             class="composer-select effort-select"
             title="推理强度"
-            ><select
+          >
+            <span class="composer-select-value" aria-hidden="true">{{ effortLabels[state.effort] || state.effort }}</span>
+            <select
               :value="state.effort"
               @change="chooseModelSetting($event, 'effort')"
               aria-label="推理强度"
@@ -1189,10 +1195,11 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               </option></select
             ><Icon name="ChevronDown" :size="12"
           /></label>
-          <ModelServiceOptions :api="api" :state="state" :disabled="modelControlsDisabled" />
+          <ModelServiceOptions v-model:error="serviceTierError" :api="api" :state="state" :disabled="modelControlsDisabled" />
         </div>
         <div class="composer-submit">
           <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : queue?.state.status !== 'supported' ? queue?.state.reason : '立即补充到当前任务'">
+            <span class="composer-select-value" aria-hidden="true">{{ delivery === 'queue' ? '排队' : '补充' }}</span>
             <select v-model="delivery" aria-label="消息发送方式" :disabled="submitting || contextBusy">
               <option value="immediate">立即补充</option>
               <option value="queue" :disabled="!queue?.canMutate.value">下一轮排队</option>
@@ -1218,7 +1225,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               'full-access': state.permission === 'danger-full-access',
             }"
             :title="state.permissionChangePending ? `${permissionLabel}：下一轮生效，当前任务保留启动时权限` : permissionLabel"
-            ><Icon
+          >
+            <Icon
               :name="
                 state.permission === 'danger-full-access'
                   ? 'Zap'
@@ -1226,7 +1234,10 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
                     ? 'Lock'
                     : 'Shield'
               "
-              :size="13" /><select
+              :size="13"
+            />
+            <span class="composer-select-value" aria-hidden="true">{{ selectedPermission === 'resumed' ? '会话权限' : permissionLabel }}</span>
+            <select
               :value="selectedPermission"
               @change="choosePermission"
               aria-label="选择权限" :data-queue-locked="queue?.settingsLocked.value"
@@ -1292,6 +1303,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         </div>
       </div>
     </div>
+    <p v-if="state.rateLimits?.ordinaryUsageAllowed === false" class="composer-setting-notice is-error" role="status">常规额度已受限</p>
+    <p v-if="serviceTierError" class="composer-setting-notice service-tier-error is-error" role="alert">{{ serviceTierError }}</p>
     <p v-if="modelSettingsError || state.modelSettingsNotice" class="composer-setting-notice" :class="{ 'is-error': !!modelSettingsError }" :role="modelSettingsError ? 'alert' : 'status'">{{ modelSettingsError || state.modelSettingsNotice }}</p>
     <p v-if="submitting && submittedDuringCompaction" class="compaction-send-note" role="status"><Icon name="LoaderCircle" :size="12" class="spin" />压缩结束后发送，草稿暂时保留。</p>
   </div>
@@ -1327,7 +1340,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 </template>
 
 <style scoped>
-.composer-setting-notice { color:var(--muted);font-size:11px;line-height:1.5;margin:5px 2px 0; }
+.composer-setting-notice { color:var(--muted);font-size:11px;line-height:1.5;margin:5px 2px 0;overflow-wrap:anywhere; }
 .composer-setting-notice.is-error { color:var(--red); }
 .compaction-send-note { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; margin: 7px 4px 0; }
 .composer-area {
@@ -1412,6 +1425,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 .composer .model-select select { width: 100%; min-width: 0; text-overflow: ellipsis; }
 .composer .effort-select { flex: 0 0 auto; }
 .composer .effort-select select { width: auto; max-width: none; }
+.composer-select-value { display: none; }
 .context-usage { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; min-height: 28px; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .context-usage:hover:not(:disabled) { color: var(--text); background: var(--soft); }
 .context-usage:disabled { opacity: 1; cursor: default; }
@@ -1436,17 +1450,70 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 @media (max-width: 760px) {
   .context-menu-actions .icon-button { width: 40px; height: 40px; }
   .context-compact-action { min-height: 44px; font-size: 13px; }
-  .composer .composer-tools { flex-wrap: wrap; column-gap: 6px; row-gap: 0; }
-  .composer .composer-tools > .icon-button { flex: 0 0 34px; width: 34px; height: 36px; }
-  .composer .model-select { flex: 1 1 120px; min-width: min(100%, 116px); margin-left: 0; gap: 3px; }
-  .composer .model-select select { flex: 1; max-width: none; min-height: 36px; font-size: 12px; }
-  .composer .effort-select { flex: 0 0 auto; margin: 0; gap: 3px; }
-  .composer .effort-select select { min-height: 36px; padding-inline: 0; font-size: 12px; }
-  .composer .composer-submit { width: 100%; gap: 7px; }
-  .context-usage { margin-right: auto; min-height: 36px; gap: 4px; padding-inline: 0; }
-  .composer .permission-select { max-width: calc(100% - 43px); }
-  .composer .permission-select select { max-width: min(170px, 100%); text-overflow: ellipsis; min-height: 36px; font-size: 12px; }
-  .composer .send-button { width: 36px; height: 36px; }
+  .composer .composer-toolbar {
+    --composer-control-height: 36px;
+    --composer-select-gap: 4px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .composer .composer-tools,
+  .composer .composer-submit {
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-height: var(--composer-control-height);
+  }
+  .composer .composer-submit { margin-left: 0; }
+  .composer .composer-tools > .icon-button {
+    flex: 0 0 32px;
+    width: 32px;
+    height: var(--composer-control-height);
+  }
+  .composer-toolbar .composer-select {
+    height: var(--composer-control-height);
+    gap: var(--composer-select-gap);
+    font: inherit;
+  }
+  .composer .model-select,
+  .composer .effort-select { margin-left: 0; }
+  .composer-toolbar .composer-select > svg { flex: none; }
+  .composer-toolbar .composer-select > svg:last-child { width: 11px; }
+  .composer-select-value {
+    display: block;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer .composer-toolbar .composer-select select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    padding: 0;
+    font: inherit;
+    opacity: 0;
+  }
+  .composer-toolbar .composer-select:has(select:focus-visible) {
+    border-radius: 4px;
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+  .composer-toolbar .composer-select:has(select:disabled) { opacity: .65; }
+  .context-usage {
+    margin-right: auto;
+    height: var(--composer-control-height);
+    gap: 4px;
+    padding-inline: 0;
+    font: inherit;
+  }
+  .composer .send-button {
+    width: var(--composer-control-height);
+    height: var(--composer-control-height);
+  }
 }
 @media (max-width: 600px) {
   .composer-area { border-radius: 12px; }
@@ -1465,5 +1532,12 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   .composer-picker { bottom: calc(100% + 7px); }
   .composer-tokens { gap: 6px; }
   .composer-token { font-size: 12px; }
+}
+@media (max-width: 360px) {
+  .composer { padding-inline: 8px; }
+  .composer .composer-toolbar { --composer-select-gap: 3px; }
+  .composer .composer-tools,
+  .composer .composer-submit { gap: 4px; }
+  .composer .composer-tools > .icon-button { flex-basis: 28px; width: 28px; }
 }
 </style>
