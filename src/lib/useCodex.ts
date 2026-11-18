@@ -5965,7 +5965,7 @@ async function loadConfig(preserveChoices = false) {
     state.models = extendModelCatalog(value.data);
     if (!state.model)
       state.model =
-        (state.models.find((model) => model.isDefault) ?? state.models[0])
+        (value.data.find((model) => model.isDefault) ?? value.data[0])
           ?.model ?? "";
     if (
       !state.models.some((model) => model.model === state.model) &&

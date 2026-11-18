@@ -70,15 +70,20 @@ test('a model incompatible with saved Fast cannot silently reset that tier on an
 });
 
 test('new GPT-6.2 Astra and Sol remain selectable with their family reasoning and speed controls', async ({ page, mock }) => {
+  mock.config.model = null;
   mock.modelCatalog = [
-    family('gpt-6.1-sol', 'GPT-6.1-Sol', true),
+    family('gpt-6.1-sol', 'GPT-6.1-Sol'),
     family('gpt-6-astra', 'GPT-6-Astra'),
+    family('gpt-5.6-sol', 'GPT-5.6-Sol'),
     family('gpt-6-sol', 'GPT-6-Sol'),
+    family('gpt-6.1-terra', 'GPT-6.1 Terra'),
   ];
   await login(page);
   const model = page.getByRole('combobox', { name: '选择模型', exact: true });
-  await expect(model.locator('option[value="gpt-6.2-astra"]')).toHaveText('GPT-6.2-Astra');
-  await expect(model.locator('option[value="gpt-6.2-sol"]')).toHaveText('GPT-6.2-Sol');
+  await expect(model.locator('option')).toHaveText([
+    'GPT-6.2-Astra', 'GPT-6.2-Sol', 'GPT-6.1-Sol', 'GPT-6.1 Terra', 'GPT-6-Astra', 'GPT-6-Sol', 'GPT-5.6-Sol',
+  ]);
+  await expect(model).toHaveValue('gpt-6.1-sol');
   await model.selectOption('gpt-6.2-astra');await expect(model).toHaveValue('gpt-6.2-astra');
   const effort = page.getByRole('combobox', { name: '推理强度', exact: true });
   await expect(effort.locator('option[value="ultra"]')).toHaveCount(1);

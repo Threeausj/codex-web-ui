@@ -10,6 +10,7 @@ const modelAliases = [
   { source: 'gpt-6-astra', model: 'gpt-6.2-astra', displayName: 'GPT-6.2-Astra' },
   { source: 'gpt-6-sol', model: 'gpt-6.2-sol', displayName: 'GPT-6.2-Sol' },
 ] as const;
+const versionOrder = new Intl.Collator('en', { numeric: true });
 
 /** Keep newly enabled relay models selectable while an older CLI catalog lags. */
 export function extendModelCatalog(models: ModelEntry[]): ModelEntry[] {
@@ -21,5 +22,8 @@ export function extendModelCatalog(models: ModelEntry[]): ModelEntry[] {
     if (!source) continue;
     result.push({ ...source, id: alias.model, model: alias.model, displayName: alias.displayName, isDefault: false });
   }
-  return result;
+  return result
+    .map(entry => ({ entry, version: /^gpt-(\d+(?:\.\d+)*)(?:-|$)/i.exec(entry.model ?? '')?.[1] ?? '' }))
+    .sort((left, right) => versionOrder.compare(right.version, left.version))
+    .map(({ entry }) => entry);
 }
