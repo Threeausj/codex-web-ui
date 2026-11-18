@@ -243,7 +243,7 @@ function quoteAnswer() {
 .side-chat-transcript { min-height: 0; min-width: 0; flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; overscroll-behavior: contain; }
 .side-chat-transcript > * { flex-shrink: 0; }
 .side-chat-transcript :deep(.message), .side-chat-transcript :deep(.tool-item), .side-chat-transcript :deep(.conversation-turn) { min-width: 0; max-width: 100%; }
-.side-chat-transcript :deep(.markdown), .side-chat-transcript :deep(.user-bubble) { font-size: 12px; max-width: 100%; overflow-wrap: anywhere; }
+.side-chat-transcript :deep(.markdown), .side-chat-transcript :deep(.user-bubble) { font-size: 13px; max-width: 100%; overflow-wrap: anywhere; }
 .side-chat-transcript :deep(.approval-card) { min-width: 0; margin: 0; }
 .side-chat-transcript :deep(pre) { max-width: 100%; overflow-x: auto; }
 .side-chat-empty { color: var(--muted); text-align: center; padding: 30px 8px; font-size: 12px; }
@@ -285,7 +285,7 @@ function quoteAnswer() {
 }
 @media (max-width: 600px) {
   .side-chat-composer-body { padding: 12px 12px 10px; }
-  .side-chat-composer-body > textarea { padding: 0 0 8px; min-height: 52px; font-size: 16px; }
+  .side-chat-composer-body > textarea { padding: 0 0 8px; min-height: 52px; font-size: var(--composer-font-size); }
   .side-chat-actions { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .side-chat-submit { width: 100%; }
 }

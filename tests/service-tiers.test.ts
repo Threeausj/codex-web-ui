@@ -11,8 +11,12 @@ test('only service tiers advertised by the current model can override a thread o
   assert.deepEqual(serviceTierParams(state), {}, 'Another conversation must preserve its own native tier');
   state.serviceTierScope = serviceTierScope(state); state.serviceTier = 'invented-tier';
   assert.deepEqual(serviceTierParams(state), {});
-  state.serviceTier = null; assert.deepEqual(serviceTierParams(state), { serviceTier: null });
+  state.serviceTier = null; assert.deepEqual(serviceTierParams(state), {}, 'A thread already using native default needs no reset');
+  state.activeThread = { id: 'conversation-a' }; state.nativeServiceTier = 'fast'; state.serviceTierScope = serviceTierScope(state);
+  assert.deepEqual(serviceTierParams(state), { serviceTier: null }, 'An existing non-default thread tier still needs an explicit reset');
   state.model = 'gateway-model'; assert.deepEqual(modelServiceTiers(state), []); assert.deepEqual(serviceTierParams(state), {});
+  state.activeThread = null; state.serviceTierScope = serviceTierScope(state);
+  assert.deepEqual(serviceTierParams(state), {}, 'A new thread has no saved tier to reset');
 });
 
 test('account quota windows show backend usage and reset times without inventing unavailable metadata', () => {

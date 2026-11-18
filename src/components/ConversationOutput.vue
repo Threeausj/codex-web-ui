@@ -5,11 +5,8 @@ import { provideHistoryDisclosures } from "../lib/history-disclosures";
 import ChatItem from "./ChatItem.vue";
 import ActivityBatch from './ActivityBatch.vue';
 import Icon from "./Icon.vue";
-import {
-  conversationBlocks,
-  elapsedLabel,
-  turnPresentation,
-} from "../lib/presentation";
+import { elapsedLabel } from "../lib/presentation";
+import { useConversationView } from '../lib/conversation-view';
 import type { DisplayItem } from "../lib/events";
 import { asyncUserInputQuestions } from '../../shared/async-user-input';
 import { messageEditDraft, releaseEditAttachments, uploadedEditAttachments, type MessageEditAttachment, type MessageEditSession } from '../lib/message-edit';
@@ -104,13 +101,7 @@ async function saveEdit() {
     session.saving = false;
   }
 }
-const blocks = computed(() =>
-  conversationBlocks(props.items, props.turns).map((block) =>
-    block.kind === "message"
-      ? block
-      : { ...block, ...turnPresentation(block.items) },
-  ),
-);
+const blocks = useConversationView(() => props.items, () => props.turns);
 const disclosures = provideHistoryDisclosures();
 const expandedTurns = reactive(new Set<string>());
 const revealedItemId = ref('');

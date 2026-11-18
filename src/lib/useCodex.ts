@@ -3,6 +3,7 @@ import { officeMime } from './file-preview';
 import { copyText } from './copy-text';
 import type { FileEntryChange, FileEntryRequest, FileClipboard } from '../../shared/file-entries';
 import { decodeCsvBytes, isCsvPath } from './csv-preview';
+import { extendModelCatalog } from './model-catalog';
 import type { InstalledPlugin, PluginInventory } from '../../shared/plugin-mentions';
 import { integrationInputs } from './plugin-mentions';
 import { validAppId } from '../../shared/plugin-mentions';
@@ -115,6 +116,7 @@ const state = reactive({
   hostId: "local",
   projects: [] as any[],
   preferences: {
+    threadTitleMode: 'ai' as 'ai' | 'preview',
     pins: [] as Pin[],
     collapsed: {} as Record<string, boolean>,
     permissionProfiles: [] as any[],
@@ -433,7 +435,7 @@ async function refreshCurrentRuntimeMetadata() {
     if (!current() || information.runtime?.engineId !== selectedEngine) return;
     await readConfig(true, true);
     if (!current()) return;
-    if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+    if (Array.isArray(information.models)) state.models = extendModelCatalog(information.models).filter((entry: any) => !entry.hidden);
   } catch { /* A later reconnect/read retries metadata; never replay mutations. */ }
   finally {
     if (choices?.observedEngine === selectedEngine && metadataReconnectChoices === choices)
@@ -478,7 +480,7 @@ async function reconnectRuntime(hostId = state.hostId, restartDaemon = false) {
         if (!currentHost()) return information;
         if (!state.connected || state.runtimePaused || engineId !== reconnectedEngine)
           throw new Error('Codex 连接已变化，请重新读取运行信息');
-        if (Array.isArray(information.models)) state.models = information.models.filter((entry: any) => !entry.hidden);
+        if (Array.isArray(information.models)) state.models = extendModelCatalog(information.models).filter((entry: any) => !entry.hidden);
         await Promise.allSettled([loadModeCapabilities(), loadSkills({ forceReload: true })]);
         assertAuthenticated();
         if (!currentHost()) return information;
@@ -770,6 +772,8 @@ function clearConversationCaches() {
   retainedHistoryTurns.clear(); retentionProbes.clear();
   threadRevisions.clear();
   threadNameRevisions.clear();
+  legacyRecency.clear();
+  recencySortSupport.clear();
   removedThreads.clear();
   deletedThreads.clear();
   threadListScope = '';
@@ -1399,8 +1403,12 @@ async function normalizeThreadRecency(hostId: string, thread: any) {
     legacyRecency.delete(legacyRecency.keys().next().value!);
   return { ...thread, recencyAt: await entry.pending };
 }
-async function normalizeThreadPage(hostId: string, result: any) {
+async function normalizeThreadPage(hostId: string, result: any, preview?: (threads: any[]) => void) {
+  const authentication = authenticationGeneration;
   const data = (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id)));
+  if (data.every((thread: any) => Number.isFinite(thread.recencyAt))) return { ...result, data };
+  preview?.(data.map((thread: any) => Number.isFinite(thread.recencyAt) ? thread : { ...thread,
+    recencyAt: legacyRecency.get(recencyKey(hostId, thread.id))?.value ?? threadActivityAt(thread) }));
   let next = 0;
   // Missing recency is a compatibility path, bounded to four lightweight
   // metadata reads rather than fetching every chat's messages at once.
@@ -1408,7 +1416,7 @@ async function normalizeThreadPage(hostId: string, result: any) {
     Array.from({ length: Math.min(4, data.length) }, async () => {
       for (;;) {
         const index = next++;
-        if (index >= data.length) return;
+        if (index >= data.length || !state.authenticated || authentication !== authenticationGeneration) return;
         data[index] = await normalizeThreadRecency(hostId, data[index]);
       }
     }),
@@ -1420,7 +1428,9 @@ async function threadPage(
   method: "thread/list" | "thread/search",
   params: any,
   metadataOnly = false,
+  preview?: (threads: any[]) => void,
 ) {
+  const authentication = authenticationGeneration;
   const projectRevision = projectChangeSequence;
   const supportKey = `${hostId}:${method}`;
   const supported = recencySortSupport.get(supportKey) !== false;
@@ -1444,6 +1454,7 @@ async function threadPage(
       sortKey: "updated_at",
     });
   }
+  if (!state.authenticated || authentication !== authenticationGeneration) return { ...result, data: [], nextCursor: null };
   result.data = (result.data || []).map((thread: any) => {
     const change = threadProjectChanges.get(recencyKey(hostId, thread.id));
     return change && change.revision > projectRevision ? { ...thread, projectId: change.projectId } : thread;
@@ -1453,7 +1464,7 @@ async function threadPage(
     ...result,
     data: (result.data ?? []).filter((thread: any) => !deletedThreads.has(recencyKey(hostId, thread.id))),
   };
-  return normalizeThreadPage(hostId, result);
+  return normalizeThreadPage(hostId, result, preview);
 }
 function mergeNavigation(hostId: string, threads: any[], replace = false) {
   const nav = hostNavigation(hostId);
@@ -1474,14 +1485,18 @@ function refreshHostNavigation(hostId: string): Promise<void> {
   const nav = hostNavigation(hostId);
   nav.loading = true;
   const revision = navigationRevisions.get(hostId) ?? 0;
+  const authentication = authenticationGeneration;
   const task = (async () => {
     try {
       const result = await threadPage(hostId, "thread/list", {
         limit: 60,
         modelProviders: [],
+      }, false, threads => {
+        if (!nav.threads.length && state.authenticated && authentication === authenticationGeneration &&
+          revision === (navigationRevisions.get(hostId) ?? 0) && state.hosts.some(host => host.id === hostId)) mergeNavigation(hostId, threads);
       });
       if (
-        !state.authenticated ||
+        !state.authenticated || authentication !== authenticationGeneration ||
         !state.hosts.some((host) => host.id === hostId) ||
         revision !== (navigationRevisions.get(hostId) ?? 0)
       )
@@ -2807,12 +2822,16 @@ async function refreshThreads() {
   const generation = ++listGeneration;
   const requestScope = state.hostId;
   const revision = threadEventSequence;
+  const authentication = authenticationGeneration;
   const nameRevisions = new Map(threadNameRevisions);
   const result = await threadPage(requestScope, "thread/list", {
     limit: 60,
     modelProviders: [],
+  }, false, threads => {
+    if (!state.threads.length && state.authenticated && authentication === authenticationGeneration && generation === listGeneration &&
+      revision === threadEventSequence && requestScope === state.hostId) state.threads = threads;
   });
-  if (generation !== listGeneration || requestScope !== state.hostId) return;
+  if (!state.authenticated || authentication !== authenticationGeneration || generation !== listGeneration || requestScope !== state.hostId) return;
   const preservePagination =
     (!threadListScope || threadListScope === requestScope) && loadedMorePages;
   const fresh = result.data
@@ -5563,23 +5582,30 @@ async function changeModelSettings(change: ModelSettingsChange) {
   state.modelSettingsBusy = true;
   state.modelSettingsNotice = "";
   try {
+    // A native default is already in effect when there is no saved thread
+    // tier. Do not make an unrelated model/effort choice depend on proving
+    // support for a redundant serviceTier:null reset.
+    const nativeChange = { ...change };
+    if (nativeChange.serviceTier === null && (!threadId || !state.nativeServiceTier)) delete nativeChange.serviceTier;
+    const fields = Object.keys(nativeChange);
     // Unknown/old runtimes can still select model and effort for the next
     // explicit turn/start, whose request already carries these fields.
     let capabilities: any = null;
-    try { capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false); } catch {}
+    if (fields.length) try { capabilities = await http(`/hosts/${encodeURIComponent(hostId)}/native-capabilities`, {}, false); } catch {}
     assertCurrent();
-    const fields = Object.keys(change);
     const queued = !!messageQueue?.state.items.length;
     let saved = false;
-    if (threadId && !queued && methodAccepts(capabilities, 'thread/settings/update', ['threadId', ...fields])) {
+    if (threadId && fields.length && !queued && methodAccepts(capabilities, 'thread/settings/update', ['threadId', ...fields])) {
       try {
-        await rpc('thread/settings/update', { threadId, ...change } as any, 15000, { silentError: true });
+        await rpc('thread/settings/update', { threadId, ...nativeChange } as any, 15000, { silentError: true });
         saved = true;
       } catch (cause: any) { if (cause.code !== -32601) throw cause; }
       assertCurrent();
     }
-    if ('serviceTier' in change && !saved && !methodAccepts(capabilities, 'turn/start', ['threadId', 'input', 'serviceTier']))
-      throw new Error("当前 Codex 的原生服务层级协议尚未确认，请更新 Codex 或稍后重试");
+    if ('serviceTier' in nativeChange && !saved && !methodAccepts(capabilities, 'turn/start', ['threadId', 'input', 'serviceTier']))
+      throw new Error(capabilities?.reason === 'runtime_version_mismatch'
+        ? `安装的 Codex CLI${capabilities.checkedCliVersion ? `（${capabilities.checkedCliVersion}）` : ''}与运行中的 App Server 版本不一致，请核对 CLI 路径并重新加载后台服务`
+        : "运行中的 Codex 尚未确认支持调整速度，请重启或重新连接 Codex 后重试");
     if (change.model) state.model = change.model;
     if (change.effort) state.effort = change.effort;
     if ('serviceTier' in change) {
@@ -5592,12 +5618,12 @@ async function changeModelSettings(change: ModelSettingsChange) {
       ? `已选择，下一次手动发送新一轮时生效${queueNotice}`
       : "已保存，后续新一轮生效";
     const activeTurnId = threadId && state.busy ? activeTurns.get(threadId) : undefined;
-    if (!activeTurnId || !methodAccepts(capabilities, 'turn/settings/update', ['threadId', 'turnId', ...fields])) {
+    if (!activeTurnId || !fields.length || !methodAccepts(capabilities, 'turn/settings/update', ['threadId', 'turnId', ...fields])) {
       state.modelSettingsNotice = state.busy || queued ? futureNotice : "";
       return;
     }
     try {
-      const result = await rpc('turn/settings/update', { threadId: threadId!, turnId: activeTurnId, ...change } as any, 15000, { silentError: true });
+      const result = await rpc('turn/settings/update', { threadId: threadId!, turnId: activeTurnId, ...nativeChange } as any, 15000, { silentError: true });
       if (!current()) return;
       state.modelSettingsNotice = result?.status === 'applied' && activeTurns.get(threadId!) === activeTurnId
         ? `已更新，当前任务后续模型请求生效；已发出的请求不变${queueNotice}`
@@ -5866,10 +5892,9 @@ async function loadConfig(preserveChoices = false) {
     rpc(method, params, 45000, { silentError: true }).then(value => {
       if (current()) apply(value);
     }).catch(() => {});
-  // Account and quota endpoints can wait on a provider's network. They are
+  // Account endpoints can wait on a provider's network. They are
   // useful metadata, but never prerequisites for reading or resuming a thread.
   void optional("account/read", { refreshToken: false }, value => { state.account = value.account; });
-  void optional("account/rateLimits/read", {}, value => { state.rateLimits = value; });
   void optional("permissionProfile/list", { cwd: state.projectPath || undefined }, value => {
     state.nativePermissionProfiles = value.data || [];
   });
@@ -5937,10 +5962,10 @@ async function loadConfig(preserveChoices = false) {
   verifiedConfiguration = { scope: requestScope, socket: requestSocket };
   void modelsRequest.then(({ value }) => {
     if (!current() || !value) return;
-    state.models = value.data;
+    state.models = extendModelCatalog(value.data);
     if (!state.model)
       state.model =
-        (state.models.find((model) => model.isDefault) ?? state.models[0])
+        (value.data.find((model) => model.isDefault) ?? value.data[0])
           ?.model ?? "";
     if (
       !state.models.some((model) => model.model === state.model) &&

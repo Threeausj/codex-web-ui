@@ -1,10 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { reactive } from 'vue';
+import { useConversationView } from '../src/lib/conversation-view';
 import {
   conversationBlocks,
   elapsedLabel,
   turnPresentation,
 } from "../src/lib/presentation";
+
+test('streaming the tail of 500 turns replaces only that presentation per delta', () => {
+  const turns = Array.from({ length: 500 }, (_, index) => ({ id: `turn-${index}` }));
+  const items = reactive(turns.map(turn => ({ id: `answer-${turn.id}`, type: 'agentMessage', text: 'one', turnId: turn.id })));
+  const view = useConversationView(() => items, () => turns);
+  let previous = view.value, changed = 0;
+  for (let update = 0; update < 50; update++) {
+    items.at(-1)!.text += 'x';
+    const current = view.value;
+    changed += current.filter((block, index) => block !== previous[index]).length;
+    assert.notEqual(current.at(-1), previous.at(-1));
+    previous = current;
+  }
+  assert.equal(changed, 50);
+});
 
 test("explicit final answers remain visible while thought, commentary and tool history stay expandable", () => {
   const items = [

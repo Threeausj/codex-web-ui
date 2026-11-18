@@ -28,7 +28,7 @@ test('multiple file drafts survive tab switches, bridge reconnection, panel clos
   await expect(page.getByRole('textbox', { name: 'README.md 文件内容' })).toContainText('Private draft');
   // Wait for a committed IndexedDB record rather than an arbitrary debounce.
   await expect.poll(() => page.evaluate(() => new Promise<number>((resolve, reject) => {
-    const open = indexedDB.open('codex-private-work', 1);
+    const open = indexedDB.open('codex-private-work');
     open.onerror = () => reject(open.error);
     open.onsuccess = () => { const tx = open.result.transaction('records'); const rows = tx.objectStore('records').getAll(); rows.onsuccess = () => { resolve(rows.result.filter(row => JSON.stringify(row.value).includes('Second draft')).length); open.result.close(); }; };
   }))).toBeGreaterThan(0);

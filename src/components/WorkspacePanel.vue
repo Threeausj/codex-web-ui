@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   computed,
+  type ComputedRef,
   defineAsyncComponent,
   nextTick,
   onBeforeUnmount,
@@ -131,27 +132,46 @@ const fileView = computed({ get: () => activeEditor.value?.view || "preview", se
 const draftWarning = ref("");
 const activeScope = ref("");
 let draftTimer: ReturnType<typeof setTimeout> | undefined, workspaceReady: Promise<void> = Promise.resolve();
+const workspaceDraft = computed(() => ({ activePath: activePath.value, tabs: editorTabs.value.map(entry => ({ ...entry,
+  saving: false, file: { ...entry.file, content: undefined, dataUrl: undefined, dataBase64: undefined } })) }));
+let lastDraft: { scope: string; value: typeof workspaceDraft.value } | undefined;
 function persistDrafts() {
   clearTimeout(draftTimer);
   if (!activeScope.value || !props.state.authenticated) return;
   const scope = activeScope.value;
-  const tabs = editorTabs.value.map(entry => ({ ...entry, saving: false, file: { ...entry.file, dataUrl: undefined, dataBase64: undefined } }));
-  void privateState.write("file-workspace", scope, { tabs, activePath: activePath.value }).then(() => { if (scope === activeScope.value) draftWarning.value = ""; }).catch(cause => { if (scope === activeScope.value) draftWarning.value = `草稿保留在当前页面，持久化失败：${cause.message}`; });
+  const value = workspaceDraft.value;
+  if (lastDraft?.scope === scope && lastDraft.value === value) return;
+  const attempt = lastDraft = { scope, value };
+  void privateState.write("file-workspace", scope, value).then(() => { if (lastDraft === attempt && scope === activeScope.value) draftWarning.value = ""; }).catch(cause => {
+    if (lastDraft !== attempt) return;
+    lastDraft = undefined;
+    if (scope === activeScope.value) draftWarning.value = `草稿保留在当前页面，持久化失败：${cause.message}`;
+  });
 }
 function scheduleDrafts() { clearTimeout(draftTimer); draftTimer = setTimeout(persistDrafts, 180); }
-watch([editorTabs, activePath], scheduleDrafts, { deep: true });
-function fileTabsSnapshot(): FileTabsSnapshot { return {
+watch(workspaceDraft, scheduleDrafts);
+const dirtyFlags = new WeakMap<EditorTab, ComputedRef<boolean>>();
+function tabDirty(entry: EditorTab) {
+  let flag = dirtyFlags.get(entry);
+  if (!flag) { flag = computed(() => entry.content !== entry.original); dirtyFlags.set(entry, flag); }
+  return flag.value;
+}
+const fileTabsSnapshot = computed<FileTabsSnapshot>(() => ({
   scope: fileScope(), hostId: props.state.hostId, projectPath: props.state.projectPath || "",
   ready: activeScope.value === fileScope(),
-  files: activeScope.value === fileScope() ? editorTabs.value.map(entry => ({ path: entry.file.path, title: entry.file.path.split('/').pop() || entry.file.path, dirty: entry.content !== entry.original, saving: entry.saving })) : [],
+  files: activeScope.value === fileScope() ? editorTabs.value.map(entry => ({ path: entry.file.path, title: entry.file.path.split('/').pop() || entry.file.path, dirty: tabDirty(entry), saving: entry.saving })) : [],
   activePath: activeScope.value === fileScope() ? activePath.value : "",
-}; }
-watch(fileTabsSnapshot, value => emit('fileTabsChange', value), { deep: true, immediate: true });
+}));
+let publishedTabs: FileTabsSnapshot | undefined;
+function publishTabs(snapshot: FileTabsSnapshot) {
+  if (publishedTabs !== snapshot) { publishedTabs = snapshot; emit('fileTabsChange', snapshot); }
+}
+watch(fileTabsSnapshot, publishTabs, { immediate: true });
 function announceFilePreview(path: string) {
   if (!externalFilePreview.value || !path) return;
   // Publish tab metadata before activation so the center can show a newly
   // opened file during this render, including from the mobile drawer.
-  emit('fileTabsChange', fileTabsSnapshot());
+  publishTabs(fileTabsSnapshot.value);
   emit('previewFile', { path, hostId: props.state.hostId, projectPath: props.state.projectPath || "" });
 }
 // Keep inactive Office tabs as metadata only. Each preview is up to 8 MiB;
@@ -245,7 +265,7 @@ const stopFileEntryListener = props.api.subscribeFileEntries?.(async (change: Fi
       if (scope === fileScope() && activeScope.value === scope) {
         const result = applyFileChange(editorTabs.value, activePath.value, change);
         editorTabs.value = result.tabs; activePath.value = result.activePath;
-        persistDrafts(); emit('fileTabsChange', fileTabsSnapshot());
+        persistDrafts(); publishTabs(fileTabsSnapshot.value);
       } else {
         const saved = await privateState.read<{ tabs: EditorTab[]; activePath: string }>('file-workspace', scope).catch(() => null);
         if (!current() || !saved || !Array.isArray(saved.tabs)) continue;
@@ -328,7 +348,8 @@ async function openFile(path: string, destination = "files", line?: number, pare
   try {
     const result = await props.api.readFile(path, { silentError: true });
     if (generation !== fileGeneration || scope !== fileScope()) return;
-    const entry: EditorTab = { file: { ...result, path }, content: result.content || "", original: result.content || "", view: "preview", conflict: null, saving: false, line: null };
+    const { content: text, ...metadata } = result;
+    const entry: EditorTab = { file: { ...metadata, path }, content: text || "", original: text || "", view: "preview", conflict: null, saving: false, line: null };
     if (existing) Object.assign(existing, entry); else editorTabs.value.push(entry);
     activePath.value = path;
     previewDocument.value = destination === "preview";
@@ -622,6 +643,7 @@ watch(
   () => {
     persistDrafts();
     ++directoryGeneration; ++fileGeneration; ++revealGeneration;
+    lastDraft = undefined;
     const version = ++workspaceGeneration;
     const scope = fileScope(); activeScope.value = "";
     const current = () => version === workspaceGeneration && scope === fileScope() && props.state.authenticated;

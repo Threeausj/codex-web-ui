@@ -65,7 +65,7 @@ try:
   result={'ok':True,'version':token(s),'isDirectory':stat.S_ISDIR(s.st_mode),'isSymlink':stat.S_ISLNK(s.st_mode)}
  else: result={'ok':True,'isDirectory':stat.S_ISDIR(s.st_mode)}
 except Exception as e:
- code='CONFLICT' if str(e)=='CONFLICT' else 'UNSUPPORTED_RENAME' if str(e)=='UNSUPPORTED_RENAME' else 'EXISTS' if isinstance(e,FileExistsError) else 'MISSING' if isinstance(e,FileNotFoundError) else 'PERMISSION' if isinstance(e,PermissionError) else 'NOT_DIRECTORY' if isinstance(e,NotADirectoryError) else 'FAILED'
+ code='CONFLICT' if str(e)=='CONFLICT' else 'UNSUPPORTED_RENAME' if str(e)=='UNSUPPORTED_RENAME' or p.get('operation')=='rename' and isinstance(e,OSError) and e.errno in (errno.ENOSYS,errno.EINVAL,errno.EOPNOTSUPP,errno.ENOTSUP) else 'EXISTS' if isinstance(e,FileExistsError) else 'MISSING' if isinstance(e,FileNotFoundError) else 'PERMISSION' if isinstance(e,PermissionError) else 'NOT_DIRECTORY' if isinstance(e,NotADirectoryError) else 'NO_SPACE' if isinstance(e,OSError) and e.errno in (errno.ENOSPC,errno.EDQUOT) else 'READ_ONLY' if isinstance(e,OSError) and e.errno==errno.EROFS else 'NAME_TOO_LONG' if isinstance(e,OSError) and e.errno==errno.ENAMETOOLONG else 'FAILED'
  result={'ok':False,'code':code}
 finally:
  if fd is not None: os.close(fd)
@@ -84,7 +84,10 @@ export const fileEntryFailures: Record<string, { status: number; error: string }
   CONFLICT: { status: 409, error: '文件或目录已被其他程序修改，请刷新后重新操作。' },
   PERMISSION: { status: 403, error: '没有权限修改此目录，请检查目标主机的文件权限。' },
   NOT_DIRECTORY: { status: 400, error: '父路径不是文件夹，请重新选择目录。' },
-  UNSUPPORTED_RENAME: { status: 501, error: '目标系统暂不支持安全重命名，原文件未被覆盖。' },
+  UNSUPPORTED_RENAME: { status: 501, error: '目标文件系统不支持此项操作所需的安全重命名或发布方式，原文件已保留；可使用主机文件管理器处理。' },
+  NO_SPACE: { status: 507, error: '目标主机的磁盘空间或账户配额不足，请释放空间后重试。' },
+  READ_ONLY: { status: 403, error: '目标目录所在文件系统为只读，请选择可写目录。' },
+  NAME_TOO_LONG: { status: 400, error: '目标文件系统不支持此长度的名称，请缩短文件名后重试。' },
   FAILED: { status: 502, error: '文件操作未完成，请刷新目录并检查主机连接和文件权限。' },
 };
 type Dependencies = { getHost: (id: string) => Host | undefined; bridgeOptions?: BridgeOptions; run?: (host: Host, source: string) => Promise<string> };

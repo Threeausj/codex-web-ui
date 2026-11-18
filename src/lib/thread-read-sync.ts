@@ -14,6 +14,7 @@ export function createThreadReadSync(state: any, api: any, indicators: ThreadInd
   const imported = new Set<string>();
   const requests = new Set<AbortController>();
   let generation = 0, disposed = false, retryDelay = 2000;
+  let lastSync = 0;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
   let reading: Promise<void> | null = null, writing: Promise<void> | null = null;
   const hostExists = (hostId: string) => state.hosts?.some((host: any) => host.id === hostId);
@@ -119,6 +120,7 @@ export function createThreadReadSync(state: any, api: any, indicators: ThreadInd
         const result = await request('GET');
         if (version !== generation || !ready()) return;
         apply(result.receipts);
+        lastSync = Date.now();
         captureLocal();
         schedule();
       } catch { /* Focus, reconnection and the periodic refresh retry without disrupting chat. */ }
@@ -150,7 +152,9 @@ export function createThreadReadSync(state: any, api: any, indicators: ThreadInd
   document.addEventListener('visibilitychange', resume);
   window.addEventListener('focus', resume);
   window.addEventListener('online', resume);
-  const refreshTimer = setInterval(resume, 30000);
+  const refreshTimer = setInterval(() => {
+    if (!state.connected || Date.now() - lastSync >= 120000) resume();
+  }, 30000);
   function stop() {
     disposed = true; ++generation;
     stopWatching(); unsubscribe?.();

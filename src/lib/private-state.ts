@@ -10,16 +10,33 @@ export function indexedPrivatePersistence(): PrivatePersistence | undefined {
   if (typeof indexedDB === 'undefined') return;
   let opening: Promise<IDBDatabase> | undefined;
   const database = () => opening ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open('codex-private-work', 1);
-    request.onupgradeneeded = () => request.result.createObjectStore('records', { keyPath: 'key' });
-    request.onsuccess = () => resolve(request.result);
+    const request = indexedDB.open('codex-private-work', 2);
+    let blocked = false;
+    request.onupgradeneeded = event => {
+      const db = request.result;
+      const records = event.oldVersion ? request.transaction!.objectStore('records') : db.createObjectStore('records', { keyPath: 'key' });
+      const sizes = db.createObjectStore('sizes');
+      if (event.oldVersion) {
+        const cursor = records.openCursor();
+        cursor.onsuccess = () => {
+          const row = cursor.result;
+          if (row) { sizes.put(row.value.bytes, row.primaryKey); row.continue(); }
+        };
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => { db.close(); opening = undefined; };
+      if (blocked) opening = Promise.resolve(db);
+      else resolve(db);
+    };
     request.onerror = () => { opening = undefined; reject(request.error); };
-    request.onblocked = () => { opening = undefined; reject(new Error('私人草稿存储被其他窗口阻塞')); };
+    request.onblocked = () => { blocked = true; reject(new Error('请关闭其他旧版窗口，再保存私人草稿')); };
   });
   const transaction = async <T>(mode: IDBTransactionMode, run: (store: IDBObjectStore, set: (value: T) => void) => void) => {
     const db = await database();
     return new Promise<T>((resolve, reject) => {
-      const tx = db.transaction('records', mode); let result: T;
+      const tx = db.transaction(mode === 'readonly' ? 'records' : ['records', 'sizes'], mode); let result: T;
       tx.oncomplete = () => resolve(result);
       tx.onerror = tx.onabort = () => reject(tx.error || new Error('私人草稿存储失败'));
       run(tx.objectStore('records'), value => { result = value; });
@@ -28,17 +45,19 @@ export function indexedPrivatePersistence(): PrivatePersistence | undefined {
   return {
     read: key => transaction('readonly', (store, set) => { const req = store.get(key); req.onsuccess = () => set(req.result); }),
     write: record => transaction<void>('readwrite', store => {
-      const req = store.getAll();
+      const sizes = store.transaction.objectStore('sizes');
+      sizes.put(record.bytes, record.key);
+      const req = sizes.getAll();
       req.onsuccess = () => {
-        const rows = (req.result as PrivateRecord[]).filter(row => row.key !== record.key);
-        if (rows.length >= 256 || rows.reduce((sum, row) => sum + row.bytes, record.bytes) > 64 * 1024 * 1024) {
+        const bytes: number[] = req.result;
+        if (bytes.length > 256 || bytes.reduce((sum, size) => sum + size, 0) > 64 * 1024 * 1024) {
           store.transaction.abort(); return;
         }
         store.put(record);
       };
     }),
-    remove: key => transaction<void>('readwrite', store => { store.delete(key); }),
-    clear: () => transaction<void>('readwrite', store => { store.clear(); }),
+    remove: key => transaction<void>('readwrite', store => { store.delete(key); store.transaction.objectStore('sizes').delete(key); }),
+    clear: () => transaction<void>('readwrite', store => { store.clear(); store.transaction.objectStore('sizes').clear(); }),
   };
 }
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -80,7 +99,8 @@ export class PrivateState {
   }
   async write<T>(namespace: string, identity: string, value: T, durable = false): Promise<void> {
     const key = this.key(namespace, identity), generation = this.generation;
-    const record = { key, scope: this.scope, value: copy(value), bytes: new TextEncoder().encode(JSON.stringify(value)).byteLength };
+    const serialized = JSON.stringify(value);
+    const record = { key, scope: this.scope, value: JSON.parse(serialized), bytes: new TextEncoder().encode(serialized).byteLength };
     if (!this.memory.has(key) && this.memory.size >= 256) throw new Error('私人草稿或操作回执已达上限，请先清理已保存的文件标签');
     if ([...this.memoryBytes].reduce((sum, [entry, bytes]) => sum + (entry === key ? 0 : bytes), record.bytes) > 64 * 1024 * 1024)
       throw new Error('私人草稿存储已超过 64 MB，请先保存并关闭部分文件标签');

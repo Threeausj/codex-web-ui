@@ -32,6 +32,7 @@ const profile = z
   );
 export const preferencesPatch = z
   .object({
+    threadTitleMode: z.enum(['ai', 'preview']).optional(),
     pins: z
       .array(
         z
@@ -86,6 +87,7 @@ export type WebPreferences = z.infer<typeof preferencesPatch>;
 export type StoredWebPreferences = Required<WebPreferences> & { defaultPermissionExplicit: boolean };
 export const emptyPreferences = () =>
   ({
+    threadTitleMode: 'ai',
     pins: [],
     collapsed: {},
     permissionProfiles: [],
@@ -119,6 +121,7 @@ export class Preferences {
   get() {
     return structuredClone(this.value);
   }
+  get threadTitleMode() { return this.value.threadTitleMode; }
   update(input: unknown) {
     const patch = preferencesPatch.parse(input);
     const operation = this.queue.then(async () => {

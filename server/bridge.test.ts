@@ -19,6 +19,23 @@ class Browser extends EventEmitter {
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
+test('four listeners share one encoding per sequenced delta', async context => {
+  const value = fixture(), browsers = Array.from({ length: 4 }, () => new Browser())
+  try {
+    browsers.forEach((browser, index) => value.bridge.attach(`s:${index}`, browser.ws(), `${index}`))
+    await value.bridge.connect()
+    const original = JSON.stringify
+    let encoded = 0
+    context.mock.method(JSON, 'stringify', (message: any, ...args: []) => {
+      if (message?.method === 'item/agentMessage/delta' && message.bridgeEventSequence) encoded++
+      return original(message, ...args)
+    })
+    for (let index = 0; index < 100; index++) value.receive({ method: 'item/agentMessage/delta', params: { threadId: 'thread', itemId: 'answer', delta: '字' } })
+    assert.equal(encoded, 100)
+    for (const browser of browsers) assert.equal(browser.sent.filter(message => message.method === 'item/agentMessage/delta').length, 100)
+  } finally { value.bridge.close() }
+})
+
 for (const failure of ['throw', 'callback', 'error'] as const) {
   test(`browser ${failure} failure is isolated from the shared Codex writer and other clients`, async () => {
     const value = fixture()

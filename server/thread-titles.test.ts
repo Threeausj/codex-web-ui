@@ -130,6 +130,17 @@ function fixture(options: ConstructorParameters<typeof ThreadTitleService>[1] = 
   return { service, forHost, webStart, accepted, observe, internalEvents };
 }
 
+test('preview mode skips all helper RPCs, including when AI is disabled between creation and first input', async () => {
+  let enabled = true;
+  const f = fixture({ enabled: () => enabled });
+  try {
+    f.webStart(); enabled = false; f.accepted();
+    f.webStart('second'); f.accepted('second');
+    await f.service.drain();
+    assert.deepEqual(f.forHost().calls, []);
+  } finally { await f.service.close(); }
+});
+
 test('only an accepted first input in a newly created Web conversation generates and persists a concise canonical title', async () => {
   const f = fixture();
   try {

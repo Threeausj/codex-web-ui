@@ -14,7 +14,8 @@ const tierSupported = computed(() => props.state.activeThread ?
 const tiers = catalogTiers;
 const capabilityLoading = ref(false);
 const tierHint = computed(() => capabilityLoading.value ? '正在读取主机的速度设置…' : !tierSupported.value ?
-  capabilities.value?.status === 'known' ? '当前主机暂不支持调整速度' : '暂时无法确认主机的速度设置，重新连接后重试' :
+  capabilities.value?.reason === 'runtime_version_mismatch' ? '安装的 Codex CLI 与运行中的 App Server 版本不一致；请核对 CLI 路径并重新加载后台服务' :
+  capabilities.value?.status === 'known' ? '当前主机暂不支持调整速度' : '暂时无法确认主机的速度设置；请重启或重新连接 Codex 后重试' :
   selectedTier.value?.description || '服务层级由当前主机的模型目录提供');
 const windows = computed(() => rateLimitWindows(props.state.rateLimits));
 const selected = computed({
@@ -76,12 +77,15 @@ async function readLimits() {
   await operation;
   if (pending === operation) { pending = null; if (quotaDirty) { quotaDirty = false; void readLimits(); } }
 }
-watch(() => [props.state.hostId, props.state.connected, props.state.authenticated], () => { generation++; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilityLoading.value = false; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
+watch(() => [props.state.hostId, props.state.connected, props.state.authenticated, props.state.authenticationGeneration], () => { generation++; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilityLoading.value = false; quotaDirty = false; pending = capabilityPending = null; capabilities.value = null; void readLimits(); void readCapabilities(); }, { immediate: true });
 watch(catalogTiers, () => { capabilityAttempts = 0; void readCapabilities(); });
 const unsubscribe = props.api.subscribeProtocol?.((hostId: string, message: any) => {
   if (hostId !== props.state.hostId) return;
   if (message.method === 'account/rateLimits/updated') { quotaRevision++; if (pending) quotaDirty = true; else void readLimits(); }
-  if (message.method === 'bridge/status' && message.params?.engineId !== seenEngine) { seenEngine = message.params?.engineId || null; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilities.value = null; capabilityPending = null; void readCapabilities(); }
+  if (message.method === 'bridge/status' && message.params?.engineId && message.params.engineId !== seenEngine) {
+    if (seenEngine) { quotaRevision++; if (pending) quotaDirty = true; else void readLimits(); }
+    seenEngine = message.params.engineId; capabilityGeneration++; clearCapabilityRetry(); capabilityAttempts = 0; capabilities.value = null; capabilityPending = null; void readCapabilities();
+  }
 }) || (() => {});
 onBeforeUnmount(() => { disposed = true; generation++; clearCapabilityRetry(); quotaDirty = false; pending = capabilityPending = null; unsubscribe(); });
 async function choose(value: string) {

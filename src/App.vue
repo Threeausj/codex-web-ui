@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import {
   computed,
+  defineAsyncComponent,
   nextTick,
   onBeforeUnmount,
   onMounted,
   provide,
   ref,
+  shallowRef,
   watch,
 } from "vue";
 import { useCodex } from "./lib/useCodex";
@@ -30,13 +32,19 @@ import ConversationImageViewer from "./components/ConversationImageViewer.vue";
 import { provideConversationImageViewer } from "./lib/conversation-image-viewer";
 import ApprovalCard from "./components/ApprovalCard.vue";
 import Composer from "./components/Composer.vue";
-import WorkspacePanel from "./components/WorkspacePanel.vue";
+type WorkspaceComponent = typeof import('./components/WorkspacePanel.vue')['default'];
+const WorkspacePanel = shallowRef<WorkspaceComponent>();
+async function loadWorkspacePanel() {
+  try { if (!WorkspacePanel.value) WorkspacePanel.value = (await import('./components/WorkspacePanel.vue')).default; }
+  catch { showError('工作区加载失败，请重试'); }
+  await nextTick();
+}
 import ReviewPanel from "./components/ReviewPanel.vue";
 import ResizableWorkspace from "./components/ResizableWorkspace.vue";
 import ResizableSidebar from "./components/ResizableSidebar.vue";
-import SettingsPanel from "./components/SettingsPanel.vue";
-import AutomationsPanel from "./components/AutomationsPanel.vue";
-import ResourcePanel from "./components/ResourcePanel.vue";
+const SettingsPanel = defineAsyncComponent(() => import('./components/SettingsPanel.vue'));
+const AutomationsPanel = defineAsyncComponent(() => import('./components/AutomationsPanel.vue'));
+const ResourcePanel = defineAsyncComponent(() => import('./components/ResourcePanel.vue'));
 import ConversationNav from "./components/ConversationNav.vue";
 import ChatTabs from './components/ChatTabs.vue';
 import { createChatTabs, sameChatTab, type ChatTabTarget } from './lib/chat-tabs';
@@ -182,7 +190,7 @@ const centerFileVisible = computed(() => !!selectedFilePath.value && fileWorkspa
 const centerFileTabs = computed(() => [...fileWorkspaceCatalog.value.values()].flatMap(workspace => workspace.files.map(file => ({
   ...file, scope: workspace.scope, hostId: workspace.hostId, projectPath: workspace.projectPath, threadId: workspace.threadId,
 }))));
-watch(workspaceOpen, open => { if (open) workspaceMounted.value = true; }, { flush: 'sync' });
+watch(workspaceOpen, open => { if (open) { workspaceMounted.value = true; void loadWorkspacePanel(); } }, { flush: 'sync' });
 watch(() => [state.hostId, state.projectPath, state.authenticationGeneration], () => {
   selectedFilePath.value = null;
   fileWorkspace.value = fileWorkspaceCatalog.value.get(workspaceScope()) || null;
@@ -228,7 +236,7 @@ useMobilePanelBack(() => state.authenticated, [
   { id: 'bookmarks', visible: () => bookmarks.state.open, close: () => bookmarks.close() },
   { id: 'bookmark-name', visible: () => !!bookmarkNaming.value, close: () => { bookmarkNaming.value = null; } },
   { id: 'image-preview', visible: () => !!conversationImages.image.value, close: () => conversationImages.close() },
-  { id: 'settings', visible: () => settingsOpen.value, close: () => settingsPanel.value?.close() },
+  { id: 'settings', visible: () => settingsOpen.value, close: closeSettings },
   { id: 'context-usage', visible: () => !!composer.value?.contextMenuOpen, close: () => composer.value?.closeContextMenu(true) },
 ]);
 const workspaceTab = ref("files");
@@ -237,7 +245,7 @@ const workspaceLine = ref<number>();
 const workspacePathScope = ref("");
 const workspaceScope = () => `${state.hostId}\0${state.projectPath}`;
 const scopedWorkspacePath = computed(() => workspacePathScope.value === workspaceScope() ? workspacePath.value : "");
-const workspace = ref<InstanceType<typeof WorkspacePanel>>();
+const workspace = ref<InstanceType<WorkspaceComponent>>();
 function clearWorkspaceReveal() {
   workspacePath.value = "";
   workspaceLine.value = undefined;
@@ -624,11 +632,11 @@ async function selectThread(
   const id = typeof selection === "string" ? selection : selection.id;
   const hostId =
     typeof selection === "string" ? state.hostId : selection.hostId;
+  sidebarOpen.value = false;
   if (hostId === state.hostId && id === state.activeThread?.id && state.threadReady && !state.threadConflict) return true;
   primeConversationReading(hostId, id);
   const generation = ++navigationSelection;
   saveScroll();
-  sidebarOpen.value = false;
   showScrollBottom.value = true;
   await action(async () => {
     try {
@@ -708,7 +716,7 @@ async function selectFileTab(tab: CenterFileTabTarget) {
   sideChat.hide();
   workspaceMounted.value = true;
   workspaceTab.value = 'files';
-  await nextTick();
+  await loadWorkspacePanel();
   if (generation !== fileTabNavigation || !await workspace.value?.waitForScope(tab.scope)) return;
   if (generation !== fileTabNavigation || workspaceScope() !== tab.scope) return;
   await workspace.value?.activateFile(tab.path);
@@ -719,7 +727,7 @@ async function closeFileTab(tab: CenterFileTabTarget) {
   // Reload restores the tab catalog before the workspace is first needed.
   // Mount it invisibly so closing still edits the actual scoped draft owner.
   workspaceMounted.value = true;
-  await nextTick();
+  await loadWorkspacePanel();
   const current = tab.scope === workspaceScope();
   if (current && !await workspace.value?.waitForScope(tab.scope)) return;
   if (!state.authenticated || authentication !== api.runtimeIdentity().authenticationGeneration || current && tab.scope !== workspaceScope()) return;
@@ -864,13 +872,18 @@ async function chooseNewContext(hostId: string, path?: string | null) {
     composer.value?.focus();
   }
 }
+function closeSettings() {
+  if (settingsPanel.value) settingsPanel.value.close();
+  else settingsOpen.value = false;
+}
 function openWorkspace(tab = "files", path = "", line?: number, revealPanel = true) {
   sideChat.hide();
   const targetScope = workspaceScope();
   const samePath = workspaceMounted.value && workspacePathScope.value === targetScope && workspacePath.value === path;
   workspaceTab.value = tab;
   workspaceMounted.value = true;
-  if (revealPanel) workspaceOpen.value = true;
+  if (revealPanel && !workspaceOpen.value) workspaceOpen.value = true;
+  else void loadWorkspacePanel();
   workspacePath.value = path;
   workspaceLine.value = line;
   workspacePathScope.value = targetScope;
@@ -1365,7 +1378,7 @@ function onKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
   if (conversationImages.image.value) return;
   if (settingsOpen.value) {
-    if (event.key === "Escape") { event.preventDefault(); settingsPanel.value?.close(); }
+    if (event.key === "Escape") { event.preventDefault(); closeSettings(); }
     return;
   }
   const modifier = event.metaKey || event.ctrlKey;
@@ -2036,6 +2049,7 @@ watch(() => [state.authenticated, state.loading], () => {
     <AttachedThreadsPanel v-if="attachedThreads && state.authenticated" :key="`${attachedThreads.hostId}:${attachedThreads.thread.id}`" :thread="attachedThreads.thread" :host-id="attachedThreads.hostId" :state="state" :api="api" @close="attachedThreads = null" @open="selection => { attachedThreads = null; selectThread(selection); }" />
     <ResizableWorkspace v-if="workspaceMounted && currentHost" v-show="workspaceOpen && !sideChat.state.open" :active="workspaceOpen && !sideChat.state.open">
       <WorkspacePanel
+        v-if="WorkspacePanel"
         id="workspace-panel"
         ref="workspace"
         :api="api"

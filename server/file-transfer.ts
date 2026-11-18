@@ -20,16 +20,29 @@ def budget():
  global count
  count+=1
  if count>20000 or time.monotonic()-started>90: raise Failure('LIMIT')
-def rename(source,target,src_fd=None,dst_fd=None):
+def rename(source,target,src_fd=None,dst_fd=None,staged=False):
  if os.name=='nt': os.rename(source,target);return
  libc=ctypes.CDLL(None,use_errno=True)
  if hasattr(libc,'renameat2'): name='renameat2';flag=1
  elif sys.platform=='darwin' and hasattr(libc,'renameatx_np'): name='renameatx_np';flag=4
- else: raise Failure('UNSUPPORTED_RENAME')
- f=getattr(libc,name);f.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];f.restype=ctypes.c_int
- atcwd=-2 if sys.platform=='darwin' else -100
- if f(src_fd if src_fd is not None else atcwd,os.fsencode(source),dst_fd if dst_fd is not None else atcwd,os.fsencode(target),flag):
-  code=ctypes.get_errno();raise OSError(code,os.strerror(code))
+ else: name=None
+ unsupported={errno.ENOSYS,errno.EINVAL,errno.EOPNOTSUPP,errno.ENOTSUP}
+ if name is not None:
+  f=getattr(libc,name);f.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];f.restype=ctypes.c_int
+  atcwd=-2 if sys.platform=='darwin' else -100
+  if f(src_fd if src_fd is not None else atcwd,os.fsencode(source),dst_fd if dst_fd is not None else atcwd,os.fsencode(target),flag)==0: return
+  code=ctypes.get_errno()
+  if code not in unsupported: raise OSError(code,os.strerror(code))
+ # NFS can reject RENAME_NOREPLACE despite supporting ordinary writes. Only
+ # complete regular files in our private staging directory use this fallback:
+ # link creates the final name atomically and refuses collisions. The private
+ # source link is removed by staging cleanup; user-owned move sources remain
+ # untouched on filesystems without a safe rename primitive.
+ if not staged or not stat.S_ISREG(os.stat(source,dir_fd=src_fd,follow_symlinks=False).st_mode): raise Failure('UNSUPPORTED_RENAME')
+ try: os.link(source,target,src_dir_fd=src_fd,dst_dir_fd=dst_fd,follow_symlinks=False)
+ except OSError as error:
+  if error.errno in unsupported: raise Failure('UNSUPPORTED_RENAME')
+  raise
 def copy_bytes(fd,out,before):
  opened=os.fstat(fd)
  # Python 3.12 on NTFS reports creation time through lstat().st_ctime but
@@ -159,7 +172,7 @@ try:
     stage_fd=os.open(stage,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=destination_fd)
     copy_at(source_fd,source,stage_fd,'entry')
     if token(os.stat(source,dir_fd=source_fd,follow_symlinks=False))!=p['expectedVersion']: raise Failure('CONFLICT')
-    rename('entry',target,stage_fd,destination_fd)
+    rename('entry',target,stage_fd,destination_fd,staged=True)
  elif op=='upload':
   if os.name=='nt':
    stage=tempfile.mkdtemp(prefix='.codex-web-upload-',dir=dest_dir)
@@ -178,12 +191,12 @@ try:
     digest.update(chunk);out.write(chunk);remaining-=len(chunk)
    out.flush();os.fsync(out.fileno())
   if digest.hexdigest()!=p['sha256']: raise Failure('INCOMPLETE_UPLOAD')
-  rename(temporary,target,stage_fd,destination_fd)
+  rename(temporary,target,stage_fd,destination_fd,staged=True)
  else: raise Failure('INVALID_INPUT')
  s=os.lstat(target) if os.name=='nt' else os.stat(target,dir_fd=destination_fd,follow_symlinks=False)
  result={'ok':True,'isDirectory':stat.S_ISDIR(s.st_mode),'version':token(s)}
 except Exception as error:
- code=str(error) if isinstance(error,Failure) else 'EXISTS' if isinstance(error,FileExistsError) else 'MISSING' if isinstance(error,FileNotFoundError) else 'PERMISSION' if isinstance(error,PermissionError) else 'NOT_DIRECTORY' if isinstance(error,NotADirectoryError) else 'CROSS_DEVICE' if isinstance(error,OSError) and error.errno==errno.EXDEV else 'FAILED'
+ code=str(error) if isinstance(error,Failure) else 'EXISTS' if isinstance(error,FileExistsError) else 'MISSING' if isinstance(error,FileNotFoundError) else 'PERMISSION' if isinstance(error,PermissionError) else 'NOT_DIRECTORY' if isinstance(error,NotADirectoryError) else 'CROSS_DEVICE' if isinstance(error,OSError) and error.errno==errno.EXDEV else 'NO_SPACE' if isinstance(error,OSError) and error.errno in (errno.ENOSPC,errno.EDQUOT) else 'READ_ONLY' if isinstance(error,OSError) and error.errno==errno.EROFS else 'NAME_TOO_LONG' if isinstance(error,OSError) and error.errno==errno.ENAMETOOLONG else 'FAILED'
  result={'ok':False,'code':code}
 finally:
  if stage_fd is not None: os.close(stage_fd)

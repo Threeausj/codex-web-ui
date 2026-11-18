@@ -15,7 +15,11 @@ export class BrowserChannel {
   send(message: RpcMessage) {
     if (this.closed || this.socket.readyState !== 1) return
     const data = JSON.stringify(message)
-    const bytes = Buffer.byteLength(data)
+    this.sendFrame(data, Buffer.byteLength(data))
+  }
+
+  sendFrame(data: string, bytes: number) {
+    if (this.closed || this.socket.readyState !== 1) return
     // The in-flight frame belongs to ws. Bound the additional application
     // queue, allowing one native history frame on an otherwise idle channel.
     if ((this.sending || this.queue.length) &&

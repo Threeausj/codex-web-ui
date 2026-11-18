@@ -20,7 +20,7 @@ async function openThread(page: Page) {
 }
 async function records(page: Page) {
   return page.evaluate(() => new Promise<any[]>((resolve, reject) => {
-    const open = indexedDB.open('codex-private-work', 1);
+    const open = indexedDB.open('codex-private-work');
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
       const db = open.result;

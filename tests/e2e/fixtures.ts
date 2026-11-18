@@ -61,6 +61,7 @@ const makeTurn = (id: string, items: any[] = [], status = "completed") => ({
 
 /** Wire fixtures only. Product code always uses a real app-server connection. */
 export class MockCodex {
+  modelCatalog: any[] = models;
   unresponsiveSockets = new Set<WebSocketRoute>();
   hosts: any[] = [{ id: "local", name: "本机", kind: "local" }];
   plugins: any[] = [];
@@ -602,7 +603,7 @@ export class MockCodex {
         return;
       }
       case "model/list":
-        return this.reply(socket, request, { data: models, nextCursor: null });
+        return this.reply(socket, request, { data: this.modelCatalog, nextCursor: null });
       case "account/read":
         return this.reply(socket, request, {
           account: {

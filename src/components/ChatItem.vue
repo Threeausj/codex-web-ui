@@ -265,7 +265,7 @@ function onLink(event: MouseEvent) {
   background: transparent;
   resize: vertical;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--chat-font-size);
   line-height: 1.8;
 }
 .message-edit-note,
@@ -303,7 +303,7 @@ function onLink(event: MouseEvent) {
 }
 @media (max-width: 760px) {
   .message-editor textarea {
-    font-size: 16px;
+    font-size: var(--composer-font-size);
   }
   .user-message .message-actions .icon-button {
     width: 36px;

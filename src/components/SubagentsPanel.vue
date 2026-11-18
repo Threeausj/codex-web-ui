@@ -7,6 +7,7 @@ import { getSubagentPrefetch } from '../lib/subagent-prefetch'
 
 const props = defineProps<{ api: any; state: any }>()
 const { rootId, connected, agents, nextCursor, loading, error, contents, load, read: fetchContent, refresh: refreshContent } = getSubagentPrefetch(props.api, props.state)
+if (!agents.value.length && !error.value) void load(false, true)
 const selectedId = ref('')
 const localDetailError = ref('')
 const now = ref(Date.now())

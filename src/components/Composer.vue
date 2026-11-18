@@ -1393,7 +1393,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 .composer:focus-within { box-shadow: none; }
 .markdown-preview-toggle[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
 .composer-markdown-preview { min-height: 51px; max-height: 210px; overflow: auto; overscroll-behavior: contain; padding: 0 2px 8px; outline: none; }
-.composer-markdown-preview .markdown { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.composer-markdown-preview .markdown { font-size: var(--composer-font-size); line-height: 1.8; overflow-wrap: anywhere; }
 .composer-markdown-preview :deep(h1), .composer-markdown-preview :deep(h2), .composer-markdown-preview :deep(h3) { margin-top: 8px; font-size: 1.1em; }
 .composer-markdown-preview :deep(h1:first-child), .composer-markdown-preview :deep(h2:first-child), .composer-markdown-preview :deep(h3:first-child) { margin-top: 0; }
 .composer-markdown-preview :deep(pre), .composer-markdown-preview :deep(table) { max-width: 100%; }
@@ -1504,7 +1504,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   .composer-area :deep(.context-choice) { max-width: 100%; }
   .composer-area :deep(.context-choice select) { max-width: 100%; }
   .composer-area :deep(.context-add) { grid-column: 1 / -1; margin-left: 0; padding: 0; }
-  .composer > textarea { padding: 0 0 8px; min-height: 52px; font-size: 16px; }
+  .composer > textarea { padding: 0 0 8px; min-height: 52px; font-size: var(--composer-font-size); }
   .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 3px; width: 100%; }
   .composer .composer-tools { display: flex; flex-wrap: nowrap; width: 100%; gap: 3px; }
   .composer .composer-tools > .icon-button { flex: 0 0 34px; width: 34px; height: 36px; }

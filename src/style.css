@@ -38,6 +38,8 @@
   --scrim: #00000045;
   --shadow: 0 12px 40px #15243b14;
   --radius: 10px;
+  --chat-font-size: 14px;
+  --composer-font-size: 15px;
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -349,7 +351,7 @@ hr {
   width: 100%;
   height: 34px;
   padding: 7px 10px;
-  font-size: 12px;
+  font-size: 13px;
   text-align: left;
   border-radius: 8px;
 }
@@ -378,10 +380,10 @@ hr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 36px;
+  height: 30px;
   padding-left: 11px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 550;
   letter-spacing: 0.5px;
 }
@@ -398,10 +400,10 @@ hr {
   align-items: center;
   gap: 9px;
   width: 100%;
-  height: 36px;
+  height: 32px;
   border-radius: 7px;
-  padding: 9px 11px;
-  font-size: 12px;
+  padding: 6px 11px;
+  font-size: 13px;
   text-align: left;
 }
 .project-row > span {
@@ -432,11 +434,11 @@ hr {
   align-items: center;
   gap: 7px;
   width: 100%;
-  min-height: 35px;
-  padding: 9px 11px;
+  min-height: 32px;
+  padding: 6px 11px;
   border-radius: 7px;
   text-align: left;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text);
 }
 .thread-row:hover,
@@ -453,7 +455,7 @@ hr {
   line-height: 1.6;
 }
 .thread-date {
-  font-size: 9px;
+  font-size: 10px;
   color: var(--muted);
   white-space: nowrap;
 }
@@ -786,7 +788,7 @@ hr {
   margin-top: 10px;
 }
 .user-bubble {
-  font-size: 13px;
+  font-size: var(--chat-font-size);
   line-height: 1.8;
   background: var(--soft);
   border: 1px solid transparent;
@@ -813,7 +815,7 @@ hr {
   width: 26px;
 }
 .agent-message .markdown {
-  font-size: 13px;
+  font-size: var(--chat-font-size);
   line-height: 1.85;
 }
 .markdown {
@@ -1238,7 +1240,7 @@ hr {
   border: 0;
   resize: none;
   background: none;
-  font-size: 14px;
+  font-size: var(--composer-font-size);
   line-height: 1.8;
   min-height: 51px;
   max-height: 210px;
@@ -2706,11 +2708,11 @@ hr {
     padding: 22px 18px 28px;
   }
   .agent-message .markdown {
-    font-size: 14px;
+    font-size: var(--chat-font-size);
     line-height: 1.8;
   }
   .user-bubble {
-    font-size: 14px;
+    font-size: var(--chat-font-size);
     max-width: 92%;
     padding: 9px 13px;
   }
@@ -3349,7 +3351,7 @@ textarea.file-editor {
   height: 24px;
 }
 .nav-section {
-  margin: 5px 0 17px;
+  margin: 3px 0 8px;
 }
 .nav-section .sidebar-section-heading {
   margin-top: 0;
@@ -3361,7 +3363,7 @@ textarea.file-editor {
   gap: 6px;
   padding: 3px;
   font: inherit;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
   border: 0;
   background: none;
@@ -3382,7 +3384,7 @@ textarea.file-editor {
   flex-wrap: wrap;
   align-items: center;
   border-radius: 7px;
-  min-height: 34px;
+  min-height: 32px;
 }
 .nav-project-header.active {
   background: var(--hover);
@@ -3429,16 +3431,17 @@ textarea.file-editor {
   flex: 1;
   min-width: 0;
   margin: 0;
-  padding: 7px 8px 7px 13px;
+  padding: 5px 8px 5px 13px;
+  line-height: 1.5;
   background: none;
   width: auto;
 }
 .nav-thread.nested .thread-row {
   padding-left: 37px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .nav-thread .thread-row small {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--muted);
   margin-left: 4px;
   flex-shrink: 0;
@@ -3484,11 +3487,11 @@ textarea.file-editor {
   background: var(--hover);
 }
 .nav-load-more {
-  margin: 8px 9px;
+  margin: 4px 9px;
   border: 0;
   background: none;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
 }
 .project-roots {
@@ -3581,12 +3584,13 @@ textarea.file-editor {
   }
 }
 @media (max-width: 760px) {
+  :root { --chat-font-size: 15px; --composer-font-size: 17px; }
   .sidebar-top {
     padding-bottom: 10px;
   }
   .sidebar-action {
-    min-height: 42px;
-    font-size: 13px;
+    min-height: 40px;
+    font-size: 14px;
   }
   .sidebar-action kbd,
   .sidebar-account {
@@ -3594,28 +3598,28 @@ textarea.file-editor {
   }
   .nav-project-header,
   .nav-thread {
-    min-height: 42px;
+    min-height: 38px;
   }
   .nav-project-header .project-row {
-    min-height: 42px;
-    font-size: 13px;
+    min-height: 38px;
+    font-size: 14px;
   }
   .nav-thread .thread-row,
   .nav-thread.nested .thread-row {
-    font-size: 13px;
-    min-height: 42px;
+    font-size: 14px;
+    min-height: 38px;
   }
   .nav-thread .thread-row small,
   .nav-project-header .project-row small,
   .project-roots button {
-    font-size: 11px;
+    font-size: 12px;
   }
   .nav-section-toggle,
   .nav-empty,
   .nav-load-more,
   .sidebar-empty {
-    font-size: 12px;
-    line-height: 1.6;
+    font-size: 13px;
+    line-height: 1.5;
   }
   .host-badge,
   .nav-host-label,
@@ -3641,11 +3645,11 @@ textarea.file-editor {
     font-size: 16px;
   }
   .nav-thread .thread-row {
-    padding-top: 9px;
-    padding-bottom: 9px;
+    padding-top: 6px;
+    padding-bottom: 6px;
   }
   .nav-section-toggle {
-    padding: 6px 3px;
+    padding: 4px 3px;
   }
   .welcome-state .conversation-scroll {
     align-items: flex-start;
