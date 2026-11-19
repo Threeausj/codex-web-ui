@@ -5475,8 +5475,8 @@ async function readDirectory(path: string) {
         a.name.localeCompare(b.name),
     );
 }
-async function readFile(path: string, options: { silentError?: boolean; hostId?: string } = {}) {
-  const result = await http(`/hosts/${encodeURIComponent(options.hostId || state.hostId)}/files?path=${encodeURIComponent(path)}`, {}, !options.silentError);
+async function readFile(path: string, options: { silentError?: boolean; hostId?: string; signal?: AbortSignal } = {}) {
+  const result = await http(`/hosts/${encodeURIComponent(options.hostId || state.hostId)}/files?path=${encodeURIComponent(path)}`, { signal: options.signal }, !options.silentError);
   if (result.dataBase64.length > Math.ceil((8 * 1024 * 1024) / 3) * 4)
     throw (options.silentError ? new Error("文件超过 8 MB，请使用终端读取") : fail(new Error("文件超过 8 MB，请使用终端读取")));
   const extensions: Record<string, string> = {

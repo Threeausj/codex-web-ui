@@ -1,10 +1,26 @@
 import DOMPurify from 'dompurify';
 import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
-import { isImagePath, previewFilePath } from './file-preview';
+import { fileLinkLocation, isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
 import { clearConversationMathCache, createConversationMarkdownParser, plainMessageMath } from './conversation-math';
+import { visualizationBlock, type ConversationVisualization } from './conversation-visualization';
 
 const marked = createConversationMarkdownParser();
+const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock] });
+
+function decorateFileLink(anchor: HTMLAnchorElement) {
+  const href = anchor.getAttribute('href') || '';
+  const location = fileLinkLocation(href === '#' ? anchor.dataset.filePath || href : href);
+  if (!location) return;
+  const path = location.path;
+  const office = officeFileKind(path);
+  const kind = /\.pdf$/i.test(path) ? 'pdf'
+    : /\.(?:zip|7z|rar|tar|gz|bz2|xz|tgz)$/i.test(path) ? 'archive'
+    : office === 'xlsx' || office === 'xls' || /\.csv$/i.test(path) ? 'spreadsheet'
+    : office || isMarkdownPath(path) || /\.(?:txt|rtf|html?)$/i.test(path) ? 'document'
+    : null;
+  if (kind) anchor.dataset.conversationFile = kind;
+}
 
 function markImage(image: HTMLImageElement) {
   image.dataset.conversationImage = 'true';
@@ -31,6 +47,7 @@ function sanitizeMarkdown(html: string, hostId: string, cwd: string) {
   const fragment = DOMPurify.sanitize(html, {
     RETURN_DOM_FRAGMENT: true, ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'iframe', 'form', 'input'],
   });
+  for (const anchor of fragment.querySelectorAll<HTMLAnchorElement>('a[href]')) decorateFileLink(anchor);
   for (const image of fragment.querySelectorAll<HTMLImageElement>('img')) {
     const source = image.getAttribute('src') || image.dataset.filePath || '';
     // Host-local assets use the authenticated image endpoint. Relative paths are
@@ -80,8 +97,11 @@ export function userMessageMath(text: string): string | null {
 /** Stable parsed blocks keep completed paragraph DOM intact during streaming.
  * The lexer resolves reference definitions across the entire message first. */
 export function conversationMarkdownBlocks(text: string, hostId = 'local', cwd = '') {
-  return marked.lexer(text).filter(token => token.type !== 'space').map((token, index) => {
-    const html = cached(JSON.stringify(['block', hostId, cwd, token]), () => sanitizeMarkdown(marked.parser([token]) as string, hostId, cwd));
+  return assistantMarkdown.lexer(text).filter(token => token.type !== 'space').map((token, index) => {
+    if (token.type === 'conversationVisualization') {
+      return { id: index, visualization: token.visualization as ConversationVisualization };
+    }
+    const html = cached(JSON.stringify(['block', hostId, cwd, token]), () => sanitizeMarkdown(assistantMarkdown.parser([token]) as string, hostId, cwd));
     return { id: index, html };
   });
 }

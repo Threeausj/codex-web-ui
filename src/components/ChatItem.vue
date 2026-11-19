@@ -6,6 +6,7 @@ import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/convers
 import UserMessageContent from './UserMessageContent.vue'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
+import ConversationVisualization from './ConversationVisualization.vue'
 import { conversationImageViewer } from '../lib/conversation-image-viewer'
 import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
@@ -197,7 +198,12 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown">
+      <template v-for="block in markdownBlocks" :key="block.id">
+        <ConversationVisualization v-if="block.visualization" :reference="block.visualization" :host-id="hostId || 'local'" />
+        <div v-else class="markdown-block" v-html="block.html"></div>
+      </template>
+    </div>
     <div v-else-if="!asyncQuestions.length" class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
     <AsyncQuestionCard v-if="asyncQuestions.length" :item="item" :status="asyncStatus" :disabled="asyncQuestionsDisabled" :answer="answerAsync" />
     <div v-if="text && (!busy || canFork)" class="message-actions">
