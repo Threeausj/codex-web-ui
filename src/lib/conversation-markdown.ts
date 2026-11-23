@@ -1,10 +1,10 @@
 import DOMPurify from 'dompurify';
-import type { Token } from 'marked';
 import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
 import { fileLinkLocation, isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
 import { clearConversationMathCache, createConversationMarkdownParser, plainMessageMath } from './conversation-math';
 import { visualizationBlock, type ConversationVisualization } from './conversation-visualization';
+import { mermaidSource } from './markdown-mermaid';
 
 const marked = createConversationMarkdownParser();
 const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock] });
@@ -94,14 +94,6 @@ export function userMessageMath(text: string): string | null {
   if (!/[\$\\]/.test(text)) return null;
   const html = plainMessageMath(text);
   return html === null ? null : cached(JSON.stringify(['user-math', text]), () => sanitizeMarkdown(html, 'local', ''));
-}
-
-function mermaidSource(token: Token): string | undefined {
-  if (token.type !== 'code' || !/^mermaid(?:\s|$)/i.test(token.lang || '')) return;
-  const fence = /^ {0,3}([`~])\1{2,}/.exec(token.raw);
-  if (!fence) return;
-  const closing = new RegExp('\n {0,3}' + fence[1] + '{' + fence[0].trimStart().length + ',}$');
-  if (closing.test(token.raw.trimEnd())) return token.text;
 }
 
 /** Stable parsed blocks keep completed paragraph DOM intact during streaming.
