@@ -1,4 +1,5 @@
 import DOMPurify from 'dompurify';
+import type { Token } from 'marked';
 import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
 import { fileLinkLocation, isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
@@ -94,6 +95,15 @@ export function userMessageMath(text: string): string | null {
   const html = plainMessageMath(text);
   return html === null ? null : cached(JSON.stringify(['user-math', text]), () => sanitizeMarkdown(html, 'local', ''));
 }
+
+function mermaidSource(token: Token): string | undefined {
+  if (token.type !== 'code' || !/^mermaid(?:\s|$)/i.test(token.lang || '')) return;
+  const fence = /^ {0,3}([`~])\1{2,}/.exec(token.raw);
+  if (!fence) return;
+  const closing = new RegExp('\n {0,3}' + fence[1] + '{' + fence[0].trimStart().length + ',}$');
+  if (closing.test(token.raw.trimEnd())) return token.text;
+}
+
 /** Stable parsed blocks keep completed paragraph DOM intact during streaming.
  * The lexer resolves reference definitions across the entire message first. */
 export function conversationMarkdownBlocks(text: string, hostId = 'local', cwd = '') {
@@ -101,6 +111,8 @@ export function conversationMarkdownBlocks(text: string, hostId = 'local', cwd =
     if (token.type === 'conversationVisualization') {
       return { id: index, visualization: token.visualization as ConversationVisualization };
     }
+    const diagram = mermaidSource(token);
+    if (diagram !== undefined) return { id: index, diagram };
     const html = cached(JSON.stringify(['block', hostId, cwd, token]), () => sanitizeMarkdown(assistantMarkdown.parser([token]) as string, hostId, cwd));
     return { id: index, html };
   });

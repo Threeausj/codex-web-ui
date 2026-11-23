@@ -814,6 +814,22 @@ hr {
   height: 26px;
   width: 26px;
 }
+.user-message:is(:has(+ .turn-activity), .prompt-before-activity) {
+  margin-bottom: 6px;
+}
+@media (min-width: 761px) and (hover: hover) {
+  .user-message:is(:has(+ .turn-activity), .prompt-before-activity) {
+    position: relative;
+  }
+  .user-message:is(:has(+ .turn-activity), .prompt-before-activity) > .message-actions {
+    position: absolute;
+    top: 100%;
+    inset-inline-end: 0;
+    z-index: 1;
+    margin-top: 0;
+    padding-top: 9px;
+  }
+}
 .agent-message .markdown {
   font-size: var(--chat-font-size);
   line-height: 1.85;

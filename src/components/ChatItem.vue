@@ -7,6 +7,7 @@ import UserMessageContent from './UserMessageContent.vue'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
 import ConversationVisualization from './ConversationVisualization.vue'
+import MermaidDiagram from './MermaidDiagram.vue'
 import { conversationImageViewer } from '../lib/conversation-image-viewer'
 import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
@@ -201,6 +202,7 @@ function onLink(event: MouseEvent) {
     <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown">
       <template v-for="block in markdownBlocks" :key="block.id">
         <ConversationVisualization v-if="block.visualization" :reference="block.visualization" :host-id="hostId || 'local'" />
+        <MermaidDiagram v-else-if="block.diagram !== undefined" :source="block.diagram" />
         <div v-else class="markdown-block" v-html="block.html"></div>
       </template>
     </div>

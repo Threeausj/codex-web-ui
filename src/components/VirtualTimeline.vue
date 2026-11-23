@@ -123,7 +123,7 @@ defineExpose({ revealItem, restoreReading, scrollToLatest, refresh });
     <div v-for="entry in visibleRows" :key="String(entry.key)" :ref="measure" :data-index="entry.index"
       :data-timeline-row="rows[entry.index]!.id" :data-history-id="rows[entry.index]!.id"
       class="virtual-timeline-row" :style="{ transform: `translateY(${entry.start - margin}px)` }">
-      <slot :row="rows[entry.index]!" />
+      <slot :row="rows[entry.index]!" :index="entry.index" />
     </div>
   </div>
 </template>
@@ -131,6 +131,9 @@ defineExpose({ revealItem, restoreReading, scrollToLatest, refresh });
 <style scoped>
 .virtual-timeline { position: relative; width: 100%; min-width: 0; overflow-anchor: none; }
 .virtual-timeline-row { position: absolute; top: 0; left: 0; width: 100%; min-width: 0; display: flow-root; overflow-anchor: none; }
+@media (min-width: 761px) and (hover: hover) {
+  .virtual-timeline-row:has(> :deep(.prompt-before-activity)) { z-index: 1; }
+}
 </style>
 
 <style>

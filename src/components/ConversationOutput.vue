@@ -248,9 +248,10 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
 
 <template>
   <span ref="location" class="timeline-location" aria-hidden="true"></span>
-  <VirtualTimeline v-if="virtualActivated" ref="timeline" :rows="rows" :pinned-ids="pinnedRows" :initial-reading="initialReading" v-slot="{ row }">
+  <VirtualTimeline v-if="virtualActivated" ref="timeline" :rows="rows" :pinned-ids="pinnedRows" :initial-reading="initialReading" v-slot="{ row, index }">
     <ChatItem v-if="row.kind === 'item'" v-bind="itemBindings(row)"
-      :class="{ 'virtual-activity-item': row.activity, 'virtual-nested-item': row.nested, 'timeline-output': row.output }"
+      :class="{ 'virtual-activity-item': row.activity, 'virtual-nested-item': row.nested, 'timeline-output': row.output,
+        'prompt-before-activity': row.item?.type === 'userMessage' && rows[index + 1]?.kind === 'turn' && rows[index + 1]?.turnId === row.turnId }"
       @fork="emit('fork', $event)" @open-file="(path, line) => emit('openFile', path, line)" @error="emit('error', $event)" />
     <button v-else-if="row.kind === 'turn'" type="button" class="virtual-turn-toggle"
       :aria-label="row.running ? '工作过程（运行中）' : '工作过程与用时'" :aria-expanded="row.expanded" @click="toggleVirtualTurn(row)">
@@ -426,6 +427,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
 <style scoped>
 .timeline-location { display: none; }
 .virtual-turn-toggle, .virtual-batch-toggle { display: flex; align-items: center; gap: 7px; width: fit-content; max-width: 100%; min-height: 40px; margin: 4px 0 12px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; line-height: 1.6; cursor: pointer; text-align: left; }
+.virtual-turn-toggle { min-height: 32px; margin: 0 0 10px; }
 .virtual-turn-toggle:hover, .virtual-batch-toggle:hover { color: var(--text); }
 .virtual-turn-toggle .virtual-expanded { transform: rotate(90deg); }
 .virtual-batch-toggle { width: 100%; margin: 4px 0; gap: 8px; }
@@ -447,7 +449,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
   min-width: 0;
 }
 .turn-activity {
-  margin: 8px 0 18px;
+  margin: 4px 0 10px;
   color: var(--muted);
 }
 .turn-activity > summary {
@@ -496,7 +498,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
   font-size: 13px;
 }
 @media (max-width: 760px) {
-  .turn-activity > summary {
+  .turn-activity > summary, .virtual-turn-toggle {
     min-height: 40px;
     font-size: 12px;
   }
