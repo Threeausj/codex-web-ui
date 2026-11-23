@@ -257,7 +257,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
       :aria-label="row.running ? '工作过程（运行中）' : '工作过程与用时'" :aria-expanded="row.expanded" @click="toggleVirtualTurn(row)">
       <span v-if="row.running" class="thinking-dot"></span><span>{{ row.label }}</span><Icon name="ChevronRight" :size="14" :class="{ 'virtual-expanded': row.expanded }" />
     </button>
-    <button v-else-if="row.kind === 'batch'" type="button" class="virtual-batch-toggle" :class="{ 'activity-batch-failed': row.failed }" :aria-expanded="row.expanded" @click="toggleVirtualBatch(row)">
+    <button v-else-if="row.kind === 'batch'" type="button" class="virtual-batch-toggle activity-summary" :class="{ 'activity-batch-failed': row.failed }" :aria-expanded="row.expanded" @click="toggleVirtualBatch(row)">
       <Icon :name="row.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: row.running }" /><span>{{ row.label }}</span>
       <small v-if="row.status">{{ row.status }}</small><Icon name="ChevronDown" :size="13" :class="{ 'virtual-expanded': row.expanded }" />
     </button>
@@ -426,21 +426,22 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
 
 <style scoped>
 .timeline-location { display: none; }
-.virtual-turn-toggle, .virtual-batch-toggle { display: flex; align-items: center; gap: 7px; width: fit-content; max-width: 100%; min-height: 40px; margin: 4px 0 12px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; line-height: 1.6; cursor: pointer; text-align: left; }
+.virtual-turn-toggle, .virtual-batch-toggle { display: flex; align-items: center; gap: 7px; width: fit-content; max-width: 100%; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; line-height: 1.6; cursor: pointer; text-align: left; }
 .virtual-turn-toggle { min-height: 32px; margin: 0 0 10px; }
 .virtual-turn-toggle:hover, .virtual-batch-toggle:hover { color: var(--text); }
 .virtual-turn-toggle .virtual-expanded { transform: rotate(90deg); }
-.virtual-batch-toggle { width: 100%; margin: 4px 0; gap: 8px; }
-.virtual-batch-toggle > span { flex: 1; }
+.virtual-batch-toggle { width: 100%; gap: 8px; }
+.virtual-batch-toggle > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .virtual-batch-toggle > small { font-size: 10px; white-space: nowrap; }
 .virtual-batch-toggle > svg:last-child { transform: rotate(-90deg); }
 .virtual-batch-toggle > svg.virtual-expanded:last-child { transform: rotate(0); }
 .virtual-batch-toggle.activity-batch-failed > small { color: var(--red); }
-.virtual-nested-item { margin-left: 24px; }
+.virtual-nested-item { margin-inline-start: 24px; }
+.virtual-batch-toggle > svg { flex-shrink: 0; }
 .virtual-activity-item:deep(.agent-message), .virtual-activity-item.agent-message { color: var(--muted); font-size: 13px; }
 .virtual-activity-item.timeline-output { color: var(--text); font-size: 14px; }
 .virtual-load-state { margin: 4px 0; }
-@media (max-width: 760px) { .virtual-nested-item { margin-left: 12px; } }
+@media (max-width: 760px) { .virtual-nested-item { margin-inline-start: 12px; } }
 .bookmark-fragment-label { margin: 12px 0; color: var(--muted); font-size: 12px; }
 .activity-loading { display: flex; align-items: center; gap: 7px; font-size: 12px; }
 .activity-load-error { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--danger); font-size: 12px; }
@@ -474,8 +475,7 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
   transform: rotate(90deg);
 }
 .turn-activity-content {
-  margin: 4px 0 16px;
-  padding: 0;
+  margin: 2px 0 4px;
 }
 .turn-activity-content :deep(.agent-message) {
   color: var(--muted);
@@ -501,9 +501,6 @@ onBeforeUnmount(() => emit('retainTurns', { hostId: retainedHostId, threadId: re
   .turn-activity > summary, .virtual-turn-toggle {
     min-height: 40px;
     font-size: 12px;
-  }
-  .turn-activity-content {
-    padding: 0;
   }
 }
 </style>

@@ -1077,10 +1077,12 @@ hr {
 .empty-conversation p {
   margin-top: 12px;
 }
+.activity-summary {
+  min-height: 28px;
+}
 .reasoning-item {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--muted);
-  margin-bottom: 16px;
 }
 .reasoning-item summary {
   display: flex;
@@ -1094,13 +1096,12 @@ hr {
 }
 .reasoning-content {
   white-space: pre-wrap;
-  font-size: 11px;
-  line-height: 1.8;
-  padding: 14px 0;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  padding-block: 2px 4px;
 }
 .tool-item {
   border: 0;
-  margin: 2px 0;
   font-size: 12px;
   min-width: 0;
   background: transparent;
@@ -1114,6 +1115,9 @@ hr {
   padding: 5px 0;
   min-width: 0;
   color: var(--muted);
+}
+.tool-item > .activity-summary {
+  padding-block: 0;
 }
 .tool-title {
   flex-shrink: 0;
@@ -2754,8 +2758,8 @@ hr {
   .message {
     margin-bottom: 22px;
   }
-  .tool-item > summary {
-    padding: 4px 0;
+  .activity-summary {
+    min-height: 40px;
   }
   .tool-title {
     font-size: 12px;

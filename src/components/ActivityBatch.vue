@@ -33,7 +33,7 @@ const summary = computed(() => activityBatchSummary(props.items));
 
 <template>
   <details class="activity-batch" :open="expanded" @toggle="toggle" :class="{ 'activity-batch-failed': summary.failed }">
-    <summary>
+    <summary class="activity-summary">
       <Icon :name="summary.running ? 'LoaderCircle' : 'ListChecks'" :size="16" :class="{ spin: summary.running }" />
       <span class="activity-batch-label">{{ summary.label }}</span>
       <span v-if="summary.status" class="activity-batch-status" aria-live="polite">{{ summary.status }}</span>
@@ -46,8 +46,8 @@ const summary = computed(() => activityBatchSummary(props.items));
 </template>
 
 <style scoped>
-.activity-batch { min-width: 0; margin: 4px 0; color: var(--muted); }
-.activity-batch > summary { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 4px 0; list-style: none; cursor: pointer; font-size: 12px; line-height: 1.6; }
+.activity-batch { min-width: 0; color: var(--muted); }
+.activity-batch > summary { display: flex; align-items: center; gap: 8px; list-style: none; cursor: pointer; font-size: 12px; line-height: 1.6; }
 .activity-batch > summary::-webkit-details-marker { display: none; }
 .activity-batch > summary > svg { flex-shrink: 0; }
 .activity-batch > summary:hover { color: var(--text); }
@@ -56,11 +56,11 @@ const summary = computed(() => activityBatchSummary(props.items));
 .activity-batch-failed .activity-batch-status { color: var(--red); }
 .activity-batch > summary > svg:last-child { transition: transform .15s; }
 .activity-batch[open] > summary > svg:last-child { transform: rotate(180deg); }
-.activity-batch-items { min-width: 0; margin: 2px 0 8px 24px; }
+.activity-batch-items { min-width: 0; margin-inline-start: 24px; }
 @media (max-width: 760px) {
-  .activity-batch > summary { min-height: 40px; flex-wrap: wrap; row-gap: 0; }
+  .activity-batch > summary { flex-wrap: wrap; row-gap: 0; }
   .activity-batch-label { flex: 1; }
   .activity-batch-status { order: 1; flex-basis: calc(100% - 24px); margin-left: 24px; }
-  .activity-batch-items { margin-left: 12px; }
+  .activity-batch-items { margin-inline-start: 12px; }
 }
 </style>
