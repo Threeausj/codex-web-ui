@@ -1,4 +1,5 @@
 import type { DisplayItem } from './events'
+import { parseResponseAnnotations, replaceResponseAnnotationRequest } from './response-annotations'
 
 export type MessageEditAttachment = {
   id: string
@@ -27,8 +28,8 @@ export function messageEditDraft(item: DisplayItem, text?: string): { text: stri
     return [{ id: `original-image-${index}`, name: input.path?.split('/').pop() || (input.fileId ? '原图片附件' : '图片'),
       path: input.path, mime: 'image/*', input: JSON.parse(JSON.stringify(input)) }]
   })
-  const raw = text ?? content.filter((input: any) => input.type === 'text').map((input: any) => input.text).join('\n')
-  const lines = raw.split('\n')
+  const raw = text ?? messageInputText(item)
+  const lines = (parseResponseAnnotations(raw)?.request ?? raw).split('\n')
   const kept = lines.filter(line => {
     const match = /^附件文件：(\/(?:[^\r\n]*\/)?(?:\.codex-web-uploads|uploads)\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/\d+-[^\r\n]+)（([^\r\n]+)）$/i.exec(line)
     if (!match || !match[1]!.split('/').pop()?.endsWith(`-${match[2]}`)) return true
@@ -36,6 +37,11 @@ export function messageEditDraft(item: DisplayItem, text?: string): { text: stri
     return false
   })
   return { text: kept.join('\n').trimEnd(), attachments }
+}
+
+function messageInputText(item: DisplayItem): string {
+  const content = Array.isArray(item.content) ? item.content : []
+  return item.text || content.filter(input => input.type === 'text').map(input => input.text).join('\n')
 }
 
 export function uploadedEditAttachments(files: any[]): MessageEditAttachment[] {
@@ -74,6 +80,7 @@ export function editedMessageInput(item: DisplayItem, text: string, attachments?
     }
     text = [text, ...files].filter(Boolean).join('\n\n')
   }
+  text = replaceResponseAnnotationRequest(messageInputText(item), text)
   if (!text.trim() && !preserved.some(input => ['image', 'localImage'].includes(input.type)))
     throw new Error('消息内容不能为空')
   return [{ type: 'text', text, text_elements: [] }, ...preserved]

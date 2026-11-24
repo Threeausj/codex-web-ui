@@ -1,10 +1,13 @@
 import { isAbsoluteHostPath } from '../../shared/host-path';
+import { responseTextOffsets, type ResponseAnnotation, type ResponseTextOffsets } from './response-annotations';
+import { randomUUID } from './uuid';
 /** A plain-text quotation from one message in the currently visible thread. */
 export type ConversationSelectionSource = {
   hostId: string;
   threadId: string;
   turnId?: string;
   itemId?: string;
+  responseOffsets?: ResponseTextOffsets;
   threadName?: string;
   text: string;
   path?: string;
@@ -34,6 +37,8 @@ export function normalizeConversationSelection(value: unknown): ConversationSele
   const itemId = identifier(input.itemId);
   if (turnId) result.turnId = turnId;
   if (itemId) result.itemId = itemId;
+  const offsets = responseTextOffsets(input.responseOffsets);
+  if (itemId && offsets) result.responseOffsets = offsets;
   if (isAbsoluteHostPath(input.path) && input.path.length <= 4096) {
     result.path = input.path;
     if (Number.isSafeInteger(input.startLine) && input.startLine! > 0) result.startLine = input.startLine;
@@ -60,15 +65,38 @@ export function captureConversationSelection(
   for (const ignored of body.querySelectorAll(ignoredSelectionElements)) {
     if (range.intersectsNode(ignored)) return null;
   }
+  const text = selection.toString();
+  // Desktop offsets count text nodes in the rendered response. Keep the
+  // quotation alone if generated content or layout makes that range ambiguous.
+  let responseOffsets: ResponseTextOffsets | undefined;
+  if (body.hasAttribute('data-selection-response') && !body.querySelector('pre,.katex,[data-selection-ignore]')) {
+    const selected = range.toString();
+    if (selected.trim() === text.trim()) {
+      const before = range.cloneRange();
+      before.selectNodeContents(body);
+      before.setEnd(range.startContainer, range.startOffset);
+      const startOffset = before.toString().length + selected.length - selected.trimStart().length;
+      responseOffsets = { startOffset, endOffset: startOffset + selected.trim().length };
+    }
+  }
   return normalizeConversationSelection({
     ...context,
     itemId: body.dataset.selectionItemId,
     turnId: body.dataset.selectionTurnId || body.closest<HTMLElement>('[data-turn-id]')?.dataset.turnId,
-    text: selection.toString(),
+    text,
+    responseOffsets,
   });
 }
 
-/** Composer quotations remain plain text; each line is explicitly quoted. */
+export function conversationResponseAnnotation(source: ConversationSelectionSource): ResponseAnnotation {
+  return {
+    id: randomUUID(),
+    text: source.text,
+    ...(source.itemId && source.responseOffsets && !source.path ? { source: { messageId: source.itemId, ...source.responseOffsets } } : {}),
+  };
+}
+
+/** File and historical Web quotations use a plain-text blockquote. */
 export function formatConversationQuote(source: ConversationSelectionSource): string {
   const normalized = normalizeConversationSelection(source);
   if (!normalized) return '';
@@ -77,5 +105,5 @@ export function formatConversationQuote(source: ConversationSelectionSource): st
 }
 
 export function conversationSelectionKey(source: ConversationSelectionSource | null | undefined): string {
-  return source ? JSON.stringify([source.hostId, source.threadId, source.turnId || '', source.itemId || '', source.path || '', source.startLine || '', source.endLine || '', source.text]) : '';
+  return source ? JSON.stringify([source.hostId, source.threadId, source.turnId || '', source.itemId || '', source.path || '', source.startLine || '', source.endLine || '', source.text, source.responseOffsets]) : '';
 }

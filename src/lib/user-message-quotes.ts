@@ -1,4 +1,6 @@
-export type UserMessageQuote = { type: 'quote'; kind: 'conversation' | 'file'; name: string; text: string };
+import { parseResponseAnnotations } from './response-annotations';
+
+export type UserMessageQuote = { type: 'quote'; kind: 'conversation' | 'file'; name: string; text: string; annotation?: string };
 export type UserMessagePart = { type: 'text'; text: string } | UserMessageQuote;
 
 function quoteHeader(line: string) {
@@ -14,10 +16,17 @@ function quoteHeader(line: string) {
 
 const quoteLine = /^[ \t]{0,3}>[ \t]?/;
 
-/** Presentation only: keep submitted/copy/edit text intact, and recognize the
- * plain-text quotation format produced by formatConversationQuote, including
- * older messages where the header followed the user's instruction directly. */
 export function userMessageParts(text: string): UserMessagePart[] {
+  const response = parseResponseAnnotations(text);
+  if (!response) return plainMessageParts(text);
+  const quotes: UserMessageQuote[] = response.annotations.map((entry, index) => ({
+    type: 'quote', kind: 'conversation', name: String(index + 1), text: entry.text, ...(entry.annotation && { annotation: entry.annotation }),
+  }));
+  return response.request ? [...quotes, ...plainMessageParts(response.request)] : quotes;
+}
+
+/** Older Web messages can have a quote header joined to the user's text. */
+function plainMessageParts(text: string): UserMessagePart[] {
   if (!text.includes('[引用')) return [{ type: 'text', text }];
   const lines = text.replace(/\r\n?/g, '\n').split('\n');
   const parts: UserMessagePart[] = [];

@@ -1,4 +1,5 @@
 import DOMPurify from 'dompurify';
+import type { TokenizerAndRendererExtension } from 'marked';
 import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
 import { fileLinkLocation, isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
 import { safeConversationImageSource } from './conversation-image-viewer';
@@ -7,7 +8,19 @@ import { visualizationBlock, type ConversationVisualization } from './conversati
 import { mermaidSource } from './markdown-mermaid';
 
 const marked = createConversationMarkdownParser();
-const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock] });
+const responseAnnotationReference: TokenizerAndRendererExtension = {
+  name: 'responseAnnotationReference',
+  level: 'inline',
+  start: text => text.indexOf(':codex-annotation{'),
+  tokenizer(text) {
+    const match = /^:codex-annotation\{index="([1-9]\d{0,5})"(?:[ \t]+id="[^"\r\n]{1,256}")?[ \t]*\}/.exec(text);
+    if (match) return { type: 'responseAnnotationReference', raw: match[0], index: match[1] };
+  },
+  renderer(token) {
+    return `<span class="response-annotation-reference" data-selection-ignore="true">引用 ${token.index}</span>`;
+  },
+};
+const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock, responseAnnotationReference] });
 
 function decorateFileLink(anchor: HTMLAnchorElement) {
   const href = anchor.getAttribute('href') || '';

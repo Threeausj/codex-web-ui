@@ -1,5 +1,6 @@
 import { test, expect, login, type MockCodex } from './fixtures';
 import type { Page } from '@playwright/test';
+import { parseResponseAnnotations } from '../../src/lib/response-annotations';
 
 /** Native-looking sidebar wire responses, wholly isolated from live Codex. */
 function selectionWire(mock: MockCodex) {
@@ -62,7 +63,12 @@ test('adding a quotation preserves typed draft, uploaded attachment and selected
   await expect(page.locator('.composer-quote')).toContainText('历史保持可读');
   expect(mock.request('turn/start')).toBeUndefined();
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
-  await expect.poll(() => mock.request('turn/start')?.params.input).toContainEqual({ type: 'text', text: '[引用对话：已有测试历史]\n> 历史保持可读', text_elements: [] });
+  await expect.poll(() => mock.request('turn/start')?.params.input[0]?.text).toContain('<response-annotations>');
+  const sent = parseResponseAnnotations(mock.request('turn/start')!.params.input[0].text)!;
+  expect(sent.annotations).toEqual([{
+    id: expect.stringMatching(/^[0-9a-f-]{36}$/), text: '历史保持可读',
+    source: { messageId: 'history-agent', startOffset: 0, endOffset: 6 },
+  }]);
   expect(mock.request('turn/start')?.params.input).toContainEqual({ type: 'skill', name: 'writer', path: '/test/skills/writer/SKILL.md' });
   expect(mock.request('turn/start')?.params.input[0].text).toContain('针对这段内容补充说明');
   expect(mock.request('turn/start')?.params.input[0].text).toContain('notes.txt');
@@ -84,7 +90,10 @@ test('quote-only sending works, while a failed send preserves the quotation for 
   await expect.poll(() => mock.requests.filter(request => request.method === 'turn/start').length).toBe(2);
   const request = mock.requests.filter(request => request.method === 'turn/start').at(-1)!;
   expect(request.params.threadId).toBe('thread-existing');
-  expect(request.params.input).toContainEqual({ type: 'text', text: '[引用对话：已有测试历史]\n> 历史保持可读', text_elements: [] });
+  expect(request.params.input).toHaveLength(1);
+  expect(parseResponseAnnotations(request.params.input[0].text)).toMatchObject({
+    annotations: [{ text: '历史保持可读' }], request: '',
+  });
 });
 
 test('quotations survive reload in their original thread and cannot leak into another thread', async ({ page, mock }) => {
@@ -174,7 +183,9 @@ test('side questions start an independent read-only ephemeral branch and preserv
   expect(mock.request('thread/fork')?.params).toMatchObject({ threadId: 'thread-existing', lastTurnId: 'turn-history', excludeTurns: true, ephemeral: true, sandbox: 'read-only' });
   expect(mock.request('thread/fork')?.params.deferGoalContinuation).toBeUndefined();
   expect(mock.request('turn/start')?.params).toMatchObject({ threadId: wire.sideThreadId, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', networkAccess: false } });
-  expect(mock.request('turn/start')?.params.input).toContainEqual({ type: 'text', text: '[引用对话：已有测试历史]\n> 历史保持可读', text_elements: [] });
+  expect(parseResponseAnnotations(mock.request('turn/start')!.params.input[0].text)).toMatchObject({
+    annotations: [{ text: '历史保持可读' }], request: '请解释这段话',
+  });
   await expect(page.locator('.side-chat-transcript')).toContainText('流式回复完成 ✅');
   await expect(main).toHaveValue('原对话尚未发送的草稿');
   expect(mock.turns.get('thread-existing')).toHaveLength(1);
@@ -280,14 +291,17 @@ test('sidebar can quote its answer, save visible context without another model c
   await expect(panel.getByRole('button', { name: '分支已保存' })).toBeDisabled();
   const fork = mock.requests.filter(request => request.method === 'thread/fork' && request.params.ephemeral === false).at(-1)!;
   expect(fork.params).toMatchObject({ threadId: 'thread-existing', lastTurnId: 'turn-history', ephemeral: false, deferGoalContinuation: true });
-  expect(mock.request('thread/inject_items')!.params.items[0].content[0].text).toContain('流式回复完成 ✅');
+  const savedText = mock.request('thread/inject_items')!.params.items[0].content[0].text;
+  expect(savedText).toContain('流式回复完成 ✅');
+  expect(savedText).toContain('引用：历史保持可读');
+  expect(savedText).not.toContain('<response-annotations>');
   const savedId = mock.request('thread/inject_items')!.params.threadId;
   expect(mock.preferences.pins).toContainEqual({ kind: 'thread', hostId: 'local', id: savedId, label: '已有测试历史 · 侧边问答' });
   expect(mock.requests.filter(request => request.method === 'turn/start')).toHaveLength(inferenceCount);
   page.once('dialog', dialog => dialog.accept());
   await panel.getByRole('button', { name: '另开侧边分支' }).click();
   await expect(panel.getByRole('button', { name: '保存并置顶正式分支' })).toHaveCount(0);
-  await expect(panel.getByText('想了解这段内容的哪一部分？')).toBeVisible();
+  await expect(panel.getByRole('textbox', { name: '基于当前对话提问', exact: true })).toBeVisible();
   expect(wire.releases).toContain(wire.sideThreadId);
   await expect(main).toHaveValue('主对话草稿');
   // Native unstarted forks may be absent from thread/list. Reload must hydrate

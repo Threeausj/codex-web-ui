@@ -199,7 +199,7 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown">
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" data-selection-response @click="onLink" @keydown="onMarkdownKeydown">
       <template v-for="block in markdownBlocks" :key="block.id">
         <ConversationVisualization v-if="block.visualization" :reference="block.visualization" :host-id="hostId || 'local'" />
         <MermaidDiagram v-else-if="block.diagram !== undefined" :source="block.diagram" />
@@ -241,6 +241,7 @@ function onLink(event: MouseEvent) {
 </template>
 
 <style scoped>
+.markdown :deep(.response-annotation-reference) { display: inline-block; margin-inline: 3px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: .72em; line-height: 1.4; vertical-align: baseline; }
 .output-window-note { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 5px 0; font-size: 11px; color: var(--muted); }
 .message-image-preview { display: block; max-width: 100%; padding: 0; border: 0; border-radius: 10px; background: transparent; cursor: zoom-in; overflow: hidden; }
 .message-image-preview:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }

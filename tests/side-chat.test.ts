@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { nextTick, reactive } from 'vue';
 import { PrivateState } from '../src/lib/private-state';
 import { useSideChat } from '../src/lib/side-chat';
+import { parseResponseAnnotations } from '../src/lib/response-annotations';
 import { PROJECTLESS_THREAD_SOURCE } from '../shared/project-context';
 
 const selected = { hostId: 'local', threadId: 'parent', turnId: 'parent-turn', itemId: 'parent-answer', text: 'NAS Git 读取不再依赖 bwrap；$dangerous', threadName: '部署项目' };
@@ -284,10 +285,10 @@ test('selection opens without inference; explicit question forks an isolated rea
     assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly', networkAccess: false });
     assert.equal(turn.approvalPolicy, 'never');
     assert.equal(turn.collaborationMode.mode, 'default');
-    assert.deepEqual(turn.input.map((input: any) => input.type), ['text', 'text']);
-    assert.equal(turn.input[0].text, '这句话是什么意思？');
-    assert.match(turn.input[1].text, /引用对话：部署项目/);
-    assert.match(turn.input[1].text, /\$dangerous/);
+    assert.deepEqual(turn.input.map((input: any) => input.type), ['text']);
+    const context = parseResponseAnnotations(turn.input[0].text);
+    assert.equal(context?.request, '这句话是什么意思？');
+    assert.equal(context?.annotations[0].text, selected.text);
     assert.equal(value.controller.state.items[0].status, undefined, 'An accepted start response confirms the optimistic user input even without an item replay');
     assert.equal(value.controller.state.items[0].turnId, 'side-turn');
     assert.equal(JSON.stringify(value.main), initialMain, 'A sidebar must not alter parent selection, running state, mode, attachments or skills');
@@ -330,7 +331,8 @@ test('selecting a running parent turn forks before it and supplies the selected 
     await value.controller.send('解释正在输出的这句话');
     assert.equal(value.calls[0].params.beforeTurnId, 'running-parent');
     assert.equal(value.calls[0].params.lastTurnId, undefined);
-    assert.equal(value.calls.find(call => call.method === 'turn/start')?.params.input[1].text.includes(selected.text), true);
+    const sent = value.calls.find(call => call.method === 'turn/start')!.params.input[0].text;
+    assert.equal(parseResponseAnnotations(sent)?.annotations[0].text, selected.text);
   } finally { value.controller.dispose(); }
 });
 

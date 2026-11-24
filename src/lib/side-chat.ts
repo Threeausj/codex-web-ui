@@ -5,7 +5,8 @@ import { resolvePermissionProfile } from './configuration';
 import { nativeCollaborationMode } from './conversation-modes';
 import { applyItemEvent, mergeSnapshotItems, upsertItem, type DisplayItem } from './events';
 import { mergeTurnSnapshot, settleInterruptedTurnItems } from './thread-sync';
-import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from './conversation-selection';
+import { conversationResponseAnnotation, formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from './conversation-selection';
+import { formatResponseAnnotations, parseResponseAnnotations } from './response-annotations';
 import { randomUUID } from './uuid';
 import { interruptConflictCandidate } from './turn-interrupt';
 import { isProjectlessThread, PROJECTLESS_THREAD_SOURCE } from '../../shared/project-context';
@@ -74,10 +75,14 @@ export function useSideChat(api: any, mainState: any) {
   // Main conversation selection is independent of the retained side branch.
   // Keep only the parent's settings and turn metadata, never copy its transcript.
   let sourceContext = { cwd: '', model: '', effort: 'medium', plan: false, busy: false, noProject: false, turns: [] as { id: string; status?: string }[] };
-  const visibleMessages = () => state.items.filter(item => item.type === 'userMessage' || item.type === 'agentMessage').map(item => ({
-    key: `${item.type}:${item.clientId || item.id}`,
-    text: `${item.type === 'userMessage' ? '用户' : '助手'}：${item.text || (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n')}`,
-  }));
+  const visibleMessages = () => state.items.filter(item => item.type === 'userMessage' || item.type === 'agentMessage').map(item => {
+    const raw = item.text || (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n');
+    const response = item.type === 'userMessage' ? parseResponseAnnotations(raw) : null;
+    const text = response
+      ? [response.request, ...response.annotations.map(entry => `引用：${entry.text}${entry.annotation ? '\n备注：' + entry.annotation : ''}`)].filter(Boolean).join('\n\n')
+      : raw;
+    return { key: `${item.type}:${item.clientId || item.id}`, text: `${item.type === 'userMessage' ? '用户' : '助手'}：${text}` };
+  });
   const hasUnsavedMessages = () => visibleMessages().some(item => savedMessages.get(item.key) !== item.text);
   const invalidateSavedTranscript = () => { if (state.savedThreadId && hasUnsavedMessages()) state.savedThreadId = ''; };
   function resetSavedBranch() {
@@ -378,10 +383,12 @@ export function useSideChat(api: any, mainState: any) {
       }
       if (!canConnect()) throw new Error('请返回侧边聊天所在的主机后再发送问题');
       optimisticId = randomUUID();
-      const input = [
-        { type: 'text', text: question.trim(), text_elements: [] },
-        ...(source.text ? [{ type: 'text', text: formatConversationQuote(source as SelectedConversationText), text_elements: [] }] : []),
-      ];
+      const input = [{ type: 'text', text: question.trim(), text_elements: [] }];
+      if (source.text) {
+        const selection = source as SelectedConversationText;
+        if (selection.path) input.push({ type: 'text', text: formatConversationQuote(selection), text_elements: [] });
+        else input[0].text = formatResponseAnnotations(input[0].text, [conversationResponseAnnotation(selection)]);
+      }
       upsertItem(state.items, { id: optimisticId, clientId: optimisticId, type: 'userMessage', content: input, status: 'sending' });
       invalidateSavedTranscript();
       state.busy = true;

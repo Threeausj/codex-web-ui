@@ -21,7 +21,8 @@ import { randomUUID } from "./uuid";
 import { browserStorage } from "./browser-storage";
 import { projectBindingKey, retainProjectBindings } from './project-membership';
 import { matchesThreadTitle, searchableThreadTitle, ThreadTitlePageCache, threadTitleQueryKey } from "./thread-title-search";
-import { formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
+import { conversationResponseAnnotation, formatConversationQuote, normalizeConversationSelection, type ConversationSelectionSource } from "./conversation-selection";
+import { formatResponseAnnotations, type ResponseAnnotation } from "./response-annotations";
 import { nativeCollaborationMode, goalMethodSupported, skillInventory, skillMention } from "./conversation-modes";
 import type { ThreadGoal } from "../../shared/protocol/v2/ThreadGoal";
 import type { ReviewTarget } from "../../shared/protocol/v2/ReviewTarget";
@@ -3784,8 +3785,14 @@ async function send(text: string, editedInput?: any[], selectionContexts: Conver
   for (const mention of integrationInputs(inputs[0]?.text || ''))
     if (!inputs.some(input => input.type === 'mention' && input.path === mention.path)) inputs.push(mention);
   // Quoted text is context, not a source of skill/app commands or a Goal objective.
-  if (!editedInput) for (const selection of selections)
-    inputs.push({ type: 'text', text: formatConversationQuote(selection!), text_elements: [] });
+  if (!editedInput && selections.length) {
+    const annotations: ResponseAnnotation[] = [];
+    for (const selection of selections) {
+      if (selection!.path) inputs.push({ type: 'text', text: formatConversationQuote(selection!), text_elements: [] });
+      else annotations.push(conversationResponseAnnotation(selection!));
+    }
+    inputs[0].text = formatResponseAnnotations(inputs[0].text, annotations);
+  }
   state.error = "";
   if (!editedInput) pendingMessageEdit = null;
   sendInFlight = true;

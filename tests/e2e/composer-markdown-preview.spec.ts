@@ -1,5 +1,6 @@
 import { test, expect, login, readComposerSource, readComposerClipboardSource, MockCodex } from './fixtures';
 import type { Page } from '@playwright/test';
+import { parseResponseAnnotations } from '../../src/lib/response-annotations';
 
 const sourceInput = (page: Page) => page.getByRole('textbox', { name: '消息输入框', exact: true });
 const preview = (page: Page) => page.getByRole('region', { name: 'Markdown 草稿预览', exact: true });
@@ -89,7 +90,7 @@ test('live Markdown keeps uploads, quoted context and structured skills attached
   await expect.poll(() => mock.request('turn/start')?.params.input[0]?.text).toContain('## 请分析附件\n\n保留 **原始语法**。');
   const input = mock.request('turn/start')!.params.input;
   expect(input[0].text).toContain('notes.txt');
-  expect(input).toContainEqual({ type: 'text', text: '[引用对话：已有测试历史]\n> 历史保持可读', text_elements: [] });
+  expect(parseResponseAnnotations(input[0].text)?.annotations).toMatchObject([{ text: '历史保持可读' }]);
   expect(input).toContainEqual({ type: 'skill', name: 'writer', path: '/test/skills/writer/SKILL.md' });
 });
 
@@ -138,7 +139,7 @@ test('a running turn accepts raw Markdown steering directly from the editor', as
   await expect.poll(() => mock.request('turn/steer')?.params.input[0]?.text).toBe(source);
 });
 
-test('queue delivery submits the original Markdown source', async ({ page, mock }) => {
+test('queue delivery preserves question Markdown and response annotations', async ({ page, mock }) => {
   const methods = {
     add: ['threadId', 'input', 'clientUserMessageId'], list: ['threadId', 'limit', 'cursor'],
     update: ['threadId', 'queuedSubmissionId', 'input'], delete: ['threadId', 'queuedSubmissionId'],
@@ -171,8 +172,13 @@ test('queue delivery submits the original Markdown source', async ({ page, mock 
   await page.getByRole('combobox', { name: '消息发送方式' }).selectOption('queue');
   const source = '## 下一轮\n\n- 保留 **Markdown** 源码';
   await sourceInput(page).fill(source);
+  await quoteHistory(page);
   await page.getByRole('button', { name: '加入下一轮队列', exact: true }).click();
-  await expect.poll(() => mock.request('thread/queue/add')?.params.input[0]?.text).toBe(source);
+  await expect.poll(() => {
+    const text = mock.request('thread/queue/add')?.params.input[0]?.text;
+    return text && parseResponseAnnotations(text)?.request;
+  }).toBe(source);
+  expect(parseResponseAnnotations(mock.request('thread/queue/add')!.params.input[0].text)?.annotations).toMatchObject([{ text: '历史保持可读' }]);
   await expect(sourceInput(page)).toBeVisible();
   await expect(sourceInput(page)).toHaveValue('');
   expect(mock.request('turn/start')).toBeUndefined();
