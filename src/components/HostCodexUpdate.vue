@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import Icon from './Icon.vue';
 import { randomUUID } from '../lib/uuid';
-import { activeCodexUpdate, type HostCodexUpdateStatus as UpdateInformation } from '../../shared/host-update';
+import { activeCodexUpdate, type HostCodexUpdateAction, type HostCodexUpdateStatus as UpdateInformation } from '../../shared/host-update';
 import { privateState } from '../lib/private-state';
 const props = defineProps<{ api: any; state: any; hostId: string; disabled?: boolean }>();
 const emit = defineEmits<{ busy: [value: boolean]; completed: [hostId: string] }>();
@@ -16,9 +16,13 @@ let disposed = false;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let controller: AbortController | undefined;
 const requestId = ref('');
+const requestAction = ref<HostCodexUpdateAction>('update');
 const receiptNamespace = 'host-codex-update';
 const refreshed = new Set<string>();
 const operation = computed(() => information.value?.operation || null);
+const verifiedCompletion = (value: UpdateInformation | null) => value?.operation?.state === 'completed' &&
+  !!value.runtimeVersion && value.operation.runtimeVersion === value.runtimeVersion;
+const updateVersions = computed(() => [operation.value?.beforeVersion, operation.value?.installedVersion].filter(Boolean).join(' → '));
 const active = computed(() => activeCodexUpdate(operation.value));
 const working = computed(() => starting.value || active.value || uncertain.value);
 const authenticated = () => props.state.authenticated !== false;
@@ -42,12 +46,15 @@ const status = computed(() => {
   if (uncertain.value) return '本次更新请求结果尚未确认，请刷新状态或重新提交同一更新请求。';
   const value = operation.value;
   if (!value) return '';
+  if (value.state === 'completed') {
+    if (!verifiedCompletion(information.value)) return '';
+    return value.action === 'reload' ? '已重新加载安装版本。' : 'Codex 更新并重启完成。';
+  }
   if (value.message) return value.message;
   return {
     checking: '正在检查主机和当前 Codex 版本…',
     updating: '正在执行 codex update…',
     restarting: 'Codex 已更新，正在重启并核对运行版本…',
-    completed: 'Codex 更新并重启完成。',
     failed: '更新未完成，请核对状态后重试。',
   }[value.state];
 });
@@ -65,6 +72,7 @@ function validate(value: any): UpdateInformation {
 }
 async function apply(value: UpdateInformation, token: number, hostId: string, identity: unknown) {
   if (!current(token, hostId, identity)) return;
+  const previousRuntime = information.value?.runtimeVersion;
   information.value = value;
   error.value = '';
   // A previous operation (or no record yet) cannot acknowledge a timed-out
@@ -75,14 +83,16 @@ async function apply(value: UpdateInformation, token: number, hostId: string, id
     requestId.value = '';
     uncertain.value = false;
   } else if (requestId.value) uncertain.value = true;
-  if (!uncertain.value && value.operation?.state === 'completed' && !refreshed.has(value.operation.id)) {
-    refreshed.add(value.operation.id);
+  const completedId = verifiedCompletion(value) ? value.operation?.id : undefined;
+  if (!uncertain.value && (completedId && !refreshed.has(completedId) ||
+      previousRuntime && value.runtimeVersion && previousRuntime !== value.runtimeVersion)) {
+    if (completedId) refreshed.add(completedId);
     try {
       await props.api.refreshRuntimeInformation(hostId);
       if (current(token, hostId, identity)) emit('completed', hostId);
     } catch {
-      if (current(token, hostId, identity)) error.value = '主机更新已完成，版本信息暂未同步；可点击“刷新更新状态”重试。';
-      refreshed.delete(value.operation.id);
+      if (current(token, hostId, identity)) error.value = '运行信息暂未同步，请点击“刷新信息”重试。';
+      if (completedId) refreshed.delete(completedId);
     }
   }
 }
@@ -113,11 +123,14 @@ async function refresh() {
     }
   }
 }
-async function start() {
+async function start(action: HostCodexUpdateAction = 'update') {
   if (reason.value && !canRetryRequest.value || loading.value) return;
   stopPolling();
   const token = generation, hostId = props.hostId, identity = authentication();
-  requestId.value ||= randomUUID();
+  if (!requestId.value) {
+    requestId.value = randomUUID();
+    requestAction.value = action;
+  }
   starting.value = true;
   error.value = '';
   const request = controller = new AbortController();
@@ -125,11 +138,11 @@ async function start() {
   try {
     await props.api.privateSessionReady();
     if (!current(token, hostId, identity)) return;
-    await privateState.write(receiptNamespace, hostId, { id: requestId.value, createdAt: Date.now() }, true);
+    await privateState.write(receiptNamespace, hostId, { id: requestId.value, createdAt: Date.now(), action: requestAction.value }, true);
     if (!current(token, hostId, identity)) return;
     dispatched = true;
     const result = await props.api.requestHttp(path(hostId), {
-      method: 'POST', body: JSON.stringify({ requestId: requestId.value }),
+      method: 'POST', body: JSON.stringify({ requestId: requestId.value, ...(requestAction.value === 'reload' ? { action: 'reload' } : {}) }),
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(20000)]),
     }, false);
     if (!current(token, hostId, identity) || controller !== request) return;
@@ -166,10 +179,11 @@ watch([() => props.hostId, () => props.state.authenticationGeneration, () => pro
       if (!authenticated() || !host.value) return;
       await props.api.privateSessionReady();
       if (!current(token, hostId, identity)) return;
-      const receipt = await privateState.read<{ id: string; createdAt: number }>(receiptNamespace, hostId);
+      const receipt = await privateState.read<{ id: string; action?: HostCodexUpdateAction }>(receiptNamespace, hostId);
       if (!current(token, hostId, identity)) return;
       if (typeof receipt?.id === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(receipt.id)) {
         requestId.value = receipt.id;
+        requestAction.value = receipt.action === 'reload' ? 'reload' : 'update';
         uncertain.value = true;
       }
     } catch (cause: any) { if (current(token, hostId, identity)) error.value = cause.message || '无法读取更新凭据'; }
@@ -185,11 +199,11 @@ defineExpose({ working });
 
 <template>
   <section class="host-codex-update" aria-label="主机 Codex 更新" :aria-busy="working">
-    <div class="host-update-heading"><div><h4>更新并重启 Codex</h4><p>在 {{ host?.name || '所选主机' }} 执行 <code>codex update</code>，再重启 Web 管理的 Codex 并核对运行版本。</p></div><Icon name="Download" :size="19" /></div>
+    <div class="host-update-heading"><div><h4>更新并重启 Codex</h4><p>在 {{ host?.name || '所选主机' }} 检查 CLI 安装，更新或加载已安装的新版本，再核对 App Server。</p></div><Icon name="Download" :size="19" /></div>
     <dl v-if="information" class="host-update-versions">
-      <div><dt>当前运行版本</dt><dd>{{ information.runtimeVersion || operation?.runtimeVersion || '未报告' }}</dd></div>
-      <div v-if="operation?.beforeVersion"><dt>更新前</dt><dd>{{ operation.beforeVersion }}</dd></div>
-      <div v-if="operation?.installedVersion"><dt>已安装版本</dt><dd>{{ operation.installedVersion }}</dd></div>
+      <div><dt>当前 App Server</dt><dd>{{ information.runtimeVersion || '未报告' }}</dd></div>
+      <div><dt>已安装 CLI</dt><dd>{{ information.cliVersion || '未读取' }}</dd></div>
+      <div v-if="updateVersions"><dt>{{ active ? '本次更新' : operation?.state === 'failed' ? '上次更新尝试' : '上次更新' }}</dt><dd>{{ updateVersions }}</dd></div>
     </dl>
     <p v-if="reason && !active && !starting && !loading" class="host-update-reason">{{ reason }}</p>
     <p v-if="status" class="host-update-status" :class="{ failed: !uncertain && operation?.state === 'failed', completed: !uncertain && operation?.state === 'completed' }" role="status"><Icon :name="active || uncertain ? 'LoaderCircle' : operation?.state === 'failed' ? 'AlertCircle' : 'CheckCircle2'" :class="{ spin: active || uncertain }" :size="15" />{{ status }}</p>
@@ -197,7 +211,9 @@ defineExpose({ working });
     <p v-if="error" class="panel-error host-update-error" role="alert">{{ error }}</p>
     <div class="host-update-actions">
       <button type="button" class="button button-secondary" :disabled="loading || starting || !host || !state.authenticated" @click="refresh"><Icon :name="loading ? 'LoaderCircle' : 'RefreshCw'" :class="{ spin: loading }" :size="15" />{{ loading ? '读取中…' : '刷新更新状态' }}</button>
-      <button type="button" class="button button-primary" :disabled="!!reason && !canRetryRequest || loading" :title="reason || undefined" @click="start"><Icon :name="working && !canRetryRequest ? 'LoaderCircle' : 'Download'" :class="{ spin: working && !canRetryRequest }" :size="15" />{{ canRetryRequest ? '重新提交同一更新请求' : working ? '更新进行中…' : '更新并重启 Codex' }}</button>
+      <button v-if="information?.cliVersion" type="button" class="button button-secondary" :disabled="!!reason || loading"
+        :title="reason || `重启 Codex 并加载已安装的 ${information.cliVersion}`" @click="start('reload')"><Icon name="RotateCw" :size="15" />重新加载已安装版本</button>
+      <button type="button" class="button button-primary" :disabled="!!reason && !canRetryRequest || loading" :title="reason || undefined" @click="start()"><Icon :name="working && !canRetryRequest ? 'LoaderCircle' : 'Download'" :class="{ spin: working && !canRetryRequest }" :size="15" />{{ canRetryRequest ? '重新提交同一更新请求' : working ? '更新进行中…' : '更新并重启 Codex' }}</button>
     </div>
     <p class="host-update-help">更新由服务器继续执行，关闭设置不会取消。运行中的任务、终端或共享代理需要先处理，网页不会强制终止它们。</p>
   </section>

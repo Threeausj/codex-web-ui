@@ -60,6 +60,9 @@ test('2000 tools in one running turn mount a bounded single layer and remain nav
   await expect(page.getByText('实时进展的末尾', { exact: true })).toBeVisible();
   await viewport(page).evaluate(element => { element.scrollTop = 0; });
   await expect(page.getByText('大型活动轮次的初始消息', { exact: true })).toBeVisible();
+  const prompt = (await page.locator('[data-timeline-row="item:active-user"] .user-bubble').boundingBox())!;
+  const toggle = (await page.getByRole('button', { name: '工作过程（运行中）', exact: true }).boundingBox())!;
+  expect(toggle.y - prompt.y - prompt.height).toBeLessThanOrEqual(12);
   expect(await page.locator('[data-timeline-row]').count()).toBeLessThan(65);
   await page.getByRole('button', { name: '跳到最新消息', exact: true }).click();
   await expect.poll(() => gap(page)).toBeLessThanOrEqual(3);

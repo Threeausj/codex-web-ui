@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'nonce-__NONCE__' __ASSET__">
+  <style>
+    html { color-scheme: light dark; }
+    body { display: flow-root; margin: 0; padding: 4px; }
+    svg { display: block; width: 100%; height: auto; margin-inline: auto; }
+  </style>
+</head>
+<body>
+  <div id="diagram"></div>
+  <script type="application/json" id="diagram-source">__SOURCE__</script>
+  <script src="__ASSET__"></script>
+  <script nonce="__NONCE__">__RENDER__</script>
+</body>
+</html>

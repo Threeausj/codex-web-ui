@@ -3,7 +3,9 @@ import type { DisplayItem } from './events';
 /** Only the public summary is suitable for the conversation UI. */
 export function publicReasoningSummary(item: DisplayItem): string {
   return (Array.isArray(item.summary) ? item.summary : [])
-    .filter((part): part is string => typeof part === 'string' && !!part.trim())
+    .filter((part): part is string => typeof part === 'string')
+    .map(part => part.trim())
+    .filter(Boolean)
     .join('\n\n');
 }
 

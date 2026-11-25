@@ -5,7 +5,7 @@ import { methodAccepts } from '../lib/integration-capabilities';
 import { modelServiceTiers, rateLimitWindows, serviceTierScope } from '../lib/service-tiers';
 const props = defineProps<{ api: any; state: any; disabled?: boolean }>();
 const busy = ref(false);
-const error = ref('');
+const error = defineModel<string>('error', { default: '' });
 const capabilities = ref<any>(null);
 const catalogTiers = computed(() => modelServiceTiers(props.state));
 const tierSupported = computed(() => props.state.activeThread ?
@@ -23,7 +23,10 @@ const selected = computed({
   set: (value: string) => { void choose(value); },
 });
 const selectedTier = computed(() => catalogTiers.value.find(tier => tier.id === selected.value));
-const selectedLabel = computed(() => !selected.value ? '原生默认' : selectedTier.value?.name || `原生：${selected.value}`);
+const selectedLabel = computed(() => {
+  if (!selected.value) return '原生默认';
+  return selectedTier.value?.name || (selected.value === 'default' ? '标准' : `原生：${selected.value}`);
+});
 const unlistedSelection = computed(() => !!selected.value && !selectedTier.value);
 let generation = 0;
 let choiceGeneration = 0;
@@ -98,14 +101,12 @@ async function choose(value: string) {
 function resetTime(value: number | null) { return value ? new Date(value).toLocaleString() : '未提供重置时间'; }
 </script>
 <template>
-  <div v-if="tiers.length || windows.length || state.rateLimits?.ordinaryUsageAllowed === false" class="model-service-options">
+  <div v-if="tiers.length || windows.length" class="model-service-options">
     <label v-if="tiers.length" class="composer-select service-tier-select" :title="tierHint">
       <Icon name="Zap" :size="13" /><span class="service-tier-value" aria-hidden="true">{{ selectedLabel }}</span><Icon name="ChevronDown" :size="12" />
       <select v-model="selected" aria-label="模型服务层级" :disabled="disabled || busy || !tierSupported"><option value="">原生默认</option><option v-if="unlistedSelection" :value="selected" disabled>{{ selectedLabel }}</option><option v-for="tier in tiers" :key="tier.id" :value="tier.id" :title="tier.description">{{ tier.name }}</option></select>
     </label>
-    <details v-if="windows.length" class="account-usage"><summary aria-label="查看账户使用额度"><Icon name="Gauge" :size="13" />额度</summary><div class="account-usage-popover"><strong>主机账户额度</strong><div v-for="window in windows" :key="window.key"><span>{{ window.name }} · {{ window.label }}</span><span>已用 {{ Math.round(window.used) }}%</span><progress :value="window.used" max="100"></progress><small>{{ resetTime(window.resetsAt) }}</small></div><p v-if="state.rateLimits?.ordinaryUsageAllowed === false">服务端已限制常规额度；以账户实际状态为准。</p></div></details>
-    <span v-if="state.rateLimits?.ordinaryUsageAllowed === false" class="service-tier-error" role="status">常规额度已受限</span>
-    <span v-if="error" class="service-tier-error" role="alert">{{ error }}</span>
+    <details v-if="windows.length" class="account-usage"><summary aria-label="查看账户使用额度"><Icon name="Gauge" :size="13" /><span class="account-usage-label">额度</span></summary><div class="account-usage-popover"><strong>主机账户额度</strong><div v-for="window in windows" :key="window.key"><span>{{ window.name }} · {{ window.label }}</span><span>已用 {{ Math.round(window.used) }}%</span><progress :value="window.used" max="100"></progress><small>{{ resetTime(window.resetsAt) }}</small></div><p v-if="state.rateLimits?.ordinaryUsageAllowed === false">服务端已限制常规额度；以账户实际状态为准。</p></div></details>
   </div>
 </template>
 <style scoped>
@@ -124,6 +125,29 @@ function resetTime(value: number | null) { return value ? new Date(value).toLoca
 .account-usage-popover { position: absolute; bottom: 28px; right: 0; width: min(280px, 80vw); z-index: 10; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 6px 20px #0002; }
 .account-usage-popover > div { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 12px; }
 .account-usage progress, .account-usage small { grid-column: 1 / -1; width: 100%; }
-.service-tier-error { color: var(--red); font-size: 11px; }
-@media(max-width:760px) { .service-tier-select { min-height: 36px; } .service-tier-value { max-width: 80px; } .account-usage summary { min-height: 36px; } }
+@media(max-width:760px) {
+  .model-service-options { gap: 4px; margin-left: auto; }
+  .service-tier-select {
+    flex: 0 1 auto;
+    height: var(--composer-control-height);
+    gap: var(--composer-select-gap);
+    font: inherit;
+  }
+  .service-tier-select > svg { flex: none; }
+  .service-tier-select > svg:last-of-type { width: 11px; }
+  .service-tier-value { min-width: 0; max-width: 80px; }
+  .account-usage { flex: none; }
+  .account-usage summary {
+    justify-content: center;
+    width: 26px;
+    height: var(--composer-control-height);
+  }
+  .account-usage-label { display: none; }
+  .account-usage-popover { bottom: var(--composer-control-height); }
+}
+@media (max-width: 360px) {
+  .model-service-options { gap: 2px; }
+  .service-tier-select > svg:first-child { display: none; }
+  .account-usage summary { width: 24px; }
+}
 </style>

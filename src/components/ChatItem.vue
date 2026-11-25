@@ -6,6 +6,8 @@ import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/convers
 import UserMessageContent from './UserMessageContent.vue'
 import Icon from './Icon.vue'
 import ConversationImage from './ConversationImage.vue'
+import ConversationVisualization from './ConversationVisualization.vue'
+import MermaidDiagram from './MermaidDiagram.vue'
 import { conversationImageViewer } from '../lib/conversation-image-viewer'
 import { reviewFindings } from '../lib/review'
 import { diffStats } from '../lib/diff-stats'
@@ -197,7 +199,13 @@ function onLink(event: MouseEvent) {
     </div>
   </article>
   <article v-else-if="item.type === 'agentMessage'" class="message agent-message">
-    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" @click="onLink" @keydown="onMarkdownKeydown"><div v-for="block in markdownBlocks" :key="block.id" class="markdown-block" v-html="block.html"></div></div>
+    <div v-if="text" class="markdown" :data-selection-item-id="item.id" :data-selection-turn-id="item.turnId" data-selection-response @click="onLink" @keydown="onMarkdownKeydown">
+      <template v-for="block in markdownBlocks" :key="block.id">
+        <ConversationVisualization v-if="block.visualization" :reference="block.visualization" :host-id="hostId || 'local'" />
+        <MermaidDiagram v-else-if="block.diagram !== undefined" :source="block.diagram" />
+        <div v-else class="markdown-block" v-html="block.html"></div>
+      </template>
+    </div>
     <div v-else-if="!asyncQuestions.length" class="thinking-line"><span class="thinking-dot"></span>正在思考</div>
     <AsyncQuestionCard v-if="asyncQuestions.length" :item="item" :status="asyncStatus" :disabled="asyncQuestionsDisabled" :answer="answerAsync" />
     <div v-if="text && (!busy || canFork)" class="message-actions">
@@ -207,14 +215,14 @@ function onLink(event: MouseEvent) {
   </article>
   <template v-else-if="item.type === 'reasoning'">
     <details v-if="reasoningSummary" class="reasoning-item" :open="reasoningExpanded" @toggle="reasoningExpanded = ($event.currentTarget as HTMLDetailsElement).open">
-      <summary><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
+      <summary class="activity-summary"><Icon name="Sparkles" :size="15" />思考过程<Icon name="ChevronDown" :size="13" /></summary>
       <div class="reasoning-content">{{ reasoningSummary }}</div>
     </details>
   </template>
   <div v-else-if="item.type === 'contextCompaction'" class="compaction-divider"><span></span><Icon :name="item.status === 'inProgress' ? 'LoaderCircle' : 'RefreshCw'" :size="13" :class="{ spin: item.status === 'inProgress' }" />{{ item.status === 'inProgress' ? '正在压缩上下文…' : item.status === 'failed' ? '上下文压缩失败' : item.status === 'interrupted' ? '上下文压缩已取消' : '上下文已压缩' }}<span></span></div>
   <article v-else-if="item.type === 'plan'" class="plan-card"><div class="tool-heading"><Icon name="ListTodo" :size="16" />计划</div><div class="markdown" @click="onLink" @keydown="onMarkdownKeydown" v-html="html"></div></article>
   <details v-else class="tool-item" @toggle="toolExpanded = ($event.currentTarget as HTMLDetailsElement).open" :open="toolOpenByDefault || toolExpanded" :class="{ 'tool-failed': item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) }">
-    <summary><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
+    <summary class="activity-summary"><Icon :name="toolIcon" :size="16" /><span class="tool-title">{{ toolTitle }}</span><span v-if="toolSummary" class="tool-command" :title="toolSummary">{{ toolSummary }}</span><span v-if="item.type === 'fileChange'" class="diff-stats"><span class="diff-count-add">+{{ totalChanges.added }}</span><span class="diff-count-remove">−{{ totalChanges.removed }}</span></span><span class="tool-status">{{ status }}</span><Icon name="ChevronDown" :size="13" /></summary>
     <template v-if="toolExpanded">
     <div v-if="item.type === 'fileChange'" class="file-changes">
       <details v-for="change in item.changes" :key="change.path" class="file-diff" :open="expandedFiles.has(change.path)" @toggle="toggleFile($event, change.path)">
@@ -233,6 +241,7 @@ function onLink(event: MouseEvent) {
 </template>
 
 <style scoped>
+.markdown :deep(.response-annotation-reference) { display: inline-block; margin-inline: 3px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: .72em; line-height: 1.4; vertical-align: baseline; }
 .output-window-note { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 5px 0; font-size: 11px; color: var(--muted); }
 .message-image-preview { display: block; max-width: 100%; padding: 0; border: 0; border-radius: 10px; background: transparent; cursor: zoom-in; overflow: hidden; }
 .message-image-preview:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
@@ -284,15 +293,6 @@ function onLink(event: MouseEvent) {
   gap: 8px;
   margin-top: 10px;
 }
-.reasoning-item > summary {
-  min-height: 32px;
-  font-size: 12px;
-}
-.reasoning-content {
-  padding: 10px 0;
-  font-size: 12px;
-  line-height: 1.7;
-}
 .reasoning-item > summary > svg:last-child,
 .tool-item > summary > svg:last-child {
   transition: transform 0.15s;
@@ -311,10 +311,6 @@ function onLink(event: MouseEvent) {
   }
   .message-edit-buttons .button {
     min-height: 36px;
-  }
-  .reasoning-item > summary,
-  .tool-item > summary {
-    min-height: 40px;
   }
   .tool-content pre {
     font-size: 12px;

@@ -126,7 +126,7 @@ onBeforeUnmount(() => { ++generation; });
       <div><dt>配置上下文窗口</dt><dd>{{ tokens(configuration.model_context_window) }}</dd></div>
       <div><dt>Codex 自动压缩阈值</dt><dd>{{ tokens(configuration.model_auto_compact_token_limit) }}</dd></div>
     </dl>
-    <p v-if="nativeCapabilities?.reason === 'runtime_version_mismatch'" class="performance-version-mismatch">已安装 CLI 与运行中的 Codex 版本不一致。{{ externalDaemon ? "请核对所配置的 CLI 路径，并在原客户端重新加载后台服务；重新连接只恢复 Web 连接。" : independentDaemon ? "请核对 CLI 路径；若刚更新 CLI，请在主机空闲时重启 daemon。重新连接只恢复 Web 连接。" : "请核对 CLI 路径，并重启所连接的 Codex 进程后刷新信息。" }}</p>
+    <p v-if="nativeCapabilities?.reason === 'runtime_version_mismatch'" class="performance-version-mismatch">已安装 CLI 与运行中的 Codex 版本不一致。{{ runtime?.managed === false ? "请在启动此服务的主机或客户端加载新版。" : "请在主机空闲时使用下方的“重新加载已安装版本”。" }}</p>
     <p class="performance-checked">最近读取：{{ time(information?.checkedAt) }}</p>
     <div class="performance-reconnect">
       <strong>重新连接 Codex</strong>

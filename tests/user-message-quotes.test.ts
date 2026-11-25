@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { formatConversationQuote } from '../src/lib/conversation-selection';
 import { collapseUserMessageQuote, userMessageParts, userMessageQuotePreview } from '../src/lib/user-message-quotes';
+import { formatResponseAnnotations, parseResponseAnnotations } from '../src/lib/response-annotations';
+import { editedMessageInput, messageEditDraft } from '../src/lib/message-edit';
+import { editedQueueInput, queuedText } from '../src/lib/message-queue';
 
 test('current conversation selections become named quotes while preserving surrounding instructions', () => {
   const quote = formatConversationQuote({ hostId: 'nas', threadId: 'thread', threadName: '部署 codex-web-ui', text: '第一段\n\n> 原文里的引用\n最后一行' });
@@ -40,4 +43,33 @@ test('multiple quotations preserve code, tables and HTML as source for the exist
   assert.equal(collapseUserMessageQuote('很短的引用'), false);
   assert.equal(collapseUserMessageQuote('一'.repeat(361)), true);
   assert.equal(userMessageQuotePreview('# 标题\n\n- **细节**与 `code`\n> 引用'), '标题 细节与 code 引用');
+});
+
+test('desktop annotations retain their order, notes and original offsets through display and editing', () => {
+  const annotations = [
+    { id: 'desktop-quote-1', text: '选中结果', annotation: '解释这里', source: {
+      messageId: 'msg_earlier', startOffset: 459, endOffset: 463, contentOffsets: { startOffset: 457, endOffset: 461 },
+    } },
+    { text: '第二处\n</response-annotations>\n仍是引用' },
+  ];
+  const raw = `\n# Response annotations:\nInstructions\n<response-annotations>\n${JSON.stringify(annotations)}\n</response-annotations>\n\n## My request:\n请展开说明。`;
+  assert.deepEqual(userMessageParts(raw), [
+    { type: 'quote', kind: 'conversation', name: '1', text: '选中结果', annotation: '解释这里' },
+    { type: 'quote', kind: 'conversation', name: '2', text: annotations[1].text },
+    { type: 'text', text: '请展开说明。' },
+  ]);
+  const input = [{ type: 'text' as const, text: raw, text_elements: [] }, { type: 'localImage' as const, path: '/workspace/example.png' }];
+  const item = { id: 'u', type: 'userMessage', content: input };
+  assert.equal(messageEditDraft(item).text, '请展开说明。');
+  assert.equal(queuedText({ input }), '请展开说明。');
+  for (const edited of [editedMessageInput(item, '新的提问'), editedQueueInput({ input }, '新的提问')]) {
+    const parsed = parseResponseAnnotations(edited[0].text);
+    assert.deepEqual(parsed?.annotations, annotations);
+    assert.equal(parsed?.request, '新的提问');
+    assert.deepEqual(edited[1], input[1]);
+    assert.match(edited[0].text, /\nInstructions\n/);
+  }
+  assert.equal(parseResponseAnnotations(formatResponseAnnotations('', annotations))?.request, '');
+  assert.equal(parseResponseAnnotations(raw.replace('<response-annotations>\n[', '<response-annotations>\n{')), null);
+  assert.deepEqual(userMessageParts('```text\n' + raw + '\n```'), [{ type: 'text', text: '```text\n' + raw + '\n```' }]);
 });

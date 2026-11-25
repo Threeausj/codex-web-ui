@@ -1,0 +1,92 @@
+:root {
+  color-scheme: light dark;
+  font: 14px/1.5 system-ui, sans-serif;
+  --font-size-base: 1rem;
+  --background: light-dark(#fff, #181e28);
+  --foreground: light-dark(#182230, #ecf1f9);
+  --muted: light-dark(#f4f6f9, #1d2531);
+  --muted-foreground: light-dark(#5e6878, #a5b0c2);
+  --border: light-dark(#e4e8ef, #303b4b);
+  --input: var(--border);
+  --accent: light-dark(#edf3ff, #24334b);
+  --accent-foreground: var(--foreground);
+  --primary: light-dark(#2454bb, #9bbcff);
+  --primary-foreground: var(--background);
+  --ring: var(--primary);
+  --card: var(--muted);
+  --card-foreground: var(--foreground);
+  --popover: var(--background);
+  --popover-foreground: var(--foreground);
+  --secondary: var(--muted);
+  --secondary-foreground: var(--foreground);
+  --destructive: light-dark(#b34740, #e4877e);
+  --blue: light-dark(#2862dc, #9bbcff);
+  --orange: light-dark(#97612a, #e8b779);
+  --green: light-dark(#317453, #82bd9d);
+  --red: var(--destructive);
+  --purple: light-dark(#6656ae, #bbb0f5);
+  --yellow: light-dark(#805b22, #d4ad67);
+  --viz-series-1: var(--blue);
+  --viz-series-2: var(--orange);
+  --viz-series-3: var(--green);
+  --viz-series-4: var(--purple);
+  --viz-series-5: var(--red);
+  --viz-series-6: var(--yellow);
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  display: flow-root;
+  margin: 0;
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 1.35rem; }
+h2 { font-size: 1.18rem; }
+h3 { font-size: 1rem; }
+a { color: var(--primary); }
+img, canvas, svg, input, textarea, select { max-width: 100%; }
+button, input, textarea, select { font: inherit; color: inherit; }
+.viz-controls, .viz-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.viz-controls > .form-label { flex: 1 1 13rem; min-width: 0; }
+.viz-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); gap: .5rem; }
+.form-label { display: block; min-width: 0; }
+.form-select, .form-control {
+  display: block;
+  width: 100%;
+  min-height: 2.25rem;
+  padding: .35rem .6rem;
+  border: 1px solid var(--input);
+  border-radius: 8px;
+  background: var(--background);
+}
+.form-range { display: block; width: 100%; accent-color: var(--primary); }
+.form-check { display: inline-flex; align-items: center; gap: .4rem; }
+.btn {
+  padding: .35rem .6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--muted);
+  color: var(--foreground);
+  text-decoration: none;
+  cursor: pointer;
+}
+.btn-primary { background: var(--primary); color: var(--primary-foreground); }
+.btn-ghost { background: transparent; }
+.btn-block { width: 100%; }
+.card { padding: .75rem; border-radius: 8px; color: var(--card-foreground); background: var(--card); }
+.table-responsive { max-width: 100%; overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; }
+.table :is(th, td) { padding: .45rem; border-bottom: 1px solid var(--border); }
+.table-sm :is(th, td) { padding: .25rem .35rem; }
+.text-center { text-align: center; }
+.text-end { text-align: end; }
+.text-muted { color: var(--muted-foreground); }
+.text-small { font-size: .85rem; }
+.text-nowrap { white-space: nowrap; }
+.text-destructive { color: var(--destructive); }
+.tabular-nums { font-variant-numeric: tabular-nums; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (pointer: coarse) {
+  .form-select, .form-control, .btn { min-height: 44px; font-size: max(16px, 1rem); }
+}

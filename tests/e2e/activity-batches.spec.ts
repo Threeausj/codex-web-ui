@@ -90,6 +90,75 @@ test('live batches open automatically, respect temporary manual collapse and spl
   await expect(batches.first().locator('.tool-item').first()).toHaveAttribute('open', '');
 });
 
+for (const scenario of [
+  { width: 1440, virtual: false },
+  { width: 390, virtual: false },
+  { width: 1440, virtual: true },
+]) {
+  const history = scenario.virtual ? 'virtual' : 'regular';
+  test(scenario.width + 'px ' + history + ' history keeps expanded activity close together', async ({ page, mock }) => {
+    await page.setViewportSize({ width: scenario.width, height: 900 });
+    const turns = mock.turns.get('thread-existing')!;
+    mock.threads[0]!.status = { type: 'active' };
+    if (scenario.virtual) {
+      turns.push(...Array.from({ length: 32 }, (_, index) => ({
+        id: 'previous-' + index, status: 'completed', durationMs: 1200, items: [
+          { id: 'previous-user-' + index, type: 'userMessage', content: [{ type: 'text', text: 'Earlier prompt' }] },
+          { id: 'previous-answer-' + index, type: 'agentMessage', text: 'Earlier result' },
+        ],
+      })));
+    }
+    turns.push({ id: 'dense-activity', status: 'inProgress', items: [
+      { id: 'dense-agent', type: 'subAgentActivity', status: 'completed' },
+      { id: 'dense-summary', type: 'reasoning', summary: ['\n\nChecking incremental progress\n\n'], content: ['private reason'] },
+      ...Array.from({ length: 3 }, (_, index) => ({
+        id: 'dense-command-' + index, type: 'commandExecution', command: 'printf fixture', status: 'completed', exitCode: 0,
+      })),
+    ] });
+    await login(page);
+    if (scenario.width < 760) await page.getByRole('button', { name: '打开侧边栏', exact: true }).click();
+    await page.locator('[data-section="recent"] .thread-row').first().click();
+    await expect(page.locator('[data-virtual-timeline]')).toHaveCount(scenario.virtual ? 1 : 0);
+    const collaboration = page.getByText('已协作 1 次', { exact: true });
+    const agent = page.getByText('代理动态', { exact: true });
+    const reasoning = page.locator('.reasoning-item > summary');
+    const content = page.locator('.reasoning-content');
+    const commands = page.getByText('已运行 3 条命令', { exact: true });
+    await expect(content).toBeVisible();
+    await expect(commands).toBeVisible();
+    const spacing = await page.evaluate(() => {
+      const locate = (selector: string, text: string) =>
+        [...document.querySelectorAll(selector)].find(element => element.textContent?.trim() === text)!.getBoundingClientRect();
+      const group = locate('summary, .virtual-batch-toggle', '已协作 1 次');
+      const nested = locate('.tool-item > summary', '代理动态');
+      const summary = document.querySelector('.reasoning-item > summary')!.getBoundingClientRect();
+      const body = document.querySelector('.reasoning-content')!;
+      const bodyBox = body.getBoundingClientRect();
+      const next = locate('summary, .virtual-batch-toggle', '已运行 3 条命令');
+      const { paddingTop, paddingBottom, lineHeight } = getComputedStyle(body);
+      return {
+        rowHeight: group.height,
+        nestedGap: nested.top - group.bottom,
+        summaryGap: bodyBox.top + parseFloat(paddingTop) - summary.bottom,
+        nextGap: next.top - bodyBox.bottom + parseFloat(paddingBottom),
+        lines: (bodyBox.height - parseFloat(paddingTop) - parseFloat(paddingBottom)) / parseFloat(lineHeight),
+      };
+    });
+    expect(spacing.rowHeight).toBe(scenario.width > 760 ? 28 : 40);
+    expect(spacing.nestedGap).toBeGreaterThanOrEqual(-1);
+    expect(spacing.nestedGap).toBeLessThanOrEqual(4);
+    expect(spacing.summaryGap).toBeLessThanOrEqual(3);
+    expect(spacing.nextGap).toBeLessThanOrEqual(6);
+    expect(spacing.lines).toBeCloseTo(1, 0);
+    await expect(page.getByText('private reason', { exact: true })).toHaveCount(0);
+    await collaboration.click();
+    await expect(agent).toBeHidden();
+    await reasoning.click();
+    await expect(content).toBeHidden();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  });
+}
+
 test('assistant commentary, plans, compaction and separate turns retain independent operation batches', async ({ page, mock }) => {
   const turn = mock.turns.get('thread-existing')![0];
   turn.items.splice(1, 0,

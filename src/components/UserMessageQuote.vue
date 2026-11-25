@@ -21,6 +21,7 @@ const html = computed(() => expanded.value ? conversationMarkdown(props.quote.te
     </button>
     <div v-if="expanded" class="user-quote-body markdown" v-html="html"></div>
     <button v-else type="button" class="user-quote-preview" :aria-label="`展开引用正文 ${quote.name}`" data-selection-ignore="true" @click="expanded = true"><span>{{ preview }}</span></button>
+    <p v-if="quote.annotation" class="user-quote-note">{{ quote.annotation }}</p>
   </section>
 </template>
 
@@ -40,6 +41,7 @@ const html = computed(() => expanded.value ? conversationMarkdown(props.quote.te
 .user-quote-preview { display: block; width: 100%; padding: 0 10px 10px 33px; border: 0; color: var(--muted); background: transparent; font: inherit; font-size: 12px; line-height: 1.65; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
 .user-quote-preview > span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .user-quote-body { padding: 0 12px 11px; font-size: 12px; line-height: 1.7; }
+.user-quote-note { margin: 0; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .user-quote-body :deep(> :first-child) { margin-top: 0; }
 .user-quote-body :deep(p) { margin-bottom: 8px; }
 .user-quote-body :deep(ul), .user-quote-body :deep(ol) { margin: 6px 0 8px; padding-left: 20px; }

@@ -157,7 +157,11 @@ test("Markdown strips active HTML and does not fetch external or out-of-project 
 <img src="https://example.invalid/image.png" onerror="document.body.dataset.filePreviewEscape='yes'">
 ![Private](../../secret.png)
 [Unsafe](javascript:alert(1))
-<style>body { display: none; }</style>` });
+<style>body { display: none; }</style>
+
+正常 $a+b$。
+
+$\\includegraphics{https://example.invalid/formula.png}$` });
   await openFiles(page);
   await page.locator(".file-tree-row").filter({ hasText: "README.md" }).click();
   const rendered = page.getByRole("region", { name: "Markdown 文件预览" });
@@ -165,6 +169,7 @@ test("Markdown strips active HTML and does not fetch external or out-of-project 
   await expect(rendered.locator("script,iframe,style,[onerror]")).toHaveCount(0);
   await expect(rendered.locator('img[src^="http"]')).toHaveCount(0);
   await expect(rendered.locator('a[href^="javascript:"]')).toHaveCount(0);
+  await expect(rendered.locator("p").filter({ hasText: "正常" }).locator(".katex")).toHaveCount(1);
   expect(await page.evaluate(() => document.body.dataset.filePreviewEscape)).toBeUndefined();
   expect(externalRequests).toBe(0);
   expect(fixture.reads).toEqual(["/workspace/demo/README.md"]);
@@ -186,6 +191,105 @@ test("the preview address supports Markdown and images while retaining opaque HT
   await expect(page.locator('iframe[title="项目预览"]')).toBeVisible();
   await expect(page.locator('iframe[title="项目预览"]')).not.toHaveAttribute("sandbox", /allow-same-origin/);
 });
+
+for (const width of [1440, 390]) {
+  test("the work area previews Mermaid and LaTeX in the same document at " + width + "px", async ({ page, mock }) => {
+    const source = [
+      "# 项目文档预览",
+      "",
+      String.raw`向量 $x,y$ 经过变换 $g(x),g(y)$，$\odot$ 表示逐维相乘。`,
+      "",
+      "$$",
+      String.raw`\begin{aligned}`,
+      String.raw`z(x,y) &= \sigma\!\left(W\operatorname{concat}\big(g(x),g(y),g(x)+g(y),|g(x)-g(y)|\big)+b\right),\\`,
+      String.raw`r(x,y) &= \big(g(x)\odot g(y)\big)+z(x,y). `,
+      String.raw`\end{aligned}`,
+      "$$",
+      "",
+      String.raw`\[\mathcal L=\frac{1}{N}\sum_{i=1}^N r(x_i,y_i)^2.\]`,
+      "",
+      "~~~mermaid",
+      'flowchart LR',
+      'A["读取项目配置及输入数据"] --> B["计算归一化特征和中间变量"] --> C["汇总评分并输出结果"]',
+      "~~~",
+      "",
+      "> ~~~mermaid",
+      "> flowchart TD",
+      '> D["候选结果"] --> E["归档"]',
+      "> ~~~",
+      "",
+      "~~~text",
+      "$x$ 和 flowchart TD 保持源码",
+      "~~~",
+      "",
+      '![项目图片](assets/preview.png "原图说明")',
+      "",
+      "[继续阅读][next]",
+      "",
+      "[next]: docs/next.md",
+    ].join("\n");
+    const file = "/workspace/demo/notes.md";
+    const image = "/workspace/demo/assets/preview.png";
+    const fixture = files(mock, {
+      [file]: source,
+      "/workspace/demo/docs/next.md": "# 下一个文件",
+    });
+    const receive = (mock as any).receive.bind(mock);
+    let releaseImage: (() => void) | undefined;
+    (mock as any).receive = (socket: any, request: any) => {
+      if (request.method === "fs/readFile" && request.params.path === image) {
+        releaseImage = () => socket.send(JSON.stringify({ id: request.id, result: { dataBase64: png } }));
+        return;
+      }
+      return receive(socket, request);
+    };
+    await page.setViewportSize({ width, height: 900 });
+    if (width < 760) await page.emulateMedia({ colorScheme: "dark" });
+    await openFiles(page);
+    await page.locator(".workspace-tabs").getByRole("button", { name: "预览", exact: true }).click();
+    await page.getByRole("textbox", { name: "预览地址" }).fill("notes.md");
+    await page.getByRole("button", { name: "打开预览", exact: true }).click();
+    const preview = page.getByRole("region", { name: "Markdown 文件预览" });
+    await expect(preview.getByRole("heading", { name: "项目文档预览" })).toBeVisible();
+    await expect(preview.locator(".katex")).toHaveCount(5);
+    await expect(preview.locator(".katex-display")).toHaveCount(2);
+    await expect(preview.locator(".katex-mathml math")).toHaveCount(5);
+    await expect(preview.locator(".katex-mathml mtable mtr")).toHaveCount(2);
+    await expect(preview.locator("pre code")).toHaveText("$x$ 和 flowchart TD 保持源码");
+    if (width < 760) expect(await preview.locator(".katex-display").first().evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
+    const diagram = preview.getByRole("region", { name: "Mermaid 流程图" }).first();
+    await diagram.scrollIntoViewIfNeeded();
+    const frame = diagram.locator("iframe");
+    await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    await expect(frame.contentFrame().locator("svg .node")).toHaveCount(3);
+    expect(await diagram.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    if (width < 760) {
+      await preview.getByRole("button", { name: "放大流程图", exact: true }).first().click();
+      expect(await diagram.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
+    }
+    const originalFrame = await frame.elementHandle();
+    await expect.poll(() => !!releaseImage).toBe(true);
+    releaseImage!();
+    const projectImage = preview.getByRole("img", { name: "项目图片" });
+    await expect(projectImage).toHaveAttribute("src", /^data:image\/png;base64,/);
+    await expect(projectImage).toHaveAttribute("title", "原图说明");
+    expect(await frame.evaluate((element, original) => element === original, originalFrame)).toBe(true);
+    const nested = preview.locator("blockquote").getByRole("region", { name: "Mermaid 流程图" });
+    await nested.scrollIntoViewIfNeeded();
+    await expect(nested.frameLocator("iframe").locator("svg .node")).toHaveCount(2);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+
+    await page.locator(".file-view-switch").getByRole("button", { name: "源码", exact: true }).click();
+    const editor = page.getByRole("textbox", { name: "notes.md 文件内容" });
+    await expect(editor).toContainText(String.raw`\begin{aligned}`);
+    await expect(preview).toHaveCount(0);
+    await page.locator(".file-view-switch").getByRole("button", { name: "预览", exact: true }).click();
+    await preview.getByRole("link", { name: "继续阅读", exact: true }).click();
+    await expect(preview.getByRole("heading", { name: "下一个文件", exact: true })).toBeVisible();
+    await expect(preview.locator("iframe, .katex")).toHaveCount(0);
+    expect(fixture.writes).toHaveLength(0);
+  });
+}
 
 test("a late Markdown image response cannot enter another project's preview", async ({ page, mock }) => {
   const receive = mock.receive.bind(mock);

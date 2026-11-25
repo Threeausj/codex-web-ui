@@ -31,6 +31,32 @@ async function openHistory(page: Page) {
   await expect(page.locator('[data-selection-item-id="history-user"]')).toBeVisible();
 }
 
+test('desktop reply annotations render as quotes and leave the actual question visible', async ({ page, mock }) => {
+  const desktopMessage = [
+    '',
+    '# Response annotations:',
+    'Use the quoted selection as context.',
+    '<response-annotations>',
+    '[{"id":"desktop-example","text":"逐维求和","annotation":"请继续解释","source":{"contentOffsets":{"startOffset":10,"endOffset":14},"messageId":"history-older","startOffset":12,"endOffset":16}}]',
+    '</response-annotations>',
+    '',
+    '## My request:',
+    '这一步有什么作用？',
+  ].join('\n');
+  history(mock, desktopMessage);
+  mock.turns.get('thread-existing')![0].items[1].text = '是逐项求和。:codex-annotation{index="1" id="desktop-example"}\n\n字面量 `:codex-annotation{index="2"}`。';
+  await openHistory(page);
+  const user = page.locator('[data-selection-item-id="history-user"]');
+  const quote = user.getByRole('region', { name: '引用对话：1', exact: true });
+  await expect(quote.locator('.user-quote-body')).toHaveText('逐维求和');
+  await expect(quote.locator('.user-quote-note')).toHaveText('请继续解释');
+  await expect(user.locator('.user-message-text')).toHaveText('这一步有什么作用？');
+  await expect(user).not.toContainText('Response annotations');
+  const assistant = page.locator('[data-selection-item-id="history-agent"]');
+  await expect(assistant.locator('.response-annotation-reference')).toHaveText('引用 1');
+  await expect(assistant.locator('code')).toHaveText(':codex-annotation{index="2"}');
+});
+
 for (const [width, theme] of [[1440, 'light'], [390, 'dark']] as const) {
   test(`${width}px ${theme} conversation references use compact expandable Markdown cards`, async ({ page, mock }) => {
     await page.setViewportSize({ width, height: 1000 });

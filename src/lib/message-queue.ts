@@ -3,6 +3,7 @@ import { computed, getCurrentScope, onScopeDispose, reactive, watch } from 'vue'
 import type { QueuedSubmission } from '../../shared/protocol/v2/QueuedSubmission';
 import type { UserInput } from '../../shared/protocol/v2/UserInput';
 import { methodAccepts, type IntegrationCapabilities } from './integration-capabilities';
+import { parseResponseAnnotations, replaceResponseAnnotationRequest } from './response-annotations';
 
 const queueFields: Record<string, string[]> = {
   'thread/queue/add': ['threadId', 'input', 'clientUserMessageId'],
@@ -16,13 +17,15 @@ const queueFields: Record<string, string[]> = {
 type Scope = { key: string; hostId: string; threadId: string; authenticationGeneration?: number; engineId?: string | null };
 type UnknownOutcome = { operation: string; clientId?: string; input?: UserInput[] };
 export function queuedText(submission: Pick<QueuedSubmission, 'input'>) {
-  return submission.input.find(input => input.type === 'text')?.text || '';
+  const text = submission.input.find(input => input.type === 'text')?.text || '';
+  return parseResponseAnnotations(text)?.request ?? text;
 }
 /** Editing the prompt preserves later quoted context, images and skill/app inputs. */
 export function editedQueueInput(submission: Pick<QueuedSubmission, 'input'>, text: string): UserInput[] {
   const input = JSON.parse(JSON.stringify(submission.input)) as UserInput[];
   const prompt = input.findIndex(entry => entry.type === 'text');
-  if (prompt >= 0) input[prompt] = { type: 'text', text, text_elements: [] };
+  const original = input[prompt];
+  if (original?.type === 'text') input[prompt] = { type: 'text', text: replaceResponseAnnotationRequest(original.text, text), text_elements: [] };
   else input.unshift({ type: 'text', text, text_elements: [] });
   return input;
 }

@@ -8,7 +8,6 @@ import MarkdownComposerEditor from "./MarkdownComposerEditor.vue";
 import { clipboardFiles, uniqueClipboardFiles } from "../lib/clipboard";
 import { browserStorage } from "../lib/browser-storage";
 import { contextUsage } from "../lib/context-usage";
-import { composerMarkdownPreview } from "../lib/composer-markdown";
 import { continueMarkdown, formatMarkdown, isMarkdownCodeAt, type MarkdownEdit, type MarkdownFormat } from "../lib/markdown-editing";
 import { insertPromptPreset } from "../lib/prompt-presets";
 import { mentionedPlugins } from '../lib/plugin-mentions';
@@ -30,12 +29,6 @@ const emit = defineEmits<{
   search: [];
 }>();
 const draft = ref("");
-const markdownPreview = ref(false);
-const previewElement = ref<HTMLElement>();
-let editingSelection = { start: 0, end: 0 };
-const renderedDraft = computed(() => markdownPreview.value
-  ? composerMarkdownPreview(draft.value, props.state.hostId, props.state.activeThread?.cwd || props.state.projectPath || '/')
-  : null);
 const draftStorageWarning = ref(false);
 const quotedContexts = ref<ConversationSelectionSource[]>([]);
 const input = ref<InstanceType<typeof MarkdownComposerEditor>>();
@@ -85,6 +78,7 @@ const contextDisabled = computed(
     props.state.selectingThread || props.state.modeBusy || uploading.value || submitting.value,
 );
 const modelSettingsError = ref("");
+const serviceTierError = ref("");
 let modelChoiceGeneration = 0;
 const modelControlsDisabled = computed(() => !!(props.contextBusy || !props.state.connected || props.state.switchingHost ||
   props.state.selectingThread || props.state.threadReleased || props.state.threadConflict || props.state.runtimePaused ||
@@ -176,7 +170,6 @@ function usePreset(preset: PromptPreset, position = input.value?.selectionStart 
   const inserted = insertPromptPreset(remaining, preset.content, before.length);
   draft.value = inserted.text;
   picker.value = "";
-  markdownPreview.value = false;
   void nextTick(() => {
     input.value?.focus(); input.value?.setSelectionRange(inserted.position, inserted.position); resize();
   });
@@ -274,6 +267,7 @@ const selectedModel = computed(() =>
       model.model === props.state.model || model.id === props.state.model,
   ),
 );
+const selectedModelLabel = computed(() => selectedModel.value?.displayName || props.state.model || "加载模型…");
 const effortLabels: Record<string, string> = {
   none: "None",
   minimal: "Minimal",
@@ -470,34 +464,12 @@ function onBeforeInput(event: InputEvent) {
   event.preventDefault();
   if (!markdownEnter()) void send();
 }
-function editDraft() {
-  markdownPreview.value = false;
-  void nextTick(() => {
-    resize();
-    input.value?.focus({ preventScroll: true });
-    input.value?.setSelectionRange(Math.min(editingSelection.start, draft.value.length), Math.min(editingSelection.end, draft.value.length));
-  });
-}
 function focusInput() {
-  markdownPreview.value = false;
   void nextTick(() => { resize(); input.value?.focus({ preventScroll: true }); });
-}
-function toggleMarkdownPreview() {
-  if (markdownPreview.value) { editDraft(); return; }
-  if (!draft.value.trim()) return;
-  editingSelection = { start: input.value?.selectionStart ?? draft.value.length, end: input.value?.selectionEnd ?? draft.value.length };
-  picker.value = "";
-  pickerError.value = "";
-  searchPending.value = false;
-  ++pickerGeneration;
-  if (searchTimer) clearTimeout(searchTimer);
-  closeContextMenu();
-  markdownPreview.value = true;
-  void nextTick(() => previewElement.value?.focus({ preventScroll: true }));
 }
 watch([() => props.state.hostId, () => props.state.projectPath, () => props.state.activeThread?.id,
   () => props.state.authenticationGeneration, () => props.state.authenticated], () => {
-  markdownPreview.value = false;
+  dropping.value = false;
   picker.value = "";
   pickerFiles.value = [];
   pickerError.value = "";
@@ -772,18 +744,29 @@ function paste(event: ClipboardEvent) {
   if (!event.clipboardData?.getData("text/plain")) event.preventDefault();
   void upload(files, true);
 }
+function dragFiles(event: DragEvent) {
+  const transfer = event.dataTransfer;
+  if (!transfer?.types.includes("Files")) return;
+  event.preventDefault();
+  transfer.dropEffect = "copy";
+  dropping.value = true;
+}
+function leaveDrag(event: DragEvent) {
+  if (!dropping.value) return;
+  const composer = event.currentTarget as HTMLElement;
+  if (event.relatedTarget instanceof Node && composer.contains(event.relatedTarget)) return;
+  if (!event.relatedTarget) {
+    const { left, right, top, bottom } = composer.getBoundingClientRect();
+    if (event.clientX >= left && event.clientX < right && event.clientY >= top && event.clientY < bottom) return;
+  }
+  dropping.value = false;
+}
 function drop(event: DragEvent) {
   dropping.value = false;
-  if (event.dataTransfer?.files.length) void upload(event.dataTransfer.files);
-}
-function insertAt() {
-  markdownPreview.value = false;
-  draft.value += draft.value && !draft.value.endsWith(" ") ? " @" : "@";
-  void nextTick(() => {
-    input.value?.focus();
-    input.value?.setSelectionRange(draft.value.length, draft.value.length);
-    inspectInput();
-  });
+  const files = event.dataTransfer?.files;
+  if (!files?.length) return;
+  event.preventDefault();
+  void upload(files);
 }
 function closePicker() {
   picker.value = "";
@@ -851,7 +834,6 @@ function clearSubmittedDraft(key: string, submitted: string) {
 watch(
   draftKey,
   (key, previous) => {
-    markdownPreview.value = false;
     if (pendingDraftSubmission && !pendingDraftSubmission.threadId &&
       previous === pendingDraftSubmission.key && props.state.activeThread?.id &&
       !props.state.selectingThread && !props.state.switchingHost &&
@@ -890,13 +872,9 @@ watch(selected, () => {
       container.scrollTop = option.offsetTop + option.offsetHeight - container.clientHeight;
   });
 });
-watch(draft, (value) => {
-  if (!value.trim()) markdownPreview.value = false;
-  saveDraft(draftKey.value, value);
-}, { flush: "sync" });
+watch(draft, value => saveDraft(draftKey.value, value), { flush: "sync" });
 watch(quotedContexts, value => saveContexts(draftKey.value, value), { deep: true, flush: 'sync' });
 function setDraft(text: string) {
-  markdownPreview.value = false;
   draft.value = text;
   void nextTick(() => {
     input.value?.focus();
@@ -1023,11 +1001,13 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
     <div
       class="composer"
       :class="{ dropping, 'composer-disabled': !state.connected }"
-      @dragover.prevent="dropping = true"
-      @dragleave.prevent="dropping = false"
-      @drop.prevent="drop"
+      @dragenter="dragFiles"
+      @dragover="dragFiles"
+      @dragleave="leaveDrag"
+      @dragend="dropping = false"
+      @drop="drop"
     >
-      <div v-if="dropping" class="drop-overlay">
+      <div v-if="dropping" class="drop-overlay" aria-hidden="true">
         <Icon name="Paperclip" :size="24" /><strong
           >松开以上传文件或图片</strong
         >
@@ -1117,7 +1097,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         </div>
       </div>
       <MarkdownComposerEditor
-        v-show="!markdownPreview"
         ref="input"
         v-model="draft"
         :placeholder="
@@ -1129,7 +1108,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               ? delivery === 'queue' ? '输入下一轮要执行的任务…' : '追加指令，调整当前任务…'
               : welcome
                 ? conversationMode === 'goal' && !state.goal ? '输入希望 Codex 持续完成的目标…' : '描述一个任务，让 Codex 帮你完成'
-                : '继续对话，/ 选择技能、@ 选择模式或引用文件'
+                : '继续对话，/ 技能 · @ 引用或模式'
         "
         :history-scope="draftKey"
         :aria-controls="picker ? 'composer-picker' : undefined"
@@ -1144,11 +1123,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         @paste="paste"
         :disabled="!state.authenticated || !state.hostId"
       />
-      <section v-if="markdownPreview" ref="previewElement" class="composer-markdown-preview" tabindex="0"
-        role="region" aria-label="Markdown 草稿预览" @keydown.esc.prevent="editDraft" @paste="paste">
-        <div class="markdown" v-html="renderedDraft?.html"></div>
-        <p v-if="renderedDraft?.truncated" class="composer-preview-note" role="status">仅预览前 100,000 个字符，完整原文仍会发送；切回编辑可查看全部内容。</p>
-      </section>
       <div class="composer-toolbar">
         <div class="composer-tools">
           <input
@@ -1168,29 +1142,14 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               :name="uploading ? 'LoaderCircle' : 'Plus'"
               :size="19"
               :class="{ spin: uploading }"
-            /></button
-          ><button
-            class="icon-button mention-button"
-            :disabled="!state.connected || contextBusy || state.modeBusy || state.switchingHost || state.selectingThread"
-            @pointerdown.prevent
-            @click="insertAt"
-            title="选择插件、应用、模式或引用项目文件"
-            aria-label="选择插件、应用、模式或引用项目文件"
-            :aria-expanded="picker === 'mentions'"
-            aria-haspopup="listbox"
-          >
-            @</button
-          ><button type="button" class="icon-button markdown-preview-toggle"
-            :disabled="!draft.trim() || contextBusy"
-            :aria-label="markdownPreview ? '编辑 Markdown' : '预览 Markdown'"
-            :title="markdownPreview ? '返回实时 Markdown 编辑' : '完整 Markdown 预览；输入框已实时渲染。Ctrl/⌘+B 粗体、I 斜体、E 代码、Shift+K 链接'"
-            :aria-pressed="markdownPreview" @pointerdown.prevent @click="toggleMarkdownPreview">
-            <Icon :name="markdownPreview ? 'Pencil' : 'Eye'" :size="16" />
-          </button><span class="toolbar-separator"></span
-          ><label
+            />
+          </button>
+          <label
             class="composer-select model-select"
-            :title="selectedModel?.description || '选择模型'"
-            ><select
+            :title="selectedModelLabel"
+          >
+            <span class="composer-select-value" aria-hidden="true">{{ selectedModelLabel }}</span>
+            <select
               :value="state.model"
               @change="chooseModelSetting($event, 'model')"
               aria-label="选择模型"
@@ -1215,7 +1174,9 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
             v-if="efforts.length"
             class="composer-select effort-select"
             title="推理强度"
-            ><select
+          >
+            <span class="composer-select-value" aria-hidden="true">{{ effortLabels[state.effort] || state.effort }}</span>
+            <select
               :value="state.effort"
               @change="chooseModelSetting($event, 'effort')"
               aria-label="推理强度"
@@ -1234,10 +1195,11 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               </option></select
             ><Icon name="ChevronDown" :size="12"
           /></label>
-          <ModelServiceOptions :api="api" :state="state" :disabled="modelControlsDisabled" />
+          <ModelServiceOptions v-model:error="serviceTierError" :api="api" :state="state" :disabled="modelControlsDisabled" />
         </div>
         <div class="composer-submit">
           <label v-if="state.busy || delivery === 'queue'" class="composer-select queue-delivery" :title="delivery === 'queue' ? queue?.blockedReason.value || '当前任务完成后由 Codex 执行' : queue?.state.status !== 'supported' ? queue?.state.reason : '立即补充到当前任务'">
+            <span class="composer-select-value" aria-hidden="true">{{ delivery === 'queue' ? '排队' : '补充' }}</span>
             <select v-model="delivery" aria-label="消息发送方式" :disabled="submitting || contextBusy">
               <option value="immediate">立即补充</option>
               <option value="queue" :disabled="!queue?.canMutate.value">下一轮排队</option>
@@ -1263,7 +1225,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
               'full-access': state.permission === 'danger-full-access',
             }"
             :title="state.permissionChangePending ? `${permissionLabel}：下一轮生效，当前任务保留启动时权限` : permissionLabel"
-            ><Icon
+          >
+            <Icon
               :name="
                 state.permission === 'danger-full-access'
                   ? 'Zap'
@@ -1271,7 +1234,10 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
                     ? 'Lock'
                     : 'Shield'
               "
-              :size="13" /><select
+              :size="13"
+            />
+            <span class="composer-select-value" aria-hidden="true">{{ selectedPermission === 'resumed' ? '会话权限' : permissionLabel }}</span>
+            <select
               :value="selectedPermission"
               @change="choosePermission"
               aria-label="选择权限" :data-queue-locked="queue?.settingsLocked.value"
@@ -1337,6 +1303,8 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
         </div>
       </div>
     </div>
+    <p v-if="state.rateLimits?.ordinaryUsageAllowed === false" class="composer-setting-notice is-error" role="status">常规额度已受限</p>
+    <p v-if="serviceTierError" class="composer-setting-notice service-tier-error is-error" role="alert">{{ serviceTierError }}</p>
     <p v-if="modelSettingsError || state.modelSettingsNotice" class="composer-setting-notice" :class="{ 'is-error': !!modelSettingsError }" :role="modelSettingsError ? 'alert' : 'status'">{{ modelSettingsError || state.modelSettingsNotice }}</p>
     <p v-if="submitting && submittedDuringCompaction" class="compaction-send-note" role="status"><Icon name="LoaderCircle" :size="12" class="spin" />压缩结束后发送，草稿暂时保留。</p>
   </div>
@@ -1372,7 +1340,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 </template>
 
 <style scoped>
-.composer-setting-notice { color:var(--muted);font-size:11px;line-height:1.5;margin:5px 2px 0; }
+.composer-setting-notice { color:var(--muted);font-size:11px;line-height:1.5;margin:5px 2px 0;overflow-wrap:anywhere; }
 .composer-setting-notice.is-error { color:var(--red); }
 .compaction-send-note { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; margin: 7px 4px 0; }
 .composer-area {
@@ -1391,14 +1359,6 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   box-shadow: none;
 }
 .composer:focus-within { box-shadow: none; }
-.markdown-preview-toggle[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
-.composer-markdown-preview { min-height: 51px; max-height: 210px; overflow: auto; overscroll-behavior: contain; padding: 0 2px 8px; outline: none; }
-.composer-markdown-preview .markdown { font-size: var(--composer-font-size); line-height: 1.8; overflow-wrap: anywhere; }
-.composer-markdown-preview :deep(h1), .composer-markdown-preview :deep(h2), .composer-markdown-preview :deep(h3) { margin-top: 8px; font-size: 1.1em; }
-.composer-markdown-preview :deep(h1:first-child), .composer-markdown-preview :deep(h2:first-child), .composer-markdown-preview :deep(h3:first-child) { margin-top: 0; }
-.composer-markdown-preview :deep(pre), .composer-markdown-preview :deep(table) { max-width: 100%; }
-.composer-markdown-preview :deep(img) { max-height: 140px; object-fit: contain; }
-.composer-preview-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .composer-area :deep(.new-context) {
   margin: 0;
   padding: 6px 15px;
@@ -1465,6 +1425,7 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 .composer .model-select select { width: 100%; min-width: 0; text-overflow: ellipsis; }
 .composer .effort-select { flex: 0 0 auto; }
 .composer .effort-select select { width: auto; max-width: none; }
+.composer-select-value { display: none; }
 .context-usage { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; min-height: 28px; padding: 3px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .context-usage:hover:not(:disabled) { color: var(--text); background: var(--soft); }
 .context-usage:disabled { opacity: 1; cursor: default; }
@@ -1489,9 +1450,72 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
 @media (max-width: 760px) {
   .context-menu-actions .icon-button { width: 40px; height: 40px; }
   .context-compact-action { min-height: 44px; font-size: 13px; }
+  .composer .composer-toolbar {
+    --composer-control-height: 36px;
+    --composer-select-gap: 4px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .composer .composer-tools,
+  .composer .composer-submit {
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-height: var(--composer-control-height);
+  }
+  .composer .composer-submit { margin-left: 0; }
+  .composer .composer-tools > .icon-button {
+    flex: 0 0 32px;
+    width: 32px;
+    height: var(--composer-control-height);
+  }
+  .composer-toolbar .composer-select {
+    height: var(--composer-control-height);
+    gap: var(--composer-select-gap);
+    font: inherit;
+  }
+  .composer .model-select,
+  .composer .effort-select { margin-left: 0; }
+  .composer-toolbar .composer-select > svg { flex: none; }
+  .composer-toolbar .composer-select > svg:last-child { width: 11px; }
+  .composer-select-value {
+    display: block;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer .composer-toolbar .composer-select select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    padding: 0;
+    font: inherit;
+    opacity: 0;
+  }
+  .composer-toolbar .composer-select:has(select:focus-visible) {
+    border-radius: 4px;
+    outline: 2px solid var(--accent-text);
+    outline-offset: 2px;
+  }
+  .composer-toolbar .composer-select:has(select:disabled) { opacity: .65; }
+  .context-usage {
+    margin-right: auto;
+    height: var(--composer-control-height);
+    gap: 4px;
+    padding-inline: 0;
+    font: inherit;
+  }
+  .composer .send-button {
+    width: var(--composer-control-height);
+    height: var(--composer-control-height);
+  }
 }
 @media (max-width: 600px) {
-  .composer-markdown-preview { max-height: min(210px, 35dvh); }
   .composer-area { border-radius: 12px; }
   .composer { padding: 12px 12px 10px; }
   .composer-area :deep(.new-context) {
@@ -1505,21 +1529,15 @@ defineExpose({ focus: focusInput, getDraft: () => draft.value, setDraft, addCont
   .composer-area :deep(.context-choice select) { max-width: 100%; }
   .composer-area :deep(.context-add) { grid-column: 1 / -1; margin-left: 0; padding: 0; }
   .composer > textarea { padding: 0 0 8px; min-height: 52px; font-size: var(--composer-font-size); }
-  .composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 3px; width: 100%; }
-  .composer .composer-tools { display: flex; flex-wrap: nowrap; width: 100%; gap: 3px; }
-  .composer .composer-tools > .icon-button { flex: 0 0 34px; width: 34px; height: 36px; }
-  .toolbar-separator { flex: 0 0 1px; margin-inline: 3px; }
-  .composer .model-select { flex: 1 1 0; margin-left: 0; gap: 3px; }
-  .composer .model-select select { flex: 1 1 0; max-width: none; min-height: 36px; font-size: 12px; }
-  .composer .effort-select { flex: 0 0 auto; margin: 0 0 0 4px; gap: 3px; }
-  .composer .effort-select select { min-height: 36px; padding-inline: 0; font-size: 12px; }
-  .composer .composer-submit { min-width: 0; width: 100%; justify-content: flex-end; gap: 7px; }
-  .context-usage { margin-right: auto; min-height: 36px; font-size: 11px; gap: 4px; padding-inline: 0; }
-  .composer .permission-select { min-width: 0; max-width: calc(100% - 50px); }
-  .composer .permission-select select { width: auto; max-width: min(170px, 100%); text-overflow: ellipsis; min-height: 36px; font-size: 12px; }
-  .composer .send-button { width: 36px; height: 36px; }
   .composer-picker { bottom: calc(100% + 7px); }
   .composer-tokens { gap: 6px; }
   .composer-token { font-size: 12px; }
+}
+@media (max-width: 360px) {
+  .composer { padding-inline: 8px; }
+  .composer .composer-toolbar { --composer-select-gap: 3px; }
+  .composer .composer-tools,
+  .composer .composer-submit { gap: 4px; }
+  .composer .composer-tools > .icon-button { flex-basis: 28px; width: 28px; }
 }
 </style>

@@ -80,9 +80,8 @@ function mathHtml(math: ConversationMath) {
   return renderConversationMath(math) || escapeMathText(math.raw);
 }
 
-/** An isolated parser keeps conversation extensions out of file previews and
- * other users of Marked. Code/link tokens retain Marked's original behavior. */
-export function createConversationMarkdownParser() {
+/** Keep math parsing isolated so each Markdown consumer can sanitize its own output. */
+export function createConversationMarkdownParser(wrapMath: (html: string) => string = html => html) {
   return new Marked({ renderer: {
     image(token) {
       // Marked's text renderer also calls extension renderers. Parsing image
@@ -109,7 +108,7 @@ export function createConversationMarkdownParser() {
       renderer(token: Token) {
         const block = token as Token & ConversationMath & { rawMath: string };
         const math = { raw: block.rawMath, formula: block.formula, display: true };
-        return `<div class="conversation-math-block">${mathHtml(math)}</div>\n`;
+        return `<div class="conversation-math-block">${wrapMath(mathHtml(math))}</div>\n`;
       },
     },
     {
@@ -135,7 +134,7 @@ export function createConversationMarkdownParser() {
       },
       renderer(token: Token) {
         const math = token as Token & Partial<ConversationMath>;
-        return typeof math.formula === 'string' ? mathHtml(math as ConversationMath) : escapeMathText(math.raw);
+        return typeof math.formula === 'string' ? wrapMath(mathHtml(math as ConversationMath)) : escapeMathText(math.raw);
       },
     },
   ] });

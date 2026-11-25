@@ -264,3 +264,50 @@ test('a transient failure while saving a read receipt retries and synchronizes w
     expect(a.mock.request('turn/start')).toBeUndefined();
   } finally { await close(); }
 });
+
+for (const historyChanged of [false, true]) {
+  test(historyChanged ? 'a newer native turn is not marked read by an older transcript' :
+    'viewing a completed transcript sends the native receipt used by desktop clients', async ({ page }) => {
+    const mock = new MockCodex();
+    await mock.install(page);
+    const threadId = 'thread-existing';
+    const response = mock.receive.bind(mock);
+    const heading = mock.turns.get(threadId)!.at(-1)!;
+    const initialReadState = { firstUnread: { type: 'turn', turnId: heading.id }, revision: 'observed-native-revision' };
+    let nativeReadState: { firstUnread: unknown; revision: string } = initialReadState;
+    mock.receive = (socket, request) => {
+      if (request.params?.threadId !== threadId) return response(socket, request);
+      const reply = (result: unknown) => {
+        mock.requests.push(request);
+        socket.send(JSON.stringify({ id: request.id, result }));
+      };
+      if (request.method === 'thread/read')
+        return reply({ thread: mock.threads.find(thread => thread.id === threadId), readState: nativeReadState });
+      if (request.method === 'thread/turns/list' && request.params.limit === 1)
+        return reply({ data: [{ ...heading, id: historyChanged ? 'newer-unseen-turn' : heading.id }], nextCursor: 'older-history' });
+      if (request.method === 'thread/readState/update') {
+        if (request.params.expectedRevision === nativeReadState.revision)
+          nativeReadState = { firstUnread: null, revision: 'desktop-read-revision' };
+        return reply({ readState: nativeReadState });
+      }
+      return response(socket, request);
+    };
+    await login(page);
+    await page.bringToFront();
+    await page.locator('[data-section="recent"] .thread-row').filter({ hasText: '已有测试历史' }).click();
+    await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
+    await expect.poll(() => mock.requests.some(request => request.method === 'thread/turns/list' && request.params.limit === 1)).toBe(true);
+    if (historyChanged) {
+      mock.emit('thread/name/updated', { threadId, name: '原生已读检查结束' });
+      await expect(row(page, 'local', '原生已读检查结束')).toBeVisible();
+      expect(nativeReadState).toEqual(initialReadState);
+      expect(mock.request('thread/readState/update')).toBeUndefined();
+    } else {
+      await expect.poll(() => nativeReadState.firstUnread).toBeNull();
+      expect(mock.request('thread/readState/update')?.params).toEqual({
+        threadId, operation: { type: 'read' }, expectedRevision: initialReadState.revision,
+      });
+    }
+    expect(mock.request('turn/start')).toBeUndefined();
+  });
+}
