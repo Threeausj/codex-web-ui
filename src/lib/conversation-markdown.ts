@@ -1,13 +1,14 @@
 import DOMPurify from 'dompurify';
 import type { TokenizerAndRendererExtension } from 'marked';
 import { isAbsoluteHostPath, isWindowsHostPath, joinHostPath } from '../../shared/host-path';
-import { fileLinkLocation, isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
+import { isImagePath, isMarkdownPath, officeFileKind, previewFilePath } from './file-preview';
+import { conversationFileCitation, conversationFileLocation } from './conversation-file-citation';
 import { safeConversationImageSource } from './conversation-image-viewer';
 import { clearConversationMathCache, createConversationMarkdownParser, plainMessageMath } from './conversation-math';
 import { visualizationBlock, type ConversationVisualization } from './conversation-visualization';
 import { mermaidSource } from './markdown-mermaid';
 
-const marked = createConversationMarkdownParser();
+const marked = createConversationMarkdownParser().use({ extensions: [conversationFileCitation] });
 const responseAnnotationReference: TokenizerAndRendererExtension = {
   name: 'responseAnnotationReference',
   level: 'inline',
@@ -20,18 +21,17 @@ const responseAnnotationReference: TokenizerAndRendererExtension = {
     return `<span class="response-annotation-reference" data-selection-ignore="true">引用 ${token.index}</span>`;
   },
 };
-const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock, responseAnnotationReference] });
+const assistantMarkdown = createConversationMarkdownParser().use({ extensions: [visualizationBlock, responseAnnotationReference, conversationFileCitation] });
 
 function decorateFileLink(anchor: HTMLAnchorElement) {
-  const href = anchor.getAttribute('href') || '';
-  const location = fileLinkLocation(href === '#' ? anchor.dataset.filePath || href : href);
+  const location = conversationFileLocation(anchor);
   if (!location) return;
   const path = location.path;
   const office = officeFileKind(path);
   const kind = /\.pdf$/i.test(path) ? 'pdf'
     : /\.(?:zip|7z|rar|tar|gz|bz2|xz|tgz)$/i.test(path) ? 'archive'
     : office === 'xlsx' || office === 'xls' || /\.csv$/i.test(path) ? 'spreadsheet'
-    : office || isMarkdownPath(path) || /\.(?:txt|rtf|html?)$/i.test(path) ? 'document'
+    : office || anchor.hasAttribute('data-conversation-citation') || isMarkdownPath(path) || /\.(?:txt|rtf|html?)$/i.test(path) ? 'document'
     : null;
   if (kind) anchor.dataset.conversationFile = kind;
 }

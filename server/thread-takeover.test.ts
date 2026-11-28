@@ -263,7 +263,8 @@ try: print(json.dumps(main(),`)
 })
 
 const codexBin = process.env.CODEX_BIN || 'codex'
-const hasCodex = canRunHelper && spawnSync(codexBin, ['--version'], { stdio: 'ignore' }).status === 0
+const hasCodex = ['linux', 'darwin'].includes(process.platform) && python.status === 0 &&
+  spawnSync(codexBin, ['--version'], { stdio: 'ignore' }).status === 0
 test('isolated real Codex writer conflict can be inspected, terminated and resumed with its persisted history intact and no model turn', { skip: !hasCodex, timeout: 30_000 }, async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-native-takeover-'))
   const home = path.join(directory, 'home')
@@ -305,11 +306,25 @@ test('isolated real Codex writer conflict can be inspected, terminated and resum
   const inspection = await inspectionResponse.json()
   // The npm Codex launcher is Node and starts the actual Rust writer as its
   // child. Verify the discovered owner belongs to this isolated test process.
-  const ownerStat = await fs.readFile(`/proc/${inspection.owner.pid}/stat`, 'utf8')
-  const ownerParent = Number(ownerStat.slice(ownerStat.lastIndexOf(')') + 1).trim().split(/\s+/)[1])
+  const ownerParent = Number(spawnSync('ps', ['-p', String(inspection.owner.pid), '-o', 'ppid='], { encoding: 'utf8' }).stdout)
   assert.ok(inspection.owner.pid === children[0]!.pid || ownerParent === children[0]!.pid)
   assert.equal(inspection.owner.affectedThreadCount, 1)
-  const takeover = await api.post('', { confirmed: true, challenge: inspection.challenge }, api.headers, 'local', id)
+  const added = await owner.request('thread/start', { cwd: directory, sandbox: 'danger-full-access', approvalPolicy: 'never', historyMode: 'paginated' }) as { thread: { id: string } }
+  if (process.platform === 'darwin') {
+    // A read-only open of the target inode is not a writer, and a new
+    // affected thread invalidates the old confirmation on Darwin as on Linux.
+    const reader = await fs.open(path.join(home, 'thread-writer-locks', id + '.lock'), 'r')
+    try {
+      const stale = await api.post('', { confirmed: true, challenge: inspection.challenge }, api.headers, 'local', id)
+      assert.equal(stale.status, 409)
+      assert.equal((await stale.json()).code, 'writer_changed')
+    } finally { await reader.close() }
+  }
+  assert.ok(added.thread.id)
+  const updated = await (await api.post('/inspect', {}, api.headers, 'local', id)).json()
+  assert.equal(updated.owner?.pid, inspection.owner.pid)
+  assert.equal(updated.owner?.affectedThreadCount, 2)
+  const takeover = await api.post('', { confirmed: true, challenge: updated.challenge }, api.headers, 'local', id)
   assert.equal(takeover.status, 200, JSON.stringify(await takeover.clone().json()))
   const resumed = await requester.request('thread/resume', resume) as { thread: { id: string; name: string; turns: unknown[] } }
   assert.equal(resumed.thread.id, id)

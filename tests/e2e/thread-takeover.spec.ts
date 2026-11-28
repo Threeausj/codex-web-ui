@@ -166,6 +166,9 @@ test('session expiry during a pending resume preserves the remembered thread and
   await expect(page.getByText('历史保持可读', { exact: true })).toBeVisible();
   const draft = page.getByRole('textbox', { name: '消息输入框' });
   await draft.fill('重新登录后继续的草稿');
+  // Selecting an already active thread only restores the chat view.
+  await page.getByRole('button', { name: /^新建对话/ }).click();
+  await expect(draft).toHaveValue('');
   const socket = mock.sockets[0]!;
   const send = socket.send.bind(socket);
   let pendingResume = false;

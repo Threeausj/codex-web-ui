@@ -81,6 +81,49 @@ test('PPTX renders one real slide at a time and cleans up when another file is o
   await expect(page.locator('iframe[title="报告.pptx 只读预览"]')).toHaveCount(0);
   await expect(page.frameLocator('iframe[title="说明.docx 只读预览"]').getByText('中文工作文档 · 第一页', { exact: true })).toBeVisible();
 });
+test('native file citations wrap on mobile and open the cited Mac file', async ({ page, mock }) => {
+  const mac = new MockCodex();
+  const name = '研究方法与结果汇报_面向论坛的完整演示版本 #100%.pptx';
+  const path = '/Users/test/Downloads/交付资料/' + name;
+  const slides = await pptxFixture();
+  files(mac, { [name]: slides });
+  mac.threads[0]!.name = mac.threads[0]!.preview = 'Mac 文件引用';
+  mock.hosts.push({ id: 'mac-citation', name: 'Mac', kind: 'ssh', hostname: 'fixture.invalid', cwd: '/Users/test' });
+  mock.hostMocks.set('mac-citation', mac);
+  const citation = `:codex-file-citation{path="${path}" purpose="output"}`;
+  const literal = ':codex-file-citation{path="/example.txt"}';
+  const external = ':codex-file-citation{path="https://example.invalid/other.pptx"}';
+  mac.turns.get('thread-existing')![0].items[1].text = [
+    '演示文稿已经准备好。', citation,
+    ':codex-file-citation[对应源码]{path="/Users/test/README.md" line_range_start="2" line_range_end="4"}',
+    '`' + literal + '`', external,
+  ].join('\n\n');
+  await page.setViewportSize({ width: 320, height: 700 });
+  await login(page);
+  await page.getByRole('button', { name: '打开侧边栏', exact: true }).click();
+  await page.locator('[data-section="recent"] .nav-thread[data-host-id="mac-citation"] .thread-row').first().click();
+  const response = page.locator('[data-selection-item-id="history-agent"]');
+  const link = response.getByRole('link', { name, exact: true });
+  await expect(link).toHaveAttribute('data-conversation-file', 'document');
+  await expect(response.getByRole('link', { name: '对应源码:2–4', exact: true })).toHaveAttribute('data-citation-line', '2');
+  await expect(response.locator('code')).toHaveText(literal);
+  await expect(response).toContainText(external);
+  await expect(response).not.toContainText(citation);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(320);
+  await link.click();
+  const preview = page.getByRole('region', { name: '文件预览', exact: true });
+  await expect(preview).toBeVisible();
+  await expect(page.frameLocator('iframe[title="' + name + ' 只读预览"]').getByText('中文幻灯片 1', { exact: true })).toBeVisible();
+  expect(mac.request('fs/readFile')?.params.path).toBe(path);
+  expect(mock.request('fs/readFile')).toBeUndefined();
+
+  const downloaded = page.waitForEvent('download');
+  await preview.getByRole('button', { name: '下载文件', exact: true }).click();
+  const transfer = new URL((await downloaded).url());
+  expect(transfer.pathname).toBe('/api/hosts/mac-citation/download');
+  expect(transfer.searchParams.get('path')).toBe(path);
+});
+
 test('damaged and legacy Office files retain download and retry actions without changing the file', async ({ page, mock }) => {
   const values = { '损坏.docx': Buffer.from('broken'), '旧版.doc': Buffer.from('legacy') };
   files(mock, values);

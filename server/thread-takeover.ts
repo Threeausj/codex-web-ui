@@ -3,6 +3,7 @@ import path from 'node:path'
 import type { Express } from 'express'
 import { z } from 'zod'
 import type { Bridge } from './bridge.js'
+import { DARWIN_WRITER_PROBE } from './thread-takeover-darwin.js'
 import type { AuthenticatedRequest, Host } from './types.js'
 
 type TakeoverBridge = Pick<Bridge, 'connect' | 'request' | 'codexHome'>
@@ -37,10 +38,16 @@ UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 
 def refuse(code): raise Refused(code)
 
+${DARWIN_WRITER_PROBE}
+
+def linux_stat(pid):
+    return open('/proc/%d/stat' % pid).read().rsplit(')', 1)[1].split()
+
 def identity(pid):
+    if sys.platform == 'darwin': return darwin_identity(pid)
     try:
-        fields = open('/proc/%d/stat' % pid).read().rsplit(')', 1)[1].split()
-        state, parent, start = fields[0], int(fields[1]), fields[19]
+        fields = linux_stat(pid)
+        state, start = fields[0], fields[19]
         uid = os.stat('/proc/%d' % pid).st_uid
         uids = next(line.split()[1:] for line in open('/proc/%d/status' % pid) if line.startswith('Uid:'))
         exe = os.readlink('/proc/%d/exe' % pid)
@@ -58,7 +65,7 @@ def ancestors():
     for _ in range(64):
         if pid <= 1 or pid in values: break
         values.add(pid)
-        try: pid = int(open('/proc/%d/stat' % pid).read().rsplit(')', 1)[1].split()[1])
+        try: pid = darwin_parent(pid) if sys.platform == 'darwin' else int(linux_stat(pid)[1])
         except (FileNotFoundError, ValueError): break
     return values
 
@@ -136,7 +143,7 @@ def inspect(directory, thread):
     try:
         if not locked(fd): return None
         info = os.fstat(fd)
-        owners = flock_owners(file_key(info))
+        owners = darwin_flock_owners(fd, directory) if sys.platform == 'darwin' else flock_owners(file_key(info))
         pids = owners.get(file_key(info), set())
         # /proc/locks filters owners outside this PID namespace. A lock can be
         # busy even though its host owner cannot safely be signalled here.
@@ -150,7 +157,9 @@ def inspect(directory, thread):
         for name in names:
             try: entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError: refuse('writer_changed')
-            if pid not in owners.get(file_key(entry), set()): continue
+            entry_owners = owners.get(file_key(entry), set())
+            if pid not in entry_owners: continue
+            if entry_owners != {pid}: refuse('writer_unidentified')
             if name == '.coordination.lock': refuse('writer_busy')
             if not name.endswith('.lock') or not UUID.fullmatch(name[:-5]) or not stat.S_ISREG(entry.st_mode):
                 refuse('writer_invalid_lock')
@@ -203,21 +212,22 @@ def await_release(directory, thread, expected, seconds):
             if '%d:%d' % (os.major(info.st_dev), os.minor(info.st_dev)) != expected['device'] or str(info.st_ino) != expected['inode']:
                 refuse('writer_changed')
             if not locked(fd): return True
-            owners = flock_owners(file_key(info)).get(file_key(info), set())
-            if owners != {expected['pid']}:
+            owners = darwin_flock_owners(fd) if sys.platform == 'darwin' else flock_owners(file_key(info))
+            pids = owners.get(file_key(info), set())
+            if pids != {expected['pid']}:
                 # The original process can exit between the busy probe and its
                 # FD scan. Recheck the real flock before treating an empty scan
                 # as failure, and allow a bounded wait while /proc is changing.
                 # A verified replacement owner always cancels this takeover;
                 # later signals still require the complete original identity.
-                if owners: refuse('writer_changed')
+                if pids: refuse('writer_changed')
                 if not locked(fd): return True
         finally: os.close(fd)
         time.sleep(0.05)
     return False
 
 def main():
-    if sys.platform != 'linux': refuse('writer_platform')
+    if sys.platform not in ('linux', 'darwin'): refuse('writer_platform')
     mode, thread, configured_home = sys.argv[1:4]
     if mode not in ('inspect', 'takeover') or not UUID.fullmatch(thread): refuse('writer_invalid_request')
     home = configured_home or os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
@@ -227,6 +237,7 @@ def main():
                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError: return {'ok': True, 'locked': False, 'released': True, 'terminated': False}
     try:
+        if sys.platform == 'darwin': darwin_check_local(directory)
         current = inspect(directory, thread)
         if mode == 'inspect': return {'ok': True, 'locked': current is not None, 'snapshot': current}
         expected = json.loads(sys.argv[4])
@@ -256,11 +267,11 @@ except (ValueError, KeyError, IndexError, StopIteration): print(json.dumps({'ok'
 `
 
 const messages: Record<string, { status: number; message: string }> = {
-  writer_unidentified: { status: 409, message: '无法安全识别占用进程。若本机运行在 Docker 中，请改用 SSH 连接 NAS 后强制进入。' },
+  writer_unidentified: { status: 409, message: '无法确认会话锁的占用进程。若通过 Docker 本机连接 NAS，请改用 SSH；也可以在占用端关闭会话后重试。' },
   writer_permissions: { status: 403, message: '无法读取或终止占用进程，请使用与该 Codex 进程相同的系统用户连接。' },
   writer_not_codex: { status: 409, message: '占用进程无法确认为 Codex，已取消强制进入。' },
   writer_bridge_owner: { status: 409, message: '会话由当前 Web 服务连接的 Codex 进程占用，不能终止自身连接；请重试打开会话。' },
-  writer_platform: { status: 409, message: '强制进入目前支持 Linux 本机或 SSH 主机，请先在占用的客户端关闭会话。' },
+  writer_platform: { status: 409, message: '强制进入支持 Linux 和 macOS。请在占用的客户端关闭会话后重试。' },
   writer_changed: { status: 409, message: '占用进程或受影响的会话已变化，请重新确认强制进入。' },
   writer_invalid_lock: { status: 409, message: '无法安全验证 Codex 会话锁，已取消强制进入。' },
   writer_busy: { status: 409, message: 'Codex 正在变更会话锁，请稍后重试强制进入。' },
