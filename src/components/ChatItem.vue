@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { historyDisclosures } from "../lib/history-disclosures";
-import { fileLinkLocation } from "../lib/file-preview";
+import { conversationFileLocation } from "../lib/conversation-file-citation";
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { conversationMarkdown, conversationMarkdownBlocks } from '../lib/conversation-markdown'
 import UserMessageContent from './UserMessageContent.vue'
@@ -163,10 +163,9 @@ function onMarkdownKeydown(event: KeyboardEvent) {
 function onLink(event: MouseEvent) {
   const image = (event.target as Element).closest('img[data-conversation-image]') as HTMLImageElement | null
   if (image) { event.preventDefault(); event.stopPropagation(); previewMarkdownImage(image); return }
-  const anchor = (event.target as Element).closest('a')
+  const anchor = (event.target as Element).closest<HTMLAnchorElement>('a')
   if (!anchor) return
-  const href = anchor.getAttribute('href') === '#' ? anchor.dataset.filePath || '#' : anchor.getAttribute('href') || ''
-  const location = fileLinkLocation(href);
+  const location = conversationFileLocation(anchor);
   if (location) { event.preventDefault(); emit('openFile', location.path, location.line); }
   else { anchor.setAttribute('target', '_blank'); anchor.setAttribute('rel', 'noopener noreferrer') }
 }

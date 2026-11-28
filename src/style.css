@@ -926,6 +926,9 @@ hr {
   text-underline-offset: 3px;
   color: var(--accent-text);
 }
+.markdown a[data-conversation-citation] {
+  overflow-wrap: anywhere;
+}
 .markdown a[data-conversation-file]::before {
   content: "";
   display: inline-block;
